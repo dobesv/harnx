@@ -84,33 +84,37 @@ pub(crate) async fn serve(app: Router) -> JwksUrl {
 /// Local JWKS server that counts fetches and can swap its key set.
 pub(crate) struct JwksServer {
     pub(crate) url: JwksUrl,
-    body: std::sync::Arc<std::sync::Mutex<&'static str>>,
+    response: std::sync::Arc<std::sync::Mutex<(axum::http::StatusCode, &'static str)>>,
     fetches: std::sync::Arc<AtomicU64>,
 }
 
 impl JwksServer {
     pub(crate) async fn start(body: &'static str) -> Self {
         let fetches = Arc::new(AtomicU64::new(0));
-        let body = Arc::new(std::sync::Mutex::new(body));
+        let response = Arc::new(std::sync::Mutex::new((axum::http::StatusCode::OK, body)));
         let counter = fetches.clone();
-        let current = body.clone();
+        let current = response.clone();
         let app = Router::new().route(
             "/.well-known/jwks.json",
             get(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
-                let body = *current.lock().unwrap();
-                async move { axum::Json(serde_json::from_str::<Value>(body).unwrap()) }
+                let response = *current.lock().unwrap();
+                async move { response }
             }),
         );
         Self {
             url: serve(app).await,
-            body,
+            response,
             fetches,
         }
     }
 
     pub(crate) fn swap(&self, body: &'static str) {
-        *self.body.lock().unwrap() = body;
+        *self.response.lock().unwrap() = (axum::http::StatusCode::OK, body);
+    }
+
+    pub(crate) fn fail(&self) {
+        *self.response.lock().unwrap() = (axum::http::StatusCode::SERVICE_UNAVAILABLE, "");
     }
 
     pub(crate) fn fetches(&self) -> u64 {
@@ -127,7 +131,7 @@ pub(crate) fn verifier(url: &JwksUrl) -> BearerVerifier {
     .unwrap()
 }
 
-/// Replace the internal clock so the 30 s refetch throttle can be tested
+/// Replace the internal clock to test cache expiry and refetch throttling
 /// without sleeping; returns the advance-by-milliseconds control.
 pub(crate) fn verifier_with_fake_clock(url: &JwksUrl) -> (BearerVerifier, impl Fn(u64)) {
     let millis = Arc::new(AtomicU64::new(0));
@@ -297,6 +301,151 @@ mod tests {
         ] {
             BearerVerifier::new(config(url)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn verify_stale_cache_refreshes_on_kid_hit() {
+        let server = JwksServer::start(JWKS_PRIMARY).await;
+        let (verifier, advance) = verifier_with_fake_clock(&server.url);
+        let verifier = Arc::new(verifier);
+        let token = sign(&forge_claims("account-id"), &PRIMARY_KEY);
+        verifier.verify(&token).await.unwrap();
+
+        advance(JWKS_CACHE_MAX_AGE.as_millis() as u64 - 1);
+        verifier.verify(&token).await.unwrap();
+        assert_eq!(server.fetches(), 1);
+
+        // Expiry applies on a kid hit too, and concurrent hits share the refresh.
+        advance(1);
+        let mut concurrent = Vec::new();
+        for _ in 0..8 {
+            let verifier = verifier.clone();
+            let token = token.clone();
+            concurrent.push(tokio::spawn(async move { verifier.verify(&token).await }));
+        }
+        for result in concurrent {
+            result.await.unwrap().unwrap();
+        }
+        assert_eq!(server.fetches(), 2);
+
+        // A successful refresh starts a new cache lifetime.
+        advance(JWKS_CACHE_MAX_AGE.as_millis() as u64 - 1);
+        verifier.verify(&token).await.unwrap();
+        assert_eq!(server.fetches(), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_removed_key_rejected_at_cache_max_age() {
+        let server = JwksServer::start(JWKS_PRIMARY).await;
+        let (verifier, advance) = verifier_with_fake_clock(&server.url);
+        let primary = sign(&forge_claims("account-id"), &PRIMARY_KEY);
+        verifier.verify(&primary).await.unwrap();
+        server.swap(JWKS_SECONDARY);
+
+        advance(JWKS_CACHE_MAX_AGE.as_millis() as u64 - 1);
+        verifier.verify(&primary).await.unwrap();
+        assert_eq!(server.fetches(), 1);
+
+        // No unknown kid is needed to stop trusting the removed key.
+        advance(1);
+        assert_eq!(
+            verifier.verify(&primary).await.unwrap_err(),
+            VerifyFailure::UnknownKid
+        );
+        let rotated = sign(&forge_claims("account-id"), &SECONDARY_KEY);
+        verifier.verify(&rotated).await.unwrap();
+        assert_eq!(server.fetches(), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_dropped_fetch_remains_throttled() {
+        let fetches = Arc::new(AtomicU64::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let counter = fetches.clone();
+        let notify = started.clone();
+        let app = Router::new().route(
+            "/.well-known/jwks.json",
+            get(move || {
+                let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                let notify = notify.clone();
+                async move {
+                    if first {
+                        notify.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    JWKS_PRIMARY
+                }
+            }),
+        );
+        let (verifier, advance) = verifier_with_fake_clock(&serve(app).await);
+        let token = sign(&forge_claims("account-id"), &PRIMARY_KEY);
+        let mut attempt = Box::pin(verifier.verify(&token));
+        tokio::select! {
+            result = &mut attempt => panic!("fetch completed before cancellation: {result:?}"),
+            () = started.notified() => {}
+        }
+        // Drop while the HTTP response is pending, as on client disconnect.
+        drop(attempt);
+
+        advance(REFETCH_THROTTLE.as_millis() as u64 - 1);
+        assert_eq!(
+            verifier.verify(&token).await.unwrap_err(),
+            VerifyFailure::UnknownKid
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        advance(1);
+        verifier.verify(&token).await.unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_stale_refresh_failure_fails_closed_and_throttles_retries() {
+        let server = JwksServer::start(JWKS_PRIMARY).await;
+        let (verifier, advance) = verifier_with_fake_clock(&server.url);
+        let token = sign(&forge_claims("account-id"), &PRIMARY_KEY);
+        verifier.verify(&token).await.unwrap();
+        server.fail();
+
+        advance(JWKS_CACHE_MAX_AGE.as_millis() as u64);
+        assert_eq!(
+            verifier.verify(&token).await.unwrap_err(),
+            VerifyFailure::JwksFetch
+        );
+        assert_eq!(server.fetches(), 2);
+
+        // Stale keys stay unusable and queued requests can't cause a fetch storm.
+        let mut concurrent = Vec::new();
+        for _ in 0..8 {
+            concurrent.push(verifier.verify(&token));
+        }
+        for result in futures::future::join_all(concurrent).await {
+            assert_eq!(result.unwrap_err(), VerifyFailure::UnknownKid);
+        }
+        advance(REFETCH_THROTTLE.as_millis() as u64 - 1);
+        assert_eq!(
+            verifier.verify(&token).await.unwrap_err(),
+            VerifyFailure::UnknownKid
+        );
+        assert_eq!(server.fetches(), 2);
+
+        // Failed refreshes don't reset the cache lifetime.
+        advance(1);
+        assert_eq!(
+            verifier.verify(&token).await.unwrap_err(),
+            VerifyFailure::JwksFetch
+        );
+        assert_eq!(server.fetches(), 3);
+
+        server.swap(JWKS_PRIMARY);
+        assert_eq!(
+            verifier.verify(&token).await.unwrap_err(),
+            VerifyFailure::UnknownKid
+        );
+        advance(REFETCH_THROTTLE.as_millis() as u64);
+        verifier.verify(&token).await.unwrap();
+        verifier.verify(&token).await.unwrap();
+        assert_eq!(server.fetches(), 4);
     }
 
     #[tokio::test]

@@ -22,13 +22,19 @@ const LEEWAY_SECONDS: u64 = 10;
 /// `kid` fails closed; a flood of garbage `kid`s can't cause a fetch storm.
 const REFETCH_THROTTLE: Duration = Duration::from_secs(30);
 
+/// Bound trust in removed keys even when their `kid` keeps matching. Expired
+/// sets fail closed if refresh fails: an outage must not extend trust in a
+/// potentially compromised key. Single-flight and the attempt throttle still
+/// bound refresh traffic during an outage; there is no stale-key grace period.
+const JWKS_CACHE_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+
 const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// JWKS response cap; a valid Forge key set is a few KiB.
 const MAX_JWKS_BYTES: usize = 1024 * 1024;
 
-/// Milliseconds since verifier construction. Injectable so the 30 s refetch
-/// throttle can be tested without sleeping.
+/// Milliseconds since verifier construction. Injectable so cache expiry and
+/// the 30 s refetch throttle can be tested without sleeping.
 type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 fn monotonic_clock() -> Clock {
@@ -115,8 +121,10 @@ impl VerifyFailure {
 struct JwksCache {
     /// The whole fetched key set; a refresh replaces it, so rotated-out keys disappear.
     keys: Option<Arc<JwkSet>>,
-    /// When the last fetch attempt ran, successful or not.
+    /// When the last fetch attempt started, including failed or cancelled fetches.
     last_fetch: Option<u64>,
+    /// When the current key set was fetched successfully, for cache expiry.
+    fetched_at: Option<u64>,
 }
 
 /// Config only, never token or JWKS state.
@@ -186,6 +194,7 @@ impl BearerVerifier {
             state: std::sync::Mutex::new(JwksCache {
                 keys: None,
                 last_fetch: None,
+                fetched_at: None,
             }),
             fetch_lock: Mutex::new(()),
             clock: monotonic_clock(),
@@ -234,7 +243,7 @@ impl BearerVerifier {
         }
     }
 
-    /// The cached key set once it contains `kid`, refetching when it doesn't.
+    /// A fresh key set containing `kid`, refetching on expiry or an unknown key.
     async fn keys(&self, kid: &str) -> Result<Arc<JwkSet>, VerifyFailure> {
         if let Some(keys) = self.cached(kid) {
             return Ok(keys);
@@ -245,18 +254,19 @@ impl BearerVerifier {
             return Ok(keys);
         }
         {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
             let now = (self.clock)();
             if let Some(last) = state.last_fetch {
                 if now.saturating_sub(last) < REFETCH_THROTTLE.as_millis() as u64 {
                     return Err(VerifyFailure::UnknownKid);
                 }
             }
+            // Record before awaiting: cancellation must not bypass the throttle.
+            state.last_fetch = Some(now);
         }
-        let fetched = self.fetch().await;
+        let keys = self.fetch().await?;
         let mut state = self.state.lock().unwrap();
-        state.last_fetch = Some((self.clock)());
-        let keys = fetched?;
+        state.fetched_at = Some((self.clock)());
         state.keys = Some(keys.clone());
         if keys.find(kid).is_some() {
             Ok(keys)
@@ -266,9 +276,12 @@ impl BearerVerifier {
     }
 
     fn cached(&self, kid: &str) -> Option<Arc<JwkSet>> {
-        self.state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        let age = (self.clock)().saturating_sub(state.fetched_at?);
+        if age >= JWKS_CACHE_MAX_AGE.as_millis() as u64 {
+            return None;
+        }
+        state
             .keys
             .as_ref()
             .filter(|keys| keys.find(kid).is_some())
