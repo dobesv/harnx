@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 CLAUDE_THINKING_PATCH = (
@@ -14,10 +15,12 @@ BEDROCK_THINKING_PATCH = (
     ".body.additionalModelRequestFields = "
     '{"thinking":{"type":"enabled","budget_tokens":16000}}'
 )
-BEDROCK_SUMMARIZED_THINKING_PATCH = (
-    '.body.inferenceConfig = {"temperature":null,"topP":null} | '
+# Delete sampling fields without discarding the builder's maxTokens.
+BEDROCK_ADAPTIVE_THINKING_PATCH = (
+    ".body.inferenceConfig = ((.body.inferenceConfig // {}) | "
+    "del(.temperature) | del(.topP)) | "
     ".body.additionalModelRequestFields = "
-    '{"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}'
+    '{"thinking":{"type":"adaptive","display":"summarized"}}'
 )
 GEMINI_THOUGHTS_PATCH = (
     ".body.generationConfig.thinkingConfig = "
@@ -36,12 +39,12 @@ ARGON_REQUEST_PATCH = GEMINI_SAMPLING_THOUGHTS_PATCH + (
 # Gemini 2.5 and later think, except these models.
 GEMINI_NON_THINKING_MARKERS = ("-image", "-tts", "-native-audio")
 
-# Opus 4.7+, Opus 5.5, Fable 5.1 and Haiku 5.5 use adaptive thinking
-# instead of fixed token budgets. Opus 5.5 and Haiku 5.5 default to medium;
-# other adaptive models use high.
-ADAPTIVE_ONLY_OPUS_MIN_MINOR = 7
-BASE_EFFORT = "high"
+# Effort levels above the default that get their own alias on adaptive Claude
+# models, where the registry says the model accepts them.
 ADAPTIVE_EFFORT_VARIANTS = ("xhigh", "max")
+# Model field holding the registry's `ThinkingSupport`. update_models.py renders
+# only the fields in its FIELD_ORDER, so this never reaches models.yaml.
+THINKING_SUPPORT_FIELD = "thinking_support"
 
 # OpenAI aliases are regenerated from the refreshed base so their prices,
 # limits, capabilities, and endpoint cannot drift from the provider model.
@@ -69,23 +72,51 @@ PROVIDER_VARIANT_RULES = {
 }
 
 
-def opus_minor_version(name: str) -> int | None:
-    """Return the minor version from a modern `claude-opus-4-N` name."""
-    match = re.search(r"opus-4-(\d{1,2})(?=$|@|:|-\d{8})", name)
-    return int(match.group(1)) if match else None
+@dataclass(frozen=True)
+class ThinkingSupport:
+    """The extended-thinking modes a model's registry entry says it accepts."""
+
+    budget: bool = False
+    """Accepts `{"type":"enabled","budget_tokens":N}`."""
+    adaptive: bool = False
+    """Accepts `{"type":"adaptive"}`."""
+    efforts: tuple[str, ...] = ()
+    """Entries of `ADAPTIVE_EFFORT_VARIANTS` the model accepts."""
+
+    @classmethod
+    def from_registry(cls, payload: dict[str, Any]) -> ThinkingSupport:
+        adaptive = payload.get("supports_adaptive_thinking") is True
+        # A fixed budget was the only mode before adaptive thinking, so the
+        # registry flags it separately only on models that accept both.
+        budget = payload.get("supports_legacy_thinking") is True or (
+            payload.get("supports_reasoning") is True and not adaptive
+        )
+        efforts = tuple(
+            effort
+            for effort in ADAPTIVE_EFFORT_VARIANTS
+            if adaptive and payload.get(f"supports_{effort}_reasoning_effort") is True
+        )
+        return cls(budget=budget, adaptive=adaptive, efforts=efforts)
+
+    @property
+    def adaptive_only(self) -> bool:
+        return self.adaptive and not self.budget
 
 
-def is_adaptive_only_opus(name: str) -> bool:
-    minor = opus_minor_version(name)
-    return (minor is not None and minor >= ADAPTIVE_ONLY_OPUS_MIN_MINOR) or bool(
-        re.search(r"(?:^|\.)claude-opus-5-5(?:$|@|-\d)", name)
-    )
+def thinking_support(model: dict[str, Any]) -> ThinkingSupport:
+    """The registry's thinking support for `model`; none when it has no entry."""
+    return model.get(THINKING_SUPPORT_FIELD) or ThinkingSupport()
 
 
-def is_adaptive_only_claude(name: str) -> bool:
-    return is_adaptive_only_opus(name) or name.startswith(
-        ("claude-fable-5-1", "claude-haiku-5-5")
-    )
+def uses_thinking_binding_controls(name: str) -> bool:
+    """Whether to ask the API to drop thinking blocks that history edits invalidated.
+
+    The registry doesn't record which models check replayed thinking, so this
+    stays a per-model rule: Fable and Mythos from 5.1 on, and Haiku 5.5.
+    """
+    match = re.search(r"claude-(?:fable|mythos)-(\d+)(?:-(\d{1,2}))?(?=$|@|:|-\d{8})", name)
+    version = (int(match.group(1)), int(match.group(2) or 0)) if match else None
+    return (version is not None and version >= (5, 1)) or name.startswith("claude-haiku-5-5")
 
 
 def claude_requires_max_tokens(name: str) -> bool:
@@ -120,18 +151,23 @@ def is_generated_variant_name(provider: str, name: str) -> bool:
     return bool(separator) and base_name.startswith(prefix) and suffix in suffixes
 
 
-def claude_adaptive_patch(effort: str) -> str:
-    """Request patch enabling adaptive Claude thinking at one effort level."""
-    return (
+def claude_adaptive_patch(effort: str | None = None) -> str:
+    """Request patch enabling adaptive Claude thinking.
+
+    Without an effort the model uses its own default, which differs by model.
+    """
+    patch = (
         "del(.body.temperature) | del(.body.top_p) | "
-        '.body.thinking = {"type":"adaptive","display":"summarized"} | '
-        f'.body.output_config = {{"effort":"{effort}"}}'
+        '.body.thinking = {"type":"adaptive","display":"summarized"}'
     )
+    if effort is not None:
+        patch += f' | .body.output_config = {{"effort":"{effort}"}}'
+    return patch
 
 
-def adaptive_model_patch(name: str, effort: str, provider: str) -> str:
+def adaptive_model_patch(name: str, effort: str | None, provider: str) -> str:
     patch = claude_adaptive_patch(effort)
-    if provider in ("claude", "vertexai") and name.startswith(("claude-fable-5-1", "claude-haiku-5-5")):
+    if provider in ("claude", "vertexai") and uses_thinking_binding_controls(name):
         # Harnx can compact history and rebuild dynamic system prompts. Ask the
         # API to drop invalidated thinking rather than reject the next tool turn.
         patch = patch.replace(
@@ -180,11 +216,11 @@ def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
         return
     if is_generated_variant_name(provider, name):
         return
-    if name.startswith("claude-") and is_adaptive_only_claude(name):
-        effort = (
-            "medium" if name.startswith(("claude-opus-5-5", "claude-haiku-5-5")) else BASE_EFFORT
-        )
-        model["patches"] = [adaptive_model_patch(name, effort, provider)]
+    if name.startswith("claude-") and thinking_support(model).adaptive_only:
+        # Unpatched, these models either don't think or hide what they think.
+        # Replace only thinking settings; curated patches such as headers stay.
+        curated = [p for p in model.get("patches", []) if ".body.thinking =" not in p]
+        model["patches"] = [*curated, adaptive_model_patch(name, None, provider)]
         model["require_max_tokens"] = True
     if claude_requires_max_tokens(name):
         model["require_max_tokens"] = True
@@ -297,71 +333,42 @@ def _claude_thinking_variants(
     base_model: dict[str, Any], provider: str
 ) -> list[dict[str, Any]]:
     name = base_model["name"]
-    if name.startswith("claude-haiku-5-5"):
-        # Keep the existing alias, but replace its rejected fixed token budget.
-        return [
-            _variant_from_base(
-                base_model,
-                "thinking",
-                adaptive_model_patch(name, "medium", provider),
-                max_output_tokens=24000,
-            )
-        ]
-    if is_adaptive_only_claude(name):
-        return [
-            _variant_from_base(
-                base_model,
-                effort,
-                adaptive_model_patch(name, effort, provider),
-                max_output_tokens=base_model.get("max_output_tokens"),
-            )
-            for effort in ADAPTIVE_EFFORT_VARIANTS
-        ]
-    return [
+    support = thinking_support(base_model)
+    # A fixed budget wherever the model still accepts one; models that only
+    # accept adaptive thinking keep the alias name with an adaptive patch.
+    if support.budget:
+        thinking_patch = CLAUDE_THINKING_PATCH
+    elif support.adaptive:
+        thinking_patch = adaptive_model_patch(name, None, provider)
+    else:
+        return []
+    thinking = _variant_from_base(
+        base_model, "thinking", thinking_patch, max_output_tokens=24000
+    )
+    return [thinking] + [
         _variant_from_base(
-            base_model, "thinking", CLAUDE_THINKING_PATCH, max_output_tokens=24000
+            base_model,
+            effort,
+            adaptive_model_patch(name, effort, provider),
+            max_output_tokens=base_model.get("max_output_tokens"),
         )
+        for effort in support.efforts
     ]
-
-
-def _bedrock_thinking_patch(name: str) -> str:
-    if name in ("us.anthropic.claude-sonnet-5-5", "us.anthropic.claude-haiku-5-5"):
-        # These models need adaptive thinking, not a fixed token budget.
-        # Use their documented defaults, not a budget-to-effort mapping:
-        # https://platform.claude.com/docs/en/build-with-claude/effort
-        # Delete sampling fields without discarding the builder's maxTokens.
-        effort = "medium" if name == "us.anthropic.claude-haiku-5-5" else "high"
-        return (
-            ".body.inferenceConfig = ((.body.inferenceConfig // {}) | "
-            "del(.temperature) | del(.topP)) | "
-            ".body.additionalModelRequestFields = "
-            '{"thinking":{"type":"adaptive","display":"summarized"},'
-            f'"output_config":{{"effort":"{effort}"}}}}'
-        )
-    if name in (
-        "us.anthropic.claude-fable-5",
-        "us.anthropic.claude-fable-5-1",
-        "us.anthropic.claude-opus-5",
-        "us.anthropic.claude-sonnet-5",
-    ):
-        # Preserve shipped summary requests without opting older aliases in.
-        return BEDROCK_SUMMARIZED_THINKING_PATCH
-    return BEDROCK_THINKING_PATCH
 
 
 def _bedrock_thinking_variants(base_model: dict[str, Any]) -> list[dict[str, Any]]:
-    name = base_model["name"]
-    if is_adaptive_only_opus(name):
+    support = thinking_support(base_model)
+    if support.budget:
+        patch = BEDROCK_THINKING_PATCH
+    elif support.adaptive:
+        patch = BEDROCK_ADAPTIVE_THINKING_PATCH
+    else:
         return []
-    return [
-        _variant_from_base(
-            base_model, "thinking", _bedrock_thinking_patch(name), max_output_tokens=24000
-        )
-    ]
+    return [_variant_from_base(base_model, "thinking", patch, max_output_tokens=24000)]
 
 
 def thinking_variants(base_model: dict[str, Any], provider: str) -> list[dict[str, Any]]:
-    """Generate Claude manual-thinking or adaptive-effort variants."""
+    """Generate the thinking aliases the registry says a Claude model supports."""
     name = base_model["name"]
     if is_generated_variant_name(provider, name):
         return []
