@@ -4,6 +4,33 @@ A2A backends share context authority, message identities and task events in NATS
 Any replica can admit, read, cancel or stream a task without sticky routing.
 The worker execution lease remains separate from the A2A context lease.
 
+## Listeners and readiness
+
+Enable readiness and Prometheus metrics on separate ports from the A2A listener:
+
+```sh
+harnx-a2a-server --agent reviewer --cluster production \
+  --host 0.0.0.0 --port 3020 \
+  --healthz-addr :8081 --metrics-addr :8456
+```
+
+`GET :8081/healthz` returns an empty `503 Service Unavailable` during startup.
+It changes to `200 OK` only after agent validation, NATS/JetStream connection,
+coordination provisioning, backend setup and binding the A2A listener succeed.
+SIGTERM or Ctrl-C changes readiness back to `503` before aborting/draining runners
+and finishing HTTP shutdown. In-flight requests and open SSE streams hold process
+exit until they finish or the termination grace period triggers SIGKILL. Readiness
+tracks startup and shutdown, not continuous broker health or worker capacity. It
+isn't a liveness probe or proof that all admitted tasks have settled.
+
+Both optional listeners are disabled unless configured. `HARNX_HEALTHZ_ADDR` is
+an alternative to `--healthz-addr` (CLI wins). Metrics require `--metrics-addr`;
+there's no environment variable fallback. `/healthz` and `/metrics` aren't served
+on the A2A application port. Blank hosts bind `0.0.0.0`; restrict these unauthenticated
+operational listeners to the probe/scraper network rather than public ingress.
+See [Kubernetes deployment](kubernetes-deployment.md#a2a-backends-behind-ingress)
+for named ports and a readiness probe.
+
 ## Provisioning and limits
 
 Verified dependency pair: **NATS Server 2.11.6 / async-nats 0.50.0**. The lease

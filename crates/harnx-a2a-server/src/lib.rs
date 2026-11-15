@@ -16,6 +16,7 @@ pub mod handler;
 mod hitl;
 pub mod identity;
 pub mod input_map;
+mod lifecycle;
 pub mod runner;
 mod sse;
 pub mod store;
@@ -40,6 +41,7 @@ pub const DEFAULT_A2A_HTTP_PORT: u16 = 3020;
 /// Unknown agents and export collisions fail before binding the listener.
 pub async fn run(args: cli::Args) -> Result<()> {
     harnx_metrics::init(&args.metrics)?;
+    let readiness = harnx_healthz::init(&args.healthz).await?;
     // Runtime path helpers read HARNX_CONFIG_DIR during turns as well as startup.
     if let Some(dir) = &args.config_dir {
         std::env::set_var("HARNX_CONFIG_DIR", dir);
@@ -93,16 +95,11 @@ pub async fn run(args: cli::Args) -> Result<()> {
         .values()
         .map(|backend| backend.runner.clone())
         .collect();
+    if let Some(readiness) = &readiness {
+        readiness.ready();
+    }
     axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            if let Err(error) = shutdown_signal().await {
-                tracing::warn!(%error, "failed to listen for shutdown signal");
-            }
-            abort.set_ctrlc();
-            for runner in shutdown_runners {
-                runner.shutdown().await;
-            }
-        })
+        .with_graceful_shutdown(lifecycle::shutdown(readiness, abort, shutdown_runners))
         .await
         .context("run A2A HTTP server")?;
     drop(bootstrap);
@@ -117,21 +114,6 @@ fn startup_identity(args: &cli::Args) -> Result<identity::Identity> {
         &args.role_header,
     )?
     .with_user_aliases(aliases))
-}
-
-async fn shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    Ok(())
 }
 
 #[cfg(test)]

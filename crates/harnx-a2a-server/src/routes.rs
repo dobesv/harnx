@@ -81,6 +81,9 @@ fn router_with(exports: &[Export], mut export_router: impl FnMut(&Export) -> Rou
         .route("/agents/{name}/", any(dispatch))
         .route("/agents/{name}/{*path}", any(dispatch))
         .with_state(Arc::new(routers))
+        .layer(axum::middleware::from_fn(
+            harnx_metrics::http_metrics_middleware,
+        ))
 }
 
 async fn dispatch(

@@ -643,6 +643,17 @@ Consequences:
   verbatim — filtering them against local declarations silently drops every
   tool-server tool.
 
+### Observability wiring for new long-running server binaries
+
+Long-running binaries that don't go through `harnx_toolset_server::run_toolset_main` (e.g. `harnx-serve`, `harnx-worker`, `harnx-a2a-server`, `harnx-mcp-bridge`) wire runtime observability by hand. `harnx-a2a-server` landed without healthz or HTTP route metrics (issue #2701). Toolset servers get runtime wiring steps 1–3 from `harnx_toolset_server::run_toolset_main`; documentation updates and packaging steps remain manual. For packaging, follow the [native toolset server checklist](#adding-a-new-native-toolset-server), including workspace membership, `.github/workflows/release.yaml` and `docker/harnx.Dockerfile`.
+
+Wire runtime observability:
+
+1. **CLI + init** — flatten `harnx_metrics::MetricsFlags` and `harnx_healthz::HealthzFlags` into the arg struct, then call `harnx_metrics::init` and `harnx_healthz::init` before anything slow (NATS connect, bootstrap). `MetricsFlags` has no env fallback; `HealthzFlags` honors `HARNX_HEALTHZ_ADDR`. Both `init`s are no-ops when the address is unset.
+2. **Readiness lifecycle** — the healthz listener starts `503`. Call `readiness.ready()` only after bootstrap completes and the main listener binds; call `readiness.not_ready()` on SIGTERM/Ctrl-C *before* draining runners and in-flight connections, so load balancers stop sending traffic during drain.
+3. **HTTP metrics** — for Axum servers, layer `harnx_metrics::http_metrics_middleware` on the outer router (as in `crates/harnx-a2a-server/src/routes.rs`), never inside per-request handlers, so route labels stay bounded templates rather than raw paths.
+4. **Docs** — add the binary to the coverage lists in `docs/healthz.md` and `docs/metrics.md`.
+
 ### Adding a new native toolset server
 
 The checklist below covers every integration point. Miss any and the release fails or the binary ships incomplete.

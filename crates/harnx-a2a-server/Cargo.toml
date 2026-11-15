@@ -25,6 +25,7 @@ clap = { workspace = true, features = ["derive", "env"] }
 chrono = { workspace = true }
 futures = { workspace = true }
 harnx-core = { path = "../harnx-core" }
+harnx-healthz = { workspace = true }
 harnx-runtime = { path = "../harnx-runtime" }
 lru = "0.18"
 metrics = { workspace = true }
@@ -44,7 +45,6 @@ tokio = { workspace = true, features = ["test-util"] }
 metrics-util = { workspace = true }
 process-wrap = { workspace = true, features = ["std"] }
 tokio-util = { workspace = true }
-harnx-healthz = { path = "../harnx-healthz" }
 shell-words = { workspace = true }
 async-nats = { workspace = true }
 http-body-util = { workspace = true }

@@ -44,6 +44,9 @@ impl FromStr for AgentSpec {
 pub struct Args {
     #[command(flatten)]
     pub metrics: harnx_metrics::MetricsFlags,
+    #[command(flatten)]
+    pub healthz: harnx_healthz::HealthzFlags,
+
     /// HTTP bind host (set explicitly to expose externally).
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
@@ -108,14 +111,19 @@ mod tests {
     impl EnvGuard {
         fn isolated() -> Self {
             harnx_core::require_nextest();
-            let saved = ["HARNX_A2A_AGENTS", "HARNX_CONFIG_DIR", "HARNX_ACCESS_RULES"]
-                .into_iter()
-                .map(|key| {
-                    let value = std::env::var_os(key);
-                    std::env::remove_var(key);
-                    (key, value)
-                })
-                .collect();
+            let saved = [
+                "HARNX_A2A_AGENTS",
+                "HARNX_CONFIG_DIR",
+                "HARNX_ACCESS_RULES",
+                "HARNX_HEALTHZ_ADDR",
+            ]
+            .into_iter()
+            .map(|key| {
+                let value = std::env::var_os(key);
+                std::env::remove_var(key);
+                (key, value)
+            })
+            .collect();
             Self(saved)
         }
     }
@@ -144,6 +152,8 @@ mod tests {
         .unwrap();
         assert_eq!(args.host, "127.0.0.1");
         assert_eq!(args.port, 3020);
+        assert_eq!(args.healthz.healthz_addr, None);
+        assert_eq!(args.metrics.metrics_addr, None);
         assert_eq!(args.max_data_part_bytes, 65536);
         assert_eq!(args.cluster, None);
         assert_eq!(args.config_dir, None);
@@ -281,6 +291,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_observability_flags_and_healthz_env() {
+        let _env = EnvGuard::isolated();
+        std::env::set_var("HARNX_HEALTHZ_ADDR", ":8081");
+        let args = Args::try_parse_from(["harnx-a2a-server", "--agent", "agent"]).unwrap();
+        assert_eq!(args.healthz.healthz_addr.as_deref(), Some(":8081"));
+        let args = Args::try_parse_from([
+            "harnx-a2a-server",
+            "--agent",
+            "agent",
+            "--healthz-addr",
+            "127.0.0.1:8082",
+            "--metrics-addr",
+            ":8456",
+        ])
+        .unwrap();
+        assert_eq!(args.healthz.healthz_addr.as_deref(), Some("127.0.0.1:8082"));
+        assert_eq!(args.metrics.metrics_addr.as_deref(), Some(":8456"));
+        let command = Args::command();
+        let metrics = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "metrics_addr")
+            .unwrap();
+        assert!(metrics.get_env().is_none());
+    }
+
+    #[test]
     fn cli_help_and_definition() {
         let _env = EnvGuard::isolated();
         Args::command().debug_assert();
@@ -288,6 +324,8 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::DisplayHelp);
         let help = error.to_string();
         for flag in [
+            "--healthz-addr",
+            "--metrics-addr",
             "--host",
             "--port",
             "--cluster",

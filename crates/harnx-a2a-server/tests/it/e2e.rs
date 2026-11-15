@@ -14,6 +14,8 @@ use std::{
 use tokio_util::task::AbortOnDropHandle;
 
 #[cfg(unix)]
+mod observability;
+#[cfg(unix)]
 mod replicas;
 #[cfg(all(unix, feature = "fault-injection"))]
 mod supervision;
