@@ -82,8 +82,12 @@ pub struct Args {
     #[arg(long, value_name = "URL")]
     pub public_base_url: Option<String>,
 
-    /// Trusted User-ID source: NAME, header:NAME or cookie:NAME (repeatable, first match wins;
-    /// enables user isolation). Cookies must carry a proxy-verified user ID, not a token.
+    /// Trusted User-ID source: NAME, header:NAME, cookie:NAME, forge-fit, or
+    /// bearer-claim:CLAIM (repeatable, first match wins; enables user isolation).
+    /// Bare forge-fit is the Forge token source, not a header name. Without
+    /// verification flags, bearer sources are decode-only and safe only behind a
+    /// verifying proxy with nothing else able to reach the server. Cookies must
+    /// carry a proxy-verified user ID, not a token.
     #[arg(long, value_name = "NAME")]
     pub user_id_header: Vec<String>,
 
@@ -94,6 +98,21 @@ pub struct Args {
     /// Trusted role membership header name (repeatable, all values contribute).
     #[arg(long, value_name = "NAME")]
     pub role_header: Vec<String>,
+
+    /// Verify bearer identity sources against this JWKS URL (https;
+    /// loopback http is allowed for tests). Requires --bearer-issuer and
+    /// --bearer-audience; off by default.
+    #[arg(long, value_name = "URL")]
+    pub bearer_jwks_url: Option<String>,
+
+    /// Expected bearer token issuer (requires --bearer-jwks-url and --bearer-audience).
+    #[arg(long, value_name = "ISSUER")]
+    pub bearer_issuer: Option<String>,
+
+    /// Expected bearer token audience (requires --bearer-jwks-url and --bearer-issuer).
+    /// Pinning audience is essential because all Forge apps share signing keys.
+    #[arg(long, value_name = "AUDIENCE")]
+    pub bearer_audience: Option<String>,
 
     /// Maximum rendered data/inline file part bytes per message.
     #[arg(long, default_value_t = 65536)]
@@ -336,6 +355,9 @@ mod tests {
             "--user-id-header",
             "--group-header",
             "--role-header",
+            "--bearer-jwks-url",
+            "--bearer-issuer",
+            "--bearer-audience",
             "--max-data-part-bytes",
         ] {
             assert!(help.contains(flag), "missing {flag}");
@@ -370,6 +392,48 @@ mod tests {
             assert!(flag.get_env().is_none());
             assert!(flag.get_all_aliases().is_none());
             assert!(flag.get_value_delimiter().is_none());
+        }
+    }
+
+    #[test]
+    fn cli_bearer_verification_flags_take_single_values_without_aliases_or_env() {
+        let _env = EnvGuard::isolated();
+        let args = Args::try_parse_from([
+            "harnx-a2a-server",
+            "--agent",
+            "agent",
+            "--bearer-jwks-url",
+            "https://example.com/.well-known/jwks.json",
+            "--bearer-issuer",
+            "forge/invocation-token",
+            "--bearer-audience",
+            "ari:cloud:ecosystem::app/app-id",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.bearer_jwks_url.as_deref(),
+            Some("https://example.com/.well-known/jwks.json")
+        );
+        assert_eq!(
+            args.bearer_issuer.as_deref(),
+            Some("forge/invocation-token")
+        );
+        assert_eq!(
+            args.bearer_audience.as_deref(),
+            Some("ari:cloud:ecosystem::app/app-id")
+        );
+        let command = Args::command();
+        for id in ["bearer_jwks_url", "bearer_issuer", "bearer_audience"] {
+            let flag = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap();
+            assert!(flag.get_env().is_none(), "{id} must not read an env var");
+            assert!(flag.get_all_aliases().is_none(), "{id} must have no alias");
+            assert!(
+                flag.get_value_delimiter().is_none(),
+                "{id} is single-valued"
+            );
         }
     }
 }

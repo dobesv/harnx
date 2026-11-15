@@ -734,6 +734,17 @@ rules:
     - "CN=alice,OU=dev,O=mycorp"
   ```
 
+  For Atlassian Forge Invocation Tokens (`forge-fit` identity source in `harnx-a2a-server`):
+  ```yaml
+  users:
+    # Match any authenticated user from a specific Jira/Confluence cloud instance:
+    - "CN=*,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+
+    # Match both user calls and automated/no-user calls from that instance:
+    - "*OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+  ```
+  Because `*` spans commas, `*OU=...` matches both user identities (`CN=<principal>,OU=<cloudId>,O=atlassian.com`) and org-only automation identities (`OU=<cloudId>,O=atlassian.com`). See [Finding Cloud ID and Account ID in the A2A Server README](../crates/harnx-a2a-server/README.md#finding-cloud-id-and-account-id) for how to locate these IDs.
+
 ### Agent References
 
 - **`harnx-serve`**: Evaluated against the client display reference:
@@ -782,7 +793,7 @@ Access rules protect `/v1/agents` and `/v1/cid/*` routes. Other endpoints remain
 ### Not Yet Supported
 
 - **`harnx-mcp-server`**: Access rules apply only to `harnx-serve` and `harnx-a2a-server`.
-- **ALB JWT payload decoding**: Decoding signed `x-amzn-oidc-data` JWT claims into user DNs is deferred; use the raw identity header `x-amzn-oidc-identity`.
+- **ALB JWT payload decoding**: Decoding signed `x-amzn-oidc-data` JWT headers into user DNs is still not implemented; use the raw identity header `x-amzn-oidc-identity`. (`harnx-a2a-server` supports decoding and verification for `Authorization: Bearer` token sources like `forge-fit` and `bearer-claim:CLAIM`, but not `x-amzn-oidc-data` headers.)
 
 ## User Aliases (`users.yaml`)
 

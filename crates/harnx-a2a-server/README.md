@@ -25,9 +25,12 @@ Usage: harnx-a2a-server [OPTIONS] --agent <SPEC>
 | `--config-dir <PATH>` | `HARNX_CONFIG_DIR` | Path to the harnx configuration directory containing `config.yaml`. |
 | `--access-rules <PATH>` | `<config dir>/access.yaml` if present | Access rules file, also set by `HARNX_ACCESS_RULES`. Requires `--user-id-header` when rules are enabled. |
 | `--public-base-url <URL>` | none | Base URL used in Agent Card interface URLs (for example, `https://agents.example.com`). If omitted, inferred from `X-Forwarded-*` or `Host` headers. |
-| `--user-id-header <NAME>` | none | Trusted identity source: bare header name, `header:NAME`, or `cookie:NAME` (repeatable, first present source wins). Empty or invalid values fail closed. Enables user isolation mode. |
+| `--user-id-header <NAME>` | none | Trusted identity source: bare header name, `header:NAME`, `cookie:NAME`, `forge-fit`, or `bearer-claim:CLAIM` (repeatable, first present source wins). Bare `forge-fit` is the Forge token source, not a header name. Without verification flags, bearer sources operate in decode-only mode. Empty or invalid values fail closed. Enables user isolation mode. |
 | `--group-header <NAME>` | none | Trusted group membership header name (repeatable, all values contribute). |
 | `--role-header <NAME>` | none | Trusted role membership header name (repeatable, all values contribute). |
+| `--bearer-jwks-url <URL>` | none | Verify bearer identity sources against this JWKS URL. Requires `--bearer-issuer` and `--bearer-audience`; off by default. |
+| `--bearer-issuer <ISSUER>` | none | Expected bearer token issuer (requires `--bearer-jwks-url` and `--bearer-audience`). |
+| `--bearer-audience <AUDIENCE>` | none | Expected bearer token audience (requires `--bearer-jwks-url` and `--bearer-issuer`). Pinning audience is essential because all Forge apps share signing keys. |
 | `--max-data-part-bytes <BYTES>` | `65536` | Maximum combined byte budget for rendered data and inline text/JSON file parts per message. Over-limit requests return an invalid params error. |
 
 ### Export Specifications and Startup Validation
@@ -209,6 +212,97 @@ The server emits JSON-RPC 2.0 error responses with structured `google.rpc.ErrorI
 - When access rules are enabled, `--user-id-header` is **required**. Startup fails closed if rules are active without configured identity headers.
 - When no rules file or flag is present, access control is disabled and standard A2A behavior applies.
 
+### Caller Identity Sources
+
+Configure caller identity sources with `--user-id-header <SPEC>`. The flag is repeatable; sources are evaluated in order and the first present source wins.
+
+| Source Syntax | Wire Location | Resolved Identity | Description |
+|---|---|---|---|
+| `NAME` or `header:NAME` | Header `NAME` | Header value | Reads first comma-separated token, trimmed. Fails closed on empty values. |
+| `cookie:NAME` | Cookie `NAME` | Cookie value | Cookie names are case-sensitive. Must carry a proxy-verified user ID, not a token. |
+| `forge-fit` | `Authorization: Bearer <FIT>` | X.500 DN | Base64url-decodes Atlassian Forge Invocation Token payload and formats a DN. Bare `forge-fit` is the source name, not a header name. |
+| `bearer-claim:CLAIM` | `Authorization: Bearer <JWT>` | Claim value | Reads named top-level string claim from the decoded token payload. |
+
+#### Forge DN Format
+
+The `forge-fit` source formats caller identity into an X.500 Distinguished Name (DN) ordered CN-first:
+
+- **User invocations** (`principal` claim present and not `"unidentified"`):
+  `CN=<principal>,OU=<context.cloudId>,O=atlassian.com`
+  Example: `CN=655362:312d3308-8954-42b0-aa38-771a10c88656,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com`
+- **Automation and anonymous invocations** (`principal` claim absent or `"unidentified"`):
+  `OU=<context.cloudId>,O=atlassian.com`
+  Example: `OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com`
+
+Component values are validated against control characters, leading/trailing whitespace, and DN delimiter characters (`,`, `=`, `+`, `<`, `>`, `#`, `;`, `"`, `\`). Any invalid character fails closed (HTTP 401 / JSON-RPC `-32000`).
+
+#### Shared-Owner Caveat for Org-Only Identities
+
+All calls lacking a user principal from the same Atlassian site/cloudId (system automations, scheduled triggers, lifecycle events, anonymous callers) resolve to the same org-only identity `OU=<cloudId>,O=atlassian.com`. Because A2A session ownership is keyed to the exact resolved identity string, these automated tasks share a single owner: any task or trigger from that site can view, prompt, or manage other sessions owned by that org-only identity under `prompt` scope.
+
+#### Fallthrough and Fail-Closed Precedence
+
+- Sources are evaluated in `--user-id-header` order. The first source present in the request wins.
+- If `Authorization` is absent or uses a scheme other than `Bearer`, the bearer source is skipped and resolution falls through to the next configured source.
+- If a bearer source is selected and an `Authorization: Bearer` token is present, resolution never falls through. If the token is malformed, missing required claims, expired, or fails verification, the request fails closed immediately with HTTP 401 / JSON-RPC `-32000`. Later sources are never tried.
+- Earlier sources take precedence. For example, with `--user-id-header header:X-User-Id --user-id-header forge-fit`, a valid `X-User-Id` header takes precedence even if an invalid bearer token is also sent.
+- If no configured source matches (the end of the source list is reached), the request is rejected with HTTP 401 / JSON-RPC `-32000`. When identity sources are configured, this rejection protects all endpoints under `/agents/{name}`, including Agent Cards when access rules are enabled (when access rules are disabled, Agent Cards remain public).
+- With zero sources configured (no `--user-id-header` flags), the server runs in shared anonymous mode and accepts requests without identity checks.
+- There is no separate "require a token" flag. The verification flags do not make a token mandatory by themselves; they ensure any present token is verified. A token becomes mandatory when the bearer source is the only configured `--user-id-header` source, because a request omitting the token reaches the end of the source list and is rejected with HTTP 401 (see [Built-in Bearer Token Verification](#built-in-bearer-token-verification)).
+
+#### Access Control and Alias Examples for Forge DNs
+
+In `access.yaml`:
+
+```yaml
+rules:
+  # Allow all authenticated Jira users from a specific site
+  - agents:
+      - triage-agent
+    scopes:
+      - prompt
+    users:
+      - "CN=*,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+
+  # Match both user calls and automated/no-user calls from the same site
+  # (*OU matches CN=...,OU=... and OU=... because * spans commas)
+  - agents:
+      - triage-agent
+    scopes:
+      - prompt
+    users:
+      - "*OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+```
+
+In `users.yaml`, map a specific Forge DN to display metadata, alias groups, and roles:
+
+```yaml
+- name: Forge Jira Lead
+  identities:
+    - "CN=655362:312d3308-8954-42b0-aa38-771a10c88656,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+  groups:
+    - engineering
+  roles:
+    - admin
+```
+
+#### Finding Cloud ID and Account ID
+
+To configure allow lists in `access.yaml` or user mappings in `users.yaml`, operators need the site's Cloud ID (`OU`) and the user's Account ID (`CN`):
+
+- **Cloud ID (`OU`)**: Identifies the Atlassian site (UUID format).
+  - Query `https://<site>.atlassian.net/_edge/tenant_info` (an unauthenticated endpoint returning JSON with `cloudId`).
+  - Read `context.cloudId` from a Forge invocation payload or app logs.
+  - Check the site's settings in Atlassian Administration (`admin.atlassian.com`).
+- **Account ID (`CN`)**: Identifies the user within Atlassian (e.g. `655362:312d3308-...`).
+  - Open the user's profile in Jira; the URL is `https://<site>.atlassian.net/jira/people/<accountId>`.
+  - Call the Jira REST API `GET /rest/api/3/myself`, which returns the caller's `accountId`.
+  - Look up the user in Atlassian Administration (`admin.atlassian.com`) under Directory > Users.
+
+Atlassian account IDs are global across sites, while `OU` pins the specific site. Combining them as `CN=<id>,OU=<cloudId>,O=atlassian.com` restricts the user's access to that single site.
+
+For security and privacy, `harnx-a2a-server` never logs resolved caller identities or token claims in server logs. After a test call, operators can inspect the resolved identity in session metadata: `harnx info session <agent> <session-id> --format json` records the identity under `extensions["dev.harnx.session_properties"].user_id.value`.
+
 ### Behavior Under Rules
 - **Authentication**: All endpoints under `/agents/{name}`, including Agent Cards and discovery GET requests, require trusted caller identity and return HTTP `401 Unauthorized` (JSON-RPC error code `-32000`) if missing. (When access rules are disabled, Agent Cards remain public).
 - **Agent Reference Matching**: Rules are evaluated against the internal agent reference (`Export::agent_ref()`, such as `coder` or `coder@cluster`), **never** against public export aliases (such as `alias=coder`).
@@ -234,11 +328,23 @@ In production, run `harnx-a2a-server` behind a reverse proxy (such as Nginx, Env
 
 ### Reverse Proxy Responsibilities
 
-1. **Authentication and JWT verification**: The server does not validate tokens or authentication signatures. For Atlassian Forge apps, the reverse proxy must verify the Forge Invocation Token (FIT JWT) signed by Atlassian's JWKS.
+1. **Authentication and token verification**: For bearer tokens, built-in verification (`--bearer-jwks-url`, `--bearer-issuer`, `--bearer-audience`) is recommended. If you verify tokens at the reverse proxy instead, configure bearer sources (`forge-fit`, `bearer-claim:CLAIM`) without verification flags; the server will operate in decode-only mode and trust the upstream proxy's validation.
 2. **Strip or overwrite identity sources**: When `--user-id-header`, `--group-header`, or `--role-header` are configured, the proxy **must strip or overwrite** the selected headers or cookies on incoming requests from clients. Cookies must contain a proxy-verified user ID, not a token or client-supplied identity. The server doesn't verify cookie signatures.
 3. **Disable SSE response buffering**: Streaming responses use Server-Sent Events (`text/event-stream`). The proxy must disable buffer accumulation (e.g. `proxy_buffering off` in Nginx; `X-Accel-Buffering: no` is emitted by the server).
 4. **Long route timeouts**: Remote agent turns can run for several minutes. Set proxy read and send timeouts to at least **900 seconds** (15 minutes), matching Forge's SSE stream allowance.
 5. **Base URL configuration**: Set `--public-base-url https://agents.example.com` or pass standard forwarding headers (`Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`) so Agent Cards generate reachable public URLs. Set `--public-base-url` in production so the card origin does not depend on request headers.
+
+### Trust Model
+
+Bearer token configuration has two distinct parts:
+1. **Identity extraction**: Bearer identity sources (`forge-fit` and `bearer-claim:CLAIM`, configured via `--user-id-header`) read caller identity from the `Authorization: Bearer` token.
+2. **Token verification**: Cryptographic verification flags (`--bearer-jwks-url`, `--bearer-issuer`, `--bearer-audience`) validate token signatures and claims against the issuer's JWKS.
+
+**Recommended approach: built-in verification.** The server verifies RS256 signatures against the JWKS endpoint, validates `iss`, `aud`, and `exp`, and checks `nbf`/`iat`. When verifying Forge tokens (whether built-in or at an upstream proxy), **pinning the audience (`aud`) is critical for security**. All Atlassian Forge apps share the same signing keys and JWKS endpoint (`https://forge.cdn.prod.atlassian-dev.net/.well-known/jwks.json`). A token signed by Atlassian is cryptographically valid for any Forge app; only matching `aud` against your app's specific ARI (`ari:cloud:ecosystem::app/<app id>`) prevents tokens from other Forge apps from authenticating against your server.
+
+**AWS ALB cannot verify Forge Invocation Tokens.** ALB's `jwt-validation` action requires `iss` to be a valid URL, but the FIT `iss` claim is the string `forge/invocation-token`, so the rule cannot match a real token. For Forge deployments, use the server's built-in verification.
+
+**Alternative: reverse proxy verification (decode-only mode).** When verification flags are omitted, bearer sources operate in decode-only mode, parsing token payloads without verifying cryptographic signatures or expiration. This is safe only when `harnx-a2a-server` runs in a private network behind a reverse proxy that verifies every incoming token before forwarding requests, with nothing else able to reach the server. If unauthenticated traffic reaches the server directly in decode-only mode, callers can forge identities by sending arbitrary JWT payloads.
 
 ### Nginx Configuration Example
 
@@ -282,6 +388,59 @@ server {
     }
 }
 ```
+
+## Built-in Bearer Token Verification
+
+`harnx-a2a-server` can verify bearer tokens directly against a remote JWKS without requiring a verifying proxy upstream.
+
+### Verification CLI Flags
+
+All three flags are required together to enable verification:
+
+| Flag | Value | Description |
+|---|---|---|
+| `--bearer-jwks-url <URL>` | JWKS URL | Remote JWKS endpoint URL to fetch RS256 public keys. Must use `https`; `http` is only accepted for loopback hosts (testing). Redirects are never followed. |
+| `--bearer-issuer <ISSUER>` | Issuer string | Expected `iss` claim in the bearer token (for Forge: `forge/invocation-token`). Must be non-empty. |
+| `--bearer-audience <AUDIENCE>` | Audience string | Expected `aud` claim in the bearer token (for Forge: `ari:cloud:ecosystem::app/<app id>`). Must be non-empty. Pinning audience is essential because all Forge apps share signing keys. |
+
+### Verification Example
+
+```sh
+harnx-a2a-server \
+  --agent jira=team/triage \
+  --user-id-header forge-fit \
+  --bearer-jwks-url https://forge.cdn.prod.atlassian-dev.net/.well-known/jwks.json \
+  --bearer-issuer forge/invocation-token \
+  --bearer-audience ari:cloud:ecosystem::app/d0d52620-3203-4cfa-8db5-f2587155f0dd
+```
+
+To require a valid token, configure `forge-fit` (or `bearer-claim:CLAIM`) as the only `--user-id-header` source alongside the verification flags:
+- When an `Authorization: Bearer` token is present, the verification flags ensure it is verified. An invalid, expired, or unverified token fails closed immediately (HTTP 401 / JSON-RPC `-32000`) with no fallthrough to later sources.
+- If a request lacks an `Authorization` header, resolution falls through to subsequent configured sources. Any additional `header:` or `cookie:` source would admit requests lacking a bearer token. With no other sources configured, requests without an `Authorization` header fail resolution and are rejected with HTTP 401.
+- Omitting `--user-id-header` entirely runs the server in shared anonymous mode without identity checks.
+
+### Verification Behavior and Parameters
+
+- **Algorithm**: Pinned to `RS256`. Tokens specifying any other algorithm (such as `none` or symmetric `HS256`) are rejected immediately before key lookup.
+- **JWKS Transport**: The JWKS URL must use `https`; an `http` URL fails startup unless the host is loopback (`127.0.0.1`, `::1`, `localhost`), which exists for tests. Redirects are never followed, so an endpoint can't be re-pointed or downgraded to a plaintext hop.
+- **JWKS Cache and Key Rotation**: Keys are fetched lazily on the first bearer request and cached by key ID (`kid`). If a token references an unknown `kid`, the server fetches a fresh JWKS. Refetches are single-flight (concurrent requests share one fetch) and throttled to at most one per 30 seconds to prevent fetch storms. A refresh replaces the entire cached key set, rejecting rotated-out keys. JWKS requests time out after 5 seconds and response bodies are capped at 1 MiB.
+- **Claims Validation**:
+  - `iss` must match `--bearer-issuer`.
+  - `aud` must match `--bearer-audience`. Pinning `aud` is essential because all Forge apps share Atlassian signing keys.
+  - `exp` is required; expired tokens are rejected.
+  - `nbf` and `iat` are validated when present. Tokens issued in the future are rejected. A present `iat` that isn't a JSON number fails closed.
+  - Clock-skew leeway for time claims is 10 seconds (tuned for FIT tokens with ~25-second lifespans).
+- **Failure Behavior**:
+  - Verification failures fail closed: HTTP 401 Unauthorized with JSON-RPC error code `-32000` and a static reason category (e.g. `bad bearer token signature`, `bearer token is expired`, `jwks fetch failed`).
+  - No fallthrough: if a bearer source is selected and an `Authorization: Bearer` token is present, any verification or decoding failure rejects the request immediately. Subsequent identity sources are never tried.
+  - Missing `Authorization` header or non-`Bearer` scheme falls through to the next configured identity source.
+- **Logging**: JWKS infrastructure faults (fetch, body, key parse) are logged at `warn` with a reason category; per-token rejections are logged at `debug`, so forged-token noise doesn't hide an outage.
+- **Redaction**: Raw tokens, claim values, and JWKS response payloads are never logged or echoed in error responses. Only the resolved identity (DN or claim string) is stored as the session or task owner.
+- **Startup Validation**:
+  - Setting any of `--bearer-jwks-url`, `--bearer-issuer`, or `--bearer-audience` without the others fails startup: `"--bearer-jwks-url, --bearer-issuer and --bearer-audience are all required to enable bearer token verification"`.
+  - A non-https `--bearer-jwks-url` on a non-loopback host fails startup: `"--bearer-jwks-url must use https; http is only allowed on loopback hosts"`.
+  - An empty or whitespace-only `--bearer-issuer` or `--bearer-audience` fails startup: `"--bearer-issuer must not be empty"` / `"--bearer-audience must not be empty"`.
+  - Setting verification flags without a bearer source (`forge-fit` or `bearer-claim:CLAIM`) fails startup: `"bearer verification flags require a bearer identity source; configure --user-id-header forge-fit or bearer-claim:CLAIM"`.
 
 ## Atlassian Forge Manifest Example
 

@@ -5,6 +5,7 @@ pub mod routes;
 
 mod access;
 mod agent_card;
+pub mod bearer_verify;
 mod bootstrap;
 pub mod cli;
 mod compat;
@@ -108,12 +109,60 @@ pub async fn run(args: cli::Args) -> Result<()> {
 
 fn startup_identity(args: &cli::Args) -> Result<identity::Identity> {
     let aliases = harnx_runtime::users::load_user_aliases()?;
-    Ok(identity::Identity::with_memberships(
+    let mut identity = identity::Identity::with_memberships(
         &args.user_id_header,
         &args.group_header,
         &args.role_header,
     )?
-    .with_user_aliases(aliases))
+    .with_user_aliases(aliases);
+    if let Some(verifier) = bearer_verifier(args)? {
+        identity = identity.with_bearer_verification(verifier);
+    }
+    identity.validate_bearer_verification()?;
+    Ok(identity)
+}
+
+/// Build the bearer verifier from the verification flags. All three flags are
+/// required together: `--bearer-jwks-url` enables verification, and issuer and
+/// audience must be pinned too.
+fn bearer_verifier(
+    args: &cli::Args,
+) -> Result<Option<std::sync::Arc<bearer_verify::BearerVerifier>>> {
+    let (Some(url), Some(issuer), Some(audience)) = (
+        args.bearer_jwks_url.as_deref(),
+        args.bearer_issuer.as_deref(),
+        args.bearer_audience.as_deref(),
+    ) else {
+        let set = [
+            args.bearer_jwks_url.is_some(),
+            args.bearer_issuer.is_some(),
+            args.bearer_audience.is_some(),
+        ]
+        .into_iter()
+        .filter(|flag| *flag)
+        .count();
+        anyhow::ensure!(
+            set == 0,
+            "--bearer-jwks-url, --bearer-issuer and --bearer-audience are all required \
+             to enable bearer token verification"
+        );
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !issuer.trim().is_empty(),
+        "--bearer-issuer must not be empty"
+    );
+    anyhow::ensure!(
+        !audience.trim().is_empty(),
+        "--bearer-audience must not be empty"
+    );
+    Ok(Some(std::sync::Arc::new(
+        bearer_verify::BearerVerifier::new(bearer_verify::BearerVerificationConfig {
+            jwks_url: url.to_owned(),
+            issuer: issuer.to_owned(),
+            audience: audience.to_owned(),
+        })?,
+    )))
 }
 
 #[cfg(test)]
