@@ -131,7 +131,7 @@ use_tools:
 description: "Task executor \u2014 handles tasks from users. For complex work,\
   \ creates local plans and executes them directly or delegates to Pantheon specialists.\
   \ Writes code directly in the project directory. Named after Sisyphus (SIS-ih-fus).\n"
-version: '0.4.19'
+version: '0.4.20'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

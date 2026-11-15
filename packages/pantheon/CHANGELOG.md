@@ -1,6 +1,69 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.20 (2026-11-15)
+
+### Features
+
+- have Pantheon reviewers read before executing (#2656)
+- route reviews by file kind and audit dependencies (#2660)
+- compress the tool invocation journal bucket with S2 (#2666)
+- expire deleted-session tombstones and standalone rows (#2668)
+- collect read-only sessions and orphan streams that hold messages (#2671)
+- cap agent waits at 240 seconds and end them early on new messages (#2677)
+- let agent callers join a busy child session's active turn (#2694)
+- Add asynchronous sub-agent delegation guidance to Pantheon agents, including prompt templates and tool selections for `session_send`, `session_wait`, and bounded `session_load`.
+- Select Pantheon reviewers by file kind and add Laocoön to audit upstream dependency changes without executing package code, with focused docs, mechanical-change and test reviews.
+- Let parents send messages to running children with `session_send` or `session_prompt`. The message joins the child's current turn and wakes waits that stop on new messages. Joined messages keep the turn's existing deadline; `timeout_secs` doesn't extend it. Parents can use the returned `session_send` handle to wait for the response to their message. Waiting is namespace-wide: `session_wait` and prompt-scoped `session_load` accept any caller in the agent namespace, not only the parent that dispatched the prompt.
+
+#### Waits on sub-agents and background commands now default to and cap at 240 seconds, accept `forever: true`, and return early when a new message arrives.
+
+Breaking argument changes:
+
+- Every wait takes `seconds` (1 to 240, default 240) or `forever: true`, not both. `0` and values above 240 are rejected.
+- `bash_spawn`'s nested `wait.timeout_secs` is now `wait.seconds`, and `bash_wait`'s `timeout_secs` is now `seconds`. The old names are rejected.
+- `session_wait` takes `seconds`, `forever`, `include_partial` and `read` at the top level; the nested `wait` object is removed.
+- `bash_spawn`, `bash_exec` and command templates take `timeout_secs` from 1 to 86400, and 86400 (24 hours) is the default for all three. `0` no longer means no deadline. A spawn killed at its deadline reports `status: timed_out`.
+- `bash_spawn`, `bash_wait` and `bash_status` now reject any argument they do not declare instead of ignoring it, which matters for third-party MCP clients of `harnx-bash-tools`.
+- `status` is now a built-in bash tool, so a command template cannot use that name or any other built-in name. A template passed with `--tool` or `--tools-dir` fails startup, and an auto-discovered one is skipped with a warning. The `--enable-tool` example in `docs/bash-mcp-server.md` now names a template `service_status`; a config that used `--enable-tool status` for its own template must rename it.
+
+New tools and results:
+
+- `bash_status` reports a spawned command's state without waiting. For a sub-agent, call `session_load` with `prompt_id`.
+- A wait can end early with `stopped_by: "new_message"` (a new message arrived for the waiting agent) or `stopped_by: "caller_deadline"` (60 seconds before the agent's own run deadline). Neither is an error. Waits over the k8s-sandbox proxy and MCP stdio routes run to their limit.
+- `session_wait` no longer reports `unknown` after a child compacts mid-turn.
+
+### Fixes
+
+- ground interviews in research and clarify plan handoffs (#2659)
+- delete a session's rows without leaving purge markers (#2663)
+- keep leases expiring, and leave expiring markers on release (#2675)
+- compact sub-agent session wait transcripts (#2684)
+- stop deletions leaving permanent markers in sessions, plans and attachments (#2686)
+- anchor sub-agent status rows to tool calls (#2699)
+- include tool discoveries in session title context (#2696)
+- Bound note bodies returned by `list_notes` to concise previews. Use `get_note` to read full note contents.
+- Ground Daedalus interviews in repository research, remove question and round quotas, and preserve consequential decisions in implementation plans. Metis proposes only unresolved decisions after reconnaissance, and Momus checks requirement coverage, cross-task contracts, and verification from the written plan before Atlas handoff.
+- Make Pantheon's code review cheaper and faster. Muses and Judges now review by reading the code and quoting CI results, and report a missing test or a manual check rather than running tests, linters or builds themselves, unless reading can't settle a finding. Aristarchus keeps the previous verdict when a rebase leaves a PR's own diff unchanged, and reviews only the files that changed since the last round. Before review, Sisyphus and Atlas run the repository's pre-submit checks rather than the whole suite. They skip the review for rebases that leave the PR's commits unchanged, docs-only edits and comment replies. Minos now runs on Gemini 4 Argon. The shared shell guidance in both packages now asks for a `bash_exec` timeout well past a command's usual run time, and for terminating a spawned command that runs well past its usual time without new output.
+- Allow bash command templates to opt in to new-message interruption with `on_user_message: terminate`. Interrupted templates terminate their process group and return partial output with `stopped_by: new_message`. Enable this for Pantheon's PR stability waiter so agents can read new messages before restarting the wait.
+
+#### Add optional nested `wait` configuration to `bash_spawn` with duration and output-filtering controls, preserving process lifecycle on wait expiry and updating eligible agent guidance.
+
+- `bash_spawn` accepts an optional nested `wait` object with `head_lines`, `tail_lines`, `max_output_bytes`, and `grep`.
+- Omitting `wait` preserves immediate spawn behavior. Wait expiry returns partial output without terminating the running process. The wait's duration fields are described in the bounded soft waits release note.
+- Shipped `coding` and `pantheon` agents with the full shell execution trio (`bash_spawn`, `bash_wait`, `bash_terminate`) now prefer `bash_spawn` with nested `wait` for tests, linters, and builds, with `bash_wait` or `bash_terminate` for post-expiry management. `bash_exec` remains available for quick synchronous commands.
+- MCP tool listings now carry each tool's request-timeout policy in `_meta` (`timeout_secs`): `harnx-mcp-bridge` copies it into `ToolSpec.timeout_secs` for its NATS registration, and `harnx_toolset_server`'s MCP adapter writes it from native specs. Bash `spawn`/`wait`/`exec` advertise `0` (no elapsed deadline) on this route, matching the native NATS toolset, so a bridged nested spawn wait returns its first execution_id-bearing response instead of expiring at the caller's 60-second request backstop. Third-party MCP servers that advertise nothing keep the caller's default backstop; malformed values are ignored rather than disabling a deadline. Direct stdio clients are unaffected.
+
+#### Add reserved output-control parameters (`head_lines`, `tail_lines`, `max_output_bytes`) to command templates and disable per-line clipping when `max_output_bytes` is explicit on bash paths.
+
+- Command templates automatically expose `head_lines`, `tail_lines`, and `max_output_bytes` alongside `timeout_secs`. Declaring any of these names in a template's `parameters` map fails at load time.
+- Passing `max_output_bytes` explicitly disables per-line middle clipping across `bash_exec`, `bash_spawn` wait and status outputs, `read_exec_log`, command templates, and the in-process `bash` script tool.
+- Command-template truncation hints omit `read_exec_log` and reference only `max_output_bytes`, `head_lines`, and `tail_lines`.
+- Templates can declare optional `output:` defaults for `head_lines`, `tail_lines`, and `max_output_bytes`. Non-negative integers only; unknown keys and invalid defaults fail loading. Caller arguments override each field independently. A template-set byte limit also disables per-line clipping.
+- Ship `gh_issue_view` and `jira_view` with a default byte limit of 65536.
+
+Before upgrading, rename or remove template parameters named `head_lines`, `tail_lines`, or `max_output_bytes`. Templates supplied through explicit `--tool`/`--tools-dir` configs fail at startup if they declare these names; auto-discovered package templates with colliding parameters are skipped with a warning.
+
 ## 0.4.19 (2026-11-04)
 
 ### Features

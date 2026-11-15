@@ -45,7 +45,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Creative coding and innovative solutions specialist — provides the creative spark for novel UX and 'out-of-the-box' logic. Named after Apollo (uh-POL-oh), God of the Arts.\n"
-version: '0.4.19'
+version: '0.4.20'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

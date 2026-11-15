@@ -5,6 +5,173 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.21 (2026-11-15)
+
+### Features
+
+- have Pantheon reviewers read before executing (#2656)
+- route reviews by file kind and audit dependencies (#2660)
+- compress the tool invocation journal bucket with S2 (#2666)
+- expire deleted-session tombstones and standalone rows (#2668)
+- collect read-only sessions and orphan streams that hold messages (#2671)
+- cap agent waits at 240 seconds and end them early on new messages (#2677)
+- let agent callers join a busy child session's active turn (#2694)
+- Add opt-in health/readiness checks to `harnx-a2a-server` with `--healthz-addr` or `HARNX_HEALTHZ_ADDR`. Readiness becomes healthy after bootstrap and the A2A listener bind, then returns to 503 before runner shutdown on SIGTERM or Ctrl-C. Add bounded-route HTTP request metrics to the existing `--metrics-addr` Prometheus listener and document separate application, readiness and metrics ports for Kubernetes deployments.
+- Add base64 encoding support to `attachment_create` for binary attachments, with encoded-length and decoded-size checks. Require UTF-8 decoded bytes for text MIME types so created attachments remain readable. Document the broker request limit separately from the 5 MiB handler ceiling. Show a schema-gated PNG creation idiom in the script-mode `bash` description using the agent-visible tool name, including server and package prefixes.
+- Sessions that are only read now expire, and orphan session streams are deleted even when they hold messages. Reading an attachment or plan (`cid:` links, `attachment_read`, `get_plan`, `list_plans` and the task and note reads) no longer refreshes the owning session's activity record; turns and attachment and plan writes still do, so session GC (`cleanup_remote_sessions_days`) deletes a session that is only read once the retention window has passed since its last turn or write. A `SESSION_` stream with no session metadata, such as one a lost or recreated `harnx_sessions` bucket left behind, is deleted once nothing has written to it for the retention window, whether or not it holds messages, unless a session lease, a scoped A2A lease or an unresolved A2A task holds the session. Each such deletion also removes the session's leftover journal rows, metadata keys, attachments and plans. At most 100 are deleted per hourly pass, so a backlog drains at about 100 an hour. `harnx delete orphan-streams` applies the same rule, and its default `--max` is 100.
+- Collect orphaned `SESSION_` JetStream streams that have no session metadata (GH #2650). The hourly session GC previously enumerated only KV metadata, so a stream whose metadata write never landed was never collected. Each pass now inventories `SESSION_` streams, maps them back to a storage key through the stream subject (verified against the stream-name hash), and deletes an orphan once nothing has written to it for the retention window, unless a session or A2A lease or an unresolved A2A task holds it, after re-checking each of those and the stream's age immediately before the delete. Unmappable streams are reported and never touched, and deletions are bounded per pass. `harnx list orphan-streams --cluster <cluster>` reports the inventory as a dry run, and `harnx delete orphan-streams --cluster <cluster>` runs the same guarded cleanup on demand (holding the session-GC leader lease, so it cannot race the periodic pass; `--grace-hours 0` and a zero retention are never treated as a zero-hour grace window). Orphan reconciliation runs automatically wherever `cleanup_remote_sessions_days` is positive, reusing that retention window.
+- Let parents send messages to running children with `session_send` or `session_prompt`. The message joins the child's current turn and wakes waits that stop on new messages. Joined messages keep the turn's existing deadline; `timeout_secs` doesn't extend it. Parents can use the returned `session_send` handle to wait for the response to their message. Waiting is namespace-wide: `session_wait` and prompt-scoped `session_load` accept any caller in the agent namespace, not only the parent that dispatched the prompt.
+- Allow bash command templates to opt in to new-message interruption with `on_user_message: terminate`. Interrupted templates terminate their process group and return partial output with `stopped_by: new_message`. Enable this for Pantheon's PR stability waiter so agents can read new messages before restarting the wait.
+
+#### Add durable `session_send` and prompt-specific `session_wait` tools for asynchronous sub-agent work. Extend `session_load` with bounded paging, filters, and continuation metadata.
+
+`session_load` now returns a bounded page by default instead of the legacy unbounded event array. Consumers that need more history should follow `next_index` or use `read.entry_index` with `read.byte_offset` to retrieve omitted content. The response retains `session_id` and `events`; event payloads use the shared rendered, source-indexed format.
+
+#### Add optional nested `wait` configuration to `bash_spawn` with duration and output-filtering controls, preserving process lifecycle on wait expiry and updating eligible agent guidance.
+
+- `bash_spawn` accepts an optional nested `wait` object with `head_lines`, `tail_lines`, `max_output_bytes`, and `grep`.
+- Omitting `wait` preserves immediate spawn behavior. Wait expiry returns partial output without terminating the running process. The wait's duration fields are described in the bounded soft waits release note.
+- Shipped `coding` and `pantheon` agents with the full shell execution trio (`bash_spawn`, `bash_wait`, `bash_terminate`) now prefer `bash_spawn` with nested `wait` for tests, linters, and builds, with `bash_wait` or `bash_terminate` for post-expiry management. `bash_exec` remains available for quick synchronous commands.
+- MCP tool listings now carry each tool's request-timeout policy in `_meta` (`timeout_secs`): `harnx-mcp-bridge` copies it into `ToolSpec.timeout_secs` for its NATS registration, and `harnx_toolset_server`'s MCP adapter writes it from native specs. Bash `spawn`/`wait`/`exec` advertise `0` (no elapsed deadline) on this route, matching the native NATS toolset, so a bridged nested spawn wait returns its first execution_id-bearing response instead of expiring at the caller's 60-second request backstop. Third-party MCP servers that advertise nothing keep the caller's default backstop; malformed values are ignored rather than disabling a deadline. Direct stdio clients are unaffected.
+
+#### Waits on sub-agents and background commands now default to and cap at 240 seconds, accept `forever: true`, and return early when a new message arrives.
+
+Breaking argument changes:
+
+- Every wait takes `seconds` (1 to 240, default 240) or `forever: true`, not both. `0` and values above 240 are rejected.
+- `bash_spawn`'s nested `wait.timeout_secs` is now `wait.seconds`, and `bash_wait`'s `timeout_secs` is now `seconds`. The old names are rejected.
+- `session_wait` takes `seconds`, `forever`, `include_partial` and `read` at the top level; the nested `wait` object is removed.
+- `bash_spawn`, `bash_exec` and command templates take `timeout_secs` from 1 to 86400, and 86400 (24 hours) is the default for all three. `0` no longer means no deadline. A spawn killed at its deadline reports `status: timed_out`.
+- `bash_spawn`, `bash_wait` and `bash_status` now reject any argument they do not declare instead of ignoring it, which matters for third-party MCP clients of `harnx-bash-tools`.
+- `status` is now a built-in bash tool, so a command template cannot use that name or any other built-in name. A template passed with `--tool` or `--tools-dir` fails startup, and an auto-discovered one is skipped with a warning. The `--enable-tool` example in `docs/bash-mcp-server.md` now names a template `service_status`; a config that used `--enable-tool status` for its own template must rename it.
+
+New tools and results:
+
+- `bash_status` reports a spawned command's state without waiting. For a sub-agent, call `session_load` with `prompt_id`.
+- A wait can end early with `stopped_by: "new_message"` (a new message arrived for the waiting agent) or `stopped_by: "caller_deadline"` (60 seconds before the agent's own run deadline). Neither is an error. Waits over the k8s-sandbox proxy and MCP stdio routes run to their limit.
+- `session_wait` no longer reports `unknown` after a child compacts mid-turn.
+
+#### Derive caller identity from Atlassian Forge Invocation Tokens and bearer JWT claims in `harnx-a2a-server`.
+
+Configuration has two parts:
+1. Bearer identity sources (`forge-fit`, `bearer-claim:CLAIM` via `--user-id-header`) read caller identity from the `Authorization: Bearer` token.
+   - For `forge-fit`: user calls format as `CN=<principal>,OU=<context.cloudId>,O=atlassian.com`; automation and anonymous calls format as `OU=<context.cloudId>,O=atlassian.com`.
+   - For `bearer-claim:CLAIM`: uses the named top-level string claim from the token.
+2. Built-in JWKS verification (`--bearer-jwks-url`, `--bearer-issuer`, `--bearer-audience`) verifies RS256 token signatures against remote keys with 10-second clock-skew leeway, requires `exp`, checks `nbf`/`iat`, and caches keys for at most 10 minutes after a successful fetch. An unknown `kid` or an expired cache triggers a single-flight refetch, throttled to one attempt per 30 seconds even after failure or cancellation. Expired keys fail closed if refresh fails, with no stale-key grace period, so an outage can't extend trust in removed keys.
+
+Built-in verification is recommended. When verification flags are omitted, bearer sources operate in decode-only mode, safe only behind a reverse proxy that verifies tokens before forwarding requests. AWS ALB rejects a `jwt-validation` listener configuration whose issuer isn't a URL, so it can't be configured for the FIT issuer `forge/invocation-token`; use the server's built-in verification for Forge deployments. To require a valid token, configure the bearer source as the only `--user-id-header` source plus verification flags. Present bearer tokens that fail decoding or verification fail closed with HTTP 401 / JSON-RPC -32000 and do not fall through to later sources; requests lacking an `Authorization` header fall through to later sources.
+
+#### Raise default tool-output truncation to 128 KiB and 1000 lines and stop clipping long lines by default.
+
+- Use a shared default of 131,072 bytes and a 250-head/750-tail line window for fs read, grep, bash tools, templates, the bash script tool, fetch, attachment text reads, and MCP bridge previews. Long lines are no longer clipped per line by default.
+- Keep TUI and CLI display truncation unchanged.
+- Set sub-agent `session_load` and `session_wait` defaults to 131,072 bytes and 250/750 lines per event; raise their byte ceiling to 307,200.
+- Set attachment text `byte_limit` default to 128 KiB.
+- Set MCP bridge default result size to 131,072 bytes; `--max-result-bytes` and `HARNX_MCP_MAX_RESULT_BYTES` still override it.
+- Set fetch `max_length` default to 131,072 characters.
+
+#### Add `harnx call bash '<script>'` CLI subcommand and `.call bash <script>` TUI dot-command to run ad-hoc BashKit scripts directly without triggering an LLM inference turn.
+
+Scripts run in an isolated subshell with an in-process virtual filesystem (`/tmp`), no host filesystem or network access, and exposed inner tools mapped to shell commands. For agentless CLI invocations, Harnx uses bounded static AST analysis to infer literal tool command names and claim backing servers; providing explicit `--tools` selectors disables inference and supports additive selection alongside named agent configurations. The TUI dot-command executes against the active session's effective tool selection without flags or inference turns.
+
+Operator-initiated scripts run under scoped operator consent: inner tool calls that trigger `PreToolUse` confirmation hooks (`ask`) auto-approve, while normal agent Bash scripts continue to fail closed with exit code 3. Hook `deny` decisions strictly block inner calls, control tools remain excluded, and child sessions spawned by inner tools retain their normal confirmation policies. Nonzero script status reports execution failure with CLI process exit code 1 while preserving the script exit status in the tool result payload.
+
+Named agent CLI invocations and TUI `.call bash` execute on the tool worker, so workers must be upgraded and restarted together with the frontend; a worker built before this feature rejects the Bash command with a clean error. Agentless CLI invocations run in-process.
+
+#### Read attachment bytes from script-mode bash through a read-only `/attachments` mount.
+
+Use `/attachments/<full-media-cid>` without another URL-encoding layer. Reads are lazy and cached per invocation, with 10 MB per-file and 100 MB cache limits. Listings remain empty, mutations fail with a read-only error, and oversized blobs fail instead of returning truncated bytes. Runtime reads use the round's broker connection and match `attachment_read` access rules, including explicit cross-session CID references.
+
+Externalize inline inner-tool images, audio and embedded resources before scripts receive results, including JSON output, structured content and partial results. Return attachment markers with readable `/attachments` paths in place of inline media blocks (data URIs inside plain text are left alone). Reads from `/attachments` follow `attachment_read`'s access rule but don't pass through tool selection or `PreToolUse` hooks. Uploads use the parent agent/session identity and finish before the command returns; storage failures stop the script rather than exposing inline data.
+
+#### Enable embedded Monty Python in script mode. `python3` and `python` can process
+
+virtual `/tmp` files and read `/attachments`, without host filesystem, network,
+or tool-call access. Apply per-run Python memory and time limits, and stop busy
+loops on cancellation without blocking the agent executor.
+
+Known risks: Python memory limits (64 MiB) and run timeouts (86,400 seconds by
+default, 1 second in the test harness) are cooperative VM limits, not hard process
+isolation. Under BashKit 0.20.2 / Monty 0.0.19, certain inputs can
+crash or OOM the entire host worker process. Known failure examples include:
+`json.dumps(0, indent=10**9)` aborts with SIGABRT (~159 MiB at indent 134217728),
+returning deeply shared list graphs (`x=[x,x]` ×30) expands to ~500 MiB during export
+ignoring timeouts, `pass; import re` bypasses the import gate (~302 MiB via `re.split`),
+parser recursion on long expression chains, and untracked native allocations in
+`str`/`bytes` `join`/`split`. A shared work budget also caps scripts at ~95 Python calls.
+Python cannot be disabled separately in this version. Use script mode with Python only
+where a crashed worker is acceptable, or leave `bash_tools` unset for untrusted prompts.
+
+#### Report a turn whose worker is gone as `stalled` in `session/get`, on every replica.
+
+`session/get` used to report `running` forever for a durable prompt no worker ever claimed, or after the worker's lease disappeared, and a replica whose follow had just failed cached `idle` beside a stale `last_turn`. The state is now derived on each read from the log and the lease sample, the same way on every replica:
+
+- `{ "status": "stalled", "reason": "unclaimed", "prompt_seq": N }` — the prompt at that sequence waited past `nats_lease_acquisition_timeout_secs` (default 60) without a worker lease.
+- `{ "status": "stalled", "reason": "worker_lost", "prompt_seq": N }` — a worker wrote fenced output for that prompt's turn, no lease is held, and the follower watchdog's missing-lease grace has passed since the worker's last timestamped log write. An approval decision records no timestamp, so a turn whose newest worker row is the decision reports `running` until the worker's next timestamped write.
+
+A lease present, a young prompt, or an approval gate still reports `running`/`awaiting_approval`, and a worker that claims the prompt later turns the state back to `running` on the next read — nothing is written to the log. `last_turn` keeps describing the last `turn_end`, `error` or `cancel`, so a stalled turn no longer masquerades as a finished one. `canPrompt` and `canCancel` stay true so clients can settle the stalled prompt by hand.
+
+#### Add reserved output-control parameters (`head_lines`, `tail_lines`, `max_output_bytes`) to command templates and disable per-line clipping when `max_output_bytes` is explicit on bash paths.
+
+- Command templates automatically expose `head_lines`, `tail_lines`, and `max_output_bytes` alongside `timeout_secs`. Declaring any of these names in a template's `parameters` map fails at load time.
+- Passing `max_output_bytes` explicitly disables per-line middle clipping across `bash_exec`, `bash_spawn` wait and status outputs, `read_exec_log`, command templates, and the in-process `bash` script tool.
+- Command-template truncation hints omit `read_exec_log` and reference only `max_output_bytes`, `head_lines`, and `tail_lines`.
+- Templates can declare optional `output:` defaults for `head_lines`, `tail_lines`, and `max_output_bytes`. Non-negative integers only; unknown keys and invalid defaults fail loading. Caller arguments override each field independently. A template-set byte limit also disables per-line clipping.
+- Ship `gh_issue_view` and `jira_view` with a default byte limit of 65536.
+
+Before upgrading, rename or remove template parameters named `head_lines`, `tail_lines`, or `max_output_bytes`. Templates supplied through explicit `--tool`/`--tools-dir` configs fail at startup if they declare these names; auto-discovered package templates with colliding parameters are skipped with a warning.
+
+### Fixes
+
+- ground interviews in research and clarify plan handoffs (#2659)
+- delete a session's rows without leaving purge markers (#2663)
+- keep leases expiring, and leave expiring markers on release (#2675)
+- compact sub-agent session wait transcripts (#2684)
+- stop deletions leaving permanent markers in sessions, plans and attachments (#2686)
+- anchor sub-agent status rows to tool calls (#2699)
+- include tool discoveries in session title context (#2696)
+- Bound note bodies returned by `list_notes` to concise previews. Use `get_note` to read full note contents.
+- Show runtime notes (time budget, sub-agent start, turn interruption, conversation summary) as a short dim line in the TUI and CLI output instead of the raw text sent to the model. The time budget note now reads like `⏱ 526m 40s elapsed · 913m 19s left of 1440m`, and the TUI detail view still shows the full note.
+- Display sub-agent session waits as a single call line and a single result summary in the transcript, preserving status, wait expiry, early-stop reasons, and brief diagnostics. Fix session call templates falling back to raw arguments when abbreviating session IDs.
+- Deleting a session or a plan document no longer leaves markers that stay in NATS forever. Purges of a session's metadata keys in `harnx_sessions`, and of plan documents in `harnx_plans`, now leave markers that expire after an hour; A2A records keep their permanent tombstones, which stop a deleted record from being created again. Opening the session metadata store or the plans bucket allows the per-message TTLs this needs on a bucket an older build created, and until something from this build has opened it, deletions leave permanent markers as before. Deleting a session's attachments now leaves nothing in `harnx_attachments`, where the object store used to keep a metadata entry marked deleted for each object. Markers left by earlier builds stay until their bucket is recreated.
+- Bound retained background bash process results and cached diffs with a 30-minute exit TTL and a 128-result cap. Keep in-flight calls working after eviction and report recently evicted execution IDs as finished and no longer tracked.
+- Fix `harnx info agent <name>` dropping tool-server tools (bash_exec, fs_*, plans_*, …) from `use_tools`: explicit selectors now stay verbatim in the rendered dump even when no local tool declaration exists, since those tools are only declared by workers at runtime. Toolsets still expand, output is deduplicated in selector order, and glob selectors (including `*`) are kept alongside the names they match locally instead of silently shrinking to builtins. Also route `.info tools` through the worker like `.list tools`, so interactive sessions list the agent's actual tools rather than synthetic handoff declarations; without an active session the command now reports an error like the other operator tool commands.
+- The tool invocation journal bucket (`harnx_tool_invocations`) is now S2-compressed. An existing bucket is switched over when a tool server or worker next opens the journal; each NATS server applies the change to its copy after it restarts, and only to blocks it writes or rewrites from then on, so rows already on disk stay uncompressed until their block is rewritten.
+- Deleting a session no longer leaves a purge marker in the tool invocation journal for every tool call the session made. Rows are removed with one filtered stream purge, and deletion no longer scans the whole bucket for rows in the layout used before October 2026; those rows, and markers left by earlier deletions, stay until the `harnx_tool_invocations` bucket is recreated.
+- A session that was deleted and then started again under the same agent and name can run tools again. Deleting a session leaves a tombstone in the tool invocation journal, and it used to refuse every later tool call in a session with that agent and name, forever; it now refuses them for an hour and then expires. Tombstones left by earlier builds stop refusing calls once they are an hour old, but stay in the `harnx_tool_invocations` bucket. Journal rows for tool calls made outside any session, which nothing deleted, now expire a week after their last write; rows written before the upgrade stay. Opening the journal turns on per-message TTLs for an existing bucket, and until a tool server or worker from this build has done that, tombstones and rows are written without a TTL as before.
+- A session lease taken after its key was released, reclaimed, deleted or expired now carries its TTL from the start. It used to be written without one until the holder's first renewal, about 10 seconds later, so a worker that died in that window held the session forever: other workers waited on a TTL that never came, and session GC treated the session as active. Releasing, reclaiming or deleting a lease also now leaves a purge marker that expires after an hour, where it used to leave a marker that stayed in `harnx_leases` for good. Markers left by earlier builds go when their key is leased again or their session is deleted.
+- Reserve session metadata before creating a transcript stream for an explicit session ID. Failed metadata writes and rejected worker activations no longer leave empty or error-only session streams behind.
+- Note tools now accept bare note IDs and full note URLs consistently.
+- `sandbox_connect` without an ID now reuses the sandbox already bound to the invoking session instead of always creating a new `SandboxClaim`; a claim is created only when no usable binding exists. A stored binding with an unknown version or blank ID no longer blocks connecting and is replaced by the new binding. Fixes #2633.
+- Keep script tool progress ordered during concurrent callbacks and cap individual trace lines so long names or arguments don't hide newer completions. Validate media attachment CIDs in URI-only embedded resources the same way as resource links.
+- Keep sub-agent status rows beside their originating tool calls when reopening TUI sessions, without appending completed rows from compacted history.
+- Strip leading thinking blocks from sub-agent delegation responses and exclude child reasoning from termination diagnostics returned to the parent. Child session logs and CLI output keep their original thinking content.
+- Make `time_wait` and `time_wait_until` stop before the caller's run deadline with `stopped_by: "caller_deadline"`, leaving time to report back before the run is cancelled.
+- Improve session titles by including tool arguments and results, retaining initial discoveries and recent progress within a bounded transcript.
+- Tool results that harnx prints to a pipe or file are no longer cut to the width of the terminal it was started from, or to 80 columns when `TERM` is set without a terminal; they get the same limits as when no terminal is attached.
+
+#### Eliminate busy activation re-polling through JetStream (#2636).
+
+When a session was busy — a turn already running on the same worker, or its lease held by a foreign worker — every other activation for it was NAKed back with a 10-12s delay and cycled through the broker until the session freed up: 88% of activation deliveries on staging were these busy re-polls, each one burning an admission permit, preflight reads and delivery budget, and adding the NAK delay to every wake. A worker now parks a busy delivery on a busy waiter instead: a task outside the admission permits that keeps the delivery's progress heartbeats going, so JetStream holds the current delivery without advancing its delivery count while parked, and claims through the normal path the moment the session actually frees — woken by this worker's own release notification, by the lease key disappearing from KV, or by a recheck timer that bounds a dropped watch. Live-holder exclusion and stale-holder fencing are unchanged, since every wake re-runs the full claim path.
+
+This also fixes the delivery-limit loss a busy session could cause: parking doesn't advance the current JetStream delivery count or trigger the worker's `MAX_ACTIVATION_DELIVERIES` termination, so an activation queued behind a long turn stays alive and runs when the session frees. Busy deferrals that fall back to the broker — past the waiter capacity or the six-hour busy-wait budget — also don't themselves trigger the worker limit. Those NAKs still increment JetStream's shared delivery count, so after enough busy redeliveries, one later non-busy error can reach the worker limit and terminate the activation. A busy-only cycle is bounded by the consumer's own `max_deliver` backstop (200). Waiters are bounded per session (default 4) and worker-wide (per-session capacity times admission concurrency, 32 by default); the capacity and busy-wait budget are test-tunable today, not yet operator settings. Past the capacity or budget, the delivery falls back to a delayed NAK instead of remaining parked indefinitely. Shutdown sends parked waiters an un-delayed NAK. Shared-route workers can receive it immediately; worker-targeted deliveries remain on their worker-specific route and require the owning frontend to restart a worker on that route.
+
+Claim metrics are corrected along the way: a busy foreign-lease deferral now counts `outcome="busy_foreign"` (previously miscounted as `preflight_not_ready`), waiter overflow counts `outcome="busy_overflow"`, and `preflight_not_ready` only counts preflights that actually settled a delivery. New gauge `harnx_worker_busy_waiters` and histogram phase `busy_wait` cover the parked state. Documentation of delayed-NAK/backoff interaction was also corrected: nats-server schedules a `+NAK <delay>` on delivery k after `delay - ack_wait + backoff[k-1]`, which this consumer's `backoff[0] == ack_wait` keeps at exactly `delay` on steady deliveries.
+
+#### Map LiteLLM's current `gemini` provider key in `scripts/update_models.py` (keeping the legacy `google_ai` alias), so the weekly catalog refresh ingests Gemini pricing again instead of silently keeping stale entries. Refresh the Gemini block of `models.yaml` from the live registry: cached-token calls now have `cache_read_price` for the whole Gemini 2.5+ family, and stale input/output prices are corrected (e.g. `gemini-2.5-pro` was listed at $0, `gemini-3.6-flash` at the wrong rate). Curated entries and request patches are preserved.
+
+Skip chat entries whose `supported_output_modalities` excludes text — LiteLLM tags the audio-only Lyria music models and `gemini-2.5-pro-preview-tts` as mode `chat`, but the shipped chat-completions transport parses text output only, so they never become selectable chat models.
+
+Add `harnx_llm_unpriced_calls_total` so a call with nonzero tokens that cannot be priced (missing input, output, or cache price) is counted instead of vanishing from all spend metrics. `Model::cost_usd` still refuses to estimate missing costs.
+
+#### Replace the script-mode `bash` placeholder description with a generated guide covering available commands, schema-derived tool synopses, quoting, Monty Python, exit codes and execution limits. Include a tool-specific pipeline when a compatible file reader is available, and show binary attachment creation only when the tool schema supports base64 encoding.
+
+Probe attachment metadata (`stat`, `test -f`) without downloading file contents or consuming cache budget. Allow distinct attachments to download concurrently, with atomic cache-budget reservations that prevent in-flight downloads from exceeding the byte limit. Fail fast with a clear error when the attachment cache is full.
+
+#### Fix TUI transcript browse actions (`d` delete, `e` edit, `r` rewind) silently doing nothing on tool-call rows (#2557).
+
+Tool-call rows now carry their session log sequence number both for live sessions and for reloaded/remote sessions, so delete and rewind work on them. Deleting a tool call also removes its paired tool results, including any approval entries journaled between them; rewinding to a tool round keeps the paired tool results (including when approval entries sit between the calls and results) and drops everything after the round (`.rewind` on a tool-calls sequence number no longer errors). Actions that cannot apply to the focused item — editing a non-user message, rewinding or deleting an item without a sequence number — now show a short notice in the footer instead of doing nothing. Delete, edit and rewind are refused with a footer notice while a turn is running (a confirmation opened before the turn started is dropped on confirm too), since mutating history mid-turn races the worker; a failed clipboard copy now shows "Copy failed" instead of a success notice.
+
 ## 0.34.20 (2026-11-04)
 
 ### Features

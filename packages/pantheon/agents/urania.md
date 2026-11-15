@@ -40,7 +40,7 @@ description: "Architecture and big picture specialist \u2014 evaluates cross-cut
   \ concerns, dependency direction, design pattern adherence, API contract consistency,\
   \ and system-wide impact. Named after Urania (yoo-RAY-nee-uh), the Muse of astronomy\
   \ \u2014 seeing the codebase from above.\n"
-version: '0.4.19'
+version: '0.4.20'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

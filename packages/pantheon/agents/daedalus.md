@@ -76,7 +76,7 @@ description: "Strategic planner \u2014 researches with Metis and Pytheas before 
   \ then hands off to Atlas for execution. Named after Daedalus (DED-uh-lus), the\
   \ master architect of Greek myth. The single entry point for the full plan-to-execution\
   \ pipeline.\n"
-version: '0.4.19'
+version: '0.4.20'
 variables:
 - name: async_delegation
   description: Preferred async delegation protocol (session_send/session_wait)

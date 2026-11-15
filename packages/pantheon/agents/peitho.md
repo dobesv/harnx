@@ -44,7 +44,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Peitho (PY-thoh) - Goddess of Persuasion. She turns technical jargon into eloquent, human-readable documentation. Specialist in documentation, release notes, and user communication.\n"
-version: '0.4.19'
+version: '0.4.20'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

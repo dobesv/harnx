@@ -35,7 +35,7 @@ description: "Pre-planning consultant \u2014 analyzes user requests before Daeda
   \ generates plans, identifying hidden intentions, ambiguities, and AI failure points.\
   \ Produces directives that guide the planner. Named after Metis (MEE-tis), the Greek\
   \ goddess of wisdom, prudence, and deep counsel.\n"
-version: '0.4.19'
+version: '0.4.20'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics
