@@ -14,23 +14,6 @@
       patches:
       - .body.reasoning = {"summary":"auto"}
       endpoint: responses
-    - name: chatgpt-4o-latest
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 5
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-    - name: computer-use-preview
-      max_input_tokens: 8192
-      max_output_tokens: 1024
-      input_price: 3
-      output_price: 12
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.reasoning = {"summary":"auto"}
-      endpoint: responses
     - name: daybreak-blue-latest
       max_input_tokens: 922000
       max_output_tokens: 128000
@@ -55,32 +38,6 @@
       patches:
       - .body.reasoning = {"summary":"auto"}
       endpoint: responses
-    - name: ft:gpt-3.5-turbo
-      max_input_tokens: 16385
-      max_output_tokens: 4096
-      input_price: 3
-      output_price: 6
-    - name: ft:gpt-3.5-turbo-0125
-      max_input_tokens: 16385
-      max_output_tokens: 4096
-      input_price: 3
-      output_price: 6
-    - name: ft:gpt-3.5-turbo-0613
-      max_input_tokens: 4096
-      max_output_tokens: 4096
-      input_price: 3
-      output_price: 6
-    - name: ft:gpt-3.5-turbo-1106
-      max_input_tokens: 16385
-      max_output_tokens: 4096
-      input_price: 3
-      output_price: 6
-    - name: ft:gpt-4-0613
-      max_input_tokens: 8192
-      max_output_tokens: 4096
-      input_price: 30
-      output_price: 60
-      supports_tool_use: true
     - name: ft:gpt-4.1-2025-04-14
       max_input_tokens: 1047576
       max_output_tokens: 32768
@@ -94,13 +51,6 @@
       input_price: 0.8
       output_price: 3.2
       cache_read_price: 0.2
-      supports_tool_use: true
-    - name: ft:gpt-4.1-nano-2025-04-14
-      max_input_tokens: 1047576
-      max_output_tokens: 32768
-      input_price: 0.2
-      output_price: 0.8
-      cache_read_price: 0.05
       supports_tool_use: true
     - name: ft:gpt-4o-2024-08-06
       max_input_tokens: 128000
@@ -123,74 +73,6 @@
       input_price: 0.3
       output_price: 1.2
       cache_read_price: 0.15
-      supports_tool_use: true
-    - name: ft:o4-mini-2025-04-16
-      max_input_tokens: 200000
-      max_output_tokens: 100000
-      input_price: 4
-      output_price: 16
-      cache_read_price: 1
-      supports_tool_use: true
-    - name: gpt-3.5-turbo
-      max_input_tokens: 16385
-      max_output_tokens: 4096
-      input_price: 0.5
-      output_price: 1.5
-      supports_tool_use: true
-    - name: gpt-3.5-turbo-0125
-      max_input_tokens: 16385
-      max_output_tokens: 4096
-      input_price: 0.5
-      output_price: 1.5
-      supports_tool_use: true
-    - name: gpt-3.5-turbo-1106
-      max_input_tokens: 16385
-      max_output_tokens: 4096
-      input_price: 1
-      output_price: 2
-      supports_tool_use: true
-    - name: gpt-3.5-turbo-16k
-      max_input_tokens: 16385
-      max_output_tokens: 4096
-      input_price: 3
-      output_price: 4
-    - name: gpt-4
-      max_input_tokens: 8192
-      max_output_tokens: 4096
-      input_price: 30
-      output_price: 60
-      supports_tool_use: true
-    - name: gpt-4-0613
-      max_input_tokens: 8192
-      max_output_tokens: 4096
-      input_price: 30
-      output_price: 60
-      supports_tool_use: true
-    - name: gpt-4-1106-preview
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 10
-      output_price: 30
-      supports_tool_use: true
-    - name: gpt-4-turbo
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 10
-      output_price: 30
-      supports_vision: true
-      supports_tool_use: true
-    - name: gpt-4-turbo-2024-04-09
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 10
-      output_price: 30
-      supports_vision: true
-      supports_tool_use: true
-    - name: gpt-4-turbo-preview
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 10
-      output_price: 30
       supports_tool_use: true
     - name: gpt-4.1
       max_input_tokens: 1047576
@@ -228,37 +110,12 @@
       supports_vision: true
       supports_tool_use: true
       endpoint: responses
-    - name: gpt-4.1-nano
-      max_input_tokens: 1047576
-      max_output_tokens: 32768
-      input_price: 0.1
-      output_price: 0.4
-      cache_read_price: 0.025
-      supports_vision: true
-      supports_tool_use: true
-      endpoint: responses
-    - name: gpt-4.1-nano-2025-04-14
-      max_input_tokens: 1047576
-      max_output_tokens: 32768
-      input_price: 0.1
-      output_price: 0.4
-      cache_read_price: 0.025
-      supports_vision: true
-      supports_tool_use: true
-      endpoint: responses
     - name: gpt-4o
       max_input_tokens: 128000
       max_output_tokens: 16384
       input_price: 2.5
       output_price: 10
       cache_read_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-    - name: gpt-4o-2024-05-13
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 5
-      output_price: 15
       supports_vision: true
       supports_tool_use: true
     - name: gpt-4o-2024-08-06
@@ -276,12 +133,6 @@
       output_price: 10
       cache_read_price: 1.25
       supports_vision: true
-      supports_tool_use: true
-    - name: gpt-4o-audio-preview
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 2.5
-      output_price: 10
       supports_tool_use: true
     - name: gpt-4o-audio-preview-2024-12-17
       max_input_tokens: 128000
@@ -311,29 +162,11 @@
       cache_read_price: 0.075
       supports_vision: true
       supports_tool_use: true
-    - name: gpt-4o-mini-audio-preview
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 0.15
-      output_price: 0.6
-      supports_tool_use: true
     - name: gpt-4o-mini-audio-preview-2024-12-17
       max_input_tokens: 128000
       max_output_tokens: 16384
       input_price: 0.15
       output_price: 0.6
-      supports_tool_use: true
-    - name: gpt-4o-mini-realtime-preview
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.6
-      output_price: 2.4
-      supports_tool_use: true
-    - name: gpt-4o-mini-realtime-preview-2024-12-17
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.6
-      output_price: 2.4
       supports_tool_use: true
     - name: gpt-4o-mini-search-preview
       max_input_tokens: 128000
@@ -343,44 +176,12 @@
       cache_read_price: 0.075
       supports_vision: true
       supports_tool_use: true
-    - name: gpt-4o-mini-search-preview-2025-03-11
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 0.15
-      output_price: 0.6
-      supports_vision: true
-      supports_tool_use: true
-    - name: gpt-4o-realtime-preview
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 5
-      output_price: 20
-      supports_tool_use: true
-    - name: gpt-4o-realtime-preview-2024-12-17
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 5
-      output_price: 20
-      supports_tool_use: true
-    - name: gpt-4o-realtime-preview-2025-06-03
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 5
-      output_price: 20
-      supports_tool_use: true
     - name: gpt-4o-search-preview
       max_input_tokens: 128000
       max_output_tokens: 16384
       input_price: 2.5
       output_price: 10
       cache_read_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-    - name: gpt-4o-search-preview-2025-03-11
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 2.5
-      output_price: 10
       supports_vision: true
       supports_tool_use: true
     - name: gpt-5
@@ -402,27 +203,6 @@
       cache_read_price: 0.125
       supports_vision: true
       supports_tool_use: true
-      patches:
-      - .body.reasoning = {"summary":"auto"}
-      endpoint: responses
-    - name: gpt-5-chat
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 1.25
-      output_price: 10
-      cache_read_price: 0.125
-      supports_vision: true
-      supports_tool_use: false
-      patches:
-      - .body.reasoning = {"summary":"auto"}
-      endpoint: responses
-    - name: gpt-5-chat-latest
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 1.25
-      output_price: 10
-      supports_vision: true
-      supports_tool_use: false
       patches:
       - .body.reasoning = {"summary":"auto"}
       endpoint: responses
@@ -508,16 +288,6 @@
       patches:
       - .body.reasoning = {"summary":"auto"}
       endpoint: responses
-    - name: gpt-5.1-chat-latest
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 1.25
-      output_price: 10
-      supports_vision: true
-      supports_tool_use: false
-      patches:
-      - .body.reasoning = {"summary":"auto"}
-      endpoint: responses
     - name: gpt-5.2
       max_input_tokens: 272000
       max_output_tokens: 128000
@@ -535,26 +305,6 @@
       input_price: 1.75
       output_price: 14
       cache_read_price: 0.175
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.reasoning = {"summary":"auto"}
-      endpoint: responses
-    - name: gpt-5.2-chat-latest
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 1.75
-      output_price: 14
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.reasoning = {"summary":"auto"}
-      endpoint: responses
-    - name: gpt-5.3-chat-latest
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 1.75
-      output_price: 14
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -956,14 +706,6 @@
       supports_vision: false
       supports_tool_use: true
       endpoint: responses
-    - name: gpt-audio-mini-2025-10-06
-      max_input_tokens: 128000
-      max_output_tokens: 16384
-      input_price: 0.6
-      output_price: 2.4
-      supports_vision: false
-      supports_tool_use: true
-      endpoint: responses
     - name: gpt-audio-mini-2025-12-15
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -972,60 +714,6 @@
       supports_vision: false
       supports_tool_use: true
       endpoint: responses
-    - name: gpt-realtime
-      max_input_tokens: 32000
-      max_output_tokens: 4096
-      input_price: 4
-      output_price: 16
-      supports_tool_use: true
-    - name: gpt-realtime-1.5
-      max_input_tokens: 32000
-      max_output_tokens: 4096
-      input_price: 4
-      output_price: 16
-      supports_tool_use: true
-    - name: gpt-realtime-2
-      max_input_tokens: 32000
-      max_output_tokens: 4096
-      input_price: 4
-      output_price: 16
-      supports_tool_use: true
-    - name: gpt-realtime-2.1
-      max_input_tokens: 128000
-      max_output_tokens: 32000
-      input_price: 4
-      output_price: 24
-      supports_tool_use: true
-    - name: gpt-realtime-2.1-mini
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.6
-      output_price: 2.4
-      supports_tool_use: true
-    - name: gpt-realtime-2025-08-28
-      max_input_tokens: 32000
-      max_output_tokens: 4096
-      input_price: 4
-      output_price: 16
-      supports_tool_use: true
-    - name: gpt-realtime-mini
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.6
-      output_price: 2.4
-      supports_tool_use: true
-    - name: gpt-realtime-mini-2025-10-06
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.6
-      output_price: 2.4
-      supports_tool_use: true
-    - name: gpt-realtime-mini-2025-12-15
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.6
-      output_price: 2.4
-      supports_tool_use: true
     - name: gpt-rosalind-discovery
       input_price: 5
       output_price: 25
@@ -1034,22 +722,6 @@
       input_price: 5
       output_price: 25
       cache_read_price: 0.5
-    - name: o1
-      max_input_tokens: 200000
-      max_output_tokens: 100000
-      input_price: 15
-      output_price: 60
-      cache_read_price: 7.5
-      supports_vision: true
-      supports_tool_use: true
-    - name: o1-2024-12-17
-      max_input_tokens: 200000
-      max_output_tokens: 100000
-      input_price: 15
-      output_price: 60
-      cache_read_price: 7.5
-      supports_vision: true
-      supports_tool_use: true
     - name: o3
       max_input_tokens: 200000
       max_output_tokens: 100000
@@ -1072,38 +744,6 @@
       patches:
       - .body.reasoning = {"summary":"auto"}
       endpoint: responses
-    - name: o3-mini
-      max_input_tokens: 200000
-      max_output_tokens: 100000
-      input_price: 1.1
-      output_price: 4.4
-      cache_read_price: 0.55
-      supports_vision: false
-      supports_tool_use: true
-    - name: o3-mini-2025-01-31
-      max_input_tokens: 200000
-      max_output_tokens: 100000
-      input_price: 1.1
-      output_price: 4.4
-      cache_read_price: 0.55
-      supports_vision: false
-      supports_tool_use: true
-    - name: o4-mini
-      max_input_tokens: 200000
-      max_output_tokens: 100000
-      input_price: 1.1
-      output_price: 4.4
-      cache_read_price: 0.275
-      supports_vision: true
-      supports_tool_use: true
-    - name: o4-mini-2025-04-16
-      max_input_tokens: 200000
-      max_output_tokens: 100000
-      input_price: 1.1
-      output_price: 4.4
-      cache_read_price: 0.275
-      supports_vision: true
-      supports_tool_use: true
     - name: text-embedding-3-large
       max_input_tokens: 8191
       input_price: 0.13
@@ -1147,20 +787,6 @@
       output_price: 12
       supports_vision: true
       supports_tool_use: false
-    - name: gemini-2.0-flash
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0
-      output_price: 0
-      supports_vision: true
-      supports_tool_use: true
-    - name: gemini-2.0-flash-lite
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0
-      output_price: 0
-      supports_vision: true
-      supports_tool_use: true
     - name: gemini-2.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -1292,6 +918,26 @@
       supports_tool_use: true
       patches:
       - .body.generationConfig = ((.body.generationConfig // {}) | del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true}) | .body.generationConfig.maxOutputTokens = ([.body.generationConfig.maxOutputTokens // 65536, (if (.url | endswith(":generateContent")) then 32768 else 65536 end)] | min)
+    - name: gemini-4-carbon
+      max_input_tokens: 1048576
+      max_output_tokens: 1048576
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-4-hydrogen
+      max_input_tokens: 1048576
+      max_output_tokens: 1048576
+      input_price: 1.5
+      output_price: 7.5
+      cache_read_price: 0.075
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-embedding-001
       max_input_tokens: 2048
       input_price: 0.15
@@ -1408,81 +1054,37 @@
       output_price: 0
       supports_vision: true
       supports_tool_use: true
-    - name: text-embedding-004
-      input_price: 0
-      type: embedding
-      max_tokens_per_chunk: 2048
-      default_chunk_size: 1500
-      max_batch_size: 100
 
 # Links:
 #  - https://docs.anthropic.com/en/docs/about-claude/models/all-models
 #  - https://docs.anthropic.com/en/api/messages
 - provider: claude
   models:
-    - name: claude-3-haiku-20240307
-      max_input_tokens: 200000
-      max_output_tokens: 4096
-      input_price: 0.25
-      output_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-3-haiku-20240307:thinking
-      real_name: claude-3-haiku-20240307
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 0.25
-      output_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-4-opus-20250514
-      max_input_tokens: 200000
-      max_output_tokens: 32000
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-4-opus-20250514:thinking
-      real_name: claude-4-opus-20250514
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-4-sonnet-20250514
-      max_input_tokens: 1000000
-      max_output_tokens: 64000
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-4-sonnet-20250514:thinking
-      real_name: claude-4-sonnet-20250514
-      max_input_tokens: 1000000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
       cache_read_price: 1
       cache_write_price: 12.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-fable-5:max
+      real_name: claude-fable-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-fable-5:thinking
       real_name: claude-fable-5
       max_input_tokens: 1000000
@@ -1495,7 +1097,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-fable-5:xhigh
+      real_name: claude-fable-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-fable-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1507,7 +1122,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"high"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1:max
       real_name: claude-fable-5-1
       max_input_tokens: 1000000
@@ -1521,6 +1136,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-1:thinking
+      real_name: claude-fable-5-1
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 0.25
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1:xhigh
       real_name: claude-fable-5-1
       max_input_tokens: 1000000
@@ -1530,6 +1158,57 @@
       output_price: 50
       cache_read_price: 0.25
       cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2:max
+      real_name: claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2:thinking
+      real_name: claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2:xhigh
+      real_name: claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -1591,7 +1270,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-haiku-5-5:max
+      real_name: claude-haiku-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-haiku-5-5:thinking
       real_name: claude-haiku-5-5
       max_input_tokens: 1000000
@@ -1604,16 +1296,45 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-haiku-5-5:xhigh
+      real_name: claude-haiku-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-mythos-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
       cache_read_price: 1
       cache_write_price: 12.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-mythos-5:max
+      real_name: claude-mythos-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-mythos-5:thinking
       real_name: claude-mythos-5
       max_input_tokens: 1000000
@@ -1626,16 +1347,45 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-mythos-5:xhigh
+      real_name: claude-mythos-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-mythos-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
       cache_read_price: 0.25
       cache_write_price: 12.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-1:max
+      real_name: claude-mythos-5-1
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 0.25
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-mythos-5-1:thinking
       real_name: claude-mythos-5-1
       max_input_tokens: 1000000
@@ -1648,65 +1398,71 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-mythos-preview
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-1:xhigh
+      real_name: claude-mythos-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
-      cache_read_price: 1
+      cache_read_price: 0.25
       cache_write_price: 12.5
       supports_vision: true
       supports_tool_use: true
-    - name: claude-mythos-preview:thinking
-      real_name: claude-mythos-preview
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2:max
+      real_name: claude-mythos-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2:thinking
+      real_name: claude-mythos-5-2
       max_input_tokens: 1000000
       max_output_tokens: 24000
       require_max_tokens: true
-      input_price: 10
-      output_price: 50
-      cache_read_price: 1
-      cache_write_price: 12.5
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-opus-4-1
-      max_input_tokens: 200000
-      max_output_tokens: 32000
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-opus-4-1:thinking
-      real_name: claude-opus-4-1
-      max_input_tokens: 200000
-      max_output_tokens: 24000
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2:xhigh
+      real_name: claude-mythos-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
       require_max_tokens: true
-      input_price: 15
-      output_price: 75
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-opus-4-1-20250805
-      max_input_tokens: 200000
-      max_output_tokens: 32000
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-opus-4-1-20250805:thinking
-      real_name: claude-opus-4-1-20250805
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-opus-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -1762,6 +1518,19 @@
       cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
+    - name: claude-opus-4-6:max
+      real_name: claude-opus-4-6
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-6:thinking
       real_name: claude-opus-4-6
       max_input_tokens: 1000000
@@ -1784,6 +1553,19 @@
       cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
+    - name: claude-opus-4-6-20260205:max
+      real_name: claude-opus-4-6-20260205
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-6-20260205:thinking
       real_name: claude-opus-4-6-20260205
       max_input_tokens: 1000000
@@ -1808,7 +1590,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-7:max
       real_name: claude-opus-4-7
       max_input_tokens: 1000000
@@ -1822,6 +1604,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-4-7:thinking
+      real_name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-7:xhigh
       real_name: claude-opus-4-7
       max_input_tokens: 1000000
@@ -1846,7 +1641,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-7-20260416:max
       real_name: claude-opus-4-7-20260416
       max_input_tokens: 1000000
@@ -1860,6 +1655,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-4-7-20260416:thinking
+      real_name: claude-opus-4-7-20260416
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-7-20260416:xhigh
       real_name: claude-opus-4-7-20260416
       max_input_tokens: 1000000
@@ -1884,7 +1692,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-8:max
       real_name: claude-opus-4-8
       max_input_tokens: 1000000
@@ -1898,6 +1706,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-4-8:thinking
+      real_name: claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-8:xhigh
       real_name: claude-opus-4-8
       max_input_tokens: 1000000
@@ -1914,12 +1735,28 @@
     - name: claude-opus-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       cache_read_price: 0.5
       cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-opus-5:max
+      real_name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-5:thinking
       real_name: claude-opus-5
       max_input_tokens: 1000000
@@ -1932,7 +1769,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-opus-5:xhigh
+      real_name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1944,7 +1794,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-5-5:max
       real_name: claude-opus-5-5
       max_input_tokens: 1000000
@@ -1958,6 +1808,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-5-5:thinking
+      real_name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-5-5:xhigh
       real_name: claude-opus-5-5
       max_input_tokens: 1000000
@@ -2027,6 +1890,19 @@
       cache_write_price: 3.75
       supports_vision: true
       supports_tool_use: true
+    - name: claude-sonnet-4-6:max
+      real_name: claude-sonnet-4-6
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 3
+      output_price: 15
+      cache_read_price: 0.3
+      cache_write_price: 3.75
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-sonnet-4-6:thinking
       real_name: claude-sonnet-4-6
       max_input_tokens: 1000000
@@ -2050,6 +1926,21 @@
       cache_write_price: 2.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5:max
+      real_name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.2
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-sonnet-5:thinking
       real_name: claude-sonnet-5
       max_input_tokens: 1000000
@@ -2062,7 +1953,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5:xhigh
+      real_name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.2
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-sonnet-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -2073,6 +1977,21 @@
       cache_write_price: 2.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5-5:max
+      real_name: claude-sonnet-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-sonnet-5-5:thinking
       real_name: claude-sonnet-5-5
       max_input_tokens: 1000000
@@ -2085,7 +2004,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5-5:xhigh
+      real_name: claude-sonnet-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
 
 # Links:
 #  - https://docs.mistral.ai/getting-started/models/models_overview/
@@ -2093,11 +2025,6 @@
 #  - https://docs.mistral.ai/api/
 - provider: mistral
   models:
-    - name: codestral-2405
-      max_input_tokens: 32000
-      max_output_tokens: 8191
-      input_price: 1
-      output_price: 3
     - name: codestral-2508
       max_input_tokens: 128000
       max_output_tokens: 128000
@@ -2134,12 +2061,6 @@
       cache_read_price: 0.007
       supports_vision: true
       supports_tool_use: true
-    - name: devstral-2512
-      max_input_tokens: 256000
-      max_output_tokens: 256000
-      input_price: 0.4
-      output_price: 2
-      supports_tool_use: true
     - name: devstral-latest
       max_input_tokens: 256000
       max_output_tokens: 256000
@@ -2147,30 +2068,12 @@
       output_price: 2
       cache_read_price: 0.04
       supports_tool_use: true
-    - name: devstral-medium-2507
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 0.4
-      output_price: 2
-      supports_tool_use: true
     - name: devstral-medium-latest
       max_input_tokens: 256000
       max_output_tokens: 256000
       input_price: 0.4
       output_price: 2
       cache_read_price: 0.04
-      supports_tool_use: true
-    - name: devstral-small-2505
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 0.1
-      output_price: 0.3
-      supports_tool_use: true
-    - name: devstral-small-2507
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 0.1
-      output_price: 0.3
       supports_tool_use: true
     - name: devstral-small-latest
       max_input_tokens: 256000
@@ -2186,41 +2089,12 @@
       output_price: 4.4
       cache_read_price: 0.14
       supports_tool_use: true
-    - name: labs-devstral-small-2512
-      max_input_tokens: 256000
-      max_output_tokens: 256000
-      input_price: 0.1
-      output_price: 0.3
-      supports_tool_use: true
-    - name: labs-leanstral-1-5
-      max_input_tokens: 262144
-      max_output_tokens: 131072
-      input_price: 0
-      output_price: 0
-      supports_tool_use: true
     - name: labs-leanstral-1-5-1
       max_input_tokens: 262144
       max_output_tokens: 131072
       input_price: 0
       output_price: 0
-      supports_tool_use: true
-    - name: magistral-medium-1-2-2509
-      max_input_tokens: 40000
-      max_output_tokens: 40000
-      input_price: 2
-      output_price: 5
-      supports_tool_use: true
-    - name: magistral-medium-2506
-      max_input_tokens: 40000
-      max_output_tokens: 40000
-      input_price: 2
-      output_price: 5
-      supports_tool_use: true
-    - name: magistral-medium-2509
-      max_input_tokens: 40000
-      max_output_tokens: 40000
-      input_price: 2
-      output_price: 5
+      supports_vision: true
       supports_tool_use: true
     - name: magistral-medium-latest
       max_input_tokens: 262144
@@ -2229,18 +2103,6 @@
       output_price: 7.5
       cache_read_price: 0.15
       supports_vision: true
-      supports_tool_use: true
-    - name: magistral-small-1-2-2509
-      max_input_tokens: 40000
-      max_output_tokens: 40000
-      input_price: 0.5
-      output_price: 1.5
-      supports_tool_use: true
-    - name: magistral-small-2506
-      max_input_tokens: 40000
-      max_output_tokens: 40000
-      input_price: 0.5
-      output_price: 1.5
       supports_tool_use: true
     - name: magistral-small-latest
       max_input_tokens: 262144
@@ -2353,24 +2215,6 @@
       max_input_tokens: 8192
       input_price: 0.1
       type: embedding
-    - name: mistral-large-2402
-      max_input_tokens: 32000
-      max_output_tokens: 8191
-      input_price: 4
-      output_price: 12
-      supports_tool_use: true
-    - name: mistral-large-2407
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 3
-      output_price: 9
-      supports_tool_use: true
-    - name: mistral-large-2411
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 2
-      output_price: 6
-      supports_tool_use: true
     - name: mistral-large-2512
       max_input_tokens: 262144
       max_output_tokens: 262144
@@ -2419,24 +2263,6 @@
       cache_read_price: 0.15
       supports_vision: true
       supports_tool_use: true
-    - name: mistral-medium-2312
-      max_input_tokens: 32000
-      max_output_tokens: 8191
-      input_price: 2.7
-      output_price: 8.1
-    - name: mistral-medium-2505
-      max_input_tokens: 131072
-      max_output_tokens: 8191
-      input_price: 0.4
-      output_price: 2
-      supports_tool_use: true
-    - name: mistral-medium-2508
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 0.4
-      output_price: 2
-      supports_vision: true
-      supports_tool_use: true
     - name: mistral-medium-2604
       max_input_tokens: 262144
       max_output_tokens: 262144
@@ -2451,13 +2277,6 @@
       input_price: 1.5
       output_price: 7.5
       cache_read_price: 0.15
-      supports_vision: true
-      supports_tool_use: true
-    - name: mistral-medium-3-1-2508
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 0.4
-      output_price: 2
       supports_vision: true
       supports_tool_use: true
     - name: mistral-medium-3-5
@@ -2499,13 +2318,6 @@
       cache_read_price: 0.015
       supports_vision: true
       supports_tool_use: true
-    - name: mistral-small-3-2-2506
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 0.06
-      output_price: 0.18
-      supports_vision: true
-      supports_tool_use: true
     - name: mistral-small-latest
       max_input_tokens: 262144
       max_output_tokens: 262144
@@ -2544,53 +2356,12 @@
       cache_read_price: 0.15
       supports_vision: true
       supports_tool_use: true
-    - name: open-codestral-mamba
-      max_input_tokens: 256000
-      max_output_tokens: 256000
-      input_price: 0.25
-      output_price: 0.25
-    - name: open-mistral-7b
-      max_input_tokens: 32000
-      max_output_tokens: 8191
-      input_price: 0.25
-      output_price: 0.25
     - name: open-mistral-nemo
       max_input_tokens: 128000
       max_output_tokens: 128000
       input_price: 0.3
       output_price: 0.3
       cache_read_price: 0.03
-    - name: open-mistral-nemo-2407
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 0.3
-      output_price: 0.3
-    - name: open-mixtral-8x22b
-      max_input_tokens: 65336
-      max_output_tokens: 8191
-      input_price: 2
-      output_price: 6
-      supports_tool_use: true
-    - name: open-mixtral-8x7b
-      max_input_tokens: 32000
-      max_output_tokens: 8191
-      input_price: 0.7
-      output_price: 0.7
-      supports_tool_use: true
-    - name: pixtral-12b-2409
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 0.15
-      output_price: 0.15
-      supports_vision: true
-      supports_tool_use: true
-    - name: pixtral-large-2411
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 2
-      output_price: 6
-      supports_vision: true
-      supports_tool_use: true
     - name: pixtral-large-latest
       max_input_tokens: 128000
       max_output_tokens: 128000
@@ -2614,13 +2385,6 @@
       cache_read_price: 0.01
       supports_tool_use: true
     - name: zai-glm-5
-      max_input_tokens: 1048576
-      max_output_tokens: 131072
-      input_price: 1.4
-      output_price: 4.4
-      cache_read_price: 0.14
-      supports_tool_use: true
-    - name: zai-glm-5-2
       max_input_tokens: 1048576
       max_output_tokens: 131072
       input_price: 1.4
@@ -2681,11 +2445,6 @@
       max_output_tokens: 256000
       input_price: 0.2
       output_price: 0.4
-    - name: jamba-large
-      max_input_tokens: 256000
-      input_price: 2
-      output_price: 8
-      supports_tool_use: true
     - name: jamba-large-1.6
       max_input_tokens: 256000
       max_output_tokens: 256000
@@ -2696,11 +2455,6 @@
       max_output_tokens: 256000
       input_price: 2
       output_price: 8
-    - name: jamba-mini
-      max_input_tokens: 256000
-      input_price: 0.2
-      output_price: 0.4
-      supports_tool_use: true
     - name: jamba-mini-1.6
       max_input_tokens: 256000
       max_output_tokens: 256000
@@ -2718,38 +2472,44 @@
 #  - https://docs.cohere.com/reference/chat
 - provider: cohere
   models:
+    - name: c4ai-aya-expanse-32b
+      max_input_tokens: 128000
+      max_output_tokens: 4000
+      input_price: 0.5
+      output_price: 1.5
     - name: command-a-03-2025
-      max_input_tokens: 262144
-      max_output_tokens: 8192
+      max_input_tokens: 256000
+      max_output_tokens: 8000
       input_price: 2.5
       output_price: 10
       supports_tool_use: true
-    - name: command-a-reasoning-08-2025
-      max_input_tokens: 262144
-      max_output_tokens: 32768
-      input_price: 2.5
-      output_price: 10
-    - name: command-a-vision-07-2025
-      max_input_tokens: 131072
-      max_output_tokens: 8192
-      input_price: 2.5
-      output_price: 10
+    - name: command-a-plus-05-2026
+      max_input_tokens: 128000
+      max_output_tokens: 64000
+      input_price: 0
+      output_price: 0
       supports_vision: true
+      supports_tool_use: true
+    - name: command-r-08-2024
+      max_input_tokens: 128000
+      max_output_tokens: 4096
+      input_price: 0.15
+      output_price: 0.6
+      supports_tool_use: true
+    - name: command-r-plus-08-2024
+      max_input_tokens: 128000
+      max_output_tokens: 4096
+      input_price: 2.5
+      output_price: 10
+      supports_tool_use: true
     - name: command-r7b-12-2024
-      max_input_tokens: 131072
+      max_input_tokens: 128000
       max_output_tokens: 4096
       input_price: 0.0375
       output_price: 0.15
-    - name: embed-english-light-v2.0
-      max_input_tokens: 1024
-      input_price: 0.1
-      type: embedding
+      supports_tool_use: true
     - name: embed-english-light-v3.0
       max_input_tokens: 512
-      input_price: 0.1
-      type: embedding
-    - name: embed-english-v2.0
-      max_input_tokens: 4096
       input_price: 0.1
       type: embedding
     - name: embed-english-v3.0
@@ -2762,10 +2522,6 @@
     - name: embed-multilingual-light-v3.0
       max_input_tokens: 512
       input_price: 100
-      type: embedding
-    - name: embed-multilingual-v2.0
-      max_input_tokens: 768
-      input_price: 0.1
       type: embedding
     - name: embed-multilingual-v3.0
       max_input_tokens: 512
@@ -2791,12 +2547,38 @@
       type: embedding
     - name: rerank-english-v3.0
       max_input_tokens: 4096
+      max_output_tokens: 4096
+      input_price: 0
       type: reranker
     - name: rerank-multilingual-v3.0
       max_input_tokens: 4096
+      max_output_tokens: 4096
+      input_price: 0
       type: reranker
     - name: rerank-v3.5
       max_input_tokens: 4096
+      max_output_tokens: 4096
+      input_price: 0
+      type: reranker
+    - name: rerank-v4.0-fast
+      max_input_tokens: 32768
+      max_output_tokens: 32768
+      input_price: 0
+      type: reranker
+    - name: rerank-v4.0-pro
+      max_input_tokens: 32768
+      max_output_tokens: 32768
+      input_price: 0
+      type: reranker
+    - name: rerank-v5.0-fast
+      max_input_tokens: 32768
+      max_output_tokens: 32768
+      input_price: 0.02
+      type: reranker
+    - name: rerank-v5.0-pro
+      max_input_tokens: 32768
+      max_output_tokens: 32768
+      input_price: 0.05
       type: reranker
 
 # Links:
@@ -2804,32 +2586,285 @@
 #  - https://docs.x.ai/docs/api-reference#chat-completions
 - provider: xai
   models:
-    - name: grok-4-1-fast-non-reasoning
-      max_input_tokens: 2000000
-      input_price: 0.2
-      output_price: 0.5
+    - name: grok-4.20
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
       supports_tool_use: true
-    - name: grok-4-1-fast-reasoning
-      max_input_tokens: 2000000
-      input_price: 0.2
-      output_price: 0.5
+    - name: grok-4.20-0309
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
       supports_tool_use: true
     - name: grok-4.20-0309-non-reasoning
-      max_input_tokens: 2000000
-      input_price: 2
-      output_price: 6
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
       supports_vision: true
       supports_tool_use: true
     - name: grok-4.20-0309-reasoning
-      max_input_tokens: 2000000
-      input_price: 2
-      output_price: 6
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
       supports_vision: true
       supports_tool_use: true
-    - name: grok-code-fast-1
+    - name: grok-4.20-beta
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-beta-0309
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-beta-0309-non-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-beta-0309-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-beta-latest
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-beta-latest-non-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-beta-latest-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-beta-non-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-beta-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-experimental-beta-0304
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-experimental-beta-0304-non-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-experimental-beta-0304-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-experimental-beta-latest
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-experimental-beta-non-reasoning-latest
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-experimental-beta-reasoning-latest
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-non-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-non-reasoning-gv2
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-non-reasoning-latest
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-reasoning
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-reasoning-gv2
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-reasoning-latest
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.3
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.3-latest
+      max_input_tokens: 1000000
+      max_output_tokens: 1000000
+      input_price: 1.25
+      output_price: 2.5
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.5
+      max_input_tokens: 500000
+      max_output_tokens: 500000
+      input_price: 2
+      output_price: 6
+      cache_read_price: 0.3
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.5-latest
+      max_input_tokens: 500000
+      max_output_tokens: 500000
+      input_price: 2
+      output_price: 6
+      cache_read_price: 0.3
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.6
+      max_input_tokens: 500000
+      max_output_tokens: 500000
+      input_price: 2
+      output_price: 6
+      cache_read_price: 0.5
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.7
+      max_input_tokens: 500000
+      max_output_tokens: 500000
+      input_price: 2
+      output_price: 6
+      cache_read_price: 0.5
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-build-0.1
       max_input_tokens: 256000
-      input_price: 0.2
-      output_price: 1.5
+      max_output_tokens: 256000
+      input_price: 1
+      output_price: 2
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-build-latest
+      max_input_tokens: 500000
+      max_output_tokens: 500000
+      input_price: 2
+      output_price: 6
+      cache_read_price: 0.3
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-code-fast
+      max_input_tokens: 256000
+      max_output_tokens: 256000
+      input_price: 1
+      output_price: 2
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-code-fast-1-0825
+      max_input_tokens: 256000
+      max_output_tokens: 256000
+      input_price: 1
+      output_price: 2
+      cache_read_price: 0.2
+      supports_vision: true
       supports_tool_use: true
 
 # Links:
@@ -2959,51 +2994,6 @@
 #  - https://console.groq.com/docs/api-reference#chat
 - provider: groq
   models:
-    - name: gemma-7b-it
-      max_input_tokens: 8192
-      max_output_tokens: 8192
-      input_price: 0.05
-      output_price: 0.08
-      supports_tool_use: true
-    - name: groq/compound
-      max_input_tokens: 131072
-      input_price: 0
-      output_price: 0
-    - name: groq/compound-mini
-      max_input_tokens: 131072
-      input_price: 0
-      output_price: 0
-    - name: llama-3.1-8b-instant
-      max_input_tokens: 128000
-      max_output_tokens: 8192
-      input_price: 0.05
-      output_price: 0.08
-      supports_tool_use: true
-    - name: llama-3.3-70b-versatile
-      max_input_tokens: 128000
-      max_output_tokens: 32768
-      input_price: 0.59
-      output_price: 0.79
-      supports_tool_use: true
-    - name: meta-llama/llama-4-maverick-17b-128e-instruct
-      max_input_tokens: 131072
-      max_output_tokens: 8192
-      input_price: 0.2
-      output_price: 0.6
-      supports_vision: true
-      supports_tool_use: true
-    - name: meta-llama/llama-4-scout-17b-16e-instruct
-      max_input_tokens: 131072
-      max_output_tokens: 8192
-      input_price: 0.11
-      output_price: 0.34
-      supports_vision: true
-      supports_tool_use: true
-    - name: meta-llama/llama-guard-4-12b
-      max_input_tokens: 8192
-      max_output_tokens: 8192
-      input_price: 0.2
-      output_price: 0.2
     - name: meta-llama/llama-prompt-guard-2-22m
       max_input_tokens: 512
       max_output_tokens: 512
@@ -3014,12 +3004,6 @@
       max_output_tokens: 512
       input_price: 0.04
       output_price: 0.04
-    - name: moonshotai/kimi-k2-instruct-0905
-      max_input_tokens: 262144
-      max_output_tokens: 16384
-      input_price: 1
-      output_price: 3
-      supports_tool_use: true
     - name: openai/gpt-oss-120b
       max_input_tokens: 131072
       max_output_tokens: 65536
@@ -3041,19 +3025,6 @@
       output_price: 0.3
       cache_read_price: 0.037
       supports_tool_use: true
-    - name: qwen/qwen3-32b
-      max_input_tokens: 131000
-      max_output_tokens: 131000
-      input_price: 0.29
-      output_price: 0.59
-      supports_tool_use: true
-    - name: qwen/qwen3.6-27b
-      max_input_tokens: 131072
-      max_output_tokens: 16384
-      input_price: 0.6
-      output_price: 3
-      supports_vision: true
-      supports_tool_use: true
     - name: qwen/qwen3.8-27b
       max_input_tokens: 131072
       max_output_tokens: 16384
@@ -3068,146 +3039,6 @@
 #  - https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/gemini
 - provider: vertexai
   models:
-    - name: claude-3-5-haiku
-      max_input_tokens: 200000
-      max_output_tokens: 8192
-      input_price: 1
-      output_price: 5
-      supports_tool_use: true
-    - name: claude-3-5-haiku:thinking
-      real_name: claude-3-5-haiku
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 1
-      output_price: 5
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-3-5-haiku@20241022
-      max_input_tokens: 200000
-      max_output_tokens: 8192
-      input_price: 1
-      output_price: 5
-      supports_tool_use: true
-    - name: claude-3-5-haiku@20241022:thinking
-      real_name: claude-3-5-haiku@20241022
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 1
-      output_price: 5
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-3-5-sonnet
-      max_input_tokens: 200000
-      max_output_tokens: 8192
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-3-5-sonnet:thinking
-      real_name: claude-3-5-sonnet
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-3-5-sonnet@20240620
-      max_input_tokens: 200000
-      max_output_tokens: 8192
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-3-5-sonnet@20240620:thinking
-      real_name: claude-3-5-sonnet@20240620
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-3-haiku
-      max_input_tokens: 200000
-      max_output_tokens: 4096
-      input_price: 0.25
-      output_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-3-haiku:thinking
-      real_name: claude-3-haiku
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 0.25
-      output_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-3-haiku@20240307
-      max_input_tokens: 200000
-      max_output_tokens: 4096
-      input_price: 0.25
-      output_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-3-haiku@20240307:thinking
-      real_name: claude-3-haiku@20240307
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 0.25
-      output_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-3-opus
-      max_input_tokens: 200000
-      max_output_tokens: 4096
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-3-opus:thinking
-      real_name: claude-3-opus
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-3-opus@20240229
-      max_input_tokens: 200000
-      max_output_tokens: 4096
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-3-opus@20240229:thinking
-      real_name: claude-3-opus@20240229
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-sonnet
       max_input_tokens: 200000
       max_output_tokens: 4096
@@ -3215,17 +3046,6 @@
       output_price: 15
       supports_vision: true
       supports_tool_use: true
-    - name: claude-3-sonnet:thinking
-      real_name: claude-3-sonnet
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-3-sonnet@20240229
       max_input_tokens: 200000
       max_output_tokens: 4096
@@ -3233,26 +3053,31 @@
       output_price: 15
       supports_vision: true
       supports_tool_use: true
-    - name: claude-3-sonnet@20240229:thinking
-      real_name: claude-3-sonnet@20240229
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
       cache_read_price: 1
       cache_write_price: 12.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-fable-5:max
+      real_name: claude-fable-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-fable-5:thinking
       real_name: claude-fable-5
       max_input_tokens: 1000000
@@ -3265,7 +3090,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-fable-5:xhigh
+      real_name: claude-fable-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-fable-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3277,7 +3115,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"high"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1:max
       real_name: claude-fable-5-1
       max_input_tokens: 1000000
@@ -3291,6 +3129,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-1:thinking
+      real_name: claude-fable-5-1
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 0.25
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1:xhigh
       real_name: claude-fable-5-1
       max_input_tokens: 1000000
@@ -3315,7 +3166,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"high"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1@default:max
       real_name: claude-fable-5-1@default
       max_input_tokens: 1000000
@@ -3329,6 +3180,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-1@default:thinking
+      real_name: claude-fable-5-1@default
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 0.25
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5-1@default:xhigh
       real_name: claude-fable-5-1@default
       max_input_tokens: 1000000
@@ -3342,15 +3206,133 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2:max
+      real_name: claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2:thinking
+      real_name: claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2:xhigh
+      real_name: claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2@default:max
+      real_name: claude-fable-5-2@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2@default:thinking
+      real_name: claude-fable-5-2@default
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-fable-5-2@default:xhigh
+      real_name: claude-fable-5-2@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-fable-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
       cache_read_price: 1
       cache_write_price: 12.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-fable-5@default:max
+      real_name: claude-fable-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      cache_write_price: 12.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-fable-5@default:thinking
       real_name: claude-fable-5@default
       max_input_tokens: 1000000
@@ -3363,53 +3345,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-haiku-4-5
-      max_input_tokens: 200000
-      max_output_tokens: 64000
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-fable-5@default:xhigh
+      real_name: claude-fable-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
       require_max_tokens: true
-      input_price: 1
-      output_price: 5
-      cache_read_price: 0.1
-      cache_write_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-haiku-4-5:thinking
-      real_name: claude-haiku-4-5
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 1
-      output_price: 5
-      cache_read_price: 0.1
-      cache_write_price: 1.25
+      input_price: 10
+      output_price: 50
+      cache_read_price: 1
+      cache_write_price: 12.5
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-haiku-4-5@20251001
-      max_input_tokens: 200000
-      max_output_tokens: 64000
-      require_max_tokens: true
-      input_price: 1
-      output_price: 5
-      cache_read_price: 0.1
-      cache_write_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-haiku-4-5@20251001:thinking
-      real_name: claude-haiku-4-5@20251001
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 1
-      output_price: 5
-      cache_read_price: 0.1
-      cache_write_price: 1.25
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-haiku-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3421,7 +3370,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-haiku-5-5:max
+      real_name: claude-haiku-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-haiku-5-5:thinking
       real_name: claude-haiku-5-5
       max_input_tokens: 1000000
@@ -3434,7 +3396,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-haiku-5-5:xhigh
+      real_name: claude-haiku-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-haiku-5-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3446,7 +3421,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-haiku-5-5@default:max
+      real_name: claude-haiku-5-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-haiku-5-5@default:thinking
       real_name: claude-haiku-5-5@default
       max_input_tokens: 1000000
@@ -3459,61 +3447,122 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"medium"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
-    - name: claude-opus-4
-      max_input_tokens: 200000
-      max_output_tokens: 32000
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-opus-4:thinking
-      real_name: claude-opus-4
-      max_input_tokens: 200000
-      max_output_tokens: 24000
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-haiku-5-5@default:xhigh
+      real_name: claude-haiku-5-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
       require_max_tokens: true
-      input_price: 15
-      output_price: 75
+      input_price: 0.1
+      output_price: 0.5
+      cache_read_price: 0.01
+      cache_write_price: 0.125
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-opus-4-1
-      max_input_tokens: 200000
-      max_output_tokens: 32000
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-opus-4-1:thinking
-      real_name: claude-opus-4-1
-      max_input_tokens: 200000
-      max_output_tokens: 24000
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
       require_max_tokens: true
-      input_price: 15
-      output_price: 75
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-opus-4-1@20250805
-      max_input_tokens: 200000
-      max_output_tokens: 32000
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-opus-4-1@20250805:thinking
-      real_name: claude-opus-4-1@20250805
-      max_input_tokens: 200000
-      max_output_tokens: 24000
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2:max
+      real_name: claude-mythos-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
       require_max_tokens: true
-      input_price: 15
-      output_price: 75
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2:thinking
+      real_name: claude-mythos-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2:xhigh
+      real_name: claude-mythos-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2@default:max
+      real_name: claude-mythos-5-2@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"max"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2@default:thinking
+      real_name: claude-mythos-5-2@default
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
+    - name: claude-mythos-5-2@default:xhigh
+      real_name: claude-mythos-5-2@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 8
+      output_price: 40
+      cache_read_price: 0.2
+      cache_write_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}} | .body.output_config = {"effort":"xhigh"} | .headers += {"anthropic-beta":([.headers["anthropic-beta"] // empty, "thinking-binding-controls-2026-08-01"] | join(","))}
     - name: claude-opus-4-5
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -3569,6 +3618,19 @@
       cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
+    - name: claude-opus-4-6:max
+      real_name: claude-opus-4-6
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-6:thinking
       real_name: claude-opus-4-6
       max_input_tokens: 1000000
@@ -3591,6 +3653,19 @@
       cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
+    - name: claude-opus-4-6@default:max
+      real_name: claude-opus-4-6@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-4-6@default:thinking
       real_name: claude-opus-4-6@default
       max_input_tokens: 1000000
@@ -3615,7 +3690,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-7:max
       real_name: claude-opus-4-7
       max_input_tokens: 1000000
@@ -3629,6 +3704,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-4-7:thinking
+      real_name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-7:xhigh
       real_name: claude-opus-4-7
       max_input_tokens: 1000000
@@ -3653,7 +3741,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-7@default:max
       real_name: claude-opus-4-7@default
       max_input_tokens: 1000000
@@ -3667,6 +3755,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-4-7@default:thinking
+      real_name: claude-opus-4-7@default
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-7@default:xhigh
       real_name: claude-opus-4-7@default
       max_input_tokens: 1000000
@@ -3691,7 +3792,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-8:max
       real_name: claude-opus-4-8
       max_input_tokens: 1000000
@@ -3705,6 +3806,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-4-8:thinking
+      real_name: claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-8:xhigh
       real_name: claude-opus-4-8
       max_input_tokens: 1000000
@@ -3729,7 +3843,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"high"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-8@default:max
       real_name: claude-opus-4-8@default
       max_input_tokens: 1000000
@@ -3743,6 +3857,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-4-8@default:thinking
+      real_name: claude-opus-4-8@default
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-4-8@default:xhigh
       real_name: claude-opus-4-8@default
       max_input_tokens: 1000000
@@ -3756,33 +3883,31 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
-    - name: claude-opus-4@20250514
-      max_input_tokens: 200000
-      max_output_tokens: 32000
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-opus-4@20250514:thinking
-      real_name: claude-opus-4@20250514
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 15
-      output_price: 75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
     - name: claude-opus-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       cache_read_price: 0.5
       cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-opus-5:max
+      real_name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-5:thinking
       real_name: claude-opus-5
       max_input_tokens: 1000000
@@ -3795,7 +3920,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-opus-5:xhigh
+      real_name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-opus-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -3807,7 +3945,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-5-5:max
       real_name: claude-opus-5-5
       max_input_tokens: 1000000
@@ -3821,6 +3959,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-5-5:thinking
+      real_name: claude-opus-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-5-5:xhigh
       real_name: claude-opus-5-5
       max_input_tokens: 1000000
@@ -3845,7 +3996,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"medium"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-5-5@default:max
       real_name: claude-opus-5-5@default
       max_input_tokens: 1000000
@@ -3859,6 +4010,19 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
+    - name: claude-opus-5-5@default:thinking
+      real_name: claude-opus-5-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      cache_write_price: 5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
     - name: claude-opus-5-5@default:xhigh
       real_name: claude-opus-5-5@default
       max_input_tokens: 1000000
@@ -3875,12 +4039,28 @@
     - name: claude-opus-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       cache_read_price: 0.5
       cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-opus-5@default:max
+      real_name: claude-opus-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-opus-5@default:thinking
       real_name: claude-opus-5@default
       max_input_tokens: 1000000
@@ -3893,71 +4073,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-sonnet-4
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-opus-5@default:xhigh
+      real_name: claude-opus-5@default
       max_input_tokens: 1000000
-      max_output_tokens: 64000
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-sonnet-4:thinking
-      real_name: claude-sonnet-4
-      max_input_tokens: 1000000
-      max_output_tokens: 24000
+      max_output_tokens: 128000
       require_max_tokens: true
-      input_price: 3
-      output_price: 15
+      input_price: 5
+      output_price: 25
+      cache_read_price: 0.5
+      cache_write_price: 6.25
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-sonnet-4-5
-      max_input_tokens: 200000
-      max_output_tokens: 64000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-sonnet-4-5:thinking
-      real_name: claude-sonnet-4-5
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-sonnet-4-5@20250929
-      max_input_tokens: 200000
-      max_output_tokens: 64000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-sonnet-4-5@20250929:thinking
-      real_name: claude-sonnet-4-5@20250929
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-sonnet-4-6
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -3968,6 +4097,19 @@
       cache_write_price: 3.75
       supports_vision: true
       supports_tool_use: true
+    - name: claude-sonnet-4-6:max
+      real_name: claude-sonnet-4-6
+      max_input_tokens: 1000000
+      max_output_tokens: 64000
+      require_max_tokens: true
+      input_price: 3
+      output_price: 15
+      cache_read_price: 0.3
+      cache_write_price: 3.75
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-sonnet-4-6:thinking
       real_name: claude-sonnet-4-6
       max_input_tokens: 1000000
@@ -3991,6 +4133,19 @@
       cache_write_price: 3.75
       supports_vision: true
       supports_tool_use: true
+    - name: claude-sonnet-4-6@default:max
+      real_name: claude-sonnet-4-6@default
+      max_input_tokens: 1000000
+      max_output_tokens: 64000
+      require_max_tokens: true
+      input_price: 3
+      output_price: 15
+      cache_read_price: 0.3
+      cache_write_price: 3.75
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-sonnet-4-6@default:thinking
       real_name: claude-sonnet-4-6@default
       max_input_tokens: 1000000
@@ -4000,24 +4155,6 @@
       output_price: 15
       cache_read_price: 0.3
       cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
-    - name: claude-sonnet-4@20250514
-      max_input_tokens: 1000000
-      max_output_tokens: 64000
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-    - name: claude-sonnet-4@20250514:thinking
-      real_name: claude-sonnet-4@20250514
-      max_input_tokens: 1000000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
       supports_vision: true
       supports_tool_use: true
       patches:
@@ -4032,6 +4169,21 @@
       cache_write_price: 2.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5:max
+      real_name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.2
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-sonnet-5:thinking
       real_name: claude-sonnet-5
       max_input_tokens: 1000000
@@ -4044,7 +4196,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5:xhigh
+      real_name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.2
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-sonnet-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -4055,6 +4220,21 @@
       cache_write_price: 2.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5-5:max
+      real_name: claude-sonnet-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-sonnet-5-5:thinking
       real_name: claude-sonnet-5-5
       max_input_tokens: 1000000
@@ -4067,7 +4247,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5-5:xhigh
+      real_name: claude-sonnet-5-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-sonnet-5-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -4078,6 +4271,21 @@
       cache_write_price: 2.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5-5@default:max
+      real_name: claude-sonnet-5-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-sonnet-5-5@default:thinking
       real_name: claude-sonnet-5-5@default
       max_input_tokens: 1000000
@@ -4090,7 +4298,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5-5@default:xhigh
+      real_name: claude-sonnet-5-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: claude-sonnet-5@default
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -4101,6 +4322,21 @@
       cache_write_price: 2.5
       supports_vision: true
       supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5@default:max
+      real_name: claude-sonnet-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.2
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"max"}
     - name: claude-sonnet-5@default:thinking
       real_name: claude-sonnet-5@default
       max_input_tokens: 1000000
@@ -4113,7 +4349,20 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000,"display":"summarized"}
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"}
+    - name: claude-sonnet-5@default:xhigh
+      real_name: claude-sonnet-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.2
+      cache_write_price: 2.5
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive","display":"summarized"} | .body.output_config = {"effort":"xhigh"}
     - name: codestral-2
       max_input_tokens: 128000
       max_output_tokens: 128000
@@ -4144,90 +4393,38 @@
       input_price: 0.2
       output_price: 0.6
       supports_tool_use: true
-    - name: deep-research-pro-preview-12-2025
-      max_input_tokens: 65536
-      max_output_tokens: 32768
-      input_price: 2
-      output_price: 12
-      cache_read_price: 0.2
-    - name: deepseek-ai/deepseek-r1-0528-maas
-      max_input_tokens: 65336
-      max_output_tokens: 8192
-      input_price: 1.35
-      output_price: 5.4
-      supports_tool_use: true
-    - name: deepseek-ai/deepseek-v3.1-maas
-      max_input_tokens: 163840
-      max_output_tokens: 32768
-      input_price: 0.6
-      output_price: 1.7
-      cache_read_price: 0.06
-      supports_tool_use: true
-    - name: deepseek-ai/deepseek-v3.2-maas
-      max_input_tokens: 163840
-      max_output_tokens: 32768
-      input_price: 0.56
-      output_price: 1.68
-      cache_read_price: 0.056
-      supports_tool_use: true
-    - name: deepseek-ai/deepseek-v4.1-flash-maas
-      max_input_tokens: 1048576
-      max_output_tokens: 1048576
-      input_price: 0.3
-      output_price: 1.2
-      cache_read_price: 0.03
-      supports_vision: true
-      supports_tool_use: true
-    - name: gemini-2.0-flash
-      input_price: 0.15
-      output_price: 0.6
-    - name: gemini-2.0-flash-001
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0.15
-      output_price: 0.6
-      supports_vision: true
-      supports_tool_use: true
-    - name: gemini-2.0-flash-lite
-      input_price: 0.075
-      output_price: 0.3
-    - name: gemini-2.0-flash-lite-001
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0.075
-      output_price: 0.3
-      supports_vision: true
-      supports_tool_use: true
-    - name: gemini-2.5-flash
-      max_input_tokens: 1048576
-      max_output_tokens: 65536
-      input_price: 0.3
-      output_price: 2.5
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
-    - name: gemini-2.5-flash-lite
-      max_input_tokens: 1048576
-      max_output_tokens: 65536
-      input_price: 0.3
-      output_price: 0.4
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
-    - name: gemini-2.5-pro
-      max_input_tokens: 1048576
-      max_output_tokens: 65536
+    - name: gemini-2.5-computer-use-preview-10-2025
+      max_input_tokens: 128000
+      max_output_tokens: 64000
       input_price: 1.25
       output_price: 10
       supports_vision: true
       supports_tool_use: true
       patches:
       - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
-    - name: gemini-3-flash-preview
+    - name: gemini-2.5-flash-lite-preview-09-2025
       max_input_tokens: 1048576
       max_output_tokens: 65535
+      input_price: 0.1
+      output_price: 0.4
+      cache_read_price: 0.01
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-2.5-flash-preview-09-2025
+      max_input_tokens: 1048576
+      max_output_tokens: 65535
+      input_price: 0.3
+      output_price: 2.5
+      cache_read_price: 0.03
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-3-flash-preview
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
       input_price: 0.5
       output_price: 3
       cache_read_price: 0.05
@@ -4287,7 +4484,7 @@
       - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-3.5-flash
       max_input_tokens: 1048576
-      max_output_tokens: 65535
+      max_output_tokens: 65536
       input_price: 1.5
       output_price: 9
       cache_read_price: 0.15
@@ -4342,7 +4539,7 @@
       output_price: 7.5
       cache_read_price: 0.15
       supports_vision: true
-      supports_tool_use: false
+      supports_tool_use: true
       patches:
       - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
     - name: gemini-4-argon
@@ -4365,6 +4562,40 @@
       supports_tool_use: true
       patches:
       - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-4-carbon
+      max_input_tokens: 1048576
+      max_output_tokens: 1048576
+      input_price: 2
+      output_price: 10
+      cache_read_price: 0.1
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-4-carbon-cyber-permissive
+      max_input_tokens: 1048576
+      max_output_tokens: 1048576
+      input_price: 4
+      output_price: 20
+      cache_read_price: 0.2
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-4-hydrogen
+      max_input_tokens: 1048576
+      max_output_tokens: 1048576
+      input_price: 1.5
+      output_price: 7.5
+      cache_read_price: 0.075
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.generationConfig.thinkingConfig = ((.body.generationConfig.thinkingConfig // {}) + {"includeThoughts":true})
+    - name: gemini-embedding-001
+      max_input_tokens: 2048
+      input_price: 0.15
+      type: embedding
     - name: gemini-embedding-2
       max_input_tokens: 8192
       input_price: 0.2
@@ -4389,10 +4620,14 @@
       output_price: 9
       supports_vision: true
       supports_tool_use: false
-    - name: gemini-robotics-er-2
-      input_price: 1
-      output_price: 5
-      cache_read_price: 0.1
+    - name: gemini-robotics-er-1.5-preview
+      max_input_tokens: 1048576
+      max_output_tokens: 65535
+      input_price: 0.3
+      output_price: 2.5
+      cache_read_price: 0
+      supports_vision: true
+      supports_tool_use: true
     - name: gemini-robotics-er-2-preview
       max_input_tokens: 131072
       max_output_tokens: 65536
@@ -4400,119 +4635,6 @@
       output_price: 5
       cache_read_price: 0.1
       supports_vision: true
-      supports_tool_use: true
-    - name: gemma-4-26b-a4b-it
-      input_price: 0.15
-      output_price: 0.6
-      cache_read_price: 0.015
-    - name: google/gemma-4-26b-a4b-it-maas
-      max_input_tokens: 262144
-      max_output_tokens: 128000
-      input_price: 0.15
-      output_price: 0.6
-      cache_read_price: 0.015
-      supports_vision: true
-      supports_tool_use: true
-    - name: jamba-1.5
-      max_input_tokens: 256000
-      max_output_tokens: 256000
-      input_price: 0.2
-      output_price: 0.4
-    - name: jamba-1.5-large
-      max_input_tokens: 256000
-      max_output_tokens: 256000
-      input_price: 2
-      output_price: 8
-    - name: jamba-1.5-large@001
-      max_input_tokens: 256000
-      max_output_tokens: 256000
-      input_price: 2
-      output_price: 8
-    - name: jamba-1.5-mini
-      max_input_tokens: 256000
-      max_output_tokens: 256000
-      input_price: 0.2
-      output_price: 0.4
-    - name: jamba-1.5-mini@001
-      max_input_tokens: 256000
-      max_output_tokens: 256000
-      input_price: 0.2
-      output_price: 0.4
-    - name: meta/llama-3.1-405b-instruct-maas
-      max_input_tokens: 128000
-      max_output_tokens: 2048
-      input_price: 5
-      output_price: 16
-      supports_vision: true
-    - name: meta/llama-3.1-70b-instruct-maas
-      max_input_tokens: 128000
-      max_output_tokens: 2048
-      input_price: 0
-      output_price: 0
-      supports_vision: true
-    - name: meta/llama-3.1-8b-instruct-maas
-      max_input_tokens: 128000
-      max_output_tokens: 2048
-      input_price: 0
-      output_price: 0
-      supports_vision: true
-    - name: meta/llama-3.2-90b-vision-instruct-maas
-      max_input_tokens: 128000
-      max_output_tokens: 2048
-      input_price: 0
-      output_price: 0
-      supports_vision: true
-    - name: meta/llama-3.3-70b-instruct-maas
-      max_input_tokens: 128000
-      max_output_tokens: 8192
-      input_price: 0.72
-      output_price: 0.72
-      supports_tool_use: true
-    - name: meta/llama-4-maverick-17b-128e-instruct-maas
-      max_input_tokens: 1000000
-      max_output_tokens: 1000000
-      input_price: 0.35
-      output_price: 1.15
-      supports_tool_use: true
-    - name: meta/llama-4-maverick-17b-16e-instruct-maas
-      max_input_tokens: 1000000
-      max_output_tokens: 1000000
-      input_price: 0.35
-      output_price: 1.15
-      supports_tool_use: true
-    - name: meta/llama-4-scout-17b-128e-instruct-maas
-      max_input_tokens: 10000000
-      max_output_tokens: 10000000
-      input_price: 0.25
-      output_price: 0.7
-      supports_tool_use: true
-    - name: meta/llama-4-scout-17b-16e-instruct-maas
-      max_input_tokens: 10000000
-      max_output_tokens: 10000000
-      input_price: 0.25
-      output_price: 0.7
-      supports_tool_use: true
-    - name: meta/llama3-405b-instruct-maas
-      max_input_tokens: 32000
-      max_output_tokens: 32000
-      input_price: 0
-      output_price: 0
-    - name: meta/llama3-70b-instruct-maas
-      max_input_tokens: 32000
-      max_output_tokens: 32000
-      input_price: 0
-      output_price: 0
-    - name: meta/llama3-8b-instruct-maas
-      max_input_tokens: 32000
-      max_output_tokens: 32000
-      input_price: 0
-      output_price: 0
-    - name: minimaxai/minimax-m2-maas
-      max_input_tokens: 196608
-      max_output_tokens: 196608
-      input_price: 0.3
-      output_price: 1.2
-      cache_read_price: 0.03
       supports_tool_use: true
     - name: mistral-large-2411
       max_input_tokens: 128000
@@ -4599,140 +4721,32 @@
       input_price: 0.4
       output_price: 2
       supports_tool_use: true
-    - name: moonshotai/kimi-k2-thinking-maas
-      max_input_tokens: 256000
-      max_output_tokens: 256000
-      input_price: 0.6
-      output_price: 2.5
-      cache_read_price: 0.06
-      supports_tool_use: true
-    - name: openai/gpt-oss-120b-maas
-      max_input_tokens: 131072
-      max_output_tokens: 32768
-      input_price: 0.09
-      output_price: 0.36
-    - name: openai/gpt-oss-20b-maas
-      max_input_tokens: 131072
-      max_output_tokens: 32768
-      input_price: 0.07
-      output_price: 0.25
-      cache_read_price: 0.007
-    - name: qwen/qwen3-235b-a22b-instruct-2507-maas
-      max_input_tokens: 262144
-      max_output_tokens: 16384
-      input_price: 0.22
-      output_price: 0.88
-      supports_tool_use: true
-    - name: qwen/qwen3-coder-480b-a35b-instruct-maas
-      max_input_tokens: 262144
-      max_output_tokens: 32768
-      input_price: 0.22
-      output_price: 1.8
-      cache_read_price: 0.022
-      supports_tool_use: true
-    - name: qwen/qwen3-next-80b-a3b-instruct-maas
-      max_input_tokens: 262144
-      max_output_tokens: 262144
-      input_price: 0.15
-      output_price: 1.2
-      supports_tool_use: true
-    - name: qwen/qwen3-next-80b-a3b-thinking-maas
-      max_input_tokens: 262144
-      max_output_tokens: 262144
-      input_price: 0.15
-      output_price: 1.2
-      supports_tool_use: true
+    - name: text-embedding-004
+      max_input_tokens: 2048
+      input_price: 0.1
+      type: embedding
     - name: text-embedding-005
-      max_input_tokens: 20000
-      input_price: 0.025
+      max_input_tokens: 2048
+      input_price: 0.1
       type: embedding
       max_tokens_per_chunk: 2048
       default_chunk_size: 1500
       max_batch_size: 5
+    - name: text-embedding-large-exp-03-07
+      max_input_tokens: 8192
+      input_price: 0.1
+      type: embedding
+    - name: text-embedding-preview-0409
+      max_input_tokens: 3072
+      input_price: 0.00625
+      type: embedding
     - name: text-multilingual-embedding-002
-      max_input_tokens: 20000
-      input_price: 0.2
+      max_input_tokens: 2048
+      input_price: 0.1
       type: embedding
       max_tokens_per_chunk: 2048
       default_chunk_size: 1500
       max_batch_size: 5
-    - name: xai/grok-4.1-fast-non-reasoning
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 0.2
-      output_price: 0.5
-      cache_read_price: 0.05
-      supports_vision: true
-      supports_tool_use: true
-    - name: xai/grok-4.1-fast-reasoning
-      max_input_tokens: 128000
-      max_output_tokens: 128000
-      input_price: 0.2
-      output_price: 0.5
-      cache_read_price: 0.05
-      supports_vision: true
-      supports_tool_use: true
-    - name: xai/grok-4.20-non-reasoning
-      max_input_tokens: 2000000
-      max_output_tokens: 2000000
-      input_price: 1.25
-      output_price: 2.5
-      cache_read_price: 0.2
-      supports_vision: true
-      supports_tool_use: true
-    - name: xai/grok-4.20-reasoning
-      max_input_tokens: 2000000
-      max_output_tokens: 2000000
-      input_price: 1.25
-      output_price: 2.5
-      cache_read_price: 0.2
-      supports_vision: true
-      supports_tool_use: true
-    - name: xai/grok-4.3
-      max_input_tokens: 200000
-      max_output_tokens: 200000
-      input_price: 1.25
-      output_price: 2.5
-      cache_read_price: 0.2
-      supports_vision: true
-      supports_tool_use: true
-    - name: xai/grok-4.6
-      max_input_tokens: 524288
-      max_output_tokens: 524288
-      input_price: 2
-      output_price: 6
-      cache_read_price: 0.5
-      supports_vision: true
-      supports_tool_use: true
-    - name: xai/grok-4.7
-      max_input_tokens: 524288
-      max_output_tokens: 524288
-      input_price: 2
-      output_price: 6
-      cache_read_price: 0.5
-      supports_vision: true
-      supports_tool_use: true
-    - name: zai-org/glm-4.7-maas
-      max_input_tokens: 200000
-      max_output_tokens: 128000
-      input_price: 0.6
-      output_price: 2.2
-      cache_read_price: 0.06
-      supports_tool_use: true
-    - name: zai-org/glm-5-maas
-      max_input_tokens: 200000
-      max_output_tokens: 128000
-      input_price: 1
-      output_price: 3.2
-      cache_read_price: 0.1
-      supports_tool_use: true
-    - name: zai-org/glm-5.2-maas
-      max_input_tokens: 1000000
-      max_output_tokens: 64000
-      input_price: 1.4
-      output_price: 4.4
-      cache_read_price: 0.14
-      supports_tool_use: true
 
 # Links:
 #  - https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids.html#model-ids-arns
@@ -4823,13 +4837,6 @@
       max_output_tokens: 8191
       input_price: 0.8
       output_price: 2.4
-    - name: anthropic.claude-mythos-preview
-      max_input_tokens: 1000000
-      max_output_tokens: 128000
-      input_price: 0
-      output_price: 0
-      supports_vision: true
-      supports_tool_use: true
     - name: anthropic.claude-v1
       max_input_tokens: 100000
       max_output_tokens: 8191
@@ -5182,11 +5189,6 @@
       output_price: 0.14
       cache_read_price: 0.00875
       supports_tool_use: true
-    - name: us.amazon.nova-premier-v1:0
-      max_input_tokens: 300000
-      max_output_tokens: 5120
-      input_price: 2.5
-      output_price: 12.5
     - name: us.amazon.nova-pro-v1:0
       max_input_tokens: 300000
       max_output_tokens: 10000
@@ -5203,106 +5205,6 @@
       cache_read_price: 0.08
       cache_write_price: 1
       supports_tool_use: true
-    - name: us.anthropic.claude-3-5-haiku-20241022-v1:0:thinking
-      real_name: us.anthropic.claude-3-5-haiku-20241022-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 0.8
-      output_price: 4
-      cache_read_price: 0.08
-      cache_write_price: 1
-      supports_tool_use: true
-      patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
-    - name: us.anthropic.claude-3-5-sonnet-20240620-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 4096
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-    - name: us.anthropic.claude-3-5-sonnet-20240620-v1:0:thinking
-      real_name: us.anthropic.claude-3-5-sonnet-20240620-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
-    - name: us.anthropic.claude-3-5-sonnet-20241022-v2:0
-      max_input_tokens: 200000
-      max_output_tokens: 8192
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-    - name: us.anthropic.claude-3-5-sonnet-20241022-v2:0:thinking
-      real_name: us.anthropic.claude-3-5-sonnet-20241022-v2:0
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
-    - name: us.anthropic.claude-3-7-sonnet-20250219-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 8192
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-    - name: us.anthropic.claude-3-7-sonnet-20250219-v1:0:thinking
-      real_name: us.anthropic.claude-3-7-sonnet-20250219-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
-    - name: us.anthropic.claude-3-haiku-20240307-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 4096
-      input_price: 0.25
-      output_price: 1.25
-      cache_read_price: 0.025
-      cache_write_price: 0.3125
-      supports_vision: true
-      supports_tool_use: true
-    - name: us.anthropic.claude-3-haiku-20240307-v1:0:thinking
-      real_name: us.anthropic.claude-3-haiku-20240307-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 0.25
-      output_price: 1.25
-      cache_read_price: 0.025
-      cache_write_price: 0.3125
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
     - name: us.anthropic.claude-3-opus-20240229-v1:0
       max_input_tokens: 200000
       max_output_tokens: 4096
@@ -5312,37 +5214,6 @@
       cache_write_price: 18.75
       supports_vision: true
       supports_tool_use: true
-    - name: us.anthropic.claude-3-opus-20240229-v1:0:thinking
-      real_name: us.anthropic.claude-3-opus-20240229-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 15
-      output_price: 75
-      cache_read_price: 1.5
-      cache_write_price: 18.75
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
-    - name: us.anthropic.claude-3-sonnet-20240229-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 4096
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-    - name: us.anthropic.claude-3-sonnet-20240229-v1:0:thinking
-      real_name: us.anthropic.claude-3-sonnet-20240229-v1:0
-      max_input_tokens: 200000
-      max_output_tokens: 24000
-      require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      supports_vision: true
-      supports_tool_use: true
-      patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
     - name: us.anthropic.claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5364,7 +5235,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-fable-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5386,7 +5257,29 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
+    - name: us.anthropic.claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 8.8
+      output_price: 44
+      cache_read_price: 0.22
+      cache_write_price: 11
+      supports_vision: true
+      supports_tool_use: true
+    - name: us.anthropic.claude-fable-5-2:thinking
+      real_name: us.anthropic.claude-fable-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 8.8
+      output_price: 44
+      cache_read_price: 0.22
+      cache_write_price: 11
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-haiku-4-5-20251001-v1:0
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -5431,7 +5324,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"medium"}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-mythos-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5453,7 +5346,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-mythos-5-1
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5475,7 +5368,29 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
+    - name: us.anthropic.claude-mythos-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 8.8
+      output_price: 44
+      cache_read_price: 0.22
+      cache_write_price: 11
+      supports_vision: true
+      supports_tool_use: true
+    - name: us.anthropic.claude-mythos-5-2:thinking
+      real_name: us.anthropic.claude-mythos-5-2
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 8.8
+      output_price: 44
+      cache_read_price: 0.22
+      cache_write_price: 11
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-mythos-preview
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5598,6 +5513,19 @@
       cache_write_price: 6.875
       supports_vision: true
       supports_tool_use: true
+    - name: us.anthropic.claude-opus-4-7:thinking
+      real_name: us.anthropic.claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5.5
+      output_price: 27.5
+      cache_read_price: 0.55
+      cache_write_price: 6.875
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5607,6 +5535,19 @@
       cache_write_price: 6.875
       supports_vision: true
       supports_tool_use: true
+    - name: us.anthropic.claude-opus-4-8:thinking
+      real_name: us.anthropic.claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5.5
+      output_price: 27.5
+      cache_read_price: 0.55
+      cache_write_price: 6.875
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-opus-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5628,7 +5569,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-opus-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5638,28 +5579,19 @@
       cache_write_price: 5.5
       supports_vision: true
       supports_tool_use: true
-    - name: us.anthropic.claude-sonnet-4-20250514-v1:0
-      max_input_tokens: 1000000
-      max_output_tokens: 64000
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
-      supports_vision: true
-      supports_tool_use: true
-    - name: us.anthropic.claude-sonnet-4-20250514-v1:0:thinking
-      real_name: us.anthropic.claude-sonnet-4-20250514-v1:0
+    - name: us.anthropic.claude-opus-5-5:thinking
+      real_name: us.anthropic.claude-opus-5-5
       max_input_tokens: 1000000
       max_output_tokens: 24000
       require_max_tokens: true
-      input_price: 3
-      output_price: 15
-      cache_read_price: 0.3
-      cache_write_price: 3.75
+      input_price: 4.4
+      output_price: 22
+      cache_read_price: 0.22
+      cache_write_price: 5.5
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-sonnet-4-5-20250929-v1:0
       max_input_tokens: 200000
       max_output_tokens: 64000
@@ -5727,7 +5659,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000,"display":"summarized"}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.anthropic.claude-sonnet-5-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -5749,7 +5681,7 @@
       supports_vision: true
       supports_tool_use: true
       patches:
-      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"high"}}
+      - .body.inferenceConfig = ((.body.inferenceConfig // {}) | del(.temperature) | del(.topP)) | .body.additionalModelRequestFields = {"thinking":{"type":"adaptive","display":"summarized"}}
     - name: us.cohere.embed-v4:0
       max_input_tokens: 128000
       input_price: 0.12
@@ -5762,16 +5694,10 @@
       supports_tool_use: false
     - name: us.deepseek.v3.2
       max_input_tokens: 163840
-      max_output_tokens: 163840
+      max_output_tokens: 8000
       input_price: 0.62
       output_price: 1.85
       supports_vision: false
-      supports_tool_use: true
-    - name: us.meta.llama3-1-405b-instruct-v1:0
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 2.4
-      output_price: 2.4
       supports_tool_use: true
     - name: us.meta.llama3-1-70b-instruct-v1:0
       max_input_tokens: 128000
@@ -5784,32 +5710,6 @@
       max_output_tokens: 4096
       input_price: 0.22
       output_price: 0.22
-      supports_tool_use: true
-    - name: us.meta.llama3-2-11b-instruct-v1:0
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.16
-      output_price: 0.16
-      supports_vision: true
-      supports_tool_use: true
-    - name: us.meta.llama3-2-1b-instruct-v1:0
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.1
-      output_price: 0.1
-      supports_tool_use: true
-    - name: us.meta.llama3-2-3b-instruct-v1:0
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.15
-      output_price: 0.15
-      supports_tool_use: true
-    - name: us.meta.llama3-2-90b-instruct-v1:0
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 0.72
-      output_price: 0.72
-      supports_vision: true
       supports_tool_use: true
     - name: us.meta.llama3-3-70b-instruct-v1:0
       max_input_tokens: 128000
@@ -6049,12 +5949,6 @@
     - name: '@cf/google/gemma-2b-it-lora'
       max_input_tokens: 8192
       max_output_tokens: 8192
-      input_price: 0
-      output_price: 0
-    - name: '@cf/google/gemma-3-12b-it'
-      max_input_tokens: 131072
-      max_output_tokens: 2048
-      require_max_tokens: true
       input_price: 0
       output_price: 0
     - name: '@cf/google/gemma-4-26b-a4b-it'
@@ -6431,41 +6325,26 @@
       cache_write_price: 0
       supports_vision: true
       supports_tool_use: true
-    - name: hunyuan-2.0-instruct-20251111
-      max_input_tokens: 131072
-      input_price: 0.112
-      output_price: 0.28
-      supports_tool_use: true
-    - name: hunyuan-2.0-thinking-20251109
-      max_input_tokens: 131072
-      input_price: 0.14
-      output_price: 0.56
-      supports_tool_use: true
     - name: hunyuan-embedding
       input_price: 0.01
       type: embedding
       max_tokens_per_chunk: 1024
       default_chunk_size: 1000
       max_batch_size: 100
-    - name: hunyuan-vision-1.5-instruct
-      max_input_tokens: 24576
-      input_price: 0.42
-      output_price: 1.26
-      supports_vision: true
     - name: hy4
       max_input_tokens: 960000
       max_output_tokens: 64000
-      input_price: 0.834
-      output_price: 2.501
-      cache_read_price: 0.042
+      input_price: 0.417
+      output_price: 1.2505
+      cache_read_price: 0.021
       supports_vision: true
       supports_tool_use: true
     - name: hy4-preview
       max_input_tokens: 960000
       max_output_tokens: 64000
-      input_price: 0.834
-      output_price: 2.501
-      cache_read_price: 0.042
+      input_price: 0.417
+      output_price: 1.2505
+      cache_read_price: 0.021
       supports_tool_use: true
     - name: kimi-k2.7-code
       max_input_tokens: 256000
@@ -6517,44 +6396,6 @@
 #  - https://platform.moonshot.cn/docs/api/chat#%E5%85%AC%E5%BC%80%E7%9A%84%E6%9C%8D%E5%8A%A1%E5%9C%B0%E5%9D%80
 - provider: moonshot
   models:
-    - name: kimi-k2-0711-preview
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 0.6
-      output_price: 2.5
-      supports_tool_use: true
-    - name: kimi-k2-0905-preview
-      max_input_tokens: 262144
-      max_output_tokens: 262144
-      input_price: 0.6
-      output_price: 2.5
-      supports_tool_use: true
-    - name: kimi-k2-thinking
-      max_input_tokens: 262144
-      max_output_tokens: 262144
-      input_price: 0.6
-      output_price: 2.5
-      supports_tool_use: true
-    - name: kimi-k2-thinking-turbo
-      max_input_tokens: 262144
-      max_output_tokens: 262144
-      input_price: 1.15
-      output_price: 8
-      supports_tool_use: true
-    - name: kimi-k2-turbo-preview
-      max_input_tokens: 262144
-      max_output_tokens: 262144
-      input_price: 1.15
-      output_price: 8
-      supports_tool_use: true
-    - name: kimi-k2.5
-      max_input_tokens: 262144
-      max_output_tokens: 262144
-      input_price: 0.6
-      output_price: 3
-      cache_read_price: 0.1
-      supports_vision: true
-      supports_tool_use: true
     - name: kimi-k2.6
       max_input_tokens: 262144
       max_output_tokens: 262144
@@ -6598,117 +6439,12 @@
       cache_write_price: 4
       supports_vision: true
       supports_tool_use: true
-    - name: kimi-latest
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 2
-      output_price: 5
-      supports_vision: true
-      supports_tool_use: true
-    - name: kimi-latest-128k
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 2
-      output_price: 5
-      supports_vision: true
-      supports_tool_use: true
-    - name: kimi-latest-32k
-      max_input_tokens: 32768
-      max_output_tokens: 32768
-      input_price: 1
-      output_price: 3
-      supports_vision: true
-      supports_tool_use: true
-    - name: kimi-latest-8k
-      max_input_tokens: 8192
-      max_output_tokens: 8192
-      input_price: 0.2
-      output_price: 2
-      supports_vision: true
-      supports_tool_use: true
-    - name: kimi-thinking-preview
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 0.6
-      output_price: 2.5
-      supports_vision: true
-    - name: moonshot-v1-128k
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 2
-      output_price: 5
-      supports_tool_use: true
-    - name: moonshot-v1-128k-0430
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 2
-      output_price: 5
-      supports_tool_use: true
-    - name: moonshot-v1-128k-vision-preview
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 2
-      output_price: 5
-      supports_vision: true
-      supports_tool_use: true
-    - name: moonshot-v1-32k
-      max_input_tokens: 32768
-      max_output_tokens: 32768
-      input_price: 1
-      output_price: 3
-      supports_tool_use: true
-    - name: moonshot-v1-32k-0430
-      max_input_tokens: 32768
-      max_output_tokens: 32768
-      input_price: 1
-      output_price: 3
-      supports_tool_use: true
-    - name: moonshot-v1-32k-vision-preview
-      max_input_tokens: 32768
-      max_output_tokens: 32768
-      input_price: 1
-      output_price: 3
-      supports_vision: true
-      supports_tool_use: true
-    - name: moonshot-v1-8k
-      max_input_tokens: 8192
-      max_output_tokens: 8192
-      input_price: 0.2
-      output_price: 2
-      supports_tool_use: true
-    - name: moonshot-v1-8k-0430
-      max_input_tokens: 8192
-      max_output_tokens: 8192
-      input_price: 0.2
-      output_price: 2
-      supports_tool_use: true
-    - name: moonshot-v1-8k-vision-preview
-      max_input_tokens: 8192
-      max_output_tokens: 8192
-      input_price: 0.2
-      output_price: 2
-      supports_vision: true
-      supports_tool_use: true
-    - name: moonshot-v1-auto
-      max_input_tokens: 131072
-      max_output_tokens: 131072
-      input_price: 2
-      output_price: 5
-      supports_tool_use: true
 
 # Links:
 #  - https://api-docs.deepseek.com/quick_start/pricing
 #  - https://platform.deepseek.com/api-docs/api/create-chat-completion
 - provider: deepseek
   models:
-    - name: deepseek-chat
-      max_input_tokens: 131072
-      max_output_tokens: 8192
-      input_price: 0.28
-      output_price: 0.42
-      cache_read_price: 0.028
-      cache_write_price: 0
-      supports_tool_use: true
     - name: deepseek-coder
       max_input_tokens: 128000
       max_output_tokens: 4096
@@ -6732,13 +6468,6 @@
       output_price: 2.19
       cache_read_price: 0.14
       supports_tool_use: true
-    - name: deepseek-reasoner
-      max_input_tokens: 131072
-      max_output_tokens: 65536
-      input_price: 0.28
-      output_price: 0.42
-      cache_read_price: 0.028
-      supports_tool_use: false
     - name: deepseek-v3
       max_input_tokens: 65536
       max_output_tokens: 8192
@@ -6893,26 +6622,6 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"adaptive"} | .body.reasoning_effort = "low" | .body.max_completion_tokens = (.body.max_completion_tokens // .body.max_tokens) | del(.body.max_tokens)
-    - name: minimax-m2.1
-      max_input_tokens: 204800
-      input_price: 0.294
-      output_price: 1.176
-      supports_tool_use: true
-    - name: minimax-m2.1-highspeed
-      max_input_tokens: 204800
-      input_price: 0.588
-      output_price: 2.352
-      supports_tool_use: true
-    - name: minimax-m2.5
-      max_input_tokens: 204800
-      input_price: 0.294
-      output_price: 1.176
-      supports_tool_use: true
-    - name: minimax-m2.5-highspeed
-      max_input_tokens: 204800
-      input_price: 0.588
-      output_price: 2.352
-      supports_tool_use: true
 
 # Links:
 #  - https://openrouter.ai/models
@@ -11009,16 +10718,6 @@
       input_price: 0.4
       output_price: 0.4
       supports_tool_use: true
-    - name: MiniMaxAI/MiniMax-M2.1
-      max_input_tokens: 196608
-      input_price: 0.27
-      output_price: 0.95
-      supports_tool_use: true
-    - name: MiniMaxAI/MiniMax-M2.5
-      max_input_tokens: 196608
-      input_price: 0.27
-      output_price: 0.95
-      supports_tool_use: true
     - name: MiniMaxAI/MiniMax-M2.7
       max_input_tokens: 196608
       max_output_tokens: 196608
@@ -11114,11 +10813,6 @@
       input_price: 0.08
       output_price: 0.28
       supports_tool_use: true
-    - name: Qwen/Qwen3-Coder-30B-A3B-Instruct
-      max_input_tokens: 262144
-      input_price: 0.07
-      output_price: 0.27
-      supports_tool_use: true
     - name: Qwen/Qwen3-Coder-480B-A35B-Instruct
       max_input_tokens: 262144
       max_output_tokens: 262144
@@ -11175,11 +10869,6 @@
       output_price: 0.6
       supports_vision: true
       supports_tool_use: true
-    - name: Qwen/Qwen3-VL-8B-Instruct
-      max_input_tokens: 262144
-      input_price: 0.18
-      output_price: 0.69
-      supports_vision: true
     - name: Qwen/Qwen3.5-122B-A10B
       max_input_tokens: 262144
       max_output_tokens: 262144
@@ -11294,6 +10983,13 @@
       cache_read_price: 0.2
       supports_vision: false
       supports_tool_use: true
+    - name: XiaomiMiMo/MiMo-V2.6-Flash
+      max_input_tokens: 1048576
+      input_price: 0.14
+      output_price: 0.28
+      cache_read_price: 0.0028
+      supports_vision: true
+      supports_tool_use: true
     - name: allenai/olmOCR-7B-0725-FP8
       max_input_tokens: 16384
       max_output_tokens: 16384
@@ -11363,8 +11059,8 @@
     - name: anthropic/claude-sonnet-5
       max_input_tokens: 1000000
       max_output_tokens: 1000000
-      input_price: 2
-      output_price: 10
+      input_price: 3
+      output_price: 15
       supports_vision: true
       supports_tool_use: true
     - name: deepseek-ai/DeepSeek-R1
@@ -11485,12 +11181,6 @@
       output_price: 0.42
       cache_read_price: 0.0042
       supports_vision: true
-      supports_tool_use: true
-    - name: google/gemini-2.0-flash-001
-      max_input_tokens: 1000000
-      max_output_tokens: 1000000
-      input_price: 0.1
-      output_price: 0.4
       supports_tool_use: true
     - name: google/gemini-2.5-flash
       max_input_tokens: 1000000
@@ -11705,7 +11395,7 @@
     - name: mistralai/Mistral-Nemo-Instruct-2407
       max_input_tokens: 131072
       max_output_tokens: 131072
-      input_price: 0.019
+      input_price: 0.029
       output_price: 0.03
       supports_tool_use: true
     - name: mistralai/Mistral-Small-24B-Instruct-2501
@@ -11738,11 +11428,6 @@
       input_price: 0.5
       output_price: 2
       cache_read_price: 0.4
-      supports_tool_use: true
-    - name: moonshotai/Kimi-K2-Thinking
-      max_input_tokens: 262144
-      input_price: 0.55
-      output_price: 2.5
       supports_tool_use: true
     - name: moonshotai/Kimi-K2.5
       max_input_tokens: 262144
@@ -11791,7 +11476,7 @@
     - name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B
       max_input_tokens: 262144
       max_output_tokens: 262144
-      input_price: 0.085
+      input_price: 0.075
       output_price: 0.4
       supports_vision: false
       supports_tool_use: true
@@ -11805,9 +11490,16 @@
       supports_tool_use: true
     - name: nvidia/NVIDIA-Nemotron-3.5-Lightning
       max_input_tokens: 262144
-      input_price: 0.08
-      output_price: 0.2
+      input_price: 0.06
+      output_price: 0.16
       cache_read_price: 0.04
+      supports_tool_use: true
+    - name: nvidia/NVIDIA-Nemotron-3.5-Super-VL
+      max_input_tokens: 262144
+      input_price: 0.15
+      output_price: 0.5
+      cache_read_price: 0.02
+      supports_vision: true
       supports_tool_use: true
     - name: nvidia/NVIDIA-Nemotron-Nano-9B-v2
       max_input_tokens: 131072
@@ -11871,6 +11563,14 @@
       cache_read_price: 0.035
       supports_vision: false
       supports_tool_use: true
+    - name: tencent/Hy4-preview
+      max_input_tokens: 1048576
+      max_output_tokens: 131072
+      input_price: 0.834
+      output_price: 2.501
+      cache_read_price: 0.042
+      supports_vision: false
+      supports_tool_use: true
     - name: thenlper/gte-large
       input_price: 0.01
       type: embedding
@@ -11907,11 +11607,6 @@
       cache_read_price: 0.1
       supports_vision: false
       supports_tool_use: true
-    - name: zai-org/GLM-4.6V
-      max_input_tokens: 131072
-      input_price: 0.3
-      output_price: 0.9
-      supports_vision: true
     - name: zai-org/GLM-4.7
       max_input_tokens: 202752
       max_output_tokens: 202752
@@ -11952,6 +11647,14 @@
       cache_read_price: 0.14
       supports_vision: false
       supports_tool_use: true
+    - name: zai-org/GLM-5.3-Flash
+      max_input_tokens: 1048576
+      max_output_tokens: 1048576
+      input_price: 0.15
+      output_price: 0.5
+      cache_read_price: 0.03
+      supports_vision: true
+      supports_tool_use: true
 
 # Links:
 #  - https://jina.ai/models
@@ -11964,19 +11667,24 @@
       max_tokens_per_chunk: 8192
       default_chunk_size: 1500
       max_batch_size: 100
-    - name: jina-colbert-v2
-      max_input_tokens: 8192
-      input_price: 0
-      type: reranker
     - name: jina-embeddings-v3
       input_price: 0
       type: embedding
       max_tokens_per_chunk: 8192
       default_chunk_size: 2000
       max_batch_size: 100
+    - name: jina-reranker-m0
+      max_input_tokens: 10240
+      input_price: 0.05
+      type: reranker
     - name: jina-reranker-v2-base-multilingual
-      max_input_tokens: 8192
-      input_price: 0
+      max_input_tokens: 1024
+      max_output_tokens: 1024
+      input_price: 0.05
+      type: reranker
+    - name: jina-reranker-v3.5
+      max_input_tokens: 131072
+      input_price: 0.05
       type: reranker
 
 # Links:
@@ -11985,12 +11693,44 @@
 #  - https://docs.voyageai.com/reference/
 - provider: voyageai
   models:
+    - name: rerank-1
+      max_input_tokens: 8000
+      max_output_tokens: 8000
+      input_price: 0.05
+      type: reranker
     - name: rerank-2
       max_input_tokens: 16000
+      max_output_tokens: 16000
       input_price: 0.05
       type: reranker
     - name: rerank-2-lite
       max_input_tokens: 8000
+      max_output_tokens: 8000
+      input_price: 0.02
+      type: reranker
+    - name: rerank-2.5
+      max_input_tokens: 32000
+      max_output_tokens: 32000
+      input_price: 0.05
+      type: reranker
+    - name: rerank-2.5-lite
+      max_input_tokens: 32000
+      max_output_tokens: 32000
+      input_price: 0.02
+      type: reranker
+    - name: rerank-3
+      max_input_tokens: 32000
+      max_output_tokens: 32000
+      input_price: 0.05
+      type: reranker
+    - name: rerank-3-lite
+      max_input_tokens: 32000
+      max_output_tokens: 32000
+      input_price: 0.02
+      type: reranker
+    - name: rerank-lite-1
+      max_input_tokens: 4000
+      max_output_tokens: 4000
       input_price: 0.02
       type: reranker
     - name: voyage-2
@@ -12101,13 +11841,130 @@
 #  - https://docs.z.ai/guides/overview/pricing
 - provider: zai
   models:
+    - name: glm-4-32b-0414-128k
+      max_input_tokens: 128000
+      max_output_tokens: 32000
+      input_price: 0.1
+      output_price: 0.1
+      supports_tool_use: true
+    - name: glm-4.5
+      max_input_tokens: 128000
+      max_output_tokens: 32000
+      input_price: 0.6
+      output_price: 2.2
+      supports_tool_use: true
+    - name: glm-4.5-air
+      max_input_tokens: 128000
+      max_output_tokens: 32000
+      input_price: 0.2
+      output_price: 1.1
+      supports_tool_use: true
+    - name: glm-4.5-airx
+      max_input_tokens: 128000
+      max_output_tokens: 32000
+      input_price: 1.1
+      output_price: 4.5
+      supports_tool_use: true
+    - name: glm-4.5-flash
+      max_input_tokens: 128000
+      max_output_tokens: 32000
+      input_price: 0
+      output_price: 0
+      supports_tool_use: true
+    - name: glm-4.5-x
+      max_input_tokens: 128000
+      max_output_tokens: 32000
+      input_price: 2.2
+      output_price: 8.9
+      supports_tool_use: true
+    - name: glm-4.5v
+      max_input_tokens: 128000
+      max_output_tokens: 32000
+      input_price: 0.6
+      output_price: 1.8
+      supports_vision: true
+      supports_tool_use: true
+    - name: glm-4.6
+      max_input_tokens: 200000
+      max_output_tokens: 128000
+      input_price: 0.6
+      output_price: 2.2
+      cache_read_price: 0.11
+      cache_write_price: 0
+      supports_tool_use: true
+    - name: glm-4.7
+      max_input_tokens: 200000
+      max_output_tokens: 128000
+      input_price: 0.6
+      output_price: 2.2
+      cache_read_price: 0.11
+      cache_write_price: 0
+      supports_tool_use: true
+    - name: glm-4.7-flash
+      max_input_tokens: 200000
+      max_output_tokens: 128000
+      input_price: 0
+      output_price: 0
+      cache_read_price: 0
+      cache_write_price: 0
+      supports_tool_use: true
+    - name: glm-5
+      max_input_tokens: 200000
+      max_output_tokens: 128000
+      input_price: 1
+      output_price: 3.2
+      cache_read_price: 0.2
+      cache_write_price: 0
+      supports_tool_use: true
+    - name: glm-5-code
+      max_input_tokens: 200000
+      max_output_tokens: 128000
+      input_price: 1.2
+      output_price: 5
+      cache_read_price: 0.3
+      cache_write_price: 0
+      supports_tool_use: true
+    - name: glm-5.1
+      max_input_tokens: 200000
+      max_output_tokens: 128000
+      input_price: 1.4
+      output_price: 4.4
+      cache_read_price: 0.26
+      cache_write_price: 0
+      supports_tool_use: true
+    - name: glm-5.2
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 1.4
+      output_price: 4.4
+      cache_read_price: 0.26
+      cache_write_price: 0
+      supports_tool_use: true
     - name: glm-5.3
-      max_input_tokens: 868928
-      max_output_tokens: 131072
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
       require_max_tokens: true
       input_price: 1.4
       output_price: 4.4
       cache_read_price: 0.26
+      cache_write_price: 0
       supports_tool_use: true
       patches:
       - .body.thinking = {"type":"enabled"} | .body.reasoning_effort = "high"
+    - name: glm-5.3-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 128000
+      input_price: 0.15
+      output_price: 0.5
+      cache_read_price: 0.03
+      cache_write_price: 0
+      supports_vision: true
+      supports_tool_use: true
+    - name: glm-5v-turbo
+      max_input_tokens: 200000
+      max_output_tokens: 128000
+      input_price: 1.2
+      output_price: 4
+      cache_read_price: 0.24
+      supports_vision: true
+      supports_tool_use: true

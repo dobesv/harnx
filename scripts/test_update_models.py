@@ -20,6 +20,7 @@ from update_models_bedrock_tests import (
     TestDropBedrockInRegionDuplicates,
     TestIsValidBedrockModelName,
 )
+from update_models_client_support_tests import TestClientSupport
 from update_models_gemini_tests import (
     TestChatOutputCompatibility,
     TestGeminiProviderMapping,
@@ -28,6 +29,10 @@ from update_models_gemini_tests import (
 from update_models_openai_tests import (
     TestOpenAIEndpointDefault,
     TestOpenAIReasoningSummaryDefault,
+)
+from update_models_thinking_tests import (
+    TestAdaptiveEffortVariants,
+    TestThinkingVariant,
 )
 from update_models_variant_tests import (
     TestDirectProviderRules,
@@ -67,15 +72,65 @@ class TestProviderMapping(unittest.TestCase):
     def test_vertex_ai_maps_to_vertexai(self) -> None:
         self.assertEqual(um.LITELLM_TO_HARNX_PROVIDER["vertex_ai"], "vertexai")
 
-    def test_all_26_providers_present(self) -> None:
+    def test_every_registry_provider_name_is_mapped(self) -> None:
+        # Only names the registry uses: a stale one silently freezes the
+        # provider, which is how Gemini (`google_ai`) and xAI (`x_ai`) went stale.
         expected = {
-            "openai", "anthropic", "gemini", "google_ai", "vertex_ai", "bedrock",
+            "openai", "anthropic", "gemini", "vertex_ai", "bedrock",
             "bedrock_converse", "mistral", "cohere", "groq", "perplexity",
-            "deepseek", "voyage", "cloudflare", "openrouter", "ai21", "x_ai",
-            "zhipu", "alibaba_cloud", "baidu", "tencent", "minimax",
-            "moonshot", "deepinfra", "github", "jina_ai",
+            "deepseek", "voyage", "cloudflare", "ai21", "xai", "zai",
+            "tencent", "minimax", "moonshot", "deepinfra", "jina_ai",
+            "cohere_chat", "vertex_ai-language-models", "vertex_ai-embedding-models",
         }
         self.assertEqual(set(um.LITELLM_TO_HARNX_PROVIDER.keys()), expected)
+
+    def test_providers_without_a_matching_registry_source_stay_unmapped(self) -> None:
+        mapped = set(um.LITELLM_TO_HARNX_PROVIDER.values())
+        for provider in ("qianwen", "zhipuai", "ernie", "openrouter", "github"):
+            self.assertNotIn(provider, mapped)
+
+    def test_mapped_provider_with_no_registry_entries_is_reported(self) -> None:
+        registry = {
+            "xai/grok-4.20-0309-reasoning": {
+                "litellm_provider": "xai", "mode": "chat",
+                "max_input_tokens": 1000000, "input_cost_per_token": 1.25e-06,
+            },
+        }
+        fetched, warnings = um.collect_provider_models(registry, {})
+        self.assertIn("grok-4.20-0309-reasoning", fetched["xai"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("anthropic", warnings[0])
+        self.assertNotIn("xai", warnings[0].split(":", 1)[1])
+
+    def test_bare_key_sources_reach_their_provider(self) -> None:
+        # Entries LiteLLM lists without a `provider/` key prefix, under a
+        # `litellm_provider` that names a model family. A covered provider
+        # drops whatever the registry doesn't list, so missing one of these
+        # deletes live models rather than freezing them.
+        registry = {
+            "command-a-03-2025": {
+                "litellm_provider": "cohere_chat", "mode": "chat",
+                "max_input_tokens": 256000, "input_cost_per_token": 2.5e-06,
+            },
+            "gemini-2.5-pro": {
+                "litellm_provider": "vertex_ai-language-models", "mode": "chat",
+                "max_input_tokens": 1048576, "input_cost_per_token": 1.25e-06,
+            },
+            "text-embedding-005": {
+                "litellm_provider": "vertex_ai-embedding-models", "mode": "embedding",
+                "max_input_tokens": 2048, "input_cost_per_token": 2.5e-08,
+            },
+            "rerank-v3.5": {
+                "litellm_provider": "cohere", "mode": "rerank",
+                "max_input_tokens": 4096, "input_cost_per_token": 0.0,
+            },
+        }
+        fetched, _ = um.collect_provider_models(registry, {})
+        self.assertIn("command-a-03-2025", fetched["cohere"])
+        self.assertIn("gemini-2.5-pro", fetched["vertexai"])
+        self.assertEqual(fetched["vertexai"]["text-embedding-005"]["type"], "embedding")
+        # LiteLLM's mode is `rerank`; the catalog's type is `reranker`.
+        self.assertEqual(fetched["cohere"]["rerank-v3.5"]["type"], "reranker")
 
     def test_both_bedrock_tags_map_to_bedrock(self) -> None:
         # LiteLLM tags most of the live Bedrock catalog `bedrock_converse`,
@@ -88,27 +143,7 @@ class TestProviderMapping(unittest.TestCase):
         self.assertNotIn("bedrock_mantle", um.LITELLM_TO_HARNX_PROVIDER)
 
 
-class TestOpusVersionDetection(unittest.TestCase):
-    def test_opus_minor_version_parsed(self) -> None:
-        self.assertEqual(um.opus_minor_version("claude-opus-4-8"), 8)
-        self.assertEqual(um.opus_minor_version("claude-opus-4-7-20260416"), 7)
-        self.assertEqual(um.opus_minor_version("claude-opus-4-1"), 1)
-
-    def test_opus_minor_version_none_for_non_opus(self) -> None:
-        self.assertIsNone(um.opus_minor_version("claude-sonnet-4-6"))
-        # Old `claude-4-opus` ordering is not matched (it predates adaptive-only).
-        self.assertIsNone(um.opus_minor_version("claude-4-opus-20250514"))
-        self.assertIsNone(um.opus_minor_version("us.anthropic.claude-opus-4-20250514-v1:0"))
-
-    def test_adaptive_only_threshold(self) -> None:
-        self.assertTrue(um.is_adaptive_only_opus("claude-opus-4-7"))
-        self.assertTrue(um.is_adaptive_only_opus("claude-opus-4-8"))
-        self.assertTrue(um.is_adaptive_only_opus("claude-opus-4-8@default"))
-        self.assertFalse(um.is_adaptive_only_opus("claude-opus-4-6"))
-        self.assertFalse(um.is_adaptive_only_opus("claude-opus-4-5"))
-        self.assertFalse(um.is_adaptive_only_opus("us.anthropic.claude-opus-4-20250514-v1:0"))
-        self.assertFalse(um.is_adaptive_only_opus("claude-sonnet-4-6"))
-
+class TestClaudeModelNames(unittest.TestCase):
     def test_required_output_limit_distinguishes_minor_from_date(self) -> None:
         self.assertTrue(um.claude_requires_max_tokens("claude-opus-5-5"))
         self.assertTrue(um.claude_requires_max_tokens("claude-opus-5-5-20260926"))
@@ -119,11 +154,6 @@ class TestOpusVersionDetection(unittest.TestCase):
         self.assertTrue(um.claude_requires_max_tokens("claude-sonnet-5"))
         self.assertTrue(um.claude_requires_max_tokens("claude-sonnet-5-5"))
         self.assertTrue(um.claude_requires_max_tokens("us.anthropic.claude-sonnet-5-5"))
-
-    def test_bedrock_dated_opus_4_retains_thinking_variant(self) -> None:
-        name = "us.anthropic.claude-opus-4-20250514-v1:0"
-        variants = um.thinking_variants({"name": name}, "bedrock")
-        self.assertEqual([variant["name"] for variant in variants], [f"{name}:thinking"])
 
     def test_is_variant_name(self) -> None:
         self.assertTrue(um.is_variant_name("claude-opus-4-6:thinking"))
@@ -143,193 +173,6 @@ class TestOpusVersionDetection(unittest.TestCase):
         )
         self.assertFalse(um.is_generated_variant_name("openai", "custom:max"))
         self.assertFalse(um.is_generated_variant_name("qianwen", "qwen3-max:thinking"))
-
-
-class TestThinkingVariant(unittest.TestCase):
-    """Manual `:thinking` variants for models that still support manual extended
-    thinking (Opus 4.6 and earlier, Sonnet, Haiku)."""
-
-    def _base_claude_model(self) -> dict:
-        return {
-            "name": "claude-opus-4-6",
-            "max_input_tokens": 1000000,
-            "max_output_tokens": 128000,
-            "input_price": 5,
-            "output_price": 25,
-            "supports_vision": True,
-            "supports_tool_use": True,
-        }
-
-    def test_claude_thinking_variant_created(self) -> None:
-        variants = um.thinking_variants(self._base_claude_model(), "claude")
-        self.assertEqual(len(variants), 1)
-        self.assertEqual(variants[0]["name"], "claude-opus-4-6:thinking")
-        self.assertEqual(variants[0]["real_name"], "claude-opus-4-6")
-
-    def test_thinking_variant_has_correct_patch(self) -> None:
-        variant = um.thinking_variants(self._base_claude_model(), "claude")[0]
-        self.assertEqual(len(variant["patches"]), 1)
-        self.assertIn('budget_tokens":16000', variant["patches"][0])
-
-    def test_real_name_alias_inherits_base_cache_prices(self) -> None:
-        base = self._base_claude_model()
-        base["cache_read_price"] = 0.5
-        base["cache_write_price"] = 6.25
-
-        alias = um.thinking_variants(base, "claude")[0]
-
-        self.assertEqual(alias["real_name"], base["name"])
-        self.assertEqual(alias["cache_read_price"], base["cache_read_price"])
-        self.assertEqual(alias["cache_write_price"], base["cache_write_price"])
-
-    def test_thinking_variant_preserves_supports_tool_use(self) -> None:
-        variant = um.thinking_variants(self._base_claude_model(), "claude")[0]
-        self.assertTrue(variant.get("supports_tool_use"))
-
-    def test_thinking_variant_preserves_supports_vision(self) -> None:
-        variant = um.thinking_variants(self._base_claude_model(), "claude")[0]
-        self.assertTrue(variant.get("supports_vision"))
-
-    def test_thinking_variant_has_require_max_tokens(self) -> None:
-        variant = um.thinking_variants(self._base_claude_model(), "claude")[0]
-        self.assertTrue(variant.get("require_max_tokens"))
-
-    def test_already_variant_returns_empty(self) -> None:
-        self.assertEqual(um.thinking_variants({"name": "claude-opus-4-6:thinking"}, "claude"), [])
-        self.assertEqual(um.thinking_variants({"name": "claude-opus-4-8:xhigh"}, "claude"), [])
-
-    def test_non_claude_model_no_variant_for_claude_provider(self) -> None:
-        self.assertEqual(um.thinking_variants({"name": "gpt-4o"}, "claude"), [])
-
-    def test_bedrock_claude_gets_bedrock_patch(self) -> None:
-        base = {
-            "name": "us.anthropic.claude-opus-4-6",
-            "max_input_tokens": 200000,
-            "supports_vision": True,
-            "supports_tool_use": True,
-        }
-        variants = um.thinking_variants(base, "bedrock")
-        self.assertEqual(len(variants), 1)
-        self.assertIn("additionalModelRequestFields", variants[0]["patches"][0])
-
-    def test_non_us_bedrock_model_no_variant(self) -> None:
-        self.assertEqual(um.thinking_variants({"name": "ap-northeast-1/anthropic.claude-v2"}, "bedrock"), [])
-
-    def test_thinking_variant_real_name_uses_base_real_name_for_aliases(self) -> None:
-        base = {
-            "name": "claude-opus-latest",
-            "real_name": "claude-opus-4-6",  # alias that points to a versioned model
-            "max_input_tokens": 1000000,
-            "supports_tool_use": True,
-        }
-        variant = um.thinking_variants(base, "claude")[0]
-        self.assertEqual(variant["real_name"], "claude-opus-4-6")
-        self.assertEqual(variant["name"], "claude-opus-latest:thinking")
-
-    def test_thinking_variant_real_name_defaults_to_name_when_no_alias(self) -> None:
-        base = {"name": "claude-opus-4-6", "max_input_tokens": 1000000}
-        variant = um.thinking_variants(base, "claude")[0]
-        self.assertEqual(variant["real_name"], "claude-opus-4-6")
-
-
-class TestAdaptiveEffortVariants(unittest.TestCase):
-    """Adaptive-only Opus (4.7+) gets effort-level variants instead of
-    `:thinking`, and adaptive thinking baked into the base model."""
-
-    def _base(self, name: str = "claude-opus-4-8") -> dict:
-        return {
-            "name": name,
-            "max_input_tokens": 1000000,
-            "max_output_tokens": 128000,
-            "input_price": 5,
-            "output_price": 25,
-            "supports_vision": True,
-            "supports_tool_use": True,
-        }
-
-    def test_effort_variants_instead_of_thinking(self) -> None:
-        for provider in ("claude", "vertexai"):
-            variants = um.thinking_variants(self._base(), provider)
-            names = [v["name"] for v in variants]
-            self.assertEqual(names, ["claude-opus-4-8:xhigh", "claude-opus-4-8:max"])
-
-    def test_no_manual_thinking_variant(self) -> None:
-        names = [v["name"] for v in um.thinking_variants(self._base(), "claude")]
-        self.assertNotIn("claude-opus-4-8:thinking", names)
-
-    def test_effort_variant_patch_is_adaptive_with_effort(self) -> None:
-        variants = um.thinking_variants(self._base(), "claude")
-        xhigh = next(v for v in variants if v["name"].endswith(":xhigh"))
-        patch = xhigh["patches"][0]
-        self.assertIn('"type":"adaptive"', patch)
-        # Whole-object assignment: jaq won't create the intermediate object.
-        self.assertIn('.body.output_config = {"effort":"xhigh"}', patch)
-        self.assertIn("del(.body.temperature)", patch)
-        self.assertNotIn("budget_tokens", patch)
-
-    def test_no_generated_patch_assigns_into_a_nested_path(self) -> None:
-        # jaq does not create missing intermediate objects, so an assignment
-        # into `.body.<obj>.<field>` errors at request time and aborts the rest
-        # of the pipeline. Every generated patch must assign whole containers.
-        patches = [um.claude_adaptive_patch(um.BASE_EFFORT), um.BEDROCK_THINKING_PATCH]
-        for provider in ("claude", "vertexai", "bedrock"):
-            base = self._base(
-                "us.anthropic.claude-opus-4-6"
-                if provider == "bedrock"
-                else "claude-opus-4-8"
-            )
-            patches += [
-                patch
-                for variant in um.thinking_variants(base, provider)
-                for patch in variant["patches"]
-            ]
-        for patch in patches:
-            for assignment in patch.split("|"):
-                lhs = assignment.split("=")[0].strip()
-                if not lhs.startswith("."):
-                    continue
-                self.assertLessEqual(
-                    lhs.count("."),
-                    2,
-                    f"patch assigns into a nested path: {assignment.strip()!r}",
-                )
-
-    def test_effort_variant_requires_max_tokens(self) -> None:
-        # Adaptive-only Opus rejects requests without an explicit max_tokens.
-        variant = um.thinking_variants(self._base(), "claude")[0]
-        self.assertTrue(variant.get("require_max_tokens"))
-        self.assertEqual(variant["max_output_tokens"], 128000)
-
-    def test_effort_variant_routes_via_real_name(self) -> None:
-        base = self._base("claude-opus-4-8@default")
-        base["real_name"] = "claude-opus-4-8@default"
-        variants = um.thinking_variants(base, "vertexai")
-        self.assertEqual(variants[0]["name"], "claude-opus-4-8@default:xhigh")
-        self.assertEqual(variants[0]["real_name"], "claude-opus-4-8@default")
-
-    def test_bedrock_adaptive_only_gets_no_variant(self) -> None:
-        # Manual thinking 400s and adaptive+effort on Bedrock is unconfirmed.
-        base = self._base("us.anthropic.claude-opus-4-8")
-        self.assertEqual(um.thinking_variants(base, "bedrock"), [])
-
-    def test_apply_base_thinking_patches_adaptive_only(self) -> None:
-        for provider in ("claude", "vertexai"):
-            model = self._base()
-            um.apply_base_thinking(model, provider)
-            self.assertEqual(len(model["patches"]), 1)
-            self.assertIn('"type":"adaptive"', model["patches"][0])
-            self.assertIn('.body.output_config = {"effort":"high"}', model["patches"][0])
-            self.assertTrue(model.get("require_max_tokens"))
-
-    def test_apply_base_thinking_skips_manual_models(self) -> None:
-        model = {"name": "claude-opus-4-6", "max_input_tokens": 1000}
-        um.apply_base_thinking(model, "claude")
-        self.assertNotIn("patches", model)
-
-    def test_apply_base_thinking_skips_bedrock(self) -> None:
-        model = self._base("us.anthropic.claude-opus-4-8")
-        um.apply_base_thinking(model, "bedrock")
-        self.assertNotIn("patches", model)
 
 
 class TestShouldSkipModel(unittest.TestCase):

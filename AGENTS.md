@@ -541,22 +541,48 @@ token action exposes.
 the LiteLLM registry every Monday. Know what it does not maintain before
 trusting a price or adding a model.
 
-A model the registry does not list is kept verbatim, never refreshed, and
-reported in the run summary as `provider <name>: preserving models not present
-in LiteLLM: ...`. That line is the only signal that an entry's price is frozen,
-so read it rather than skimming the diff. Fields in `HARNX_ONLY_FIELDS`, such
-as `patches` and `require_max_tokens`, describe harnx's own request handling,
-are never supplied upstream, and must stay in that list or a refresh resets
-them. Any new field of that kind belongs there too.
+For each kind of model (chat, embedding, reranker) the registry lists for a
+provider, the registry is the whole list. A model it stops listing, or marks
+past its deprecation date, is dropped with its aliases and appears under
+`removed:` in the run summary, which becomes the auto-merge pull request's
+body. Hand-maintained entries survive only for providers the script doesn't
+map (qianwen, zhipuai, ernie, openrouter and github; the comment above
+`LITELLM_TO_HARNX_PROVIDER` says why) and for kinds the registry doesn't list
+for a covered provider, such as Jina's embedding models. A kind counts as
+listed even when its only entries are deprecated or are models harnx's client
+can't call (`registry_kinds`). Fields in `HARNX_ONLY_FIELDS`, such as `patches`
+and `require_max_tokens`, describe harnx's own request handling, are never
+supplied upstream, and must stay in that list or a refresh resets them. Any new
+field of that kind belongs there too.
 
-A provider whose LiteLLM prefix is missing from `LITELLM_TO_HARNX_PROVIDER`
+The refresh lists only models the provider's client can call
+(`client_can_call`). Vertex's client dispatches chat by model family and sends
+embeddings in the text-embedding schema, so Vertex's partner models (Llama,
+gpt-oss, Grok and other `-maas` entries) and multimodal embeddings stay out,
+and no client without a rerank operation (Bedrock, Vertex, Gemini, Claude,
+OpenAI) gets rerankers. Supporting one of those in the client means widening
+`client_can_call` and the guards that mirror it,
+`clients_without_rerank_list_no_rerankers` and
+`vertex_lists_only_model_families_its_client_can_call`.
+
+A provider whose LiteLLM name is missing from `LITELLM_TO_HARNX_PROVIDER`
 never reaches the merge path at all: `regenerate_provider_models` copies the
-existing block verbatim and prints nothing, so the whole provider's prices
-freeze with no warning line. That is how Gemini went stale — LiteLLM renamed
-its `google_ai` prefix to `gemini`, every Gemini entry was dropped before any
-other check ran, and cached-token calls then recorded no cost (#2638). If an
-entire provider's prices look frozen, check the mapping table in
-`scripts/update_models.py` before blaming the registry.
+existing block verbatim, so the whole provider's prices freeze. That is how
+Gemini went stale when LiteLLM renamed `google_ai` to `gemini`, after which
+cached-token calls recorded no cost (#2638), and how xAI went stale after
+`x_ai` became `xai`. The run summary reports a mapped name that matches no
+registry entry (`mapped LiteLLM providers with no registry entries: ...`), so
+a rename shows up as that line; the fix is the new name in the table. A
+provider that was never mapped still freezes silently.
+
+A missing name for part of a provider deletes rather than freezes. LiteLLM
+lists Cohere's chat models under `cohere_chat`, and Vertex's Gemini and
+embedding models under bare keys tagged `vertex_ai-language-models` and
+`vertex_ai-embedding-models`; without those table entries the refresh drops
+them as unlisted. Its modes are the registry's too: rerankers are `rerank`,
+which the catalog stores as type `reranker`. Before accepting a removal, check
+that the registry stopped listing the model rather than listing it under a
+name or mode the script doesn't read.
 
 A model the registry adds starts with no `patches`, because only an existing
 entry has any to carry over. The refresh gives new models the patches harnx
@@ -572,6 +598,22 @@ adds the next such model. An OpenAI failure means a Responses model has no
 reasoning patch, usually because the registry doesn't mark it
 `supports_reasoning`: give it a curated patch if it reasons, or add it to the
 guard's `openai_model_without_reasoning` if it doesn't.
+
+Claude thinking aliases come from the registry's flags rather than model
+names. `ThinkingSupport.from_registry` (`scripts/model_variants.py`) reads
+`supports_adaptive_thinking`, `supports_legacy_thinking` (a fixed
+`budget_tokens` is still accepted), `supports_reasoning` and the
+`supports_{xhigh,max}_reasoning_effort` flags. A model that accepts a budget
+keeps a fixed-budget `:thinking`. One that accepts only adaptive thinking gets
+it on the base model and on `:thinking` (Bedrock: `:thinking` only), at the
+model's own default effort, plus `:xhigh` and `:max` on the Claude API and
+Vertex where flagged. The one per-model rule left is
+`uses_thinking_binding_controls`, because the registry doesn't say which
+models check replayed thinking. The guard names the adaptive-only families
+itself (`claude_is_adaptive_only`), so an entry that loses its adaptive flag
+fails the job with `sends a fixed thinking budget, which it rejects` instead of
+shipping an alias that always returns 400. Check the model card, then correct
+the guard or wait for the registry rather than patching the catalog.
 
 LiteLLM records a capability only where it holds, so an omission is silence
 rather than a denial. `CURATED_CAPABILITY_FLAGS` lets a curated `true` survive
