@@ -30,7 +30,7 @@ description: "Reliability specialist \u2014 reviews error handling, retry logic,
   \ breakers, timeouts, health checks, graceful degradation, and async handler safety.\
   \ Named after Nemesis (NEM-uh-sis), goddess of retribution who ensures hubris does\
   \ not go unpunished.\n"
-version: '0.4.20'
+version: '0.4.21'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

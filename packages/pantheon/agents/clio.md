@@ -35,7 +35,7 @@ use_tools:
 - attachments_attachment_create
 description: |
   Git operations agent — handles commits, squash, rebase, and push. Squashes branches into a single clean commit, rebases on origin/HEAD, and pushes to remote. Named after Clio (KLEE-oh), the Muse of history.
-version: '0.4.20'
+version: '0.4.21'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

@@ -44,7 +44,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "High-level system design and architecture specialist — designs the perfect architecture that other agents try to replicate. Named after Plato (PLAY-toh), the Master of Ideal Forms.\n"
-version: '0.4.20'
+version: '0.4.21'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

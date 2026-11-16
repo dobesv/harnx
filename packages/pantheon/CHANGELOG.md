@@ -1,6 +1,15 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.21 (2026-11-16)
+
+### Fixes
+
+- prefer bounded waits to preserve prompt caches (#2710)
+- derive Claude thinking aliases and models from LiteLLM (#2709)
+- drop models when all of a provider's entries are dead (#2711)
+- Prefer repeated four-minute waits for work expected to finish within roughly two hours to help keep the model's prompt cache warm, even when there is no other work to do. Reserve indefinite waits for longer idle periods.
+
 ## 0.4.20 (2026-11-15)
 
 ### Features

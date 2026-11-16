@@ -40,7 +40,7 @@ description: "Security vulnerability specialist \u2014 identifies injection risk
   \ authentication flaws, authorization gaps, secrets exposure, input validation issues,\
   \ and supply chain risks. Named after Melpomene (mel-POM-uh-nee), the Muse of tragedy\
   \ \u2014 preventing security tragedies.\n"
-version: '0.4.20'
+version: '0.4.21'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics
