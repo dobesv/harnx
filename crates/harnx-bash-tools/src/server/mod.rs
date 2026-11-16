@@ -54,6 +54,7 @@ mod handlers;
 mod lifecycle;
 mod params;
 mod process;
+mod protocol_reader;
 mod render;
 mod retention;
 mod supervisor;
@@ -66,7 +67,7 @@ pub(crate) use render::*;
 use retention::SpawnedProcesses;
 use supervisor::{spawn_supervisor, ProcessControl, ProcessExit};
 
-use crate::tool_template::{OnUserMessage, ToolTemplate};
+use crate::tool_template::{OnUserMessage, ToolProtocol, ToolTemplate};
 use crate::tool_templates;
 
 pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
@@ -106,6 +107,7 @@ pub(crate) struct RegisteredToolTemplate {
     pub(crate) no_network: bool,
     pub(crate) ignored_grants: bool,
     pub(crate) on_user_message: OnUserMessage,
+    pub(crate) protocol: Option<ToolProtocol>,
 }
 
 #[derive(Clone, Copy)]

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
-use super::type_mismatch;
+use super::{type_mismatch, ToolProtocol};
 
 pub(crate) const HEAD_LINES_DESCRIPTION: &str =
     "Return only the first N lines of each stream. Prefer this over `| head -N` in the command.";
@@ -16,6 +16,23 @@ pub(crate) const OUTPUT_CONTROL_PARAMS: [(&str, &str); 3] = [
     ("head_lines", HEAD_LINES_DESCRIPTION),
     ("tail_lines", TAIL_LINES_DESCRIPTION),
     ("max_output_bytes", MAX_OUTPUT_BYTES_DESCRIPTION),
+];
+
+/// A protocol template returns only stderr, so its controls say so. The
+/// command is fixed, so the advice against `| head` in the command is dropped.
+const PROTOCOL_OUTPUT_CONTROL_PARAMS: [(&str, &str); 3] = [
+    (
+        "head_lines",
+        "Return only the first N lines of stderr, the tool's result.",
+    ),
+    (
+        "tail_lines",
+        "Return only the last N lines of stderr, the tool's result.",
+    ),
+    (
+        "max_output_bytes",
+        "Truncate stderr, the tool's result, to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window.",
+    ),
 ];
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -68,13 +85,18 @@ pub(crate) fn is_output_control(name: &str) -> bool {
 pub(crate) fn add_output_controls(
     properties: &mut Map<String, Value>,
     defaults: &TemplateOutputOptions,
+    protocol: Option<ToolProtocol>,
 ) -> Result<()> {
+    let params = match protocol {
+        Some(ToolProtocol::Jsonl) => PROTOCOL_OUTPUT_CONTROL_PARAMS,
+        None => OUTPUT_CONTROL_PARAMS,
+    };
     let defaults = [
         defaults.head_lines,
         defaults.tail_lines,
         defaults.max_output_bytes,
     ];
-    for ((name, description), default) in OUTPUT_CONTROL_PARAMS.into_iter().zip(defaults) {
+    for ((name, description), default) in params.into_iter().zip(defaults) {
         if properties.contains_key(name) {
             anyhow::bail!("parameter `{name}` is reserved for output control");
         }

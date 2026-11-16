@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod test_support;
 
+pub use tool_template::protocol::TOOL_PROTOCOL_ENV;
 pub use tool_template::ToolTemplate;
 pub use toolset::{builtin_tool_specs, BashToolset};
 

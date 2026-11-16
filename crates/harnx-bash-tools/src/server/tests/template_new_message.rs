@@ -6,7 +6,7 @@ use crate::{tool_template::ToolTemplate, BashToolset};
 use harnx_toolset::{ToolInvocation, ToolInvocationContext, Toolset};
 use tokio_util::sync::CancellationToken;
 
-fn template(policy: &str, script: &str) -> ToolTemplate {
+pub(super) fn template(policy: &str, script: &str) -> ToolTemplate {
     serde_yaml::from_str(&format!(
         "name: test_template\ndescription: Test template\n{policy}\nsandbox: {{enabled: false}}\nscript: {}\n",
         serde_json::to_string(script).unwrap()
@@ -14,12 +14,12 @@ fn template(policy: &str, script: &str) -> ToolTemplate {
     .unwrap()
 }
 
-fn toolset(directory: &TestDir, template: ToolTemplate) -> BashToolset {
+pub(super) fn server(directory: &TestDir, template: ToolTemplate) -> BashServer {
     // These unsandboxed fixtures need only a cwd grant. System grants can make
     // the default cwd /Library on macOS, whose history discovery exceeds our bounds.
     let mut allowlist = ResolvedAllowlist::new();
     assert!(allowlist.insert_rwx(directory.path()));
-    let server = BashServer::new_with_templates(
+    BashServer::new_with_templates(
         SandboxConfig {
             enabled: false,
             allowlist: Arc::new(allowlist),
@@ -29,8 +29,11 @@ fn toolset(directory: &TestDir, template: ToolTemplate) -> BashToolset {
         },
         vec![template],
     )
-    .unwrap();
-    BashToolset::from_server(server)
+    .unwrap()
+}
+
+pub(super) fn toolset(directory: &TestDir, template: ToolTemplate) -> BashToolset {
+    BashToolset::from_server(server(directory, template))
 }
 
 fn invocation(tool: &str, args: Value, token: &CancellationToken) -> ToolInvocation {
@@ -45,7 +48,7 @@ fn invocation(tool: &str, args: Value, token: &CancellationToken) -> ToolInvocat
     }
 }
 
-fn result_text(result: &Value) -> &str {
+pub(super) fn result_text(result: &Value) -> &str {
     assert_ne!(result["isError"], true, "{result}");
     result["content"][0]["text"].as_str().unwrap()
 }

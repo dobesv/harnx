@@ -253,6 +253,20 @@ pub(crate) fn render_streams_block(
     )
 }
 
+/// Render only stderr, for protocol templates: their stdout carries progress
+/// messages, so stderr is the whole result. Returns (rendered_string, lines,
+/// bytes).
+pub(crate) fn render_stderr_block(
+    stderr: &str,
+    truncate_opts: &TruncateOpts,
+) -> (String, usize, usize) {
+    (
+        render_stream_block("stderr", stderr, truncate_opts, None),
+        count_lines(stderr),
+        stderr.len(),
+    )
+}
+
 #[derive(serde::Serialize)]
 pub(crate) struct MetadataHeader<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]

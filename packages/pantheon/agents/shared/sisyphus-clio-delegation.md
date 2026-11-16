@@ -28,6 +28,8 @@ When delegating to `clio`, send the plan URL (`cid:plan:...`) and instruct `clio
 
 You may pass an explicit issue reference override (e.g. `Issue: FDEV-1234`, `Issue: #123`, or repo-qualified `Issue: owner/repo#123` when target repository differs) if needed, but Clio reads plan metadata first by default.
 
+If the work is stacked on another branch, name that base branch in your delegation to Clio.
+
 Clio will return structured delivery metadata with either an existing pull request's
 link and status or, when none is open, a compare link for opening one. Clio does NOT
 create pull requests.
@@ -40,9 +42,9 @@ Every final PR delivery must remain active while the pull request is opened and 
    the response after printing the link.
 2. In that same response, call `bash_wait_for_pr_stable`. Pass `pr_url` for an existing
    pull request. For a compare link, pass Clio's `repository` value as `repo`, plus its
-   `branch` and `head_owner`, so the tool can wait for the user to open the PR. Use the
-   default 24-hour timeout unless
-   the task calls for another limit.
+   `branch` and `head_owner`, plus `base` when Clio reported one, so the tool can wait for
+   the user to open the PR. Use the default 24-hour timeout unless the task calls for
+   another limit.
 3. Let the tool do its own GitHub polling. Do not repeatedly wake the model to check whether
    a PR exists or whether checks have changed.
 4. When the tool returns, inspect the current checks, reviews, and comments. Failed checks or

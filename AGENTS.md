@@ -104,7 +104,9 @@ package whose tests the change can break, or `--workspace` when that is all of
 them. It uses guppy's determinator, so a `Cargo.lock` bump selects only the
 packages that build the bumped crate. If it prints nothing, no Rust test is
 affected; don't run the bare `cargo nextest run` it would expand to, which
-tests everything.
+tests everything. It checks the merge base out with `git worktree add`, which
+fails inside Claude Code's Bash sandbox because the sandbox makes the
+repository's `.git/worktrees` read-only; run that one command outside it.
 
 Cargo's graph cannot see tests that launch another workspace binary by path,
 or read files outside their crate (`packages/`, `example_config/`, an
@@ -2050,6 +2052,12 @@ passed to `Toolset::invoke_with_context`. Defaults to a no-op sink when the requ
 `harnx:tool_progress` capability. Tools call `progress.update(patch)` to emit live state; the handle
 is call-bound and safe to clone into spawned tasks. Implementations that forward only `Toolset::invoke`
 will not receive the handle.
+
+Bash command templates reach the handle through the script's stdout instead: a template that
+declares `protocol: jsonl` writes `{"progress": {"title", "markdown"}}` lines there, and its stderr
+becomes the tool result (`crates/harnx-bash-tools/README.md`, "Structured protocol"). The bash
+toolset keeps the invocation context in a task-local, so code that needs the handle reads it
+(`invocation_progress()`) before any `tokio::spawn`.
 
 The server-side `ProgressPublisher` (`harnx-toolset-server/src/progress.rs`) coalesces on a 250ms
 interval, mirroring the engine's `RuntimeToolProgress`. First update publishes promptly; subsequent

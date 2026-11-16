@@ -240,6 +240,7 @@ the Mnemosyne knowledge-reconciliation step has run (or been intentionally skipp
 delegate to `clio` to squash, rebase, and push. Provide:
 - The full **plan URL** (`cid:plan:...`). Clio reads the plan via `plans_get_plan` to inspect structured issue metadata (`github_issue` paired with `github_owner_repo`, or `external_task_url`) or legacy plan notes to compose the commit message.
 - An optional **issue reference** override (e.g. `Issue: FDEV-1234`, `Issue: #123`, or repo-qualified `Issue: owner/repo#123` when target repository differs). Clio reads plan metadata first by default, so pass this only if overriding or supplying a reference not yet in plan metadata.
+- The **base branch**, when the work is stacked on another branch rather than the default branch.
 
 **Do NOT provide a pre-composed commit message.** Clio reads the full diff
 against the default branch and the plan metadata to compose a message
@@ -259,9 +260,9 @@ Every final PR delivery must remain active while the pull request is opened and 
    the response after printing the link.
 2. In that same response, call `bash_wait_for_pr_stable`. Pass `pr_url` for an existing
    pull request. For a compare link, pass Clio's `repository` value as `repo`, plus its
-   `branch` and `head_owner`, so the tool can wait for the user to open the PR. Use the
-   default 24-hour timeout unless
-   the plan calls for another limit.
+   `branch` and `head_owner`, plus `base` when Clio reported one, so the tool can wait for
+   the user to open the PR. Use the default 24-hour timeout unless the plan calls for
+   another limit.
 3. Let the tool perform its own GitHub polling instead of repeatedly waking the model.
 4. When it returns, inspect current checks, reviews, and comments. Failed checks or actionable
    feedback resume specialist delegation, Argus verification, review, Clio delivery, and the

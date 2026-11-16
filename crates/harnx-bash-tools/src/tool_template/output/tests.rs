@@ -27,10 +27,14 @@ fn command_templates_expose_reserved_output_controls_with_exec_descriptions() {
         ] {
             let control = &schema["properties"][name];
             assert_eq!(control["type"], "integer", "{}: {name}", template.name);
-            assert_eq!(
-                control["description"],
-                exec_schema["properties"][name]["description"]
-            );
+            // Protocol templates describe the controls as applying to stderr
+            // (see protocol_output_control_descriptions_mention_stderr).
+            if template.protocol.is_none() {
+                assert_eq!(
+                    control["description"],
+                    exec_schema["properties"][name]["description"]
+                );
+            }
             assert!(!schema["required"]
                 .as_array()
                 .unwrap()

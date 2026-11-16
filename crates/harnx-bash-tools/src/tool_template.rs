@@ -16,7 +16,9 @@ use serde_json::{json, Map, Value};
 use crate::server::{BUILTIN_TOOL_NAMES, COMMAND_TIMEOUT_ARG, COMMAND_TIMEOUT_MAX_SECS};
 
 pub(crate) mod output;
+pub(crate) mod protocol;
 use output::{add_output_controls, is_output_control, BoundTemplateArgs, TemplateOutputOptions};
+pub(crate) use protocol::ToolProtocol;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +42,8 @@ pub struct ToolTemplate {
     pub(crate) template: bool,
     #[serde(default)]
     pub(crate) on_user_message: OnUserMessage,
+    #[serde(default)]
+    pub(crate) protocol: Option<ToolProtocol>,
     pub(crate) script: String,
 }
 
@@ -69,7 +73,7 @@ impl ToolTemplate {
             }),
         );
 
-        add_output_controls(&mut properties, &self.output)?;
+        add_output_controls(&mut properties, &self.output, self.protocol)?;
 
         Ok(json!({
             "type": "object",
@@ -396,6 +400,8 @@ fn default_true() -> bool {
 /// - `CDPATH`, `GLOBIGNORE`: path/glob behavior
 /// - `BASHOPTS`: shell options
 /// - `TIMEOUT_SECS`: harnx-owned command execution metadata
+/// - `HARNX_TOOL_PROTOCOL`: set by harnx for protocol templates, after the
+///   parameters, so a parameter of that name would never reach the script
 ///
 /// Anyone extending or relaxing this list must treat it as a security boundary,
 /// not an ergonomic convenience. A new entry should only be added after confirming
@@ -432,6 +438,7 @@ pub(crate) fn param_to_env_name(param: &str) -> Result<String> {
         "GLOBIGNORE",
         "BASHOPTS",
         "TIMEOUT_SECS",
+        protocol::TOOL_PROTOCOL_ENV,
     ];
     if CRITICAL_ENV_VARS.contains(&env_name.as_str()) {
         anyhow::bail!(
@@ -1073,6 +1080,16 @@ script: echo ok
                 "unexpected error for {parameter}: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn parameter_name_rejects_tool_protocol_variable() {
+        let error = param_to_env_name("harnx_tool_protocol").unwrap_err();
+
+        assert!(
+            error.to_string().contains("`HARNX_TOOL_PROTOCOL` collides"),
+            "{error:#}"
+        );
     }
 
     #[test]

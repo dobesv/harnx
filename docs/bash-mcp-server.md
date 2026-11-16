@@ -216,6 +216,10 @@ When a template tool's output is truncated, the hint lists only template-support
 
 Template hints do not mention `read_exec_log` because template tools accept output controls directly, and their callers may not have `read_exec_log`. Re-calling a template with larger limits re-runs its command.
 
+### Structured protocol
+
+A template with `protocol: jsonl` sends live status from its script: each stdout line is a JSON message such as `{"progress": {"title": "...", "markdown": "..."}}`, and stderr is the tool's result. Output controls and `output:` defaults then apply to stderr only. See [Structured protocol](../crates/harnx-bash-tools/README.md#structured-protocol-protocol-jsonl) in the `harnx-bash-tools` README for the message format and escaping.
+
 ## Native and stdio modes
 
 Native mode is the default and is used by files in `tool_servers/`:

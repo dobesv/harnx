@@ -51,6 +51,7 @@ fn build_registered_tool_template(
     }
     let entry = RegisteredToolTemplate {
         on_user_message: template.on_user_message,
+        protocol: template.protocol,
         template,
         description,
         input_schema,
