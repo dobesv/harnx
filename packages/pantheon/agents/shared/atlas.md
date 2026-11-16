@@ -160,7 +160,7 @@ the prompt, you've gone too far — you might as well have done the work directl
 
 ## Task Verification (Argus)
 
- After EVERY delegation returns, delegate verification to `argus`.
+After every delegation returns, delegate verification to `argus`, except as noted below.
 NEVER trust subagent claims without independent verification.
 
 Delegate to `argus` with:
@@ -179,9 +179,13 @@ Argus will return a structured **PASS** or **FAIL** verdict with evidence.
 - Maximum 3 retry attempts per task. After 3 failures, document the problem
   and move to the next task — do not block the entire plan.
 
+Skip Argus on the final task before the Aristarchus review and on fixes for review
+findings, and never run it in parallel with Aristarchus. The quality gate below has the
+full rule, including when a change skips the review and still needs Argus.
+
 ## Incremental Commit & Push
 
-**After each task is verified (Argus PASS)** and **before requesting review** from Aristarchus, commit and push your work to protect against work loss if the session is interrupted:
+**After each task is verified** (Argus PASS, or for the final task and review fixes, once the pre-submit checks pass) and **before requesting review** from Aristarchus, commit and push your work to protect against work loss if the session is interrupted:
 
 1. Run the necessary git commands to stage and commit the verified work with a descriptive message.
 2. Push the branch to the remote repository.
@@ -265,7 +269,7 @@ Every final PR delivery must remain active while the pull request is opened and 
    another limit.
 3. Let the tool perform its own GitHub polling instead of repeatedly waking the model.
 4. When it returns, inspect current checks, reviews, and comments. Failed checks or actionable
-   feedback resume specialist delegation, Argus verification, review, Clio delivery, and the
+   feedback resume specialist delegation, pre-submit checks, review, Clio delivery, and the
    stability wait. If everything is clear, report the stable PR status. If the wait timed out,
    was cancelled, or returned `activity_stalled`, report the remaining blocker precisely.
 

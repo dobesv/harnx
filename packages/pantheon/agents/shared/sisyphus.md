@@ -46,7 +46,8 @@ If you encounter challenges or blockers, attempt to resolve them yourself.
 - `librarian` — external knowledge research
 - `oracle` — architectural decisions and consultation
 - `aristarchus` — code review and quality critique
-- `argus` — independent task verification (reads files, runs tests, returns PASS/FAIL)
+- `argus` — quick independent verification between tasks (reads files, runs tests, returns
+  PASS/FAIL). The quality gate below says when to skip it around the Aristarchus review.
 - `mnemosyne` — repository knowledge reconciliation. Verifies durable learnings and updates the
   narrowest authoritative source. Run BEFORE Clio so knowledge maintenance is included in the
   same squashed final commit.
