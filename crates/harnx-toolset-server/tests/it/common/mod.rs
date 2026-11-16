@@ -2,8 +2,7 @@
 //! tests: spawning a real `nats-server`, a stub `Toolset`, and a running
 //! `serve_with_shutdown` instance to exercise. Split out of `nats_server.rs`
 //! because this infrastructure shares no data with the test bodies
-//! themselves, and keeping it there pushed that file's cohesion (LCOM4) over
-//! CodeScene's threshold.
+//! themselves, and keeping it there left that file with unrelated halves.
 
 // Each integration-test binary includes only the subset of this shared
 // harness that it exercises.

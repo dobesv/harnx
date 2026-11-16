@@ -4,8 +4,8 @@
 //! blocked until its own 60s timeout).
 //!
 //! Split out of `lib.rs`: this tracking shares no data with the idempotency
-//! cache or registration-refresh logic, and keeping it there pushed the
-//! module over CodeScene's cohesion threshold.
+//! cache or registration-refresh logic, so keeping it there left that
+//! module with unrelated halves.
 
 use std::time::Duration;
 use tokio::sync::watch;

@@ -53,6 +53,7 @@ jobs:
               - '!LICENSE-*'
               - '!renovate.json'
               - '!knope.toml'
+              - '!rustqual.toml'
               - '!.mergify.yml'
               - '!.github/workflows/web-ci.yml'
               - '!.github/workflows/web-e2e.yml'
@@ -258,6 +259,35 @@ jobs:
     - name: Format
       if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
       run: cargo fmt --all --check
+
+  # Fails a pull request that adds rustqual findings or makes existing ones
+  # worse (`cargo xtask quality`; AGENTS.md, "Code quality gate"). It is
+  # advisory: .mergify.yml doesn't require it. A change to rustqual.toml alone
+  # skips it, because both sides of the comparison use the new settings.
+  quality:
+    name: Code quality
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # As in `All`: the second commit is the pull request's base.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The pinned rustqual isn't a workspace member and builds into a target
+      # directory of its own (xtask/rustqual/Cargo.toml).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            xtask/rustqual -> target/rustqual
+
+      - name: Compare rustqual findings with the base
+        run: cargo xtask quality --base HEAD^1
 
   docker-lint:
     name: Lint Dockerfiles

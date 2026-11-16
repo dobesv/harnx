@@ -58,8 +58,7 @@ impl ServerScope {
 /// How a server binary can be run without a worker supplying its scope.
 ///
 /// The three ways to run standalone are fixed, so a free-form hint would let a
-/// caller pass text matching no real flag — an enum keeps the hint honest, and
-/// keeps this file under CodeScene's string-argument threshold.
+/// caller pass text matching no real flag — an enum keeps the hint honest.
 pub enum StandaloneMode {
     /// Toolset servers: serve MCP over stdio instead of registering over NATS.
     McpStdio,
