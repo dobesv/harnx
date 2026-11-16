@@ -76,7 +76,6 @@ fn run_waiter_with_env(fixture: WaiterFixture<'_>, env: &[(&str, &str)]) -> Outp
         .env("HARNX_WAIT_PR_SETTLE_SECONDS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.envs(env.iter().copied());
     if direct_pr {
         command.env("PR_URL", PR_URL);
     } else {
@@ -84,6 +83,7 @@ fn run_waiter_with_env(fixture: WaiterFixture<'_>, env: &[(&str, &str)]) -> Outp
             .env("REPO", "example/project")
             .env("BRANCH", "feature");
     }
+    command.envs(env.iter().copied());
     let mut child = command.spawn().expect("run waiter");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -197,6 +197,18 @@ fn jsonl_waiter_compare_link_uses_base_and_fork_owner() {
     assert!(
         first.contains(
             "https://github.com/example/project/compare/stack/parent...forker:feature?expand=1"
+        ),
+        "{first}"
+    );
+}
+
+#[test]
+fn jsonl_waiter_compare_link_percent_encodes_branch_names() {
+    let (lines, _) = run_jsonl_discovery(&[("BRANCH", "fix/#12"), ("BASE", "stack/a&b")]);
+    let first = progress_field(&lines, 0, "markdown");
+    assert!(
+        first.contains(
+            "https://github.com/example/project/compare/stack/a%26b...fix/%2312?expand=1"
         ),
         "{first}"
     );

@@ -62,11 +62,17 @@ Plan-Id: cid:plan:pantheon%2Fatlas/armDRA/token-refresh-race
 
 ## Squash Base Rule
 
-**Always use `origin/HEAD` as the squash base — NEVER `git merge-base`.**
+**Always use the remote tip of the PR's base branch as the squash base — NEVER `git merge-base`.**
 
 When squashing commits before a push, use `origin/HEAD` as the base. It always resolves to
 the current tip of the default branch on the remote, which is the correct boundary for what
 belongs in this PR.
+
+When the caller named a base branch because the work is stacked on another branch, use
+`origin/<base>` instead of `origin/HEAD` everywhere in this section: the squash, the
+sanity check and the rebase. Squashing a stacked branch onto `origin/HEAD` folds the
+parent branch's commits into this PR's commit, so the PR against the parent shows the
+parent's changes as well.
 
 > **Prerequisite**: `origin/HEAD` must be set. If in doubt, run `git fetch origin` before
 > squashing. If `origin/HEAD` is not set (rare in some shallow clones), set it explicitly:

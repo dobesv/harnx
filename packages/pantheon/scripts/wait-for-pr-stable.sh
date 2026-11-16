@@ -64,16 +64,33 @@ say() {
   fi
 }
 
+# Percent-encodes a branch name for a URL path. Git allows `#`, `%` and `&` in
+# branch names, and a bare `#` would cut the link short. `/` stays as it is, so
+# the link reads like the ones GitHub shows.
+url_path_encode() (
+  LC_ALL=C
+  s=$1 out=""
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case $c in
+      [A-Za-z0-9._~/-]) out+=$c ;;
+      *) out+=$(printf '%%%02X' "'$c") ;;
+    esac
+  done
+  printf '%s' "$out"
+)
+
 # Page where the user can open the PR for the branch being waited on. The head
 # is owner-qualified only for forks; a branch in the repo itself needs no prefix.
 compare_url() {
-  local head="$branch"
+  local head
+  head=$(url_path_encode "$branch")
   if [[ -n "$head_owner" && "$head_owner" != "${repo%%/*}" ]]; then
-    head="${head_owner}:${branch}"
+    head="${head_owner}:${head}"
   fi
   local range="$head"
   if [[ -n "$base" ]]; then
-    range="${base}...${head}"
+    range="$(url_path_encode "$base")...${head}"
   fi
   printf 'https://%s/%s/compare/%s?expand=1' "${GH_HOST:-github.com}" "$repo" "$range"
 }

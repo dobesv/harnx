@@ -298,7 +298,8 @@ script: |
 Parameter names are transformed to `UPPER_SNAKE_CASE` env vars, so avoid names
 that map onto critical shell variables (`PATH`, `IFS`, `HOME`, `PWD`,
 `LD_PRELOAD`, `LD_LIBRARY_PATH`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `PS4`,
-`BASH_XTRACEFD`, `CDPATH`, `GLOBIGNORE`, `BASHOPTS`) or the `BASH_FUNC` prefix.
+`BASH_XTRACEFD`, `CDPATH`, `GLOBIGNORE`, `BASHOPTS`), onto `HARNX_TOOL_PROTOCOL`,
+which harnx sets itself, or the `BASH_FUNC` prefix.
 Two parameters that map to the same env var name, or a parameter that collides
 with a top-level `env:` key, are also rejected. A template that violates any of
 these is rejected at load.
