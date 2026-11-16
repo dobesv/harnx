@@ -61,7 +61,8 @@ hashes for semantically-identical payloads with different key ordering.
 ├── docs/                       # User-facing documentation
 ├── scripts/                    # Shell completions and shell-integration scripts
 ├── Argcfile.sh                 # Developer helper commands (argc-based; install moved to xtask)
-├── xtask/                      # Rust task runner (`cargo xtask install`) for local automation
+├── xtask/                      # Rust task runner (`cargo xtask install`, `affected`, `quality`) for local automation
+├── rustqual.toml               # Settings for the code quality gate (`cargo xtask quality`)
 ├── .changeset/                 # Changeset files for release notes
 ├── knope.toml                  # Release automation config
 ├── renovate.json               # Dependency update bot config
@@ -78,7 +79,7 @@ cargo fmt --all                                               # Auto-format code
 cargo clippy --workspace --all-targets -- -D warnings         # Lint — treat warnings as errors
 cargo nextest run $(cargo xtask affected)                    # Run the tests of every package the change can affect, once
 cargo nextest run --workspace -E 'test(=<name>) | ...' --stress-count=20  # Stress only the tests you added or changed
-cs delta origin/HEAD --error-on-warnings                      # Run CodeScene analysis and fail on quality warnings
+cargo xtask quality                                           # Fail on rustqual findings the change adds or makes worse
 python3 scripts/check_changesets.py                           # Check that every changeset will reach a changelog
 ```
 
@@ -90,12 +91,6 @@ If the workspace build fails with `Permission denied (os error 13)` from
 `protoc-bin-vendored-linux-x86_64`, the cargo registry is on a noexec mount, so
 `a2a-pb`'s vendored protoc binary can't run. Prefix cargo commands with
 `PROTOC=/usr/bin/protoc` to use the system protoc instead.
-
-If `cs delta` fails its license or API request with an SSL handshake error
-behind a TLS-intercepting proxy, set `CS_CERTS` to the proxy CA file path.
-Use `CS_CERTS="$SSL_CERT_FILE"` only when `SSL_CERT_FILE` is set and points to
-that CA. `cs` is a GraalVM native image and doesn't honor `SSL_CERT_FILE` on
-its own.
 
 **Scope the test run to the affected packages.** `cargo xtask affected` diffs
 the working tree, uncommitted and untracked files included, against its merge
@@ -141,24 +136,44 @@ test failures.
 
 **Do not skip any of these steps or you WILL miss problems**
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
-**CodeScene Health scores MUST NOT decrease as part of the change, only increase**
+**Don't add rustqual findings or make existing ones worse** (see "Code quality gate").
 
-A clean `cs delta` doesn't guarantee CodeScene's PR check passes. The check
-(`CodeScene Code Health Review (main)`) runs the server's analysis, which
-scores some files differently and can report findings `cs` doesn't: it once
-flagged Low Cohesion in a file where three helper functions had been added,
-while `cs check` scored the same file as improved, and moving the helpers to
-their own module cleared it. Read the PR check's result after pushing, and
-when it fails on something `cs` can't reproduce, satisfy the PR check. A
-check stuck in `queued` restarts with
-`gh api -X POST repos/dobesv/harnx/check-runs/<id>/rerequest`.
+### Code quality gate
 
-`cs delta` also fails on "String Heavy Function Arguments" once roughly 39%
-of a module's function arguments are strings. Test fixtures and multi-setting
-constructors trip it; group related settings into one config struct and
-bundle stringly-typed fixture data into typed structs and consts instead of
-adding `&str` parameters (see `BearerVerificationConfig` and `TestKey` in
-`harnx-a2a-server/src/bearer_verify.rs` and `bearer_verify_test_util.rs`).
+`cargo xtask quality` runs [rustqual](https://github.com/SaschaOnTour/rustqual)
+on the working tree, uncommitted and untracked files included, and on its merge
+base with `origin/HEAD` (or `--base <rev>`), and fails on every finding the
+change added or made worse. The workspace's thousands of existing findings are
+not a to-do list, and the gate ignores them. Findings are matched by file,
+category and function rather than by line, and follow a renamed file. "Worse"
+means a bigger number on a finding both sides have: a longer function, higher
+complexity, deeper nesting, more parameters or more `unwrap`s. A file already
+over the length limit may grow; only crossing the limit counts.
+
+rustqual is pinned in `xtask/rustqual/Cargo.toml` and its lockfile, so nothing
+needs installing; the first run builds it, which takes about a minute. Its
+settings live in `rustqual.toml`, and both sides of the comparison use the
+working tree's copy, so changing a setting never fails the gate by itself.
+`cargo xtask rustqual <path> --verbose` runs the same binary with the same
+settings to show what is behind a finding, and `--suggestions` adds refactoring
+hints for logic-plus-calls (`iosp`) violations.
+
+Fix what the gate reports. When a finding is deliberate, suppress it with a
+comment on the line above the item: `// qual:allow(iosp) — <reason>` for a
+logic-plus-calls violation, and `// qual:allow(<dimension>, <target>) reason:
+"<reason>"` for anything else, where the target names the kind of finding and a
+metric target pins its ceiling (`max_function_lines=80`).
+`cargo xtask rustqual --explain allow` lists the targets. `// qual:api` and
+`// qual:test_helper` mark a function used only from outside its crate or only
+from tests, which rustqual otherwise reports as dead code.
+
+rustqual treats only an exact `#[cfg(test)]` as test code. A module gated with
+`#[cfg(all(test, unix))]` is analysed as production code, so its helpers'
+`unwrap`s and test-only calls are reported. Write that gate as two attributes,
+`#[cfg(test)]` and `#[cfg(unix)]`, which compile the same.
+
+The `Code quality` CI job runs the gate on pull requests and annotates the diff
+with what it finds. It is advisory: `.mergify.yml` doesn't require it.
 
 ### Test sandbox
 

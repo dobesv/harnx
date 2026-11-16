@@ -667,8 +667,7 @@ impl AgentFrontMatter {
     }
 
     /// `use_tools` and `bash_tools` are the two tool-selector settings; they
-    /// group together so `content_is_empty` stays under CodeScene's
-    /// complexity threshold.
+    /// group together to keep `content_is_empty`'s complexity down.
     fn tool_selection_is_empty(&self) -> bool {
         self.use_tools.is_none() && self.bash_tools.is_none()
     }

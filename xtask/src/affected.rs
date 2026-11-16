@@ -20,10 +20,9 @@ use guppy::graph::{DependencyDirection, PackageGraph};
 use guppy::MetadataCommand;
 use serde::Deserialize;
 
-use crate::command_failure;
+use crate::git::{self, output as git_output};
 
 const CONFIG_PATH: &str = ".config/affected.toml";
-const DEFAULT_BASE_REFS: [&str; 2] = ["origin/HEAD", "origin/main"];
 
 pub struct AffectedArgs {
     base: Option<String>,
@@ -48,11 +47,10 @@ pub fn parse_affected_args(args: &[OsString]) -> Result<AffectedArgs> {
 }
 
 pub fn affected(args: AffectedArgs) -> Result<()> {
-    let root = git_output(Path::new("."), &["rev-parse", "--show-toplevel"])?;
-    let root = PathBuf::from(root.trim());
+    let root = git::toplevel()?;
     let base = match args.base {
         Some(base) => base,
-        None => default_base(&root)?,
+        None => git::default_base(&root, "HEAD")?,
     };
     let config = AffectedConfig::load(&root.join(CONFIG_PATH))?;
     let changed = changed_paths(&root, &base)?;
@@ -204,15 +202,6 @@ fn deserialize_globs<'de, D: serde::Deserializer<'de>>(
     builder.build().map_err(serde::de::Error::custom)
 }
 
-fn default_base(root: &Path) -> Result<String> {
-    for candidate in DEFAULT_BASE_REFS {
-        if let Ok(base) = git_output(root, &["merge-base", "HEAD", candidate]) {
-            return Ok(base.trim().to_owned());
-        }
-    }
-    bail!("no merge base with {DEFAULT_BASE_REFS:?}; pass --base <rev>")
-}
-
 /// Tracked changes since `base` in the working tree, plus untracked files, so
 /// uncommitted work is covered too.
 fn changed_paths(root: &Path, base: &str) -> Result<Vec<String>> {
@@ -267,19 +256,6 @@ impl Drop for BaseCheckout {
             eprintln!("warning: failed to remove worktree {}", self.path.display());
         }
     }
-}
-
-fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .context("failed to run git")?;
-    if !output.status.success() {
-        let label = format!("git {}", args.join(" "));
-        return Err(command_failure(&label, output.status, &output.stderr));
-    }
-    String::from_utf8(output.stdout).context("git output is not UTF-8")
 }
 
 fn utf8(value: &std::ffi::OsStr) -> Result<&str> {

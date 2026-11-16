@@ -37,8 +37,8 @@ pub(crate) fn forge_claims(principal: &str) -> Value {
     })
 }
 
-/// Signing key bundled as one typed value: CodeScene flags modules where too
-/// many function arguments are strings.
+/// Signing key bundled as one typed value, so the helpers that sign test
+/// tokens take one key rather than a run of string arguments.
 pub(crate) struct TestKey {
     pub(crate) kid: &'static str,
     pub(crate) pem: &'static str,
