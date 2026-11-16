@@ -16,7 +16,9 @@ use serde_json::{json, Map, Value};
 use crate::server::{BUILTIN_TOOL_NAMES, COMMAND_TIMEOUT_ARG, COMMAND_TIMEOUT_MAX_SECS};
 
 pub(crate) mod output;
+pub(crate) mod protocol;
 use output::{add_output_controls, is_output_control, BoundTemplateArgs, TemplateOutputOptions};
+pub(crate) use protocol::ToolProtocol;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +42,8 @@ pub struct ToolTemplate {
     pub(crate) template: bool,
     #[serde(default)]
     pub(crate) on_user_message: OnUserMessage,
+    #[serde(default)]
+    pub(crate) protocol: Option<ToolProtocol>,
     pub(crate) script: String,
 }
 
@@ -69,7 +73,7 @@ impl ToolTemplate {
             }),
         );
 
-        add_output_controls(&mut properties, &self.output)?;
+        add_output_controls(&mut properties, &self.output, self.protocol)?;
 
         Ok(json!({
             "type": "object",

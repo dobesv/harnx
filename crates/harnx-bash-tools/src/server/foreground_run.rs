@@ -1,6 +1,42 @@
 //! Foreground process ownership, output collection, and interruption.
 use super::foreground_output::ForegroundOutput;
+use super::protocol_reader::read_protocol_pipe_to_file;
 use super::*;
+use harnx_toolset::ToolProgressHandle;
+
+/// What the foreground runner does with a command's stdout.
+pub(crate) enum StdoutHandling {
+    /// Log it and keep it for the result.
+    Capture,
+    /// Log it and forward its progress lines to this handle. Protocol stdout
+    /// carries status messages, so none of it reaches the result.
+    Protocol(ToolProgressHandle),
+}
+
+impl StdoutHandling {
+    fn spawn_reader<R>(
+        self,
+        pipe: R,
+        log: TokioFile,
+    ) -> tokio::task::JoinHandle<std::io::Result<Vec<u8>>>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        match self {
+            Self::Capture => tokio::spawn(read_pipe_to_file(pipe, log)),
+            Self::Protocol(progress) => {
+                tokio::spawn(read_protocol_pipe_to_file(pipe, log, progress))
+            }
+        }
+    }
+}
+
+/// How a foreground command runs, apart from where its output is logged.
+pub(crate) struct ForegroundSettings {
+    pub(crate) timeout_secs: Option<u64>,
+    pub(crate) on_user_message: OnUserMessage,
+    pub(crate) stdout: StdoutHandling,
+}
 
 impl BashServer {
     pub(crate) async fn run_exec_command(
@@ -17,10 +53,20 @@ impl BashServer {
                 Stdio::piped(),
             )
             .await?;
+        // Taken here, in the invocation's task: the reader runs in a spawned
+        // task, where the invocation context is not visible.
+        let stdout = if params.protocol.is_some() {
+            StdoutHandling::Protocol(crate::toolset::invocation_progress())
+        } else {
+            StdoutHandling::Capture
+        };
         Self::run_to_completion(
             command,
-            params.timeout_secs,
-            params.on_user_message,
+            ForegroundSettings {
+                timeout_secs: params.timeout_secs,
+                on_user_message: params.on_user_message,
+                stdout,
+            },
             targets,
         )
         .await
@@ -28,11 +74,11 @@ impl BashServer {
 
     /// Wrap, spawn, and run `command` to completion (or timeout), streaming its
     /// stdout/stderr into the provided log files. Returns the exit status,
-    /// how it ended, and the captured stdout/stderr as lossy UTF-8.
+    /// how it ended, and the captured stdout/stderr as lossy UTF-8. Protocol
+    /// stdout is logged but not captured, so its string is empty.
     async fn run_to_completion(
         mut command: CommandWrap,
-        timeout_secs: Option<u64>,
-        on_user_message: OnUserMessage,
+        settings: ForegroundSettings,
         targets: LogTargets<'_>,
     ) -> Result<RunOutcome, ErrorData> {
         let LogTargets {
@@ -60,12 +106,17 @@ impl BashServer {
             .take()
             .ok_or_else(|| internal_error("failed to capture stderr"))?;
 
-        let stdout_task = tokio::spawn(read_pipe_to_file(stdout, stdout_file));
+        let stdout_task = settings.stdout.spawn_reader(stdout, stdout_file);
         let stderr_task = tokio::spawn(read_pipe_to_file(stderr, stderr_file));
 
         let mut output = ForegroundOutput::new(stdout_task, stderr_task);
-        let outcome =
-            wait_for_child(child.as_mut(), timeout_secs, on_user_message, &mut output).await;
+        let outcome = wait_for_child(
+            child.as_mut(),
+            settings.timeout_secs,
+            settings.on_user_message,
+            &mut output,
+        )
+        .await;
         if let Err(error) = outcome {
             // Never retry a raw group kill after identity validation failed.
             harnx_toolset::cleanup::unconfirmed(

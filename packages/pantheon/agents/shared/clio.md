@@ -134,6 +134,8 @@ pending, or failing. Return this existing pull request URL instead of a compare 
 
 Only when no open pull request exists for the branch, return a GitHub compare or
 new-pull-request link so the caller can open one. Never create the pull request yourself.
+When the caller named a base branch, build the compare link against it:
+`https://github.com/<owner>/<repo>/compare/<base>...<branch>?expand=1`.
 
 Always include enough structured delivery metadata for the caller to monitor the result:
 
@@ -143,11 +145,14 @@ delivery_kind: existing_pr | compare
 repository: <owner/name>
 branch: <head branch>
 head_owner: <fork owner, when known>
+base: <base branch, when the caller named one>
 ```
 
 The caller streams `delivery_url` to the user immediately. For an existing PR it monitors
-that URL directly; for a compare link it uses `repository`, `branch`, and `head_owner` to
-wait for the user to open the pull request.
+that URL directly; for a compare link it passes `repository`, `branch`, `head_owner`, and
+`base` to the waiter, which waits for the user to open the pull request.
+
+Include `base` only when the caller told you which branch the pull request targets.
 
 ## Issue Tracker Reference Detection
 

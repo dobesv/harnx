@@ -100,6 +100,7 @@ Each command template file contains the following fields:
 | `sandbox` | Map (optional) | Sandbox capabilities for this template. Omitting this field uses the server's default sandbox allowlist. |
 | `template` | Boolean (optional) | Enable Minijinja rendering of `script` before execution. Default is `false`. |
 | `on_user_message` | String (optional) | Action when a new user message arrives: `ignore` (default) or `terminate` (terminate and reap the foreground process group). Unknown values fail template loading. |
+| `protocol` | String (optional) | `jsonl` makes the script's stdout a channel for live status messages and its stderr the tool's result. See [Structured protocol](#structured-protocol-protocol-jsonl). Omit it for plain output. Unknown values fail template loading. |
 | `script` | String (required) | Script body to execute as bash under the sandbox. |
 
 With `on_user_message: terminate`, native NATS calls also stop for a user message
@@ -226,6 +227,38 @@ When template output is truncated, the hint lists only output controls:
 ```
 
 Template hints do not mention `read_exec_log` because template tools accept output controls directly, and callers may not have `read_exec_log`. Re-calling a template with larger limits re-runs its command.
+
+### Structured protocol (`protocol: jsonl`)
+
+A template with `protocol: jsonl` can report live status while its script runs. The TUI shows the status on the tool's row and the Web UI on its card, and links in its markdown can be opened from both. In this mode stdout and stderr do different jobs: stdout carries status messages, and stderr is the tool's result.
+
+The script's environment gets `HARNX_TOOL_PROTOCOL=jsonl`. A script can check it to choose between status messages and plain output, so it still works when run by hand.
+
+Each stdout line is one JSON object. A line with a `progress` object updates the status:
+
+```json
+{"progress": {"title": "PR #123 · 12 passed · 3 pending", "markdown": "[PR #123](https://github.com/o/r/pull/123): 12 passed, 3 pending"}}
+```
+
+`title` and `markdown` are optional strings, and a field left out keeps its current value. Other fields inside `progress` are ignored. A line that isn't UTF-8, isn't a JSON object, has no `progress` object, or is longer than 128 KiB is logged as a warning and skipped. A bad line never fails the call. All of stdout still goes to the execution's stdout log file, but none of it reaches the result.
+
+stderr is the result, on success and on failure. The result keeps the usual metadata header (exit code, log paths and the rest) and contains only the stderr block, which is empty when the script wrote nothing to stderr. `total_lines` and `total_bytes` count stderr only. `head_lines`, `tail_lines`, `max_output_bytes` and the template's `output:` defaults apply to stderr, and the tool's schema describes them that way. Exit codes, timeouts and `stopped_by: new_message` work as they do in plain mode.
+
+Status updates are live events and aren't saved to the session transcript, so write anything the model needs to stderr. The MCP stdio and HTTP routes have no progress channel: status lines are dropped there and the result is the same.
+
+An older harnx that doesn't know `protocol` ignores the field and runs the template in plain mode. The script then sees no `HARNX_TOOL_PROTOCOL` and can print plain output instead.
+
+Without a JSON tool such as `jq`, a bash script has to escape strings itself. This function escapes backslashes, quotes, newlines, carriage returns and tabs, and drops other control characters:
+
+```bash
+json_string() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+  printf '"%s"' "$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')"
+}
+printf '{"progress":{"title":%s}}\n' "$(json_string "$title")"
+```
 
 ### Threat model and security framing
 

@@ -10,6 +10,9 @@ pub(crate) struct ExecPipelineParams<'a> {
     pub(crate) include_log_hints: bool,
     pub(crate) template_sandbox: Option<TemplateSandbox<'a>>,
     pub(crate) on_user_message: OnUserMessage,
+    /// Set for protocol templates: their stdout carries progress messages and
+    /// only stderr is returned.
+    pub(crate) protocol: Option<ToolProtocol>,
 }
 
 /// Inputs for building a sandboxed child command. Groups the parameters

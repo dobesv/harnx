@@ -7,7 +7,8 @@ use crate::tool_templates;
 use async_trait::async_trait;
 use harnx_sandbox_common::SandboxConfig;
 use harnx_toolset::{
-    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolProgressKind, ToolSpec, Toolset,
+    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolProgressHandle, ToolProgressKind,
+    ToolSpec, Toolset,
 };
 use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
@@ -28,6 +29,15 @@ tokio::task_local! {
 pub(crate) fn invocation_new_message() -> CancellationToken {
     INVOCATION_CONTEXT
         .try_with(|context| context.new_message.clone())
+        .unwrap_or_default()
+}
+
+/// The running call's live progress sink. Outside a native invocation (the
+/// MCP route) it discards updates. Task-locals don't cross `tokio::spawn`, so
+/// call this in the invocation's task and move the handle into spawned work.
+pub(crate) fn invocation_progress() -> ToolProgressHandle {
+    INVOCATION_CONTEXT
+        .try_with(|context| context.progress.clone())
         .unwrap_or_default()
 }
 

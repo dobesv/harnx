@@ -1,5 +1,6 @@
 name: wait_for_pr_stable
 on_user_message: terminate
+protocol: jsonl
 description: Wait for a GitHub pull request to appear and become stable without agent polling
 parameters:
   pr_url:
@@ -20,6 +21,12 @@ parameters:
     type: string
     description: Optional fork owner used to disambiguate branches with the same name
     pattern: "^[A-Za-z0-9-]+$"
+  base:
+    type: string
+    description: Base branch the PR should merge into, for stacked PRs; GitHub's default branch when omitted
+    pattern: "^[A-Za-z0-9._/-]+$"
+    min: 1
+    max: 255
 env: { GH_PAGER: "" }
 sandbox:
   read:
