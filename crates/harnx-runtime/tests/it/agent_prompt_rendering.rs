@@ -743,6 +743,44 @@ fn planning_prompts_do_not_restore_question_quotas_or_early_approval_gates() {
     }
 }
 
+/// Argus is the between-task check; Aristarchus is the final review. The
+/// assembled coordinator prompts must not ask for Argus right before or
+/// alongside the review (#2728), but must keep it for review-exempt changes.
+#[test]
+fn coordinator_prompts_skip_argus_before_and_alongside_aristarchus() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    for name in ["pantheon/atlas", "pantheon/sisyphus"] {
+        let prompt = render_agent_prompt(name, &[]).expect("render coordinator agent");
+        let normalized = prompt
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        for rule in [
+            "don't run argus on the final task before review, on fixes for review findings, or alongside aristarchus",
+            "verify the final task with argus as usual",
+            "without an argus pass in between",
+        ] {
+            assert!(normalized.contains(rule), "{name}: missing rule: {rule}");
+        }
+        for obsolete in [
+            "individually verified by argus",
+            "verify each fix via argus",
+            "argus verification, review",
+        ] {
+            assert!(
+                !normalized.contains(obsolete),
+                "{name}: assembled prompt restores obsolete Argus step: {obsolete}"
+            );
+        }
+    }
+}
+
 #[test]
 fn daedalus_research_and_review_tools_keep_the_execution_approval_hook() {
     harnx_core::require_nextest();

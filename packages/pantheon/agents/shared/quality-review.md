@@ -4,7 +4,13 @@
 the exemptions below. This is not limited to "significant changes." Do not report
 completion to the user until the Aristarchus review passes.
 
-After all implementation work is complete and individually verified by Argus:
+Argus is the quick check between tasks; Aristarchus is the final review. Don't run Argus
+on the final task before review, on fixes for review findings, or alongside Aristarchus.
+The pre-submit checks in step 1 and the review already cover that work, so another Argus
+pass only repeats them. When the change skips the review (see "Changes that skip the
+review" below), verify the final task with Argus as usual.
+
+After all implementation work is complete:
 
 1. **Run the repository's pre-submit checks.** This is mandatory — do not skip it.
    - Use the checklist in `AGENTS.md` and the scoped docs it points to; these take
@@ -40,9 +46,10 @@ After all implementation work is complete and individually verified by Argus:
    - **APPROVE**: Work is complete. Proceed to final reporting and git operations (clio).
    - **REQUEST_CHANGES**: Aristarchus has identified **blocker** findings that must
      be fixed before the work can be considered done. Address ALL blocker findings —
-     delegate fixes to the appropriate Pantheon agent, verify each fix via Argus,
-     then request another review from Aristarchus. Non-blocking suggestions do not
-     need to be resolved before re-review, but consider addressing them.
+     delegate fixes to the appropriate Pantheon agent, then re-run step 1 and request
+     another review from Aristarchus, without an Argus pass in between. Non-blocking
+     suggestions do not need to be resolved before re-review, but consider addressing
+     them.
    - **NEEDS_DISCUSSION**: Aristarchus has raised questions or identified areas
      needing human judgment. Report the open questions and context to the user
      and wait for guidance before proceeding.
