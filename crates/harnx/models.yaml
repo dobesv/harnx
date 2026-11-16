@@ -3023,7 +3023,7 @@
       max_output_tokens: 65536
       input_price: 0.075
       output_price: 0.3
-      cache_read_price: 0.037
+      cache_read_price: 0.0375
       supports_tool_use: true
     - name: qwen/qwen3.8-27b
       max_input_tokens: 131072
@@ -6090,6 +6090,13 @@
       max_output_tokens: 24000
       input_price: 0.66
       output_price: 1
+    - name: '@cf/thinkingmachines/inkling-2-small'
+      max_input_tokens: 1048576
+      input_price: 0.3
+      output_price: 1
+      cache_read_price: 0.1
+      supports_vision: true
+      supports_tool_use: true
     - name: '@cf/zai-org/glm-4.7-flash'
       max_input_tokens: 131072
       max_output_tokens: 131072
