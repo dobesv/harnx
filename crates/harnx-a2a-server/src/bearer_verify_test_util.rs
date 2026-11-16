@@ -11,6 +11,9 @@ pub(crate) const AUDIENCE: &str = "ari:cloud:ecosystem::app/test-app";
 pub(crate) const PRIMARY_PEM: &str = include_str!("../tests/fixtures/bearer/primary.pem");
 pub(crate) const SECONDARY_PEM: &str = include_str!("../tests/fixtures/bearer/secondary.pem");
 pub(crate) const JWKS_PRIMARY: &str = include_str!("../tests/fixtures/bearer/jwks-primary.json");
+/// JWKS_PRIMARY with `n` padded with `=`, as Forge publishes its keys.
+pub(crate) const JWKS_PRIMARY_PADDED: &str =
+    include_str!("../tests/fixtures/bearer/jwks-primary-padded.json");
 pub(crate) const JWKS_SECONDARY: &str =
     include_str!("../tests/fixtures/bearer/jwks-secondary.json");
 
@@ -150,7 +153,7 @@ pub(crate) fn verifier_with_fake_clock(url: &JwksUrl) -> (BearerVerifier, impl F
 mod tests {
     use super::test_util::{
         forge_claims, now, serve, sign, verifier, verifier_with_fake_clock, JwksServer, AUDIENCE,
-        JWKS_PRIMARY, JWKS_SECONDARY, PRIMARY_PEM, SECONDARY_PEM,
+        JWKS_PRIMARY, JWKS_PRIMARY_PADDED, JWKS_SECONDARY, PRIMARY_PEM, SECONDARY_PEM,
     };
     use super::*;
 
@@ -184,6 +187,28 @@ mod tests {
         // The key set is cached: a second verification doesn't refetch.
         verifier.verify(&token).await.unwrap();
         assert_eq!(server.fetches(), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_accepts_padded_jwks_values() {
+        // Forge pads `n` with `=`; the key must still verify, and a token
+        // signed by another key must fail on its signature, not the key.
+        let server = JwksServer::start(JWKS_PRIMARY_PADDED).await;
+        let verifier = verifier(&server.url);
+        let token = sign(&forge_claims("557058:account-id"), &PRIMARY_KEY);
+        let verified = verifier.verify(&token).await.unwrap();
+        assert_eq!(verified["principal"], "557058:account-id");
+        let forged = sign(
+            &forge_claims("account-id"),
+            &TestKey {
+                kid: "primary-2026-01",
+                pem: SECONDARY_PEM,
+            },
+        );
+        assert_eq!(
+            verifier.verify(&forged).await.unwrap_err(),
+            VerifyFailure::BadSignature
+        );
     }
 
     #[tokio::test]
