@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "primary-2026-01",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "zb-zEUM-EBfZFM1ir0gjMxsUgkoO0JLc8IPBQkeuta6QWUsO58ji0kpFBrZD7EqsdjnsYb4Pc3uiNyfJocw3yrUNNGYOnh_13Isc_c5_JiRs5H-_OyOyzuQ2QjvMcu2iEN1BjFTH6cZ3DOAWYl025OhRjQxIMOjhe_KJ3m74jVY_MVKB_ZxHUdH2wZoHQdRNumHsphJXjLR5DmoxUelxrwz24bN4_Goguqpa1kHvo_e5MNC2m1_JGc3cKdMhAbR0l2F1zN_3iZUHk60lGFh1SE6lQXLjs-_Rh2H_f407cucDhgeImmaEpCXK_IsPt2WxKQLf7hBEgDHwCxnHi2gpzw==",
+      "e": "AQAB"
+    }
+  ]
+}

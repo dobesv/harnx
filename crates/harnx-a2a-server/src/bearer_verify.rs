@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use jsonwebtoken::{jwk::JwkSet, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{
+    jwk::{AlgorithmParameters, Jwk, JwkSet},
+    Algorithm, DecodingKey, Validation,
+};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
@@ -217,7 +220,7 @@ impl BearerVerifier {
         let Some(jwk) = keys.find(&kid) else {
             return Err(VerifyFailure::UnknownKid);
         };
-        let key = DecodingKey::from_jwk(jwk).map_err(|_| VerifyFailure::InvalidKey)?;
+        let key = decoding_key(jwk)?;
         let data = jsonwebtoken::decode::<Value>(token, &key, &self.validation)
             .map_err(VerifyFailure::from_jsonwebtoken)?;
         // jsonwebtoken doesn't validate iat; reject tokens issued in the
@@ -320,6 +323,20 @@ impl BearerVerifier {
         let keys: JwkSet = serde_json::from_slice(&body).map_err(|_| VerifyFailure::JwksBody)?;
         Ok(Arc::new(keys))
     }
+}
+
+/// Build a decoding key, tolerating `=` padding on RSA components. JWK values
+/// are unpadded base64url (RFC 7518 §6.3.1.1), but Forge's JWKS pads `n`, and
+/// `DecodingKey::from_jwk` rejects padding (#2712).
+fn decoding_key(jwk: &Jwk) -> Result<DecodingKey, VerifyFailure> {
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(params) => DecodingKey::from_rsa_components(
+            params.n.trim_end_matches('='),
+            params.e.trim_end_matches('='),
+        ),
+        _ => DecodingKey::from_jwk(jwk),
+    }
+    .map_err(|_| VerifyFailure::InvalidKey)
 }
 
 #[cfg(test)]
