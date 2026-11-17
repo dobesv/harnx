@@ -1997,10 +1997,11 @@ messages produce non-empty output. Render sites: `nats_session.rs:render_message
 ### Metadata rendering requires session reconstruction
 
 Text-format session metadata (`.info session` or `harnx info session`) uses `session::render()`
-(`config/session.rs:500`) which requires a reconstructed `Session` with model resolution and
-token counts. The helper `load_session_for_render()` (`session_format.rs:88`) loads KV metadata,
-resolves the model via `overrides.model` or the named agent's config, reconstructs transcript-
-derived fields (`turns`, `tokens`), and calls `update_tokens()`. Do NOT pass the raw
+(`config/session.rs:80`) which requires a reconstructed `Session` with model resolution and
+token counts. The helper `load_session_for_render()` (`session_format.rs:190`) loads KV metadata,
+resolves the model via `overrides.model` or the named agent's config (falling back to the
+recorded override ID or an unknown model when local configuration is unavailable), reconstructs
+transcript-derived fields (`turns`, `tokens`), and calls `update_tokens()`. Do NOT pass the raw
 `SessionMetadata` KV record to `session::render()` — it lacks resolved model and transcript state.
 
 ## Usage Accounting Semantics
