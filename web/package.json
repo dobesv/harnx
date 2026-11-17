@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@ag-ui/client": "1.0.3",
-    "@assistant-ui/react": "0.15.32",
+    "@assistant-ui/react": "0.15.36",
     "@assistant-ui/react-ag-ui": "0.0.63",
     "@assistant-ui/react-markdown": "0.14.24",
     "@assistant-ui/react-syntax-highlighter": "0.14.7",
