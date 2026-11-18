@@ -1,5 +1,5 @@
 //! Load shipped agents, not parallel copies of their confirmation scripts.
-use super::fixture::Probe;
+use super::{documentation::normalize_line_endings, fixture::Probe};
 use harnx_core::{
     abort::{create_abort_signal, AbortSignal},
     config_data::ConfigData,
@@ -178,7 +178,7 @@ fn normalized_middleware(middleware: &impl serde::Serialize) -> serde_json::Valu
 
 fn documented_middleware(path: &str) -> Vec<serde_json::Value> {
     let guide = std::fs::read_to_string(root().join(path)).unwrap();
-    guide
+    normalize_line_endings(&guide)
         .split("```yaml\n")
         .skip(1)
         .filter_map(|block| {

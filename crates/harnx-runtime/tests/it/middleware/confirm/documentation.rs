@@ -5,9 +5,9 @@ async fn middleware_confirm_documentation_examples_execute_verbatim() {
     let examples = super::super::documentation::blocks();
     assert_eq!(examples.len(), 12);
     for (index, (language, source)) in examples.into_iter().take(10).enumerate().skip(6) {
-        let entry = match language {
-            "bash" => bash(source),
-            "python" => python(source),
+        let entry = match language.as_str() {
+            "bash" => bash(&source),
+            "python" => python(&source),
             _ => panic!("uncovered confirmation example: {language}"),
         };
         for action in ["approve", "deny"] {

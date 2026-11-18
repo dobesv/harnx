@@ -17,13 +17,36 @@ const EXAMPLE_CONFIG: &str = include_str!(concat!(
     "/../../example_config/config.yaml"
 ));
 
-pub(super) fn blocks() -> Vec<(&'static str, &'static str)> {
-    GUIDE
+pub(super) fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+fn fenced_blocks(text: &str) -> Vec<(String, String)> {
+    normalize_line_endings(text)
         .split("```")
         .enumerate()
         .filter(|(index, _)| index % 2 == 1)
-        .map(|(_, block)| block.split_once('\n').unwrap())
+        .map(|(_, block)| {
+            let (language, source) = block.split_once('\n').unwrap();
+            (language.to_string(), source.to_string())
+        })
         .collect()
+}
+
+pub(super) fn blocks() -> Vec<(String, String)> {
+    fenced_blocks(GUIDE)
+}
+
+#[test]
+fn documentation_fence_parser_normalizes_crlf() {
+    let lf = "before\n```bash\necho ok\n```\n";
+    let crlf = lf.replace('\n', "\r\n");
+    assert_eq!(fenced_blocks(&crlf), fenced_blocks(lf));
+
+    let agent = "---\r\nmiddleware:\r\n  - name: gate\r\n    match: '^tool$'\r\n    bash: |\r\n      confirm 'Approve?'\r\n      next\r\n---\r\nPrompt\r\n";
+    let config = harnx_core::agent_config::AgentConfig::from_markdown("crlf", agent).unwrap();
+    assert_eq!(config.middleware.entries.len(), 1);
+    assert_eq!(config.middleware.entries[0].name(), "gate");
 }
 
 fn entries(yaml: &str) -> Vec<Value> {
@@ -78,16 +101,19 @@ async fn assert_config_rewrite(yaml: &str) {
 async fn middleware_documentation_examples_execute_verbatim() {
     let examples = blocks();
     assert_eq!(
-        examples.iter().map(|(lang, _)| *lang).collect::<Vec<_>>(),
+        examples
+            .iter()
+            .map(|(lang, _)| lang.as_str())
+            .collect::<Vec<_>>(),
         [
             "yaml", "bash", "python", "python", "bash", "python", "bash", "python", "bash",
             "python", "yaml", "yaml"
         ],
         "update execution coverage when adding an example"
     );
-    assert_config_rewrite(examples[0].1).await;
+    assert_config_rewrite(&examples[0].1).await;
     for (index, (lang, source)) in examples.iter().take(6).enumerate().skip(1) {
-        let entry = match *lang {
+        let entry = match lang.as_str() {
             "bash" => bash(source),
             "python" => python(source),
             _ => panic!("uncovered example language: {lang}"),
@@ -117,8 +143,9 @@ async fn middleware_documentation_examples_execute_verbatim() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn middleware_example_config_parses_and_uncommented_example_executes() {
-    let _: ConfigData = serde_yaml::from_str(EXAMPLE_CONFIG).unwrap();
-    let (_, rest) = EXAMPLE_CONFIG
+    let example_config = normalize_line_endings(EXAMPLE_CONFIG);
+    let _: ConfigData = serde_yaml::from_str(&example_config).unwrap();
+    let (_, rest) = example_config
         .split_once("# BEGIN middleware example\n")
         .unwrap();
     let (commented, _) = rest.split_once("# END middleware example").unwrap();
@@ -128,17 +155,17 @@ async fn middleware_example_config_parses_and_uncommented_example_executes() {
         .collect::<Vec<_>>()
         .join("\n");
     // Parse the entire config after enabling the example, not only its fragment.
-    let enabled = EXAMPLE_CONFIG.replacen(commented, &format!("{yaml}\n"), 1);
+    let enabled = example_config.replacen(commented, &format!("{yaml}\n"), 1);
     let _: ConfigData = serde_yaml::from_str(&enabled).unwrap();
     assert_config_rewrite(&yaml).await;
-    assert_eq!(entries(&yaml), entries(blocks()[0].1));
+    assert_eq!(entries(&yaml), entries(&blocks()[0].1));
 }
 
 #[test]
 fn middleware_documentation_disable_override_resolves() {
     use harnx_runtime::config::{agent::Agent, AgentConfig, Config};
     let mut config = Config {
-        data: serde_yaml::from_str(blocks()[0].1).unwrap(),
+        data: serde_yaml::from_str(&blocks()[0].1).unwrap(),
         ..Config::default()
     };
     assert_eq!(config.resolved_middleware().unwrap().entries.len(), 1);
