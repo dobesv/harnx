@@ -69,10 +69,16 @@ fn load_with_qualified_name_from_contents(
     contents: &str,
 ) -> Result<Agent> {
     let mut config = AgentConfig::from_markdown(qualified_name, contents)?;
-    let _ = path;
-    if let Some((pkg, stem)) = qualified_name.split_once('/') {
+    let package_dir = if let Some((pkg, stem)) = qualified_name.split_once('/') {
         apply_package_agent_transforms(&mut config, pkg, stem)?;
-    }
+        Some(harnx_core::config_paths::package_dir(pkg))
+    } else {
+        None
+    };
+    middleware::bind_middleware(
+        &mut config.middleware,
+        middleware::file_origin(path, package_dir.as_deref())?,
+    )?;
     Ok(Agent::new(config))
 }
 

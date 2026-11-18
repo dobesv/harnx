@@ -31,12 +31,27 @@ pub struct ToolConfirmationRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct ToolConfirmationResponse {
-    approved: bool,
+    // null defers to durable interaction acceptance. Older workers reject it, never approve.
+    #[serde(deserialize_with = "deserialize_approval")]
+    approved: Option<bool>,
+}
+
+fn deserialize_approval<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    // Unlike serde's default Option handling, require the field to be present.
+    Option::<bool>::deserialize(deserializer)
 }
 
 pub type ToolConfirmationFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 pub type ToolConfirmationHandler =
     dyn Fn(ToolConfirmationRequest) -> ToolConfirmationFuture + Send + Sync;
+
+/// `None` leaves middleware decisions to the durable interaction frontend.
+/// Legacy callers keep using `ToolConfirmationHandler` and boolean responses.
+pub type DeferredToolConfirmationHandler = dyn Fn(ToolConfirmationRequest) -> Pin<Box<dyn Future<Output = Option<bool>> + Send>>
+    + Send
+    + Sync;
 
 /// Frontend-owned confirmation route. Keep this alive while the frontend is
 /// attached to the session so queued continuation turns can reuse its subject.
@@ -49,6 +64,20 @@ impl ToolConfirmationRoute {
     pub(crate) async fn start(
         client: async_nats::Client,
         handler: Arc<ToolConfirmationHandler>,
+    ) -> Result<Self> {
+        Self::start_with_defer(
+            client,
+            Arc::new(move |request| {
+                let future = handler(request);
+                Box::pin(async move { Some(future.await) })
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_defer(
+        client: async_nats::Client,
+        handler: Arc<DeferredToolConfirmationHandler>,
     ) -> Result<Self> {
         let subject = client.new_inbox();
         let responder = ToolConfirmationResponder::start(client, subject.clone(), handler).await?;
@@ -85,7 +114,7 @@ impl ToolConfirmationResponder {
     async fn start(
         client: async_nats::Client,
         subject: String,
-        handler: Arc<ToolConfirmationHandler>,
+        handler: Arc<DeferredToolConfirmationHandler>,
     ) -> Result<Self> {
         let mut subscriber = client
             .subscribe(subject)
@@ -111,14 +140,14 @@ impl ToolConfirmationResponder {
                         Ok(request) => handler(request).await,
                         Err(error) => {
                             log::warn!("invalid tool confirmation request: {error}");
-                            false
+                            Some(false)
                         }
                     }
                 };
                 tokio::pin!(decision);
                 let (approved, shutting_down) = tokio::select! {
                     approved = &mut decision => (approved, false),
-                    _ = &mut shutdown_rx => (false, true),
+                    _ = &mut shutdown_rx => (Some(false), true),
                 };
                 publish_confirmation_response(&client, message, approved).await;
                 if shutting_down {
@@ -136,7 +165,7 @@ impl ToolConfirmationResponder {
                 log::debug!("failed to flush tool confirmation unsubscribe: {error}");
             }
             while let Some(message) = subscriber.next().await {
-                publish_confirmation_response(&client, message, false).await;
+                publish_confirmation_response(&client, message, Some(false)).await;
             }
         });
         Ok(Self {
@@ -168,7 +197,7 @@ impl Drop for ToolConfirmationResponder {
 async fn publish_confirmation_response(
     client: &async_nats::Client,
     message: async_nats::Message,
-    approved: bool,
+    approved: Option<bool>,
 ) {
     let Some(reply) = message.reply else {
         log::warn!("tool confirmation request had no reply subject");
@@ -231,8 +260,13 @@ pub(crate) fn nats_confirm_tool_use(
                 }
             };
             match serde_json::from_slice::<ToolConfirmationResponse>(&response.payload) {
-                Ok(ToolConfirmationResponse { approved: true }) => ToolUseConfirmation::Approve,
-                Ok(ToolConfirmationResponse { approved: false }) => denied(reason),
+                Ok(ToolConfirmationResponse {
+                    approved: Some(true),
+                }) => ToolUseConfirmation::Approve,
+                Ok(ToolConfirmationResponse {
+                    approved: Some(false),
+                }) => denied(reason),
+                Ok(ToolConfirmationResponse { approved: None }) => ToolUseConfirmation::Defer,
                 Err(error) => {
                     log::warn!("invalid tool confirmation response; denying call: {error}");
                     denied(reason)

@@ -82,6 +82,92 @@ async fn finding_a_call_lists_only_that_call_in_its_round() -> Result<()> {
     Ok(())
 }
 
+/// Exact lookup finds the specific physical invocation without listing,
+/// and disambiguates repeated physical attempts for the same transcript call in the same round
+/// where legacy `find` fails with "ambiguous durable tool invocation".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_lookup_finds_specific_physical_invocation_without_listing_and_disambiguates_attempts(
+) -> Result<()> {
+    let (server, journal) = common::journal().await;
+    journal_rows(
+        &journal,
+        &[
+            ("parent", "physical-1", 4),
+            ("parent", "physical-2", 4),
+            ("parent", "other-round", 5),
+            ("other-parent", "physical-1", 4),
+        ],
+    )
+    .await?;
+
+    // Legacy find fails because there are multiple attempts for model-call in round 4
+    let ambiguous = journal.find("parent", 4, "model-call").await;
+    assert!(
+        ambiguous.is_err(),
+        "legacy find must report ambiguous when multiple attempts exist"
+    );
+    assert!(ambiguous
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous durable tool invocation"));
+
+    // Exact lookup by physical ID finds each attempt individually without issuing any STREAM.INFO listings
+    let (found_1, filters_1) = listings_during(
+        &server.url,
+        journal.exact("parent", 4, "model-call", "physical-1"),
+    )
+    .await?;
+    assert_eq!(
+        found_1.map(|row| row.request.call_id),
+        Some("physical-1".to_string())
+    );
+    assert_eq!(
+        filters_1,
+        Vec::<String>::new(),
+        "exact lookup must not perform wildcard listings"
+    );
+
+    let (found_2, filters_2) = listings_during(
+        &server.url,
+        journal.exact("parent", 4, "model-call", "physical-2"),
+    )
+    .await?;
+    assert_eq!(
+        found_2.map(|row| row.request.call_id),
+        Some("physical-2".to_string())
+    );
+    assert_eq!(filters_2, Vec::<String>::new());
+
+    // Non-existent physical ID in the same round returns None
+    let missing = journal
+        .exact("parent", 4, "model-call", "physical-nonexistent")
+        .await?;
+    assert!(missing.is_none());
+
+    // Wrong round returns None
+    let wrong_round = journal
+        .exact("parent", 5, "model-call", "physical-1")
+        .await?;
+    assert!(wrong_round.is_none());
+
+    // Wrong session returns None
+    let wrong_session = journal
+        .exact("nonexistent-parent", 4, "model-call", "physical-1")
+        .await?;
+    assert!(wrong_session.is_none());
+
+    // find_exact alias works identically
+    let alias = journal
+        .find_exact("parent", 4, "model-call", "physical-1")
+        .await?;
+    assert_eq!(
+        alias.map(|row| row.request.call_id),
+        Some("physical-1".to_string())
+    );
+
+    Ok(())
+}
+
 /// Wind-up needs the rows of the rounds a `Cancel` interrupted, and nothing
 /// from the session's other rounds or from other sessions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -213,6 +299,17 @@ async fn ids_with_separators_or_escapes_keep_their_own_rows() -> Result<()> {
             .await?
             .with_context(|| format!("no row for {call_id} in {session}"))?;
         assert_eq!(by_call.request.tool_call_id.as_deref(), Some(tool_call_id));
+        let exact_row = journal
+            .exact(session, 3, tool_call_id, call_id)
+            .await?
+            .with_context(|| {
+                format!("no exact row for {tool_call_id:?} + {call_id:?} in {session}")
+            })?;
+        assert_eq!(exact_row.request.call_id, call_id);
+        assert_eq!(
+            exact_row.request.tool_call_id.as_deref(),
+            Some(tool_call_id)
+        );
     }
     for (session, expected) in [
         ("a.b", vec!["call.0", "call=2E0"]),

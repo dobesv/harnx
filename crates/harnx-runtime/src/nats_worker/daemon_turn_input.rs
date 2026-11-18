@@ -94,6 +94,24 @@ impl TurnWorker {
         lease: &NatsSessionLease,
         high_water: Option<u64>,
     ) -> Result<(Input, Option<u64>)> {
+        // Check before either queued-input folding or resumable-input derivation.
+        // A marked post-results handoff must not become another model turn.
+        if super::agent_loop::parks_recovery(ctx.backend, ctx.per_session).await? {
+            return Ok((
+                crate::config::input::from_str(ctx.per_session, "", None),
+                None,
+            ));
+        }
+        self.derive_unparked_turn_input(ctx, lease, high_water)
+            .await
+    }
+
+    async fn derive_unparked_turn_input(
+        &self,
+        ctx: TurnInputCtx<'_>,
+        lease: &NatsSessionLease,
+        high_water: Option<u64>,
+    ) -> Result<(Input, Option<u64>)> {
         if let Some(continuation) = self.derive_continuation_turn_input(ctx, high_water).await {
             return Ok(continuation);
         }

@@ -12,6 +12,7 @@ async fn example() {
             script: "echo '{\"value\":42}' | jq '.value'",
             limits: ScriptLimits::default(),
             commands: vec![], // Arc<dyn ScriptCommand>
+            python_functions: None, // Explicit Python host capabilities
             fs_mounts: vec![], // FsMount
             cancel: CancellationToken::new(),
         })
@@ -40,7 +41,7 @@ async fn example() {
   syntax errors as ordinary stderr with exit 2; if its own stderr cap has
   discarded that diagnostic, the backend can't recover it.
 - BashKit is pinned to `=0.20.2`, with `jq` and `python` enabled. HTTP, SSH,
-  git and host filesystems aren't enabled. Curl/wget are also filtered out at
+  git and host filesystems aren't enabled. `http`/`curl`/`wget` are also filtered out at
   construction. Builtins operate on virtual files, including BashKit's synthetic
   `/etc` and `/proc`, not host files.
 
@@ -66,9 +67,10 @@ stdlib is a subset; network, subprocesses and `re` aren't available. Monty 0.0.1
 supports simple classes, but not inheritance or metaclasses. BashKit's older
 "no classes" hint doesn't describe this version.
 
-**Python cannot call tools.** No external-function handler is installed. Call
-tool commands in Bash, save their output in `/tmp`, then process those files in
-Python. Tool names, `tools` and `call_tool` aren't Python globals.
+**Python has no host functions by default.** With `python_functions: None`, the
+backend keeps `python_with_limits` behavior: Bash command registrations don't
+become Python globals. Call tool commands in Bash and process their VFS output in
+Python, or explicitly register Python host functions as described below.
 
 The backend enables in-process Python with
 `.env("BASHKIT_ALLOW_INPROCESS_PYTHON", "1")` on each Bash builder. It never sets
@@ -95,6 +97,71 @@ BashKit charges each Python invocation against a shared per-script work budget
 95 Python invocations; invoking Python a 96th time aborts the script with a work units
 resource limit. Rather than invoking `python` or `python3` repeatedly inside shell loops,
 batch per-item processing into a single Python invocation.
+
+### Python host functions
+
+Set `ScriptRequest.python_functions` to `Some(ScriptPythonFunctions { names,
+handler })`. Both `python` and `python3` then use BashKit 0.20.2's
+`python_with_external_handler` with the same Python resource limits. Names are an
+allowlist; an unregistered name raises `NameError` without calling the handler.
+The adapter also checks dispatch names so returned callable values can't bypass
+that allowlist.
+
+Implement `ScriptPythonHandler` using `async_trait`. Its async `call` receives the
+function name, positional arguments (`Vec<MontyObject>`), keyword arguments
+(`Vec<(MontyObject, MontyObject)>`) and `ScriptHostContext`. It returns
+`ExtFunctionResult::Return(value)` or `ExtFunctionResult::Error(exception)`.
+`MontyObject`, `ExtFunctionResult`, `MontyException` and `ExcType` are re-exported
+by this crate, so callers need no direct Monty dependency. Values aren't coerced
+through strings or JSON. The host must validate each operation's arguments.
+
+```rust
+use std::sync::Arc;
+use async_trait::async_trait;
+use harnx_script::{
+    BashKitBackend, CancellationToken, ExtFunctionResult, MontyObject, ScriptBackend,
+    ScriptHostContext, ScriptLimits, ScriptPythonFunctions, ScriptPythonHandler,
+    ScriptRequest, ScriptStatus,
+};
+
+struct Answer;
+
+#[async_trait]
+impl ScriptPythonHandler for Answer {
+    async fn call(
+        &self,
+        _name: String,
+        _args: Vec<MontyObject>,
+        _kwargs: Vec<(MontyObject, MontyObject)>,
+        _ctx: ScriptHostContext,
+    ) -> ExtFunctionResult {
+        ExtFunctionResult::Return(MontyObject::Int(42))
+    }
+}
+
+async fn example() {
+    let result = BashKitBackend.run(ScriptRequest {
+        script: "python3 -c 'print(answer())'",
+        limits: ScriptLimits::default(),
+        commands: vec![],
+        python_functions: Some(ScriptPythonFunctions {
+            names: vec!["answer".into()],
+            handler: Arc::new(Answer),
+        }),
+        fs_mounts: vec![],
+        cancel: CancellationToken::new(),
+    }).await;
+    assert_eq!(result.status, ScriptStatus::Ok);
+    assert_eq!(result.stdout, "42\n");
+}
+```
+
+A `ScriptCommand` and `ScriptPythonHandler` can share an `Arc` holding the same
+async host operations and run state. `ScriptHostContext` supplies the same child
+cancellation token and `ScriptControl` as Bash's command context. External calls
+are awaited inline, not detached. Their time counts against both the run deadline
+and Python's remaining duration; a slow downstream tool needs a larger run timeout.
+Host handlers should still enforce their own I/O limits.
 
 ### Known crash risks and isolation limits
 
@@ -155,7 +222,12 @@ implementation.
 
 The interpreter runs on a Tokio blocking worker so synchronous Monty execution
 can't prevent the caller from polling cancellation or its wall-clock deadline.
-A process-wide cap admits at most eight running or queued interpreter closures.
+Process-wide admission pools allow eight running or queued interpreter closures
+at each nesting depth. Depth 0 is the root and `MAX_SCRIPT_NESTING` is 16 (depths
+0–15), so at most 128 closures hold permits. Each pool is fair. A parent awaiting
+a host operation never competes with its descendants for the same permits.
+Depth 16 fails immediately with `ScriptStatus::Error` and
+`script nesting depth limit exceeded (maximum 16 runs)`, rather than waiting.
 Waiting for admission counts against the run deadline and observes cancellation;
 queued closures retain their permits until Tokio drops them.
 Cancellation sets BashKit's atomic flag (checked inside the VM) and cancels a
@@ -170,6 +242,45 @@ cannot undo remote side effects. Completing a run never cancels its caller's
 token. Joining a running worker has no hard grace-period bound: a native Monty
 operation that misses VM checkpoints can delay cancellation indefinitely.
 Returning after a grace period would detach interpreter-owned work, not stop it.
+
+### Host stops
+
+Bash commands and Python handlers can call `ctx.control.stop()`. It marks a
+host-only stop and cancels interpreter-owned work. The run returns
+`ScriptStatus::Stopped` (serialized `stopped`) and exit code 130, distinct from
+`Error`, `Cancelled` and `TimedOut`. Never infer a host stop from stdout or exit
+130: a script can produce either without stopping host-side control flow. Python
+`try`/`except`, Bash `set +e` and background jobs can't catch a host stop.
+
+For suspension or fatal/cancel propagation, store the original typed outcome in
+caller-owned state **before** calling `stop()`, then inspect that state after the
+backend returns `Stopped`. This crate doesn't serialize that payload or depend
+on runtime-specific outcome types. The host-stop marker takes precedence over a
+simultaneous interpreter error or deadline. Stop cancels the run's child token,
+not the caller's token, and uses the same worker/job cleanup as cancellation.
+
+Ordinary Python host errors remain catchable `ExtFunctionResult::Error` values.
+Bash `ScriptCommand::run` returning `Err(message)` still reports `Error`, not
+`Stopped`; use the control handle when the caller must propagate a typed outcome.
+
+### Nesting across host awaits
+
+A task-local depth is restored inside each blocking interpreter worker and
+propagates through Bash command and Python handler awaits, including BashKit's
+inline-polled pipelines and jobs. Prefer inline host futures. Tokio doesn't
+inherit task locals when spawning a new task. If host dispatch must spawn, clone
+its `ScriptControl` and call `control.scope(future).await` **inside** that task,
+then join it before the host operation returns. This also applies when passing
+work through a host queue to another task. Without that explicit scope, a
+separately spawned task looks like a new root and loses nesting protection.
+
+The pools bound interpreter closures, not arbitrary host tasks or remote effects.
+The Tokio blocking pool must have room for nested workers (Tokio's default 512
+threads exceeds the 128-closure admission bound). Embedders that lower its limit
+or occupy it with unrelated blocking work must leave capacity for descendants.
+Timeout and cancellation still observe queued-worker waits.
+
+### Mounts
 
 `FsMount` accepts a trusted virtual `FileSystem` mounted at an absolute path.
 Mounted filesystem paths start at `/`. For read-only mounts, wrap the filesystem
@@ -305,7 +416,7 @@ fallbacks for real MCP schemas with `$ref`, `anyOf` or nullable types.
 
 `description::bash_tool_description(tools, concurrent_cap, call_cap)` builds the
 model-facing guide from the resolved `ToolSpec` catalog. Builtins come from
-`BashKitBackend::builtin_names` (already filtered to exclude `curl`/`wget`);
+`BashKitBackend::builtin_names` (already filtered to exclude `http`/`curl`/`wget`);
 sorted tool synopses use the same generator as `tools` and `--help`. Runtime
 supplies admission caps; execution and filesystem defaults come from their limit
 types. The guide includes quoting patterns, Monty restrictions and one pipeline

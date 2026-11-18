@@ -705,6 +705,7 @@ mod tests {
 
     fn tool_server(package: Option<&str>) -> ToolServerConfig {
         ToolServerConfig {
+            middleware: Default::default(),
             name: "test".to_string(),
             command: "test".to_string(),
             args: Vec::new(),

@@ -45,6 +45,7 @@ use tracing::{debug, error, info, warn};
 pub mod event_map;
 pub mod event_sink;
 pub mod handoff;
+mod interaction_permission;
 pub mod permission;
 pub mod prompt_content;
 pub mod server_main;
@@ -239,7 +240,7 @@ impl HarnxAgent {
         let session_id = nats_session.session_id().to_string();
 
         // Wrap in server-side context with idle tracking
-        let session_ctx = Arc::new(SessionContext::new(nats_session));
+        let session_ctx = self.session_context(nats_session, global_config);
 
         // Touch on creation to mark as active
         session_ctx.touch();
@@ -300,6 +301,21 @@ impl HarnxAgent {
         Ok(LoadSessionResponse::new())
     }
 
+    fn session_context(
+        &self,
+        session: harnx_runtime::NatsSession,
+        config: harnx_runtime::config::GlobalConfig,
+    ) -> Arc<SessionContext> {
+        let context = Arc::new(SessionContext::new(session));
+        context.permissions.observe(
+            context.nats_session().clone(),
+            config,
+            self.cluster.clone(),
+            Arc::clone(&self.connection),
+        );
+        context
+    }
+
     /// Establish a `SessionContext` for an existing loaded session.
     ///
     /// This mirrors `new_session` but reuses an existing session ID from durable storage.
@@ -333,7 +349,11 @@ impl HarnxAgent {
         .context("failed to create NATS session for loaded session")
         .map_err(acp_error)?;
 
-        let session_ctx = Arc::new(SessionContext::new(nats_session));
+        // Reuse live state and its permission gate on repeated or concurrent attachments.
+        let mut sessions = self.sessions.write().await;
+        let session_ctx = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| self.session_context(nats_session, global_config));
         session_ctx.touch();
 
         // Rehydrate handoff state from durable transcript.
@@ -341,11 +361,6 @@ impl HarnxAgent {
         if let Some(target) = find_handoff_target(entries, &self.cluster) {
             session_ctx.commit_handoff(target);
         }
-
-        self.sessions
-            .write()
-            .await
-            .insert(session_id.to_string(), session_ctx);
 
         Ok(())
     }
@@ -522,6 +537,8 @@ impl HarnxAgent {
             confirmation_handler: permission::tool_confirmation_handler(
                 connection,
                 session_id.clone(),
+                Arc::clone(&session_ctx.permissions.gate),
+                session_ctx.permissions.legacy_probe().map_err(acp_error)?,
             ),
         };
 
@@ -652,7 +669,8 @@ struct PromptTurn {
     input: Input,
     sink: Arc<AcpEventSink>,
     cancel_rx: tokio::sync::mpsc::Receiver<()>,
-    confirmation_handler: Arc<harnx_runtime::nats_tool_confirmation::ToolConfirmationHandler>,
+    confirmation_handler:
+        Arc<harnx_runtime::nats_tool_confirmation::DeferredToolConfirmationHandler>,
 }
 
 async fn run_prompt_turn(
@@ -661,7 +679,7 @@ async fn run_prompt_turn(
 ) -> acp::Result<harnx_runtime::NatsTurnResult> {
     let nats_session = session.nats_session();
     let route = nats_session
-        .tool_confirmation_route(turn.confirmation_handler)
+        .tool_confirmation_route_with_defer(turn.confirmation_handler)
         .await
         .context("failed to create tool confirmation route")
         .map_err(acp_error)?;
@@ -679,7 +697,10 @@ async fn run_prompt_turn(
                 turn.sink,
                 Some(turn.cancel_rx),
                 Some(route.subject()),
-                harnx_runtime::RunTurnOptions::default(),
+                harnx_runtime::RunTurnOptions {
+                    wait_for_interactions: true,
+                    ..Default::default()
+                },
             )
             .await
             .context("prompt turn failed")

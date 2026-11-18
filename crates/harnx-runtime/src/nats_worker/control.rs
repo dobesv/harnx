@@ -1,6 +1,7 @@
 //! Control plane for cancel over NATS.
 
 mod hitl;
+mod interaction;
 use hitl::HitlDecisionParams;
 
 use super::backend::NatsSessionLogBackend;
@@ -15,34 +16,28 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 /// Control command sent over the control subject (`sessions.{id}.control`).
-///
-/// Clients publish these commands to interact with an active session without
-/// going through the durable activation workflow. Workers optionally
-/// acknowledge request/reply delivery after durable state lands in the session
-/// log; plain publish remains supported for callers that do not need
-/// confirmation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlCommand {
     /// Cancel the current turn.
-    ///
-    /// Worker-originated: carries the fence token for tombstone.
-    /// The worker appends a Cancel entry BEFORE firing the AbortSignal.
     Cancel,
     /// Latency hint that a `Cancel` entry was appended to this session's log.
-    /// The log is authoritative; the listener re-reads the tail on receipt.
     Interrupt { cancellation_id: String },
     /// Resolve one durable pending tool approval.
     HitlApprovalDecision {
         tool_call_id: String,
         approved: bool,
         note: Option<String>,
-        /// Expected approval generation. None retains tool-ID-only legacy routing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_seq: Option<u64>,
     },
+    /// Resolve one durable pending tool interaction.
+    InteractionResponse {
+        interaction_id: String,
+        request_seq: u64,
+        response: harnx_core::interaction::InteractionResponse,
+    },
     /// Latency hint that a `CompactRequest` entry was appended to this session's log.
-    /// The log is authoritative; the worker detects and runs compaction at a safe boundary.
     Compact { compaction_id: String },
 }
 
@@ -64,6 +59,7 @@ pub(super) struct AppliedHitlDecision {
     pub approved: bool,
     pub note: Option<String>,
 }
+
 pub(super) struct SessionControlHandler {
     client: async_nats::Client,
     jetstream: async_nats::jetstream::Context,
@@ -116,21 +112,20 @@ impl SessionControlHandler {
                 let params = HitlDecisionParams::new(tool_call_id, approved, note, request_seq);
                 self.apply_hitl_decision(params, reply).await
             }
+            ControlCommand::InteractionResponse {
+                interaction_id,
+                request_seq,
+                response,
+            } => {
+                self.apply_interaction_response(&interaction_id, request_seq, &response, reply)
+                    .await;
+            }
             ControlCommand::Compact { .. } => {
-                // Compact is a hint only; worker detects pending requests via session watcher.
-                // Acknowledge receipt but don't trigger compaction here - T4 handles execution.
                 self.acknowledge(reply).await;
             }
         }
     }
 
-    /// An `Interrupt` command is only a hint that a `Cancel` was appended. The
-    /// log decides: abort (and acknowledge) only once it carries one for the
-    /// turn in progress.
-    /// The hint names a `Cancel` that should be the log's last entry. One
-    /// already followed by other entries is still caught by the session
-    /// watcher and by this worker's next fenced append, so the hint does not
-    /// pay for a wider read.
     async fn confirm_logged_interrupt(&self, reply: Option<async_nats::Subject>) {
         let Ok(Some((_, harnx_core::session::SessionLogEntry::Cancel { .. }))) =
             self.backend.last_entry_async().await
@@ -141,9 +136,6 @@ impl SessionControlHandler {
         self.acknowledge(reply).await;
     }
 
-    /// The legacy client cancel: no `Cancel` is in the log yet, so this worker
-    /// writes one itself before aborting, exactly as a frontend's
-    /// `interrupt_session` would have.
     async fn cancel(&self, reply: Option<async_nats::Subject>) {
         if self.append_cancel().await {
             self.acknowledge(reply).await;
@@ -211,16 +203,12 @@ impl SessionControlHandler {
 }
 
 /// Control subject pattern for a session.
-///
 /// Format: `sessions.{session_id}.control`
 pub fn control_subject(session_id: &str) -> String {
     format!("sessions.{session_id}.control")
 }
 
 /// Publish a control command to a session's control subject.
-///
-/// This is the client-side helper for driving control commands. Workers
-/// subscribe to this subject and handle commands when holding the lease.
 pub async fn publish_control_command(
     client: &async_nats::Client,
     session_id: &str,
@@ -241,10 +229,6 @@ pub async fn publish_control_command(
 
 /// Send a control command and wait for the lease holder to confirm that its
 /// durable control entry was written.
-///
-/// A missing subscriber is reported by the caller-provided timeout. This lets
-/// recovery code re-activate an orphaned session and retry without mistaking a
-/// successful NATS publish for a handled cancellation.
 pub async fn request_control_command(
     client: &async_nats::Client,
     session_id: &str,

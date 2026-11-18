@@ -2,6 +2,22 @@
 
 Hooks allow you to extend Harnx by running external commands at specific points during agent execution. They can be used for auditing, policy enforcement, environment injection, or even modifying the interaction between the agent and its tools.
 
+For in-process Bash/Python scripts that wrap tool calls, rewrite arguments and
+results, or deny calls in cloud/unmanaged workers, use
+[tool middleware](middleware-guide.md). The legacy `hooks:` configuration described
+here remains separate.
+
+## Middleware and PostToolUse
+
+When middleware calls `next`, legacy `PostToolUse` runs for each successful
+physical downstream dispatch, before that result returns to the script.
+`PostToolUseFailure` handles failed dispatches. Two `next` calls can therefore
+produce two post-tool hook events even though the model receives one final outer
+result. Skipping `next` produces no downstream post-tool event. Outer middleware
+finalization doesn't fire an extra `PostToolUse`; transformations made after
+`next` aren't another dispatch. Call/result UI publication remains once per outer
+call.
+
 ## 1. Overview
 
 Hooks are external programs or scripts that Harnx executes when specific events occur. Depending on the event and the hook configuration, a hook can:

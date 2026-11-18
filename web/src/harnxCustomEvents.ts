@@ -21,7 +21,17 @@ export const NAVIGATION_CONTROL_EVENTS = [
   'session_compacting_started',
   'session_compacting_completed',
   'session_compacting_failed',
+  'pending_interaction',
 ] as const;
+
+export interface PendingInteraction {
+  interactionId: string;
+  requestSeq: number;
+  toolCallId: string;
+  kind: string;
+  message: string;
+  pendingCount: number;
+}
 
 export interface MessageAttachmentMeta {
   partIndex: number;
@@ -55,6 +65,8 @@ export interface HarnxCustomEventCallbacks {
   onSessionCompaction?: (compaction: CompactionMetadata | null) => void;
   /** Called when a tool_update CUSTOM event is received. */
   onToolUpdate?: (patch: ToolCallUpdatePatch) => void;
+  /** Called when a pending_interaction CUSTOM event is received (or null to clear). */
+  onPendingInteraction?: (interaction: PendingInteraction | null) => void;
   /** Called when turn_interrupted is received. */
   onTurnInterrupted?: () => void;
   /**
@@ -166,6 +178,42 @@ function parseCompactionOutcome(value: unknown): CompactionOutcome | undefined {
   return undefined;
 }
 
+export function parsePendingInteraction(value: unknown): PendingInteraction | null | undefined {
+  if (value === null) return null;
+  if (typeof value !== 'object') return undefined;
+  const rec = value as Record<string, unknown>;
+  const interactionId = nonBlankString(rec.interaction_id);
+  const toolCallId = nonBlankString(rec.tool_call_id);
+  const kind = typeof rec.kind === 'string' && rec.kind.trim().length > 0 ? rec.kind : undefined;
+  const message = typeof rec.message === 'string' ? rec.message : undefined;
+  const requestSeq = validSeq(rec.request_seq) && rec.request_seq > 0 ? rec.request_seq : undefined;
+  const pendingCount =
+    typeof rec.pending_count === 'number' &&
+    Number.isSafeInteger(rec.pending_count) &&
+    rec.pending_count >= 0
+      ? rec.pending_count
+      : undefined;
+
+  if (
+    interactionId !== undefined &&
+    toolCallId !== undefined &&
+    kind !== undefined &&
+    message !== undefined &&
+    requestSeq !== undefined &&
+    pendingCount !== undefined
+  ) {
+    return {
+      interactionId,
+      requestSeq,
+      toolCallId,
+      kind,
+      message,
+      pendingCount,
+    };
+  }
+  return undefined;
+}
+
 const handlers: Record<string, CustomEventHandler> = {
   status: (callbacks, value) => callbacks.onStatus(stringField(value, 'text') || null),
   usage: (callbacks, value) => {
@@ -236,6 +284,12 @@ const handlers: Record<string, CustomEventHandler> = {
   tool_update: (callbacks, value) => {
     const patch = parseToolUpdateEvent(value);
     if (patch) callbacks.onToolUpdate?.(patch);
+  },
+  pending_interaction: (callbacks, value) => {
+    const parsed = parsePendingInteraction(value);
+    if (parsed !== undefined) {
+      callbacks.onPendingInteraction?.(parsed);
+    }
   },
   turn_interrupted: (callbacks) => {
     callbacks.onTurnInterrupted?.();

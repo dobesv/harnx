@@ -76,6 +76,7 @@ async fn script(script: &str, fs: AttachmentFs) -> ScriptRun {
     BashKitBackend
         .run(crate::ScriptRequest {
             script,
+            python_functions: None,
             limits: ScriptLimits::default(),
             commands: vec![],
             fs_mounts: vec![fs.mount()],
@@ -531,6 +532,7 @@ async fn backend_cancellation_drops_pending_attachment_download() {
         BashKitBackend
             .run(crate::ScriptRequest {
                 script: &command,
+                python_functions: None,
                 limits: ScriptLimits::default(),
                 commands: vec![],
                 fs_mounts: vec![mount],

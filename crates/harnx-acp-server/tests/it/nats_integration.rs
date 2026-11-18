@@ -4,6 +4,8 @@
 mod cancellation;
 #[path = "nats_integration/handoff.rs"]
 mod handoff;
+#[path = "nats_integration/interaction_permission.rs"]
+mod interaction_permission;
 #[path = "nats_integration/lifecycle.rs"]
 mod lifecycle;
 #[path = "nats_integration/listing.rs"]

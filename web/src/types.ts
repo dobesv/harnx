@@ -44,6 +44,7 @@ export interface JsonRpcResponse<T = unknown> {
   error?: {
     code: number;
     message?: string;
+    data?: unknown;
   };
 }
 

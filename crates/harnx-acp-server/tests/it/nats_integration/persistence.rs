@@ -487,6 +487,7 @@ fn load_fixture_entries() -> Vec<SessionLogEntry> {
             fence_token: None,
         },
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![ToolOutput {
                 id: Some("load-call".to_string()),
                 name: "fs_read".to_string(),

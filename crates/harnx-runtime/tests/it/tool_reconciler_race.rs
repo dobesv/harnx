@@ -15,6 +15,7 @@ fn tool_server(name: &str) -> ToolServerConfig {
     // explicit. Same shape as `fn tool_server` in `tool_reconciler.rs` and
     // the `daemon.rs` test module — keep them in sync.
     ToolServerConfig {
+        middleware: Default::default(),
         name: name.to_string(),
         command: format!("harnx-{name}-server"),
         args: Vec::new(),

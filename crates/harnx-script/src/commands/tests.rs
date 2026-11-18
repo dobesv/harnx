@@ -83,6 +83,7 @@ async fn run(script: &str, executor: Arc<FakeExecutor>) -> ScriptRun {
     BashKitBackend
         .run(crate::ScriptRequest {
             script,
+            python_functions: None,
             limits: ScriptLimits {
                 timeout_secs: 5,
                 ..Default::default()

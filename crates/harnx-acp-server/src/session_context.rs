@@ -69,6 +69,7 @@ impl Drop for TurnGuard {
 /// Server-owned state for one NATS session.
 pub struct SessionContext {
     backend: SessionBackend,
+    pub(crate) permissions: crate::interaction_permission::SessionPermissions,
     /// Milliseconds since `created_at`, stored atomically for idle checks.
     last_active_ms: AtomicU64,
     created_at: Instant,
@@ -86,6 +87,7 @@ impl SessionContext {
     fn from_backend(backend: SessionBackend) -> Self {
         Self {
             backend,
+            permissions: Default::default(),
             last_active_ms: AtomicU64::new(0),
             created_at: Instant::now(),
             state: Mutex::new(SessionState::default()),
@@ -171,6 +173,7 @@ impl SessionContext {
 
     /// Wake the in-process prompt follower without releasing the active-turn gate.
     pub(crate) fn cancel_local_turn(&self) -> bool {
+        self.permissions.cancel_request();
         let state = self.state.lock();
         let Some(turn) = state.active_turn.as_ref() else {
             return false;

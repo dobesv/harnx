@@ -15,6 +15,7 @@ pub mod input;
 mod input_attachments;
 mod input_commands;
 mod input_modal;
+mod interaction_confirmation;
 pub mod lifecycle;
 pub mod markdown_render;
 pub mod prompt;

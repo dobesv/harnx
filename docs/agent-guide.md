@@ -76,7 +76,8 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | `conversation_starters` | `list` | `[]` | Suggested prompts shown when starting the agent in TUI mode. |
 | `documents` | `list` | `[]` | Document paths for RAG integration. See [Documents](#documents-rag). |
 | `instructions` | `string` | none | If set, overrides the Markdown body as the system prompt. |
-| `hooks` | `object` | none | Per-agent hook configuration. See [Hooks](#hooks). |
+| `middleware` | `list` | `[]` | In-process tool-call scripts, including durable confirmations. See [Tool middleware and confirmation](#tool-middleware-and-confirmation). |
+| `hooks` | `object` | none | Legacy per-agent hook configuration. See [Hooks](#hooks). |
 
 ## Variables
 
@@ -476,6 +477,52 @@ documents:
 ```
 
 Relative paths are resolved from the agent's data directory.
+
+## Tool middleware and confirmation
+
+Add `middleware:` in agent front matter to wrap matching tool calls with BashKit
+Bash or Monty Python. Global and tool-server/package middleware runs before agent
+middleware. Scripts run inside the worker, including unmanaged/cloud deployments.
+Package `script:` paths resolve from the package directory; inline `bash:` needs
+no separate file.
+
+Daedalus uses this shipped policy before handing a plan to Atlas:
+
+```yaml
+middleware:
+- name: confirm-atlas-handoff
+  match: '^atlas_session_handoff$'
+  bash: |
+    if confirm --id handoff 'Hand off this plan to Atlas for execution?'; then
+      next --id dispatch
+    else
+      deny 'Atlas handoff denied by the user.'
+    fi
+```
+
+An unanswered `confirm` durably suspends the call, not a live interpreter. TUI,
+serve/web, A2A and ACP can answer; ACP permissions have no note field. Accepted
+responses rerun only that call's chain from the start. Completed siblings aren't
+repeated, and handoffs activate only after the whole round finishes. `answer KEY`
+reads runtime-accepted responses, never model arguments. Explicit step keys keep
+identity stable across changed traversal order; each `next` is still fresh. Use
+`save`/`saved` before a post-tool confirm to restore the earlier result instead of
+running the tool twice. See the [tested save/restore example](middleware-guide.md#keep-a-downstream-result-without-running-the-tool-twice).
+
+Inner model-script calls pass through middleware but can't suspend. A confirm
+there returns `interaction required, can't be answered inside a script`; call the
+protected tool directly instead. Operator root calls auto-approve confirms under
+scoped operator consent, while denial and rewriting remain enforced. Middleware's
+allowlisted helper calls bypass the chain to prevent recursion.
+
+A worker crash during an unfinished dispatch can return **interrupted, outcome
+unknown** rather than repeat effects. Check external state before retrying.
+Cluster deployment requires **T2.1 readers before T2.2 durable writers**, a
+checkpoint store reachable by every resuming worker, and no rollback below T2.1
+after any T2.2 worker has run. Drain in-flight middleware turns when upgrading
+Phase 1 or T2.1 workers to T2.2. The [Middleware Guide](middleware-guide.md#cluster-rollout-and-rollback)
+explains those compatibility boundaries and recovery rules; the
+[Tool Confirmation Guide](tool-confirmation-guide.md) covers each frontend.
 
 ## Hooks
 

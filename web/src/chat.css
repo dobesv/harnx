@@ -1366,7 +1366,7 @@ body {
   max-width: 100%;
 }
 
-.aui-sub-agent-row { display: flex; align-items: center; gap: .5rem; }
+.aui-sub-agent-row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
 .aui-sub-agent-row .aui-sub-agent-note { flex: 1; min-width: 0; }
 .aui-sub-agent-open {
   display: inline-flex;
@@ -1399,6 +1399,96 @@ body {
 }
 .aui-sub-agent-stop { padding: .4rem .7rem; cursor: pointer; }
 .aui-sub-agent-status-unconfirmed .aui-sub-agent-status-icon { animation: none; }
+
+.aui-sub-agent-interaction {
+  width: 100%;
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.25rem;
+  padding: 0.5rem 0.6rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 6px);
+}
+.aui-sub-agent-interaction-message {
+  font-size: 0.85rem;
+  color: var(--text);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.aui-sub-agent-interaction-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.aui-sub-agent-interaction-note {
+  flex: 1;
+  min-width: 140px;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+  background: var(--bg);
+  color: var(--text);
+}
+.aui-sub-agent-approve {
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+  border-radius: var(--radius-sm, 4px);
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-contrast, #fff);
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+.aui-sub-agent-approve:hover:not(:disabled) {
+  opacity: 0.9;
+}
+.aui-sub-agent-deny {
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+  border-radius: var(--radius-sm, 4px);
+  border: 1px solid var(--border);
+  background: var(--muted);
+  color: var(--text);
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+.aui-sub-agent-deny:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.aui-sub-agent-interaction-notice {
+  font-size: 0.8rem;
+  color: var(--text-muted, var(--text));
+  width: 100%;
+  flex-basis: 100%;
+}
+.aui-sub-agent-interaction-error {
+  font-size: 0.8rem;
+  color: var(--status-error, #e53e3e);
+  width: 100%;
+  flex-basis: 100%;
+}
+.aui-sub-agent-unsupported {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-muted, var(--text));
+}
+.aui-sub-agent-open-session {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.8rem;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
 
 /* Static handoff link row in tool card */
 .aui-handoff-row {

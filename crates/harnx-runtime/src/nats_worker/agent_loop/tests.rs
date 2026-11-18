@@ -1,5 +1,7 @@
 #[path = "hitl_progress_tests.rs"]
 mod hitl_progress;
+#[path = "interaction_continuation_tests.rs"]
+mod interaction_continuation;
 
 use super::{
     agent_resolved_hooks, derive_hitl_tool_round_continuation, derive_pending_compaction,
@@ -186,6 +188,7 @@ fn tool_calls_entry(call_id: &str) -> SessionLogEntry {
 
 fn tool_results_entry(call_id: &str) -> SessionLogEntry {
     SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results: vec![harnx_core::session::ToolOutput {
             id: Some(call_id.to_string()),
             name: "search".to_string(),
@@ -313,6 +316,69 @@ fn tool_call_without_results_remains_orphaned_after_queued_user() {
     let orphans = find_orphan_tool_calls(&entries);
     assert_eq!(orphans.len(), 1);
     assert_eq!(orphans[0].seq, 1);
+}
+
+#[test]
+fn clear_abandons_all_orphan_batches_and_preserves_new_rounds() {
+    let mut entries = vec![
+        (1, tool_calls_entry("older-orphan")),
+        (2, tool_calls_entry("latest-orphan")),
+        (3, SessionLogEntry::Clear),
+    ];
+    assert!(find_orphan_tool_calls(&entries).is_empty());
+    entries.push((4, tool_calls_entry("fresh-call")));
+    let orphans = find_orphan_tool_calls(&entries);
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].seq, 4);
+    assert_eq!(orphans[0].calls[0].id.as_deref(), Some("fresh-call"));
+}
+
+#[test]
+fn clear_discards_old_consent_even_when_tool_call_id_is_reused() {
+    let mut entries = vec![
+        (1, tool_calls_entry("reused-call")),
+        (
+            2,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "reused-call".into(),
+                summary: "Old consent".into(),
+                fence_token: 7,
+            },
+        ),
+        (
+            3,
+            SessionLogEntry::HitlApprovalDecision {
+                tool_call_id: "reused-call".into(),
+                approved: true,
+                note: None,
+                fence_token: 7,
+            },
+        ),
+        (4, SessionLogEntry::Clear),
+    ];
+    assert!(derive_pending_hitl_approvals(&entries).unwrap().is_empty());
+    assert!(derive_hitl_tool_round_continuation(&entries)
+        .unwrap()
+        .is_none());
+    entries.extend([
+        (5, tool_calls_entry("reused-call")),
+        (
+            6,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "reused-call".into(),
+                summary: "Fresh consent".into(),
+                fence_token: 8,
+            },
+        ),
+    ]);
+    let pending = derive_pending_hitl_approvals(&entries).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].request_seq, 6);
+    let continuation = derive_hitl_tool_round_continuation(&entries)
+        .unwrap()
+        .unwrap();
+    assert_eq!(continuation.round.seq, 5);
+    assert!(continuation.decisions.is_empty());
 }
 
 #[test]

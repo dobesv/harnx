@@ -143,6 +143,7 @@ async fn a_consuming_worker_launches_no_child_servers() {
             description: None,
             package: None,
             hooks: None,
+            middleware: Default::default(),
         }];
     }
     let daemon = harnx_runtime::nats_worker::WorkerDaemonConfig::new("prod", "w1");

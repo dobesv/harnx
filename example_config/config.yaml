@@ -48,6 +48,23 @@ toolsets:
     - fs_re_replace
     - fs_rollback_file
 
+# ---- middleware ----
+# In-process tool wrappers; also run in cloud/unmanaged workers.
+# See docs/middleware-guide.md. Timeout includes waiting inside next.
+# Uncomment this block to label bash_exec calls and annotate their JSON result.
+# BEGIN middleware example
+# middleware:
+#   - name: label-bash
+#     match: '^bash_exec$'
+#     bash: |
+#       args=$(tool_input | jq '.arguments | .env = ((.env // {}) + {"MIDDLEWARE_LABEL":"reviewed"})')
+#       result=$(next --id run "$args")
+#       respond "$(echo "$result" | jq '.output.reviewed = true')"
+#     tools: []
+#     timeout: 60s
+#     on_error: deny
+# END middleware example
+
 # ---- hooks ----
 # hooks:
 #   entries:

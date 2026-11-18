@@ -63,6 +63,7 @@ fn configure_managed_tools(
         description: None,
         package: package.then(|| "pkg".into()),
         hooks: None,
+        middleware: Default::default(),
     }];
     let path = if package {
         dir.join("packages/pkg/agents/limited.md")

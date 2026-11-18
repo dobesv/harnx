@@ -120,7 +120,7 @@ is timing-sensitive, also run it once alongside the rest of its crate.
 CI uses the same selection on pull requests and runs the whole suite in the
 merge queue and on `main`, so a missing edge is caught before merge rather than
 after. CI skips the build and tests entirely when every changed file is on the
-exclusion list in `.github/workflows/ci.yaml` (web, docs, changesets, READMEs,
+exclusion list in `.github/workflows/ci.yaml` (web, changesets, READMEs,
 release workflows), which the first path rule in `.config/affected.toml`
 mirrors. A test that starts reading one of those paths must take it off both.
 
@@ -1235,6 +1235,20 @@ changes but should be audited for correctness. `message_role_for_assignment`
 `renumber_remote_messages_for_window` wipe every reloaded tool message's `log_seq`,
 silently disabling TUI transcript actions on tool rows (#2557).
 
+Tool rounds are "open" only through `interactions::pending::open_rounds`
+(`harnx-runtime/src/interactions/pending.rs`); any new derivation of open or
+suspended rounds must share it rather than copy the round-boundary logic. A
+private copy in `interaction_checkpoint/guard.rs` that skipped `Clear` let a
+pre-Clear suspended round be redispatched after `.empty session` (#2744 review),
+which also required `find_orphan_tool_calls` and
+`nats_worker/agent_loop/handoff_recovery.rs` to honor `Clear` separately. The
+durable interaction variants (`ToolCallCompleted`, `InteractionRequested`,
+`SuspensionReady`, `InteractionResponse`) follow the readers-before-writers rule
+above; their reader arms live in `config/session/replay.rs`, `session_history.rs`
+and `interaction_checkpoint/guard.rs`, and rollout order plus the
+`harnx_interaction_checkpoints` store are documented in
+`docs/middleware-guide.md`.
+
 Mid-tool entries (arriving between `ToolCalls` and `ToolResults`) must be queued in
 `messages_queued_during_tool` during reconstruction so tool_use→tool_result adjacency is
 preserved. See `SubAgentStarted` handling in `config/session.rs` for the pattern.
@@ -1419,7 +1433,14 @@ Parked `INPUT_REQUIRED` tasks release A2A ownership but keep their fixed admissi
 
 Session-prefix keys are purged by `delete_remote_session_by_key` through
 `purge_session_prefix`. Coordinated session deletion also removes global first-message reservations, recovery registrations, task event subjects and the scoped A2A lease. It refuses unsettled work and revision-purges authority before the log; purge tombstones fence stale writers. Those A2A tombstones (under `sessions/<key>/a2a/`, `a2a/first-messages/` and `a2a.registry.`) are permanent on purpose: A2A records are created with strict creates (`update(key, value, 0)`), which a marker blocks but an expired one doesn't, so a deleted record could come back. Delete other KV keys through `harnx_nats_common::markers::purge` (in a bucket created with `limit_markers` or reconciled with `allow_expiring_markers`) rather than a plain `delete` or `purge`, whose marker stays forever, and only when nothing guards the key with a strict create. Remove an object-store object by purging its chunk and metadata subjects, reading its metadata from the stream leader (`harnx_blob_store::media`), since the object store's `delete` leaves a metadata entry behind. Checkpoint cleanup retains subject predecessors and never purges an active pending envelope. Stream policy, measured payload limits, permissions and drain rollout live in `docs/a2a-operations.md`. New per-session storage
-should use the session prefix to reuse existing GC.
+should use the session prefix to reuse existing GC, and each new per-session
+bucket must be added to the `delete_session_leftovers` cascade
+(`harnx-runtime/src/nats_admin.rs`), opened without creating it since an absent
+bucket has nothing to purge. When the bucket has no TTL, purge its subjects
+physically with a stream purge plus subject filter (like
+`CheckpointStore::purge_session` for `harnx_interaction_checkpoints`) instead
+of per-key KV purge: a per-key PURGE marker leaves the subject listed forever,
+which "keys gone" checks and listings then misreport.
 
 ### Crate layering for NATS tool servers
 
@@ -2137,6 +2158,15 @@ the legacy poll-based reporter with the shared tool-call rendering path. Key inv
    soon as it starts, then one per metric change and one per 10-second heartbeat
    (`SUBAGENT_PROGRESS_HEARTBEAT` in `subagent_toolset.rs`). The projection layer
    does not add throttling.
+
+7. **Fields, not status variants** — `SubAgentProgressStatus` has no
+   `#[serde(other)]`, so a new variant breaks every older reader decoding the
+   live progress event or the persisted `sub_agent_progress`, and web drops the
+   whole event. Extend `SubAgentProgress` with optional
+   `#[serde(default, skip_serializing_if)]` fields instead
+   (`pending_interaction`, #2744), and add the field to web's `subAgentNotes.ts`
+   parser and `SubAgentNote` type too: that parser copies only known fields and
+   silently drops the rest.
 
 Implementation: `subagent_progress_to_update` in `event_map.rs:320-360` (ACP), and
 `emit_subagent_progress_update` in `ag_ui.rs:578-610` (Web). Tests enforce status mapping

@@ -1271,6 +1271,7 @@ mod tests {
         let result_entries = vec![(
             2,
             SessionLogEntry::ToolResults {
+                handoff_selection: None,
                 results: vec![ToolOutput {
                     id: Some("call-1".into()),
                     name: "bash_exec".into(),

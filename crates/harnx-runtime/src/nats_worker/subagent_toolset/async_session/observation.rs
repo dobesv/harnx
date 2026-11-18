@@ -3,6 +3,10 @@
 mod budget;
 mod load;
 mod output;
+mod pending;
+#[cfg(test)]
+mod pending_tests;
+pub(in crate::nats_worker::subagent_toolset) use pending::attach_pending_progress;
 mod repair;
 mod scope;
 mod snapshot;
@@ -224,11 +228,14 @@ fn observation_budget(
     (budget, single_pass)
 }
 
-/// Close out a settled observation: the frame's result value plus the durable
-/// terminal summary attached to it, merged with the live watcher's last
-/// published snapshot. Everything the summary needs except the watcher share
-/// lives on the observer (toolset, wait budget ceiling); synchronous —
-/// publishing here is the caller's job.
+fn live_snapshot(
+    watcher_share: Option<&SharedSnapshots>,
+) -> Option<harnx_core::event::SubAgentProgress> {
+    watcher_share.and_then(|shared| shared.lock().expect("watcher share").clone())
+}
+
+/// Merge durable observation results with the watcher's last published snapshot.
+/// Publishing remains the caller's job.
 fn finish_with_terminal_progress(
     observer: &Observer<'_>,
     frame: Frame,
@@ -250,15 +257,15 @@ fn finish_with_terminal_progress(
         // duration (F11). Read the cell held since `ensure_watcher`, not the
         // registry: the watcher may have exited and unregistered itself
         // before this summary is built.
-        let live = watcher_share.and_then(|shared| shared.lock().expect("watcher share").clone());
+        let live = live_snapshot(watcher_share);
         attach_terminal_progress(
             &mut value,
             toolset,
             TerminalSummary {
                 child: progress::ChildIdentity {
                     agent: toolset.agent.clone(),
-                    session_id: observed.0,
-                    prompt_id: observed.1,
+                    session_id: observed.0.clone(),
+                    prompt_id: observed.1.clone(),
                 },
                 status,
                 usage,
@@ -266,6 +273,15 @@ fn finish_with_terminal_progress(
                 max_bytes,
             },
         );
+    }
+    if let Some(pending) = observer.snapshot.pending_interaction(
+        &toolset.agent,
+        toolset.route.cluster(),
+        &observed.0,
+        observer.scope.admission.invocation_id.as_str(),
+    ) {
+        let live = live_snapshot(watcher_share);
+        attach_pending_progress(&mut value, pending, live, max_bytes);
     }
     value
 }

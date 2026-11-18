@@ -73,6 +73,7 @@ impl Config {
         if !info_flag {
             ret?;
         }
+        config.resolved_middleware()?;
         Ok(config)
     }
 
@@ -92,6 +93,10 @@ impl Config {
             data,
             ..Self::default()
         };
+        middleware::bind_middleware(
+            &mut config.middleware,
+            middleware::file_origin(config_path, None)?,
+        )?;
         let config_dir = config_path.parent().unwrap_or(config_path);
         config.clients = Self::load_clients_from_dir(&config_dir.join(paths::CLIENTS_DIR_NAME))?;
         config.nats_servers =
@@ -103,6 +108,7 @@ impl Config {
             Self::load_packages(&mut config, &packages_dir)?;
         }
 
+        config.resolved_middleware()?;
         Ok(config)
     }
 
@@ -120,7 +126,7 @@ impl Config {
         packages.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (pkg_name, path) in packages {
             let patch = load_package_patch(&pkg_name);
-            Self::load_package_servers(config, &path, &pkg_name, patch.as_ref());
+            Self::load_package_servers(config, &path, &pkg_name, patch.as_ref())?;
             config
                 .clients
                 .extend(Self::load_package_clients(&path, &pkg_name, patch.as_ref()));
@@ -285,6 +291,7 @@ impl Config {
             Self::load_nats_servers_from_dir(&config_dir.join(paths::NATS_SERVERS_DIR_NAME))?;
         config.tool_servers =
             Self::load_tool_servers_from_dir(&config_dir.join(paths::TOOL_SERVERS_DIR_NAME))?;
+        config.resolved_middleware()?;
         Ok(config)
     }
 

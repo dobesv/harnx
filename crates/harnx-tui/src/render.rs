@@ -595,6 +595,12 @@ impl Tui {
     }
 
     fn bottom_region_height(&self, input_width: u16, screen_height: u16) -> u16 {
+        if let Some(ModalState::ConfirmInteraction(state)) = &self.app.modal {
+            return self
+                .interaction_modal_height(input_width, state)
+                .max(crate::interaction_confirmation::MIN_MODAL_HEIGHT)
+                .min(screen_height);
+        }
         if let Some(modal @ ModalState::ConfirmToolUse(_)) = &self.app.modal {
             return self
                 .confirm_tool_modal_height(input_width, modal)
@@ -621,15 +627,35 @@ impl Tui {
         input_height + attachment_height + status_height
     }
 
-    fn render_bottom_region(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    fn render_confirmation_tray(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+    ) -> bool {
+        if matches!(self.app.modal, Some(ModalState::ConfirmInteraction(_))) {
+            if let Some(ModalState::ConfirmInteraction(mut state)) = self.app.modal.take() {
+                self.render_interaction_modal(frame, area, &mut state);
+                self.app.modal = Some(ModalState::ConfirmInteraction(state));
+            }
+            return true;
+        }
         if matches!(self.app.modal, Some(ModalState::ConfirmToolUse(_))) {
-            let mut modal = self.app.modal.take().expect("modal checked above");
-            self.render_tool_confirm_overlay(frame, area, &mut modal);
-            self.app.modal = Some(modal);
-            return;
+            if let Some(mut modal) = self.app.modal.take() {
+                self.render_tool_confirm_overlay(frame, area, &mut modal);
+                self.app.modal = Some(modal);
+            }
+            return true;
         }
         if let Some(modal @ ModalState::ConfirmExit { .. }) = self.app.modal.clone() {
             self.render_exit_confirm_modal(frame, area, &modal);
+            return true;
+        }
+
+        false
+    }
+
+    fn render_bottom_region(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        if self.render_confirmation_tray(frame, area) {
             return;
         }
 
@@ -694,7 +720,9 @@ impl Tui {
         if let Some(modal) = &self.app.modal {
             if !matches!(
                 modal,
-                ModalState::ConfirmToolUse(_) | ModalState::ConfirmExit { .. }
+                ModalState::ConfirmToolUse(_)
+                    | ModalState::ConfirmInteraction(_)
+                    | ModalState::ConfirmExit { .. }
             ) {
                 self.render_modal(frame, area, modal);
             }
@@ -1036,6 +1064,9 @@ impl Tui {
             return;
         }
         match modal {
+            ModalState::ConfirmInteraction(state) => {
+                self.render_interaction_modal(frame, screen_size, &mut state.clone());
+            }
             ModalState::ConfirmToolUse(_) => {
                 let mut modal = modal.clone();
                 self.render_tool_confirm_overlay(frame, screen_size, &mut modal);
@@ -1048,20 +1079,7 @@ impl Tui {
                 selected,
                 query,
             } => {
-                let title = "Select Agent";
-                let footer = "type to filter  ↑↓ navigate  Enter select  Esc cancel";
-                let items = ModalState::filtered_agents(agents, query);
-                self.render_list_modal(
-                    frame,
-                    screen_size,
-                    &items,
-                    *selected,
-                    ListModalOpts {
-                        title,
-                        footer,
-                        query: Some(query),
-                    },
-                );
+                self.render_agent_picker(frame, screen_size, agents, *selected, query);
             }
             ModalState::SessionPicker {
                 sessions,
@@ -1095,6 +1113,30 @@ impl Tui {
             }
         }
     }
+    fn render_agent_picker(
+        &self,
+        frame: &mut Frame<'_>,
+        screen_size: ratatui::layout::Rect,
+        agents: &[String],
+        selected: usize,
+        query: &str,
+    ) {
+        let title = "Select Agent";
+        let footer = "type to filter  ↑↓ navigate  Enter select  Esc cancel";
+        let items = ModalState::filtered_agents(agents, query);
+        self.render_list_modal(
+            frame,
+            screen_size,
+            &items,
+            selected,
+            ListModalOpts {
+                title,
+                footer,
+                query: Some(query),
+            },
+        );
+    }
+
     fn render_simple_modal(
         &self,
         frame: &mut Frame<'_>,

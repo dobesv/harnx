@@ -566,6 +566,7 @@ impl InterruptedAppend {
     /// `age` separates two workers' entries the way their own timestamps do.
     fn wind_up_entry(&self, age: chrono::TimeDelta) -> SessionLogEntry {
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: crate::config::session::interrupted_tool_outputs(
                 &[call("c1")],
                 Some(CANCELLATION_ID),

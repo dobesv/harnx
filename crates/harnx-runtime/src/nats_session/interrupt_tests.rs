@@ -345,6 +345,7 @@ fn cancel(id: &str) -> SessionLogEntry {
 
 fn tool_results() -> SessionLogEntry {
     SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results: Vec::new(),
         timestamp: None,
     }

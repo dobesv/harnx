@@ -334,12 +334,38 @@ impl NatsSession {
         let FixedAdmissionOutcome::Admitted { prompt_sequence } = outcome else {
             anyhow::bail!("fixed prompt is not admitted: {outcome:?}");
         };
-        Self::fixed_prompt_progress_from_entries(
+        let progress = Self::fixed_prompt_progress_from_entries(
             ticket,
             prompt_sequence,
             &self.session_id,
             &entries,
+        )?;
+        self.guard_fixed_progress(prompt_sequence, &entries, progress)
+            .await
+    }
+
+    async fn guard_fixed_progress(
+        &self,
+        prompt_sequence: u64,
+        entries: &[(u64, SessionLogEntry)],
+        progress: super::PromptProgress,
+    ) -> Result<super::PromptProgress> {
+        if matches!(progress, super::PromptProgress::Terminal(_)) {
+            return Ok(progress);
+        }
+        // Terminal proof is invocation-scoped and wins even if an old checkpoint
+        // remains. Only this invocation's nonterminal work needs a store read.
+        let start = entries.partition_point(|(seq, _)| *seq <= prompt_sequence);
+        if crate::interaction_checkpoint::guard::is_parked(
+            self.jetstream(),
+            self.storage_key(),
+            &entries[start..],
         )
+        .await?
+        {
+            return Ok(super::PromptProgress::Parked);
+        }
+        Ok(progress)
     }
 
     /// Observe the original fixed invocation's durable completion without

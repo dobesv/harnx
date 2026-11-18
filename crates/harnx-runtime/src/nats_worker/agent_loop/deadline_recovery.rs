@@ -17,24 +17,8 @@ pub(in crate::nats_worker) async fn recover_completed_before_deadline(
     }
     let journal = InvocationJournal::ensure(js, replicas).await?;
     for orphan in orphans {
-        let mut results = Vec::new();
-        let mut complete = true;
-        for call in &orphan.calls {
-            let record = match call.id.as_deref() {
-                Some(id) => journal.find(backend.session_id(), orphan.seq, id).await?,
-                None => None,
-            };
-            let saved = match record {
-                Some(record) => saved_reply(&journal, &record, config).await?.map(|reply| {
-                    super::super::wind_up::tool_output_from_reply(call, &record, reply)
-                }),
-                None => None,
-            };
-            match saved {
-                Some(output) => results.push(output),
-                None => complete = false,
-            }
-        }
+        let (results, complete) =
+            saved_recovery_outputs(&journal, backend, &orphan, config).await?;
         // Partial observations stay in the journal. A ToolResults batch would
         // hide unresolved calls from Cancel wind-up and skip their cleanup.
         if complete {
@@ -43,6 +27,9 @@ pub(in crate::nats_worker) async fn recover_completed_before_deadline(
             backend
                 .append_event_fenced_with_lease(
                     &SessionLogEntry::ToolResults {
+                        handoff_selection: results
+                            .iter()
+                            .find_map(|result| result.switch_agent.as_ref().and(result.id.clone())),
                         results,
                         timestamp: orphan.timestamp,
                     },
@@ -55,6 +42,69 @@ pub(in crate::nats_worker) async fn recover_completed_before_deadline(
     Ok(())
 }
 
+async fn saved_recovery_outputs(
+    journal: &InvocationJournal,
+    backend: &NatsSessionLogBackend,
+    orphan: &PendingToolCalls,
+    config: &GlobalConfig,
+) -> Result<(Vec<harnx_core::session::ToolOutput>, bool)> {
+    use crate::interaction_checkpoint::recovery::{classify, CallRecovery};
+    let plan = Box::pin(classify(config, backend, orphan.seq, &orphan.calls)).await?;
+    if !middleware_recovery::requires_reconciliation(&plan) {
+        return saved_round_outputs(journal, backend.session_id(), orphan, config).await;
+    }
+    // An expired invocation cannot rerun a chain. Only effective outer results
+    // are recoverable here; raw leaf replies must not bypass middleware.
+    let complete = plan
+        .calls
+        .iter()
+        .all(|call| matches!(call, CallRecovery::Completed(_)));
+    let results = plan
+        .calls
+        .into_iter()
+        .filter_map(|state| match state {
+            CallRecovery::Completed(result) => {
+                let switch_agent = crate::handoff_result::effective_switch(&result);
+                Some(harnx_core::session::ToolOutput {
+                    id: result.call.id,
+                    name: result.call.name,
+                    output: result.output,
+                    markdown: result.markdown,
+                    content: result.content,
+                    switch_agent,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    Ok((results, complete))
+}
+async fn saved_round_outputs(
+    journal: &InvocationJournal,
+    session_id: &str,
+    orphan: &PendingToolCalls,
+    config: &GlobalConfig,
+) -> Result<(Vec<harnx_core::session::ToolOutput>, bool)> {
+    let mut results = Vec::new();
+    let mut complete = true;
+    for call in &orphan.calls {
+        let record = match call.id.as_deref() {
+            Some(id) => journal.find(session_id, orphan.seq, id).await?,
+            None => None,
+        };
+        let saved = match record {
+            Some(record) => saved_reply(journal, &record, config)
+                .await?
+                .map(|reply| super::super::wind_up::tool_output_from_reply(call, &record, reply)),
+            None => None,
+        };
+        match saved {
+            Some(output) => results.push(output),
+            None => complete = false,
+        }
+    }
+    Ok((results, complete))
+}
 /// The reply the journal saved for `record`'s call, or one recovered from the
 /// child session a sub-agent call left behind, which is saved now.
 async fn saved_reply(

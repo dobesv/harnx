@@ -8,17 +8,20 @@ use bashkit::{Builtin, BuiltinContext, Error, ExecResult, ExecutionLimits};
 
 use crate::{
     CancellationToken, InMemoryFs, ScriptCommand, ScriptCommandContext, ScriptLimits, ScriptRun,
-    ScriptStatus,
 };
 
 mod capture;
 mod outcome;
+mod python;
 mod resolver;
 mod shell;
 mod worker;
 use capture::Capture;
-use outcome::classify;
 use shell::build_shell;
+pub(crate) use worker::NESTING_DEPTH;
+
+// Shell convention: 128 + SIGINT, shared by cancellation and host-requested stops.
+const INTERRUPTED_EXIT_CODE: i32 = 130;
 
 /// Stateless factory: BashKit cancellation flags and shell state never cross runs.
 #[derive(Clone, Copy, Debug, Default)]
@@ -37,8 +40,8 @@ impl BashKitBackend {
             .python_with_limits(python_limits(limits))
             .env("BASHKIT_ALLOW_INPROCESS_PYTHON", "1")
             // Defense against accidental Cargo feature unification enabling HTTP.
-            // No host mounts or network transports are configured.
-            .builtin_filter(|name| !matches!(name, "curl" | "wget"))
+            // Network access is only through explicitly registered host commands.
+            .builtin_filter(|name| !matches!(name, "curl" | "wget" | "http"))
     }
 
     /// Names compiled into this backend, excluding caller-registered commands.
@@ -67,13 +70,21 @@ fn python_limits(limits: &ScriptLimits) -> bashkit::PythonLimits {
         .max_memory(limits.max_python_memory_bytes)
 }
 
-struct RunControl {
+pub(crate) struct RunControl {
     stop: CancellationToken,
     fatal: Mutex<Option<String>>,
     flag: OnceLock<Arc<AtomicBool>>,
+    host_stopped: AtomicBool,
+    // Admission depth inherited by runs started from this run's host callbacks.
+    pub(crate) child_depth: usize,
 }
 
 impl RunControl {
+    pub(crate) fn stop_from_host(&self) {
+        self.host_stopped.store(true, Ordering::Release);
+        self.cancel();
+    }
+
     fn cancel(&self) {
         // Publish the stop first: a worker installing its flag concurrently
         // must see either this token or the flag write below.
@@ -103,8 +114,16 @@ impl Builtin for CommandAdapter {
             cwd: ctx.cwd,
             fs: ctx.fs.clone(),
             cancel: self.control.stop.clone(),
+            control: crate::ScriptControl {
+                inner: self.control.clone(),
+            },
         };
-        match self.command.run(ctx.args, ctx.stdin_bytes(), context).await {
+        let result = self.command.run(ctx.args, ctx.stdin_bytes(), context).await;
+        if self.control.host_stopped.load(Ordering::Acquire) {
+            // Yield to the run's stop branch instead of resuming script code.
+            return std::future::pending().await;
+        }
+        match result {
             Ok(result) => Ok(ExecResult {
                 stdout: result.stdout.into(),
                 stderr: result.stderr.into(),
@@ -132,10 +151,11 @@ impl BashKitBackend {
             script,
             limits,
             commands,
+            python_functions,
             fs_mounts,
             cancel: _,
         } = request;
-        let mut bash = build_shell(&limits, commands, &control);
+        let mut bash = build_shell(&limits, commands, python_functions, &control);
         let flag = bash.cancellation_token();
         control.flag.set(flag.clone()).unwrap();
         if control.stop.is_cancelled() {
@@ -176,22 +196,12 @@ impl BashKitBackend {
         drop(bash);
         let fatal = control.fatal.lock().unwrap().take();
         let mut capture = captured.lock().unwrap();
-        let (status, exit_code, limit_hit) = if let Some(message) = fatal {
-            capture.record_error(message);
-            (ScriptStatus::Error, 1, capture.output_limit())
-        } else {
-            classify(result, &mut capture)
-        };
-        ScriptRun {
-            stdout: std::mem::take(&mut capture.stdout.text),
-            stderr: std::mem::take(&mut capture.stderr.text),
-            stdout_truncated: capture.stdout.truncated,
-            stderr_truncated: capture.stderr.truncated,
-            exit_code,
-            status,
-            limit_hit,
-            error: capture.error.take(),
-        }
+        outcome::finish(
+            result,
+            &mut capture,
+            fatal,
+            control.host_stopped.load(Ordering::Acquire),
+        )
     }
 }
 

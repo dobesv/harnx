@@ -46,6 +46,7 @@ fn completed_compaction() -> Vec<(u64, SessionLogEntry)> {
             fence_token: None,
         },
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![harnx_core::session::ToolOutput {
                 id: Some("edit-1".into()),
                 name: "edit".into(),

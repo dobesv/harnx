@@ -902,6 +902,7 @@ async fn terminal_retry_republishes_only_a_terminal_snapshot() -> Result<()> {
     .await;
     let shared: crate::nats_worker::subagent_progress::SharedSnapshots =
         std::sync::Arc::new(std::sync::Mutex::new(Some(SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "prompt-1".into(),
             agent: "helper".into(),
             session_id: "child".into(),
@@ -918,6 +919,7 @@ async fn terminal_retry_republishes_only_a_terminal_snapshot() -> Result<()> {
     assert_eq!(republished.invocation_id, "prompt-1");
     // A Running share stays unpublished.
     *shared.lock().expect("watcher share") = Some(SubAgentProgress {
+        pending_interaction: None,
         invocation_id: "prompt-1".into(),
         agent: "helper".into(),
         session_id: "child".into(),

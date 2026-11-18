@@ -138,7 +138,10 @@ impl NatsSession {
         };
         let entries = self.load_durable_entries().await?;
         let pending = crate::nats_worker::derive_pending_hitl_approvals(&entries)?;
-        if let Some(pending) = pending.into_iter().find(|i| i.tool_call_id == tool_call_id) {
+        if let Some(pending) = pending
+            .into_iter()
+            .find(|i| i.tool_call_id == tool_call_id && i.interaction_id.is_none())
+        {
             self.decide_pending_approval(intent, pending, &entries)
                 .await
         } else {
@@ -206,7 +209,9 @@ impl NatsSession {
         };
         let progress = Self::invocation_progress_from_entries(&scope, entries)?;
         match progress {
-            PromptProgress::InputRequired(pending) if is_matching_pending(&pending, target) => {
+            PromptProgress::InputRequired(pending)
+                if pending.interaction_id.is_none() && is_matching_pending(&pending, target) =>
+            {
                 Ok(None)
             }
             PromptProgress::Running {

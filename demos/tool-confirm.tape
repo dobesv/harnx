@@ -32,15 +32,13 @@ Enter
 Sleep 3s
 Show
 
-# First turn: ask about the time. The mock LLM will call time_get_current_time,
-# which triggers the PreToolUse "ask" hook and shows a confirmation prompt.
+# First turn: time_get_current_time suspends at the middleware confirm.
 Type "What time is it in UTC?"
 Sleep 400ms
 Enter
 Sleep 4s
 
-# The confirmation prompt appears. Approve the tool call by typing 'y'.
-Type "y"
+# Enter approves after two idle seconds; typing would edit the optional note.
 Enter
 Sleep 5s
 
@@ -50,8 +48,8 @@ Sleep 400ms
 Enter
 Sleep 4s
 
-# This time deny the tool call (default is No, so just press Enter).
-Enter
+# Ctrl+D denies without interrupting the turn.
+Ctrl+D
 Sleep 4s
 
 # Ctrl+D exits the TUI.

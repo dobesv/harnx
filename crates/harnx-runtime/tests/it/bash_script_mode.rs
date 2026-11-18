@@ -63,6 +63,7 @@ impl Drop for EnvGuard {
 
 fn time_server_config(command: &str) -> ToolServerConfig {
     ToolServerConfig {
+        middleware: Default::default(),
         name: "time".to_string(),
         command: command.into(),
         args: Vec::new(),

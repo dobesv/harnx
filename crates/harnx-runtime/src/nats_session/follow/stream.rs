@@ -43,6 +43,7 @@ pub(super) struct FollowLoopContext<'a> {
     pub boundary_options: Option<&'a FollowBoundaryOptions>,
     pub event_sink: &'a Arc<dyn AgentEventSink>,
     pub live: &'a LiveEventState,
+    pub wait_for_interactions: bool,
 }
 
 pub(super) struct FollowStreamState {
@@ -215,6 +216,7 @@ impl NatsSession {
                 boundary_options: params.boundary_options,
                 event_sink: params.event_sink,
                 live: params.live,
+                wait_for_interactions: params.options.wait_for_interactions,
             },
         }
     }

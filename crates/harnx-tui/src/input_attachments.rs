@@ -208,6 +208,9 @@ impl Tui {
 
     pub(super) async fn handle_paste(&mut self, text: String) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.paste_interaction_note(&text) {
+            return;
+        }
         if let Some(crate::types::ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
             state.last_key_at = std::time::Instant::now();
             state.message.insert_str(text);

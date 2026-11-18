@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type HarnxCustomEventCallbacks } from './harnxCustomEvents';
+import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, parsePendingInteraction, type HarnxCustomEventCallbacks } from './harnxCustomEvents';
 
 const callbacks = (isForeground: boolean): HarnxCustomEventCallbacks => ({
   onStatus: () => {},
@@ -256,6 +256,166 @@ describe('harnx compaction events', () => {
       from_seq: 6,
       to_seq: 14,
       earlier_compaction: 5,
+    });
+  });
+});
+
+
+describe('pending_interaction events and parsing', () => {
+  it('is included in NAVIGATION_CONTROL_EVENTS', () => {
+    expect(NAVIGATION_CONTROL_EVENTS).toContain('pending_interaction');
+  });
+
+  describe('parsePendingInteraction', () => {
+    it('parses a valid pending_interaction object', () => {
+      const parsed = parsePendingInteraction({
+        interaction_id: 'int-123',
+        request_seq: 42,
+        tool_call_id: 'tool-call-abc',
+        kind: 'confirm',
+        message: 'Execute dangerous command?',
+        pending_count: 2,
+      });
+
+      expect(parsed).toEqual({
+        interactionId: 'int-123',
+        requestSeq: 42,
+        toolCallId: 'tool-call-abc',
+        kind: 'confirm',
+        message: 'Execute dangerous command?',
+        pendingCount: 2,
+      });
+    });
+
+    it('returns null when value is null (authoritative clear signal)', () => {
+      expect(parsePendingInteraction(null)).toBeNull();
+    });
+
+    it('returns undefined for non-objects', () => {
+      expect(parsePendingInteraction(undefined)).toBeUndefined();
+      expect(parsePendingInteraction(123)).toBeUndefined();
+      expect(parsePendingInteraction('hello')).toBeUndefined();
+    });
+
+    it('returns undefined when required fields are missing or invalid', () => {
+      // Missing interaction_id
+      expect(
+        parsePendingInteraction({
+          request_seq: 1,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      // Blank interaction_id
+      expect(
+        parsePendingInteraction({
+          interaction_id: '  ',
+          request_seq: 1,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      expect(
+        parsePendingInteraction({
+          interaction_id: 'int-1',
+          request_seq: 0,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      // Negative request_seq
+      expect(
+        parsePendingInteraction({
+          interaction_id: 'int-1',
+          request_seq: -1,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      // Non-integer request_seq
+      expect(
+        parsePendingInteraction({
+          interaction_id: 'int-1',
+          request_seq: 1.5,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      // Negative pending_count
+      expect(
+        parsePendingInteraction({
+          interaction_id: 'int-1',
+          request_seq: 1,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: -1,
+        }),
+      ).toBeUndefined();
+    });
+  });
+
+  describe('handleHarnxCustomEvent pending_interaction', () => {
+    it('dispatches parsed interaction to onPendingInteraction callback', () => {
+      const onPendingInteraction = vi.fn();
+      handleHarnxCustomEvent(
+        'pending_interaction',
+        {
+          interaction_id: 'int-456',
+          request_seq: 10,
+          tool_call_id: 'tool-xyz',
+          kind: 'confirm',
+          message: 'Allow file modification?',
+          pending_count: 0,
+        },
+        { ...callbacks(true), onPendingInteraction },
+      );
+
+      expect(onPendingInteraction).toHaveBeenCalledWith({
+        interactionId: 'int-456',
+        requestSeq: 10,
+        toolCallId: 'tool-xyz',
+        kind: 'confirm',
+        message: 'Allow file modification?',
+        pendingCount: 0,
+      });
+    });
+
+    it('dispatches null to onPendingInteraction callback when value is null', () => {
+      const onPendingInteraction = vi.fn();
+      handleHarnxCustomEvent(
+        'pending_interaction',
+        null,
+        { ...callbacks(true), onPendingInteraction },
+      );
+
+      expect(onPendingInteraction).toHaveBeenCalledWith(null);
+    });
+
+    it('does not dispatch onPendingInteraction when value is malformed', () => {
+      const onPendingInteraction = vi.fn();
+      handleHarnxCustomEvent(
+        'pending_interaction',
+        { invalid: true },
+        { ...callbacks(true), onPendingInteraction },
+      );
+
+      expect(onPendingInteraction).not.toHaveBeenCalled();
     });
   });
 });

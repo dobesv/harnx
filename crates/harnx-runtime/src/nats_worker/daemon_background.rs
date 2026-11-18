@@ -506,6 +506,7 @@ mod tests {
 
     fn tool_server(name: &str) -> ToolServerConfig {
         ToolServerConfig {
+            middleware: Default::default(),
             name: name.to_string(),
             command: format!("harnx-{name}-server"),
             args: Vec::new(),

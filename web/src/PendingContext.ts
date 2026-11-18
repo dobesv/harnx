@@ -1,4 +1,5 @@
 import { createContext } from 'react';
+import type { PendingInteraction } from './harnxCustomEvents';
 
 /** Hydrated HITL pending approval from durable log. */
 export interface HydratedPendingApproval {
@@ -21,6 +22,17 @@ export const PendingContext = createContext<{
   /** Clear hydrated approvals (e.g., when session changes). */
   clearHydratedApprovals: () => void;
   removeHydratedApproval: (toolCallId: string) => void;
+  /** Authoritative pending interaction snapshot from pending_interaction CUSTOM event. */
+  pendingInteraction?: PendingInteraction | null;
+  setPendingInteraction?: (
+    interaction:
+      | PendingInteraction
+      | null
+      | ((prev: PendingInteraction | null) => PendingInteraction | null)
+  ) => void;
+  clearPendingInteraction?: () => void;
+  /** Only clear pending interaction if it still matches the given ID and sequence. */
+  clearPendingInteractionIfMatch?: (interactionId: string, requestSeq: number) => void;
 }>({
   statusText: null,
   setStatusText: () => {},
@@ -32,4 +44,8 @@ export const PendingContext = createContext<{
   addHydratedApproval: () => {},
   clearHydratedApprovals: () => {},
   removeHydratedApproval: () => {},
+  pendingInteraction: null,
+  setPendingInteraction: () => {},
+  clearPendingInteraction: () => {},
+  clearPendingInteractionIfMatch: () => {},
 });

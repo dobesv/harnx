@@ -5,12 +5,16 @@ use harnx_core::event::{
 };
 use serde_json::json;
 
+#[path = "ag_ui_subagent_tests/pending.rs"]
+mod pending;
+
 #[test]
 fn maps_subagent_progress_custom_event() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let sink = AgUiSink::new(tx, MessageId::from(uuid::Uuid::new_v4()));
     sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(
         SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "inv-1".into(),
             agent: "researcher".into(),
             session_id: "child-session".into(),
@@ -46,6 +50,7 @@ fn sub_agent_progress_title_serializes_when_present() {
     let sink = AgUiSink::new(tx, MessageId::from(uuid::Uuid::new_v4()));
     sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(
         SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "inv-2".into(),
             agent: "researcher".into(),
             session_id: "child-session".into(),
@@ -92,6 +97,7 @@ fn subagent_progress_emits_both_legacy_and_tool_update() {
     let sink = AgUiSink::new(tx, MessageId::from(uuid::Uuid::new_v4()));
     sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(
         SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "inv-proj".into(),
             agent: "atlas".into(),
             session_id: "child-proj".into(),
@@ -140,6 +146,7 @@ fn subagent_progress_projected_with_zero_usage() {
     let sink = AgUiSink::new(tx, MessageId::from(uuid::Uuid::new_v4()));
     sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(
         SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "inv-zero".into(),
             agent: "pytheas".into(),
             session_id: "child-zero".into(),
@@ -188,6 +195,7 @@ fn subagent_progress_projected_status_mapping() {
         let sink = AgUiSink::new(tx, MessageId::from(uuid::Uuid::new_v4()));
         sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(
             SubAgentProgress {
+                pending_interaction: None,
                 invocation_id: "inv-status".into(),
                 agent: "researcher".into(),
                 session_id: "child-status".into(),

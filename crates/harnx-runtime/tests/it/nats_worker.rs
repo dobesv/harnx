@@ -45,6 +45,8 @@ mod abort_signal;
 mod compaction_continuity;
 #[path = "nats_worker/dispatch_and_fencing.rs"]
 mod dispatch_and_fencing;
+#[path = "nats_worker/interaction_owned_guard.rs"]
+mod interaction_owned_guard;
 #[path = "nats_worker/leader_reads.rs"]
 mod leader_reads;
 #[path = "nats_worker/orphan_repair.rs"]

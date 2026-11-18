@@ -126,6 +126,7 @@ pub struct Tui {
     /// Confirmation route retained for the frontend's current session. Prompt
     /// and busy-enqueue paths share it so queued continuations keep a live modal.
     pub(super) tool_confirmation_route: SharedToolConfirmationRoute,
+    pub(super) interactions: crate::interaction_confirmation::InteractionClient,
     /// Deterministic enqueue seam for confirmation orchestration tests.
     #[cfg(test)]
     pub(super) confirmation_enqueue_override:
@@ -559,6 +560,60 @@ pub(super) struct ConfirmToolUseState {
     pub submitting: bool,
 }
 
+impl std::fmt::Debug for ConfirmToolUseState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfirmToolUse")
+            .field("arguments", &self.arguments)
+            .field("tool_name", &self.tool_name)
+            .field("reason", &self.reason)
+            .field("session_id", &self.session_id)
+            .field("cluster", &self.cluster)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("submission_id", &self.submission_id)
+            .field("view", &self.view)
+            .field("has_template", &self.has_template)
+            .field("template_text", &self.template_text)
+            .field("opened_at", &self.opened_at)
+            .field("last_key_at", &self.last_key_at)
+            .field("submitting", &self.submitting)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for ConfirmToolUseState {
+    // qual:allow(dry, boilerplate) reason: "ScrollState has no Clone; preserve the existing manual copy of its position and follow state."
+    fn clone(&self) -> Self {
+        ConfirmToolUseState {
+            arguments: self.arguments.clone(),
+            tool_name: self.tool_name.clone(),
+            reason: self.reason.clone(),
+            session_id: self.session_id.clone(),
+            cluster: self.cluster.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+            submission_id: self.submission_id.clone(),
+            confirmation_route: self.confirmation_route.clone(),
+            submission_cancel: Arc::clone(&self.submission_cancel),
+            submission_error: self.submission_error.clone(),
+            view: self.view,
+            has_template: self.has_template,
+            template_text: self.template_text.clone(),
+            // ScrollState doesn't implement Clone, so create a new one
+            // preserving only the position and follow state
+            scroll: {
+                let mut new_scroll = ratatui_widget_scrolling::ScrollState::new();
+                new_scroll.position = self.scroll.position;
+                new_scroll.follow = self.scroll.follow;
+                new_scroll.last_max_position = self.scroll.last_max_position;
+                new_scroll
+            },
+            message: self.message.clone(),
+            opened_at: self.opened_at,
+            last_key_at: self.last_key_at,
+            submitting: self.submitting,
+        }
+    }
+}
+
 /// Modal dialog state for destructive action confirmations.
 /// Used by D5 for delete/rewind confirmations.
 #[allow(dead_code)]
@@ -573,6 +628,8 @@ pub(super) enum ModalState {
     /// Confirmation for a tool call gated by a `PreToolUse` "ask" hook.
     /// The reply channel lives in `App::pending_confirm_reply`.
     ConfirmToolUse(Box<ConfirmToolUseState>),
+    /// Durable middleware request; never answered through the legacy bool route.
+    ConfirmInteraction(Box<crate::interaction_confirmation::InteractionModal>),
     /// Agent is still working when user tries to exit.
     ConfirmExit {
         worker_state: ExitWorkerState,
@@ -618,22 +675,10 @@ impl std::fmt::Debug for ModalState {
                 .field("seq", seq)
                 .field("user_text", user_text)
                 .finish(),
-            Self::ConfirmToolUse(state) => f
-                .debug_struct("ConfirmToolUse")
-                .field("arguments", &state.arguments)
-                .field("tool_name", &state.tool_name)
-                .field("reason", &state.reason)
-                .field("session_id", &state.session_id)
-                .field("cluster", &state.cluster)
-                .field("tool_call_id", &state.tool_call_id)
-                .field("submission_id", &state.submission_id)
-                .field("view", &state.view)
-                .field("has_template", &state.has_template)
-                .field("template_text", &state.template_text)
-                .field("opened_at", &state.opened_at)
-                .field("last_key_at", &state.last_key_at)
-                .field("submitting", &state.submitting)
-                .finish_non_exhaustive(),
+            Self::ConfirmInteraction(state) => {
+                f.debug_tuple("ConfirmInteraction").field(state).finish()
+            }
+            Self::ConfirmToolUse(state) => std::fmt::Debug::fmt(state, f),
             Self::ConfirmExit {
                 worker_state,
                 phase,
@@ -681,37 +726,9 @@ impl Clone for ModalState {
                 seq: *seq,
                 user_text: user_text.clone(),
             },
-            Self::ConfirmToolUse(state) => {
-                let state = state.as_ref();
-                Self::ConfirmToolUse(Box::new(ConfirmToolUseState {
-                    arguments: state.arguments.clone(),
-                    tool_name: state.tool_name.clone(),
-                    reason: state.reason.clone(),
-                    session_id: state.session_id.clone(),
-                    cluster: state.cluster.clone(),
-                    tool_call_id: state.tool_call_id.clone(),
-                    submission_id: state.submission_id.clone(),
-                    confirmation_route: state.confirmation_route.clone(),
-                    submission_cancel: Arc::clone(&state.submission_cancel),
-                    submission_error: state.submission_error.clone(),
-                    view: state.view,
-                    has_template: state.has_template,
-                    template_text: state.template_text.clone(),
-                    // ScrollState doesn't implement Clone, so create a new one
-                    // preserving only the position and follow state
-                    scroll: {
-                        let mut new_scroll = ratatui_widget_scrolling::ScrollState::new();
-                        new_scroll.position = state.scroll.position;
-                        new_scroll.follow = state.scroll.follow;
-                        new_scroll.last_max_position = state.scroll.last_max_position;
-                        new_scroll
-                    },
-                    message: state.message.clone(),
-                    opened_at: state.opened_at,
-                    last_key_at: state.last_key_at,
-                    submitting: state.submitting,
-                }))
-            }
+            Self::ConfirmInteraction(state) => Self::ConfirmInteraction(state.clone()),
+            Self::ConfirmToolUse(state) => Self::ConfirmToolUse(state.clone()),
+
             Self::ConfirmExit {
                 worker_state,
                 phase,
@@ -745,6 +762,43 @@ impl Clone for ModalState {
     }
 }
 
+fn same_tool_confirmation(a: &ConfirmToolUseState, b: &ConfirmToolUseState) -> bool {
+    // Scroll and message are intentionally excluded, matching the legacy comparison.
+    (
+        &a.arguments,
+        &a.tool_name,
+        &a.reason,
+        &a.session_id,
+        &a.cluster,
+        &a.tool_call_id,
+        &a.submission_id,
+        &a.submission_error,
+    ) == (
+        &b.arguments,
+        &b.tool_name,
+        &b.reason,
+        &b.session_id,
+        &b.cluster,
+        &b.tool_call_id,
+        &b.submission_id,
+        &b.submission_error,
+    ) && (
+        a.view,
+        a.has_template,
+        &a.template_text,
+        a.opened_at,
+        a.last_key_at,
+        a.submitting,
+    ) == (
+        b.view,
+        b.has_template,
+        &b.template_text,
+        b.opened_at,
+        b.last_key_at,
+        b.submitting,
+    )
+}
+
 impl PartialEq for ModalState {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -757,7 +811,7 @@ impl PartialEq for ModalState {
                     from: b_from,
                     to: b_to,
                 },
-            ) => a_from == b_from && a_to == b_to,
+            ) => (a_from, a_to) == (b_from, b_to),
             (
                 Self::ConfirmRewind {
                     seq: a_seq,
@@ -768,23 +822,8 @@ impl PartialEq for ModalState {
                     user_text: b_user_text,
                 },
             ) => a_seq == b_seq && a_user_text == b_user_text,
-            (Self::ConfirmToolUse(a), Self::ConfirmToolUse(b)) => {
-                a.arguments == b.arguments
-                    && a.tool_name == b.tool_name
-                    && a.reason == b.reason
-                    && a.session_id == b.session_id
-                    && a.cluster == b.cluster
-                    && a.tool_call_id == b.tool_call_id
-                    && a.submission_id == b.submission_id
-                    && a.submission_error == b.submission_error
-                    && a.view == b.view
-                    && a.has_template == b.has_template
-                    && a.template_text == b.template_text
-                    && a.opened_at == b.opened_at
-                    && a.last_key_at == b.last_key_at
-                    && a.submitting == b.submitting
-                // scroll and message intentionally excluded from equality check
-            }
+            (Self::ConfirmInteraction(a), Self::ConfirmInteraction(b)) => a.same_request(b),
+            (Self::ConfirmToolUse(a), Self::ConfirmToolUse(b)) => same_tool_confirmation(a, b),
             (
                 Self::ConfirmExit {
                     worker_state: a_worker_state,
@@ -1246,6 +1285,7 @@ pub(crate) enum TuiEvent {
     /// Prompt task consumed pending message; retained for queued-message tests.
     #[allow(dead_code)]
     PendingMessageConsumed(PendingMessage),
+    Interaction(crate::interaction_confirmation::InteractionEvent),
     ToolConfirmation(ToolConfirmationEvent),
     ToolConfirmationEnqueueFinished {
         confirmation_id: u64,

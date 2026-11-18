@@ -14,8 +14,11 @@ use serde_json::{json, Value};
 
 mod cancellation;
 mod compaction;
+mod hitl_exact;
+mod interaction;
 
 pub const JSON_RPC_UNKNOWN_SESSION_CODE: i64 = -32001;
+const JSON_RPC_METHOD_NOT_FOUND_CODE: i64 = -32601;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceKind {
@@ -184,6 +187,14 @@ async fn handle_ag_ui_rpc_bytes_for_target(
     }
 
     let key = SessionKey::new(target.clone(), session);
+    dispatch_rpc(rpc, context, key).await
+}
+
+async fn dispatch_rpc(
+    rpc: JsonRpcRequest,
+    context: RpcContext<'_>,
+    key: SessionKey,
+) -> anyhow::Result<AppResponse> {
     let RpcContext {
         config,
         registry,
@@ -200,13 +211,24 @@ async fn handle_ag_ui_rpc_bytes_for_target(
         "session/hitl_decision" => {
             handle_hitl_decision(rpc.id, rpc.params, config, registry, key).await
         }
+        "session/hitl_decision_exact" => {
+            hitl_exact::handle(rpc.id, rpc.params, (config, registry, key)).await
+        }
+        "session/interaction_response" => {
+            interaction::handle(rpc.id, rpc.params, (config, registry, key)).await
+        }
         "session/cancel" => cancellation::handle(rpc.id, (config, registry, key)).await,
         "session/compact" => compaction::handle(rpc.id, (config, registry, key)).await,
         "session/mark_read" => handle_mark_read(rpc.id, config, key).await,
         "session/mark_unread" => handle_mark_unread(rpc.id, config, key).await,
         _ => json_rpc_response(
             StatusCode::OK,
-            json_rpc_error(rpc.id, -32601, "method not found", None),
+            json_rpc_error(
+                rpc.id,
+                JSON_RPC_METHOD_NOT_FOUND_CODE,
+                "method not found",
+                None,
+            ),
         ),
     }
 }

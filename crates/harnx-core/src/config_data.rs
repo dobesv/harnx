@@ -268,6 +268,12 @@ pub struct ConfigData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksConfig>,
 
+    #[serde(
+        default,
+        skip_serializing_if = "crate::middleware::MiddlewareConfig::is_empty"
+    )]
+    pub middleware: crate::middleware::MiddlewareConfig,
+
     /// Enable terminal/OS agent protocol emission. When false, the emitter
     /// suppresses all terminal-agent protocol output. Defaults to true.
     #[serde(default = "default_terminal_status")]
@@ -303,6 +309,7 @@ impl ConfigData {
     }
 }
 impl Default for ConfigData {
+    // qual:allow(complexity, max_function_lines=61) reason: "Keep exhaustive config field defaults together; this initializer has no control flow."
     fn default() -> Self {
         Self {
             model_id: Default::default(),
@@ -351,6 +358,7 @@ impl Default for ConfigData {
             sync_models_url: None,
 
             hooks: None,
+            middleware: Default::default(),
 
             terminal_status: default_terminal_status(),
 

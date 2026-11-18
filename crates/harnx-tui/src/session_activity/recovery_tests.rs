@@ -179,6 +179,7 @@ fn assert_completed_child(tui: &Tui, progress: &harnx_core::event::SubAgentProgr
 
 fn completed_child_progress() -> harnx_core::event::SubAgentProgress {
     harnx_core::event::SubAgentProgress {
+        pending_interaction: None,
         invocation_id: "invocation".into(),
         agent: "researcher".into(),
         session_id: "child".into(),
@@ -197,6 +198,7 @@ fn child_result_history(
     vec![(
         3,
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![harnx_core::session::ToolOutput {
                 id: Some("call".into()),
                 name: "session_prompt".into(),

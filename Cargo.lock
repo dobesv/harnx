@@ -3541,7 +3541,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7518b930f6aeb75e871d32ce873c2ae46e35cef19b5a0b039d4337f651d897cd"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -4395,10 +4395,13 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "async-nats",
+ "async-trait",
  "clap",
  "futures",
  "harnx-core",
  "harnx-runtime",
+ "harnx-toolset",
+ "harnx-toolset-server",
  "parking_lot",
  "process-wrap",
  "serde_json",
@@ -4589,6 +4592,7 @@ dependencies = [
  "globset",
  "harnx-toolset",
  "hmac",
+ "humantime",
  "indexmap 2.14.2",
  "jaq-core",
  "jaq-json",
@@ -5508,6 +5512,7 @@ dependencies = [
  "harnx-render",
  "harnx-runtime",
  "harnx-toolset",
+ "harnx-toolset-server",
  "indexmap 2.14.2",
  "insta",
  "log",
@@ -5532,6 +5537,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-test",
+ "tokio-util",
  "unicode-width 0.2.3",
  "uuid",
  "which",
@@ -5833,6 +5839,12 @@ name = "human_format"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaec953f16e5bcf6b8a3cb3aa959b17e5577dbd2693e94554c462c08be22624b"
+
+[[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hybrid-array"

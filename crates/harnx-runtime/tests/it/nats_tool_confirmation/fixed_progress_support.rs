@@ -125,6 +125,7 @@ async fn assert_next_round_reused_id(
 ) -> Result<(SessionLogEntry, SessionLogEntry, PendingHitlApproval)> {
     ctx.log
         .append_event_async(&SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: Vec::new(),
             timestamp: None,
         })

@@ -193,6 +193,12 @@ pub enum Script {
     SerialTool,
     SameRoundTools,
     CountedTool,
+    ReadOnlyTool,
+    ConfirmTool,
+    ConfirmHeld,
+    ConfirmSerial,
+    ConfirmSameRound,
+    ShippedDaedalus,
     Fail,
     Many,
     Large,
@@ -319,7 +325,10 @@ fn write_fixture_support_configs(
     if matches!(script, Script::Large | Script::Boundary | Script::Overflow) {
         config_yaml.push_str("loop_detection:\n  output: false\n");
     }
-    if script == Script::CountedTool {
+    if matches!(
+        script,
+        Script::CountedTool | Script::ConfirmTool | Script::ConfirmHeld | Script::ConfirmSerial
+    ) {
         write_counted_tool_config(dir)?;
     }
     std::fs::write(dir.join("config.yaml"), config_yaml)?;
@@ -353,10 +362,32 @@ fn write_tool_handoff_agent() -> Result<String> {
     Ok(format!("---\nmodel: mock:test\nuse_tools:\n- target_session_handoff\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest runner agent\n"))
 }
 
+#[path = "support/interaction.rs"]
+mod interaction;
+
 fn fixture_agent_content(script: Script, dir: &std::path::Path) -> Result<String> {
+    if let Some(agent) = interaction::agent(script, dir)? {
+        return Ok(agent);
+    }
     if script == Script::CountedTool {
         return Ok(
             "---\nmodel: mock:test\nuse_tools: [bash_exec]\n---\nTest counted tool agent\n".into(),
+        );
+    }
+    if script == Script::ReadOnlyTool {
+        std::fs::create_dir_all(dir.join("tool_servers"))?;
+        std::fs::write(
+            dir.join("tool_servers/time.yaml"),
+            format!(
+                "command: {:?}\n",
+                binary("harnx-time-tools")?
+                    .to_str()
+                    .context("time tool path")?
+            ),
+        )?;
+        return Ok(
+            "---\nmodel: mock:test\nuse_tools: [time_get_current_time]\nmiddleware:\n- name: pass\n  match: '^time_get_current_time$'\n  bash: next\n---\nTest runner agent\n"
+                .into(),
         );
     }
     if script == Script::SameRoundTools {
@@ -380,6 +411,10 @@ fn fixture_config(
     std::fs::write(
         dir.join("agents/target.md"),
         "---\nmodel: mock:test\n---\nHandoff target\n",
+    )?;
+    std::fs::write(
+        dir.join("agents/atlas.md"),
+        "---\nmodel: mock:test\n---\nAtlas target\n",
     )?;
     let config = Arc::new(ConfigLock::new(Config::load_from_file(
         &dir.join("config.yaml"),

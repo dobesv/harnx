@@ -6,12 +6,14 @@ import { LinkButton } from './LinkButton';
 import { OpenInNewIcon } from './icons';
 import type { SubAgentNote } from './subAgentNotes';
 import type { SubAgentSessionNotesProps } from './SubAgentSessionNotes';
+import { resolveChildAgentAddress } from './subAgentPendingInteraction';
+import { SubAgentPendingControls } from './SubAgentPendingControls';
 
 // The row renders note.status, the single event-driven source of truth: the
-// child session's lifecycle and control events (RUN_*, turn_interrupted,
-// hitl_pending_approval) fold into the note, including the approval gate it is
-// parked at and the interrupt that stopped it. The only local overlay is the
-// optimistic stop state set on Stop-click (requestedStop).
+// child session's lifecycle, control events, and active pending interactions fold
+// into the note, including the approval gate it is parked at and any interrupt that
+// stopped it. Local state includes the optimistic stop state set on Stop-click
+// (requestedStop) and inline pending interaction controls.
 type RowStatus = SubAgentNote['status'];
 
 const STATUS_LABEL: Record<RowStatus, string> = {
@@ -31,8 +33,6 @@ function elapsedMs(note: SubAgentNote, nowMs: number) {
     : note.elapsedMs + Math.max(0, nowMs - note.updatedAtMs);
 }
 
-// Use shared formatElapsedMs from toolCallPresentation
-
 function formatTokens(value: number) {
   return value.toLocaleString();
 }
@@ -44,12 +44,23 @@ interface DerivedRowStatus {
   canStop: boolean;
 }
 
-function deriveRowStatus(note: SubAgentNote, requestedStop?: 'cancelling' | 'unconfirmed'): DerivedRowStatus {
+function deriveRowStatus(
+  note: SubAgentNote,
+  requestedStop?: 'cancelling' | 'unconfirmed',
+): DerivedRowStatus {
   const isTerminal = ['done', 'failed', 'cancelled'].includes(note.status);
   const localStatus = isTerminal ? undefined : requestedStop;
-  const status = localStatus ?? note.status;
-  const stopInFlight = localStatus === 'cancelling' || localStatus === 'unconfirmed' || note.status === 'cancelling' || note.status === 'cancelled';
-  const canStop = (note.status === 'running' || note.status === 'awaiting_approval') && !stopInFlight && !isTerminal && Boolean(note.invocationId);
+  const status = localStatus ?? (note.pendingInteraction && !isTerminal ? 'awaiting_approval' : note.status);
+  const stopInFlight =
+    localStatus === 'cancelling' ||
+    localStatus === 'unconfirmed' ||
+    note.status === 'cancelling' ||
+    note.status === 'cancelled';
+  const canStop =
+    (note.status === 'running' || note.status === 'awaiting_approval' || status === 'awaiting_approval') &&
+    !stopInFlight &&
+    !isTerminal &&
+    Boolean(note.invocationId);
   return { isTerminal, localStatus, status, canStop };
 }
 
@@ -77,7 +88,13 @@ async function executeStop(
   }
 }
 
-function SubAgentMetricsView({ note, displayedElapsedMs }: { note: SubAgentNote; displayedElapsedMs: number }) {
+function SubAgentMetricsView({
+  note,
+  displayedElapsedMs,
+}: {
+  note: SubAgentNote;
+  displayedElapsedMs: number;
+}) {
   return (
     <span className="aui-sub-agent-identity">
       <span className="aui-sub-agent-identity-line">
@@ -100,7 +117,15 @@ function SubAgentMetricsView({ note, displayedElapsedMs }: { note: SubAgentNote;
   );
 }
 
-export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs: number; onOpen: SubAgentSessionNotesProps['onOpen'] }) {
+export function SubAgentRow({
+  note,
+  nowMs,
+  onOpen,
+}: {
+  note: SubAgentNote;
+  nowMs: number;
+  onOpen: SubAgentSessionNotesProps['onOpen'];
+}) {
   const [requestedStop, setRequestedStop] = useState<'cancelling' | 'unconfirmed'>();
   const [error, setError] = useState<string>();
   const [stoppedAt, setStoppedAt] = useState<number>();
@@ -109,7 +134,7 @@ export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs
 
   const stop = async () => {
     if (!note.invocationId) return;
-    setStoppedAt(previous => previous ?? Date.now());
+    setStoppedAt((previous) => previous ?? Date.now());
     setRequestedStop('cancelling');
     setError(undefined);
     await executeStop(
@@ -125,7 +150,13 @@ export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs
 
   const statusLabel = STATUS_LABEL[status];
   const displayedElapsedMs = computeDisplayedElapsed(note, localStatus, stoppedAt, nowMs);
-  const sessionHref = `/agents/${encodeURIComponent(note.agent)}/sessions/${encodeURIComponent(note.sessionId)}`;
+  const pending = note.pendingInteraction;
+  const targetAgent = pending?.agent ?? note.agent;
+  const targetCluster = pending?.cluster;
+  const targetSessionId = pending?.sessionId ?? note.sessionId;
+  const childAddress = resolveChildAgentAddress(targetAgent, targetCluster);
+  const sessionHref = `/agents/${encodeURIComponent(childAddress)}/sessions/${encodeURIComponent(targetSessionId)}`;
+
   return (
     <div
       className="aui-sub-agent-row"
@@ -141,16 +172,40 @@ export function SubAgentRow({ note, nowMs, onOpen }: { note: SubAgentNote; nowMs
       </div>
       <LinkButton
         href={sessionHref}
-        onNavigate={() => onOpen(note.agent, note.sessionId)}
+        onNavigate={() => onOpen(childAddress, targetSessionId)}
         className="aui-sub-agent-open"
-        aria-label={`Open ${note.agent} sub-agent session ${note.sessionId} (${statusLabel.toLowerCase()})`}
-        title={`Open ${note.agent} sub-agent session ${note.sessionId}`}
+        aria-label={`Open ${targetAgent} sub-agent session ${targetSessionId} (${statusLabel.toLowerCase()})`}
+        title={`Open ${targetAgent} sub-agent session ${targetSessionId}`}
       >
         <OpenInNewIcon />
       </LinkButton>
-      {canStop && <button type="button" className="aui-sub-agent-stop" aria-label={`Stop ${note.agent} sub-agent session ${note.sessionId}`} onClick={() => void stop()}>Stop</button>}
-      {requestedStop === 'unconfirmed' && !isTerminal && <button type="button" aria-label={`Retry stopping ${note.agent}`} onClick={() => void stop()}>Retry</button>}
+      {canStop && (
+        <button
+          type="button"
+          className="aui-sub-agent-stop"
+          aria-label={`Stop ${note.agent} sub-agent session ${note.sessionId}`}
+          onClick={() => void stop()}
+        >
+          Stop
+        </button>
+      )}
+      {requestedStop === 'unconfirmed' && !isTerminal && (
+        <button
+          type="button"
+          aria-label={`Retry stopping ${note.agent}`}
+          onClick={() => void stop()}
+        >
+          Retry
+        </button>
+      )}
       {error && <span role="alert">{error}</span>}
+      <SubAgentPendingControls
+        note={note}
+        isTerminal={isTerminal}
+        childAddress={childAddress}
+        sessionHref={sessionHref}
+        onOpen={onOpen}
+      />
     </div>
   );
 }

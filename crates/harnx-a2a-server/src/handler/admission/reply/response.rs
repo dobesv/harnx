@@ -25,14 +25,23 @@ impl HarnxHandler {
             )
             .map_err(map_error)?;
         let mut record = active.snapshot.clone();
-        if let PromptProgress::InputRequired(pending) = session
-            .fixed_prompt_progress(&ticket)
-            .await
-            .map_err(map_error)?
+        if let PromptProgress::InputRequired(pending) =
+            crate::hitl::interaction::fixed_progress(&session, &ticket)
+                .await
+                .map_err(map_error)?
         {
             record.task.status.message = Some(Message::new(
                 a2a_lf::Role::Agent,
-                vec![Part::text(render_unrecognized(&pending))],
+                vec![Part::text(if pending.interaction_id.is_some() {
+                    format!(
+                        "Reply not recognized or not supported by this client.\n\n{}",
+                        crate::hitl::interaction::render_challenge(&session, &pending)
+                            .await
+                            .map_err(map_error)?
+                    )
+                } else {
+                    render_unrecognized(&pending)
+                })],
             ));
         }
         Ok(Admission::reply_snapshot(record))

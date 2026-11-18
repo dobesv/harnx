@@ -215,6 +215,135 @@ function usablePromptMessageId(value: unknown): string | null {
   return value.trim().length > 0 ? value : null;
 }
 
+export type InteractionResponseAction = 'approve' | 'deny';
+
+export interface InteractionResponsePayload {
+  action: InteractionResponseAction;
+  data?: Record<string, unknown>;
+  note?: string;
+}
+
+export interface SubmitInteractionResponseParams {
+  interactionId: string;
+  requestSeq: number;
+  response: InteractionResponsePayload;
+}
+
+export type InteractionResponseOutcome = 'applied' | 'already_applied';
+
+export interface InteractionResponseResult {
+  applied: boolean;
+  outcome: InteractionResponseOutcome;
+}
+
+export type InteractionRejectionOutcome =
+  | 'conflicting'
+  | 'wrong_sequence'
+  | 'stale'
+  | 'after_complete'
+  | 'lease_lost';
+
+export interface RecordedInteractionResponse {
+  action: string;
+  data?: Record<string, unknown>;
+  note?: string | null;
+}
+
+export interface InteractionRejectionData {
+  outcome: InteractionRejectionOutcome;
+  response?: RecordedInteractionResponse;
+  [key: string]: unknown;
+}
+
+export class InteractionResponseError extends Error {
+  readonly code: number;
+  readonly outcome?: InteractionRejectionOutcome;
+  readonly data?: InteractionRejectionData;
+  readonly response?: RecordedInteractionResponse;
+
+  constructor(
+    message: string,
+    code: number,
+    outcome?: InteractionRejectionOutcome,
+    data?: InteractionRejectionData
+  ) {
+    super(message);
+    this.name = "InteractionResponseError";
+    this.code = code;
+    this.outcome = outcome;
+    this.data = data;
+    this.response = data?.response;
+  }
+}
+
+export async function submitInteractionResponse(
+  agent: string,
+  session: string,
+  params: SubmitInteractionResponseParams
+): Promise<InteractionResponseResult> {
+  const { interactionId, requestSeq, response } = params;
+  const responsePayload: {
+    action: InteractionResponseAction;
+    data: Record<string, unknown>;
+    note?: string;
+  } = {
+    action: response.action,
+    data: response.data ?? {},
+  };
+  if (response.note !== undefined && response.note.trim().length > 0) {
+    responsePayload.note = response.note.trim();
+  }
+
+  const res = await observedFetch(
+    `${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/interaction_response',
+        params: {
+          interaction_id: interactionId,
+          request_seq: requestSeq,
+          response: responsePayload,
+        },
+      }),
+    }
+  );
+
+  let json: JsonRpcResponse<InteractionResponseResult> | undefined;
+  try {
+    json = (await res.json()) as JsonRpcResponse<InteractionResponseResult>;
+  } catch {
+    json = undefined;
+  }
+
+  if (json?.error) {
+    const code = json.error.code;
+    const message = json.error.message || `RPC Error: ${code}`;
+    const data = json.error.data as InteractionRejectionData | undefined;
+    const outcome = data?.outcome;
+    throw new InteractionResponseError(message, code, outcome, data);
+  }
+
+  if (!res.ok) {
+    throw new Error(`RPC call failed with HTTP ${res.status}`);
+  }
+
+  const result = json?.result;
+  if (
+    !result ||
+    typeof result !== 'object' ||
+    result.applied !== true ||
+    (result.outcome !== 'applied' && result.outcome !== 'already_applied')
+  ) {
+    throw new Error('RPC call returned malformed interaction response result');
+  }
+
+  return result;
+}
+
 export async function submitHitlDecision(
   agent: string,
   session: string,
@@ -232,6 +361,14 @@ export async function submitHitlDecision(
   });
   return sessionRpcResponse<{ applied: boolean }>(res, { applied: false });
 }
+
+export {
+  submitHitlDecisionExact,
+  type ApprovalRef,
+  type HitlExactOutcome,
+  type HitlExactDecisionResult,
+  type SubmitHitlDecisionExactParams,
+} from './hitlExactApi';
 
 export interface SessionTarget {
   agent: string;

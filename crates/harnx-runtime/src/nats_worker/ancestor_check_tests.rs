@@ -166,6 +166,7 @@ async fn a_parent_holding_the_calls_result_forbids_resuming_its_child() -> Resul
         &fixture.js,
         &fixture.parent_key,
         &SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![ToolOutput {
                 id: Some(CALL.into()),
                 name: "subagent_session_prompt".into(),

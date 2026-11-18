@@ -75,8 +75,57 @@ pub enum SessionLogEntry {
     #[serde(rename = "tool_results")]
     ToolResults {
         results: Vec<ToolOutput>,
+        /// Trusted round-level selection, never inferred from persisted output.
+        /// Readers deploy before T2.2 starts writing this marker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff_selection: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<DateTime<Utc>>,
+    },
+    /// Effective outer result, not yet a model-visible round result. Readers only
+    /// until T2.2; the opaque reference points to a durable private snapshot.
+    #[serde(rename = "tool_call_completed")]
+    ToolCallCompleted {
+        tool_round_seq: u64,
+        tool_call_id: String,
+        result: ToolOutput,
+        private_snapshot: String,
+        fence_token: u64,
+    },
+    /// Checkpoint storage must commit before this request. Not visible to an
+    /// interaction UI until the latest SuspensionReady lists its identity.
+    #[serde(rename = "interaction_requested")]
+    InteractionRequested {
+        tool_round_seq: u64,
+        tool_call_id: String,
+        interaction_id: String,
+        producer: String,
+        step_path: Vec<crate::interaction::InteractionStep>,
+        key: String,
+        kind: String,
+        payload: Value,
+        summary: String,
+        chain_version: String,
+        checkpoint: String,
+        fence_token: u64,
+    },
+    /// All siblings have settled or been durably classified. The latest manifest
+    /// supersedes earlier manifests for this round; only one modal is shown.
+    #[serde(rename = "suspension_ready")]
+    SuspensionReady {
+        tool_round_seq: u64,
+        pending: Vec<String>,
+        fence_token: u64,
+    },
+    /// First-wins user response bound to an exact request generation. Never
+    /// projected into model context or model-authored tool arguments.
+    #[serde(rename = "interaction_response")]
+    InteractionResponse {
+        request_seq: u64,
+        interaction_id: String,
+        tool_call_id: String,
+        response: crate::interaction::InteractionResponse,
+        fence_token: u64,
     },
     #[serde(rename = "data_urls")]
     DataUrls { urls: HashMap<String, String> },
@@ -275,7 +324,11 @@ impl SessionLogEntry {
                 *fence_token = Some(fence);
             }
             SessionLogEntry::HitlApprovalRequested { fence_token, .. }
-            | SessionLogEntry::HitlApprovalDecision { fence_token, .. } => {
+            | SessionLogEntry::HitlApprovalDecision { fence_token, .. }
+            | SessionLogEntry::ToolCallCompleted { fence_token, .. }
+            | SessionLogEntry::InteractionRequested { fence_token, .. }
+            | SessionLogEntry::SuspensionReady { fence_token, .. }
+            | SessionLogEntry::InteractionResponse { fence_token, .. } => {
                 *fence_token = fence;
             }
             _ => {}
@@ -310,7 +363,11 @@ impl SessionLogEntry {
             | SessionLogEntry::Error { fence_token, .. }
             | SessionLogEntry::TurnEnd { fence_token, .. }
             | SessionLogEntry::HitlApprovalRequested { fence_token, .. }
-            | SessionLogEntry::HitlApprovalDecision { fence_token, .. } => Some(*fence_token),
+            | SessionLogEntry::HitlApprovalDecision { fence_token, .. }
+            | SessionLogEntry::ToolCallCompleted { fence_token, .. }
+            | SessionLogEntry::InteractionRequested { fence_token, .. }
+            | SessionLogEntry::SuspensionReady { fence_token, .. }
+            | SessionLogEntry::InteractionResponse { fence_token, .. } => Some(*fence_token),
             _ => None,
         }
     }
@@ -944,6 +1001,7 @@ mod tests {
     #[test]
     fn session_log_entry_tool_results_timestamp_serde_round_trip() {
         let yaml = assert_entry_round_trips(SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![],
             timestamp: Some(Utc::now()),
         });

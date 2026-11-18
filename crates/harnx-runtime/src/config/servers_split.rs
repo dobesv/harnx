@@ -12,25 +12,24 @@ impl Config {
         pkg_path: &Path,
         pkg_name: &str,
         patch: Option<&harnx_core::package::PackagePatch>,
-    ) {
+    ) -> Result<()> {
         let pkg_tool_dir = pkg_path.join(paths::TOOL_SERVERS_DIR_NAME);
         if !pkg_tool_dir.is_dir() {
-            return;
+            return Ok(());
         }
 
-        for mut server in Self::load_tool_servers_from_dir(&pkg_tool_dir).unwrap_or_default() {
+        for mut server in
+            Self::load_tool_servers_with_middleware_base(&pkg_tool_dir, Some(pkg_path))?
+        {
             server.package = Some(pkg_name.to_string());
             if let Some(patch) = patch {
-                if let Err(e) = apply_tool_server_patch(&mut server, &patch.tool_servers) {
-                    log::error!(
-                        "Package patch failed for tool server '{}': {e:#}",
-                        server.name
-                    );
-                    continue;
-                }
+                apply_tool_server_patch(&mut server, &patch.tool_servers).with_context(|| {
+                    format!("Package patch failed for tool server '{}'", server.name)
+                })?;
             }
             config.tool_servers.push(server);
         }
+        Ok(())
     }
 }
 
@@ -47,9 +46,13 @@ pub(super) fn apply_tool_server_patch(
     let input = serde_json::to_value(&*server).context("Failed to serialize tool server config")?;
     let output =
         harnx_core::jaq::eval_filters_strict(patches, input).context("jq patch evaluation")?;
-    *server =
+    let mut patched: ToolServerConfig =
         serde_json::from_value(output).context("Failed to deserialize patched tool server")?;
-    server.package = saved_package;
+    patched.package = saved_package;
+    if let Some(origin) = &server.middleware.origin {
+        middleware::bind_middleware(&mut patched.middleware, origin.clone())?;
+    }
+    *server = patched;
     Ok(())
 }
 
@@ -59,6 +62,7 @@ mod tests {
 
     fn package_server() -> ToolServerConfig {
         ToolServerConfig {
+            middleware: Default::default(),
             name: "time".to_string(),
             command: "harnx-time-tools".to_string(),
             args: Vec::new(),

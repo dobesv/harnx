@@ -61,7 +61,12 @@ impl NatsSession {
         let completion_visible = if cx.boundary_options.is_some() {
             observed_boundary.is_some()
         } else {
-            Self::is_turn_completion_visible(entries, effective.as_deref(), cx.target.prompt_seq)
+            Self::is_follow_completion_visible(
+                entries,
+                effective.as_deref(),
+                cx.target.prompt_seq,
+                cx.wait_for_interactions,
+            )
         };
         Ok((observed_boundary, completion_visible))
     }

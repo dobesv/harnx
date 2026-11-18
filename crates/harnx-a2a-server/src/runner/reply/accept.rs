@@ -31,17 +31,16 @@ async fn deliver_and_evaluate_reply(
     authority: &mut OwnedTask,
 ) -> Result<bool> {
     let (receipt, note) = parse_accepted_receipt(authority)?;
-    let outcome = target
-        .session
-        .decide_hitl_approval_for(target.request, receipt.approved, note)
-        .await?;
+    let outcome =
+        crate::hitl::interaction::decide(target.session, target.request, receipt.approved, note)
+            .await?;
     #[cfg(feature = "fault-injection")]
     runner
         .hooks
         .checkpoint(crate::fault_injection::Boundary::HitlDecisionCommitted)
         .await;
     let ticket = authority.ticket(target.session.storage_key())?;
-    let progress = target.session.fixed_prompt_progress(&ticket).await?;
+    let progress = crate::hitl::interaction::fixed_progress(target.session, &ticket).await?;
     let evaluation = DecisionEvaluation {
         outcome: &outcome,
         progress: &progress,

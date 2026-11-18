@@ -107,7 +107,17 @@ pub(super) fn reconcile_subagent_progress(
     emitted: &mut HashSet<String>,
 ) {
     for progress in completed_subagent_progress(entries, after_seq) {
-        if emitted.insert(progress.invocation_id.clone()) {
+        let key = if progress.status == SubAgentProgressStatus::Running {
+            if emitted.contains(&progress.invocation_id) {
+                continue;
+            }
+            // A blocked tool return isn't invocation completion. Deduplicate
+            // this request without suppressing a later request or final result.
+            serde_json::json!([progress.invocation_id, progress.pending_interaction]).to_string()
+        } else {
+            progress.invocation_id.clone()
+        };
+        if emitted.insert(key) {
             sink.emit(AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)));
         }
     }
@@ -134,10 +144,16 @@ pub fn completed_subagent_progress(
             if progress.tool_call_id.is_none() {
                 progress.tool_call_id = result.id.clone();
             }
-            if progress.status != SubAgentProgressStatus::Running {
+            if progress.status != SubAgentProgressStatus::Running
+                || progress.pending_interaction.is_some()
+            {
                 completed.push(progress);
             }
         }
     }
     completed
 }
+
+#[cfg(test)]
+#[path = "completion_pending_tests.rs"]
+mod pending_tests;

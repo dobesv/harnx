@@ -7,12 +7,12 @@ mod session;
 mod transport;
 mod worker;
 
-pub(crate) use broker::spawn_nats_server;
+pub(crate) use broker::{spawn_nats_server, NatsServerHandle};
 pub(crate) use config::{new_agent, test_config};
 pub(crate) use messages::{notification_text, spawn_prompt, text_prompt};
 pub(crate) use session::initialize_and_create_session;
 pub(crate) use transport::{attach_test_client, PermissionReply, TestClient};
-pub(crate) use worker::spawn_worker;
+pub(crate) use worker::{spawn_worker, spawn_worker_with_config};
 
 pub(crate) const TOKEN: &str = "acp-test-token";
 pub(crate) const CLUSTER: &str = "acp-test";

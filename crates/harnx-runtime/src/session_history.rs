@@ -44,6 +44,10 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::HandoffCommitted { .. } => "handoff_committed",
         SessionLogEntry::HitlApprovalRequested { .. } => "hitl_approval_requested",
         SessionLogEntry::HitlApprovalDecision { .. } => "hitl_approval_decision",
+        SessionLogEntry::ToolCallCompleted { .. } => "tool_call_completed",
+        SessionLogEntry::InteractionRequested { .. } => "interaction_requested",
+        SessionLogEntry::SuspensionReady { .. } => "suspension_ready",
+        SessionLogEntry::InteractionResponse { .. } => "interaction_response",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
         SessionLogEntry::CompactRequest { .. } => "compact_request",
@@ -510,6 +514,7 @@ mod tests {
             (
                 2,
                 SessionLogEntry::ToolResults {
+                    handoff_selection: None,
                     results: vec![harnx_core::session::ToolOutput {
                         id: Some("c1".into()),
                         name: "bash".into(),

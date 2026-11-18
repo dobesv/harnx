@@ -17,9 +17,7 @@ pub(super) struct Snapshot {
     pub(super) prompt: Option<u64>,
     pub(super) through: u64,
     pub(super) terminal: Option<(u64, SessionPromptStatus)>,
-    /// The durable turn total, when the terminal row is a `TurnEnd` that
-    /// carries one. Authoritative usage for a settled prompt, unlike the
-    /// lossy per-request advisory estimates.
+    /// The durable turn total when the terminal row is a `TurnEnd` carrying one.
     pub(super) terminal_usage: Option<CompletionTokenUsage>,
     pub(super) complete: bool,
     gap: bool,
@@ -85,8 +83,7 @@ impl Snapshot {
     }
 
     fn advance(&mut self, seq: u64, gap: bool) {
-        // Even a pre-prompt gap could hide the original before a compaction copy.
-        // Without durable sequence identity, choosing that copy is not safe.
+        // Without durable sequence identity, choosing a compaction copy is not safe.
         self.gap |= gap;
         self.through = seq;
     }
@@ -182,6 +179,9 @@ impl Snapshot {
             }
             SessionLogEntry::HitlApprovalRequested { .. }
             | SessionLogEntry::HitlApprovalDecision { .. }
+            | SessionLogEntry::InteractionRequested { .. }
+            | SessionLogEntry::InteractionResponse { .. }
+            | SessionLogEntry::SuspensionReady { .. }
             | SessionLogEntry::ToolResults { .. } => {
                 if self.round.is_empty() {
                     self.unsafe_live = true;
@@ -225,6 +225,27 @@ impl Snapshot {
         } else {
             None
         }
+    }
+
+    pub(super) fn pending_interaction(
+        &self,
+        agent: &str,
+        cluster: &str,
+        session_id: &str,
+        invocation_id: &str,
+    ) -> Option<harnx_core::pending_interaction::PendingInteractionSummary> {
+        if self.status() != SessionPromptStatus::Blocked {
+            return None;
+        }
+        crate::interactions::derive_pending_interaction_summary(
+            &self.round,
+            agent,
+            cluster,
+            session_id,
+            invocation_id,
+        )
+        .ok()
+        .flatten()
     }
 
     pub(super) fn status(&self) -> SessionPromptStatus {

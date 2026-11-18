@@ -15,6 +15,9 @@ use harnx_core::event::{
     AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent,
     SubAgentProgress, SubAgentProgressStatus, ToolEvent, TurnEvent, UserEvent,
 };
+use harnx_core::pending_interaction::{
+    PendingInteractionSummary, PENDING_INTERACTION_MESSAGE_MAX_BYTES,
+};
 use harnx_core::session::{CompactOutcome, UnchangedReason};
 use harnx_toolset::{
     is_subagent_launcher, TOOL_TIMER_MIN_ELAPSED_MS, TOOL_TIMER_NOTICE_INTERVAL_MS,
@@ -223,13 +226,52 @@ struct CliSubagentReporter {
 
 #[derive(Default)]
 struct CliInvocationReport {
+    announced: bool,
     last_running_bucket: u64,
+    last_pending: Option<PendingInteractionSummary>,
     terminal: bool,
+}
+
+impl CliInvocationReport {
+    fn announce_first_progress(&mut self, progress: &SubAgentProgress) -> String {
+        self.announced = true;
+        self.last_pending = progress.pending_interaction.clone();
+        self.last_running_bucket = progress.elapsed_ms / SUBAGENT_REPORT_INTERVAL_MS;
+        if progress.pending_interaction.is_none()
+            && progress.status == SubAgentProgressStatus::Running
+        {
+            format!(
+                "[sub-agent] started agent={} session={}",
+                progress.agent, progress.session_id
+            )
+        } else {
+            format_subagent_progress(progress)
+        }
+    }
+
+    fn update_pending_change(&mut self, progress: &SubAgentProgress) -> bool {
+        if self.last_pending != progress.pending_interaction {
+            self.last_pending = progress.pending_interaction.clone();
+            self.last_running_bucket = progress.elapsed_ms / SUBAGENT_REPORT_INTERVAL_MS;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn should_throttle_running(&mut self, elapsed_ms: u64) -> bool {
+        let bucket = elapsed_ms / SUBAGENT_REPORT_INTERVAL_MS;
+        if bucket == 0 || bucket <= self.last_running_bucket {
+            true
+        } else {
+            self.last_running_bucket = bucket;
+            false
+        }
+    }
 }
 
 impl CliSubagentReporter {
     fn progress(&mut self, progress: &SubAgentProgress) -> Option<String> {
-        let announced = self.invocations.contains_key(&progress.invocation_id);
         let report = self
             .invocations
             .entry(progress.invocation_id.clone())
@@ -237,33 +279,41 @@ impl CliSubagentReporter {
         if report.terminal {
             return None;
         }
-        match progress.status {
-            // The reporter's first snapshot is a running one; it names the
-            // child the way the start line always has.
-            SubAgentProgressStatus::Running if !announced => {
-                return Some(format!(
-                    "[sub-agent] started agent={} session={}",
-                    progress.agent, progress.session_id
-                ));
-            }
-            SubAgentProgressStatus::Running => {
-                let bucket = progress.elapsed_ms / SUBAGENT_REPORT_INTERVAL_MS;
-                if bucket == 0 || bucket <= report.last_running_bucket {
-                    return None;
-                }
-                report.last_running_bucket = bucket;
-            }
-            SubAgentProgressStatus::Cancelling | SubAgentProgressStatus::Unconfirmed => {}
-            SubAgentProgressStatus::Done
-            | SubAgentProgressStatus::Failed
-            | SubAgentProgressStatus::Cancelled => report.terminal = true,
+
+        if is_subagent_terminal(progress.status) {
+            report.terminal = true;
+            return Some(format_subagent_progress(progress));
         }
+
+        if !report.announced {
+            return Some(report.announce_first_progress(progress));
+        }
+
+        if report.update_pending_change(progress) {
+            return Some(format_subagent_progress(progress));
+        }
+
+        if progress.status == SubAgentProgressStatus::Running
+            && report.should_throttle_running(progress.elapsed_ms)
+        {
+            return None;
+        }
+
         Some(format_subagent_progress(progress))
     }
 }
 
+fn is_subagent_terminal(status: SubAgentProgressStatus) -> bool {
+    matches!(
+        status,
+        SubAgentProgressStatus::Done
+            | SubAgentProgressStatus::Failed
+            | SubAgentProgressStatus::Cancelled
+    )
+}
+
 fn format_subagent_progress(progress: &SubAgentProgress) -> String {
-    let status = match progress.status {
+    let mut status = match progress.status {
         SubAgentProgressStatus::Running => "running",
         SubAgentProgressStatus::Done => "done",
         SubAgentProgressStatus::Failed => "failed",
@@ -271,8 +321,15 @@ fn format_subagent_progress(progress: &SubAgentProgress) -> String {
         SubAgentProgressStatus::Cancelled => "cancelled",
         SubAgentProgressStatus::Unconfirmed => "unconfirmed",
     };
+    let mut message_suffix = String::new();
+    if let Some(pending) = &progress.pending_interaction {
+        if !is_subagent_terminal(progress.status) {
+            status = "awaiting";
+            message_suffix = format!(" message={}", bound_pending_message(&pending.message));
+        }
+    }
     format!(
-        "[sub-agent] {status} agent={} session={} elapsed={} in={} out={} cached={} tools={}",
+        "[sub-agent] {status} agent={} session={} elapsed={} in={} out={} cached={} tools={}{message_suffix}",
         progress.agent,
         progress.session_id,
         format_elapsed(progress.elapsed_ms),
@@ -281,6 +338,14 @@ fn format_subagent_progress(progress: &SubAgentProgress) -> String {
         progress.usage.cached_tokens,
         progress.tool_call_count,
     )
+}
+
+fn bound_pending_message(message: &str) -> &str {
+    let mut end = message.len().min(PENDING_INTERACTION_MESSAGE_MAX_BYTES);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
 }
 
 fn format_elapsed(elapsed_ms: u64) -> String {
@@ -1077,6 +1142,7 @@ mod tests {
         elapsed_ms: u64,
     ) -> SubAgentProgress {
         SubAgentProgress {
+            pending_interaction: None,
             invocation_id: invocation_id.into(),
             agent: "researcher".into(),
             session_id: session_id.into(),
@@ -1253,6 +1319,228 @@ mod tests {
                 20_000,
             ))
             .is_some());
+    }
+
+    fn subagent_progress_with_pending(
+        invocation_id: &str,
+        session_id: &str,
+        status: SubAgentProgressStatus,
+        elapsed_ms: u64,
+        pending: Option<PendingInteractionSummary>,
+    ) -> SubAgentProgress {
+        SubAgentProgress {
+            pending_interaction: pending,
+            invocation_id: invocation_id.into(),
+            agent: "researcher".into(),
+            session_id: session_id.into(),
+            status,
+            elapsed_ms,
+            usage: harnx_core::api_types::CompletionTokenUsage::new(Some(120), Some(45), Some(30)),
+            tool_call_count: 3,
+            title: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn legacy_pending_summary(tool_name: &str, message: &str) -> PendingInteractionSummary {
+        PendingInteractionSummary {
+            agent: "researcher".into(),
+            cluster: "__local__".into(),
+            session_id: "child-session".into(),
+            request: harnx_core::pending_interaction::PendingInteractionRequest::LegacyApproval {
+                request: harnx_core::pending_interaction::ApprovalRef {
+                    invocation_id: "inv-1".into(),
+                    tool_round_seq: 1,
+                    request_seq: 1,
+                    tool_call_id: "call-1".into(),
+                },
+            },
+            tool_name: tool_name.into(),
+            message: message.into(),
+            pending_count: 0,
+        }
+    }
+
+    fn confirm_pending_summary(tool_name: &str, message: &str) -> PendingInteractionSummary {
+        PendingInteractionSummary {
+            agent: "researcher".into(),
+            cluster: "__local__".into(),
+            session_id: "child-session".into(),
+            request: harnx_core::pending_interaction::PendingInteractionRequest::Interaction {
+                interaction_id: "int-1".into(),
+                request_seq: 2,
+                interaction_kind: "confirm".into(),
+            },
+            tool_name: tool_name.into(),
+            message: message.into(),
+            pending_count: 0,
+        }
+    }
+
+    #[test]
+    fn subagent_formatter_renders_awaiting_and_bounds_message_for_legacy_and_confirm() {
+        let legacy = subagent_progress_with_pending(
+            "inv-1",
+            "child-session",
+            SubAgentProgressStatus::Running,
+            1_500,
+            Some(legacy_pending_summary(
+                "bash_exec",
+                "Run dangerous command?",
+            )),
+        );
+        let legacy_line = format_subagent_progress(&legacy);
+        assert!(legacy_line.contains("[sub-agent] awaiting"));
+        assert!(legacy_line.contains("agent=researcher"));
+        assert!(legacy_line.contains("session=child-session"));
+        assert!(legacy_line.contains("message=Run dangerous command?"));
+
+        let confirm = subagent_progress_with_pending(
+            "inv-2",
+            "child-session",
+            SubAgentProgressStatus::Running,
+            2_500,
+            Some(confirm_pending_summary(
+                "time_wait",
+                "Confirm timeout extension",
+            )),
+        );
+        let confirm_line = format_subagent_progress(&confirm);
+        assert!(confirm_line.contains("[sub-agent] awaiting"));
+        assert!(confirm_line.contains("message=Confirm timeout extension"));
+
+        let oversized_message = "x".repeat(600);
+        let oversized = subagent_progress_with_pending(
+            "inv-3",
+            "child-session",
+            SubAgentProgressStatus::Running,
+            3_000,
+            Some(confirm_pending_summary("fs_write", &oversized_message)),
+        );
+        let oversized_line = format_subagent_progress(&oversized);
+        assert!(oversized_line.contains(&format!(
+            "message={}",
+            "x".repeat(PENDING_INTERACTION_MESSAGE_MAX_BYTES)
+        )));
+        assert!(!oversized_line.contains(&format!("message={}", oversized_message)));
+    }
+
+    #[test]
+    fn subagent_formatter_and_reporter_suppress_awaiting_on_terminal_status() {
+        for status in [
+            SubAgentProgressStatus::Done,
+            SubAgentProgressStatus::Failed,
+            SubAgentProgressStatus::Cancelled,
+        ] {
+            let terminal = subagent_progress_with_pending(
+                "inv-term",
+                "child-session",
+                status,
+                4_000,
+                Some(legacy_pending_summary("bash_exec", "Should not display")),
+            );
+            let line = format_subagent_progress(&terminal);
+            assert!(!line.contains("awaiting"));
+            assert!(!line.contains("message="));
+            assert!(!line.contains("Should not display"));
+
+            let mut reporter = CliSubagentReporter::default();
+            reporter.progress(&subagent_progress(
+                "inv-term",
+                "child-session",
+                SubAgentProgressStatus::Running,
+                0,
+            ));
+            let term_line = reporter
+                .progress(&terminal)
+                .expect("terminal progress reported immediately");
+            assert!(!term_line.contains("awaiting"));
+            assert!(!term_line.contains("Should not display"));
+            assert!(reporter.progress(&terminal).is_none());
+        }
+    }
+
+    #[test]
+    fn subagent_reporter_handles_pending_appearance_update_clear_vs_throttle() {
+        let mut reporter = CliSubagentReporter::default();
+
+        let start = subagent_progress("inv-1", "child", SubAgentProgressStatus::Running, 0);
+        let start_line = reporter.progress(&start).expect("started line emitted");
+        assert!(start_line.contains("[sub-agent] started"));
+
+        let running_early =
+            subagent_progress("inv-1", "child", SubAgentProgressStatus::Running, 1_000);
+        assert!(reporter.progress(&running_early).is_none());
+
+        let pending1 = subagent_progress_with_pending(
+            "inv-1",
+            "child",
+            SubAgentProgressStatus::Running,
+            2_000,
+            Some(legacy_pending_summary("bash_exec", "Allow exec?")),
+        );
+        let line1 = reporter
+            .progress(&pending1)
+            .expect("emits on pending appearance");
+        assert!(line1.contains("awaiting"));
+        assert!(line1.contains("message=Allow exec?"));
+
+        let pending1_again = subagent_progress_with_pending(
+            "inv-1",
+            "child",
+            SubAgentProgressStatus::Running,
+            3_000,
+            Some(legacy_pending_summary("bash_exec", "Allow exec?")),
+        );
+        assert!(reporter.progress(&pending1_again).is_none());
+
+        let pending2 = subagent_progress_with_pending(
+            "inv-1",
+            "child",
+            SubAgentProgressStatus::Running,
+            4_000,
+            Some(confirm_pending_summary("bash_exec", "Updated message")),
+        );
+        let line2 = reporter
+            .progress(&pending2)
+            .expect("emits on pending update");
+        assert!(line2.contains("awaiting"));
+        assert!(line2.contains("message=Updated message"));
+
+        let cleared = subagent_progress("inv-1", "child", SubAgentProgressStatus::Running, 5_000);
+        let line3 = reporter.progress(&cleared).expect("emits on pending clear");
+        assert!(line3.contains("running"));
+        assert!(!line3.contains("awaiting"));
+        assert!(!line3.contains("message="));
+
+        let running_still =
+            subagent_progress("inv-1", "child", SubAgentProgressStatus::Running, 6_000);
+        assert!(reporter.progress(&running_still).is_none());
+
+        let heartbeat =
+            subagent_progress("inv-1", "child", SubAgentProgressStatus::Running, 10_000);
+        let line4 = reporter
+            .progress(&heartbeat)
+            .expect("emits on heartbeat boundary");
+        assert!(line4.contains("elapsed=10s"));
+    }
+
+    #[test]
+    fn subagent_reporter_avoids_first_announcement_dropping_summary() {
+        let mut reporter = CliSubagentReporter::default();
+        let initial_pending = subagent_progress_with_pending(
+            "inv-init-pending",
+            "child-session",
+            SubAgentProgressStatus::Running,
+            0,
+            Some(confirm_pending_summary("tool_a", "Initial gate")),
+        );
+        let line = reporter
+            .progress(&initial_pending)
+            .expect("first announcement with pending is emitted");
+        assert!(line.contains("awaiting"));
+        assert!(line.contains("message=Initial gate"));
+        assert!(!line.contains("[sub-agent] started"));
     }
 
     // ----------------------------------------------------------------

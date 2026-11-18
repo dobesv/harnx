@@ -31,6 +31,59 @@ pub use cancellation::publish_tool_cancel;
 use in_flight::InFlightFailure;
 pub(crate) use in_flight::InFlightRegistration;
 pub use in_flight::{InFlightCancelTarget, NatsInFlightCalls};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalInvocationScope {
+    pub physical_id: String,
+    pub tool_call_id: String,
+}
+
+tokio::task_local! {
+    static PHYSICAL_INVOCATION: PhysicalInvocationScope;
+}
+
+/// Execute `future` within the scope of a runtime-issued physical invocation ID
+/// bound to a specific transcript `tool_call_id`.
+///
+/// When active, [`NatsToolProvider`] uses `physical_id` as the wire call UUID (`call_id`)
+/// only for downstream tool requests whose `origin.tool_call_id` matches `tool_call_id`.
+/// Nested calls with different tool call IDs (e.g. inner calls inside bash) generate
+/// fresh random UUIDs.
+pub async fn with_physical_invocation<F: std::future::Future>(
+    physical_id: impl Into<String>,
+    tool_call_id: impl Into<String>,
+    future: F,
+) -> F::Output {
+    PHYSICAL_INVOCATION
+        .scope(
+            PhysicalInvocationScope {
+                physical_id: physical_id.into(),
+                tool_call_id: tool_call_id.into(),
+            },
+            future,
+        )
+        .await
+}
+
+/// Read the ambient physical invocation ID if one is active and matches `tool_call_id`.
+pub fn current_physical_invocation_for(tool_call_id: &str) -> Option<String> {
+    PHYSICAL_INVOCATION
+        .try_with(|scope| {
+            if scope.tool_call_id == tool_call_id {
+                Some(scope.physical_id.clone())
+            } else {
+                None
+            }
+        })
+        .ok()
+        .flatten()
+}
+
+/// Read the current ambient physical invocation scope, if set.
+// qual:api — Read by diagnostics to inspect the active physical scope.
+pub fn current_physical_invocation() -> Option<PhysicalInvocationScope> {
+    PHYSICAL_INVOCATION.try_with(Clone::clone).ok()
+}
 mod new_message;
 #[cfg(test)]
 pub(crate) use new_message::NEW_MESSAGE_ATTEMPTS;
@@ -763,11 +816,11 @@ pub async fn describe_discovery(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_registered_tools, request_timeout, NatsInFlightCalls, NatsToolProvider,
-        ProgressDispatcher, RegisteredTool, DEFAULT_REQUEST_TIMEOUT,
+        build_registered_tools, request_timeout, with_physical_invocation, NatsInFlightCalls,
+        NatsToolProvider, ProgressDispatcher, RegisteredTool, DEFAULT_REQUEST_TIMEOUT,
     };
     use harnx_core::instance::ServerScope;
-    use harnx_toolset::{Registration, ToolSpec};
+    use harnx_toolset::{Registration, ToolSpec, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY};
     use opentelemetry::global;
     use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
     use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -777,6 +830,7 @@ mod tests {
     use std::time::Duration;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     use tracing_subscriber::layer::SubscriberExt;
+    use uuid::Uuid;
 
     /// A dispatch of the transcript call `id`, made outside any recorded round.
     fn transcript_call(id: &str) -> harnx_core::tool::ToolCallOrigin<'_> {
@@ -890,16 +944,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn prepared_request_headers_carry_active_trace_id() {
-        harnx_core::require_nextest();
-        let Some(server) = spawn_nats_server_without_jetstream() else {
-            eprintln!(
-                "skipping prepared_request_headers_carry_active_trace_id: nats-server missing"
-            );
-            return;
-        };
-        let client = async_nats::connect(&server.url)
+    async fn setup_test_provider_and_route(url: &str) -> (NatsToolProvider, RegisteredTool) {
+        let client = async_nats::connect(url)
             .await
             .expect("connect to test NATS server");
         let provider = make_test_provider(&client).await;
@@ -909,6 +955,91 @@ mod tests {
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
             ..Default::default()
         };
+        (provider, route)
+    }
+    #[tokio::test]
+    async fn with_physical_invocation_threads_id_to_prepared_request() {
+        harnx_core::require_nextest();
+        let Some(server) = spawn_nats_server_without_jetstream() else {
+            eprintln!("skipping with_physical_invocation test: nats-server missing");
+            return;
+        };
+        let (provider, route) = setup_test_provider_and_route(&server.url).await;
+
+        let expected_phys_id = "phys-inv-12345";
+        let target_call_id = "model-call-id";
+
+        let pending = with_physical_invocation(expected_phys_id, target_call_id, async {
+            provider
+                .prepare_request(json!({ "value": 1 }), &route, Some(target_call_id))
+                .ok()
+                .expect("prepare request")
+        })
+        .await;
+
+        assert_eq!(pending.call_id, expected_phys_id);
+        assert_eq!(pending.durable.call_id, expected_phys_id);
+        assert_eq!(pending.durable.operation_id, expected_phys_id);
+        assert_eq!(
+            pending.durable.tool_call_id.as_deref(),
+            Some(target_call_id)
+        );
+
+        let headers = pending.request.headers.expect("NATS request headers");
+        assert_eq!(headers.get(HDR_CALL_ID).unwrap().as_str(), expected_phys_id);
+        assert_eq!(
+            headers.get(HDR_IDEMPOTENCY_KEY).unwrap().as_str(),
+            expected_phys_id
+        );
+
+        // Different tool call ID generates a fresh UUID
+        let nested_inner_pending =
+            with_physical_invocation(expected_phys_id, target_call_id, async {
+                provider
+                    .prepare_request(
+                        json!({ "value": 1 }),
+                        &route,
+                        Some("different-inner-call-id"),
+                    )
+                    .ok()
+                    .expect("prepare request")
+            })
+            .await;
+
+        assert_ne!(nested_inner_pending.call_id, expected_phys_id);
+        assert!(Uuid::parse_str(&nested_inner_pending.call_id).is_ok());
+
+        // None tool call ID generates a fresh UUID
+        let none_pending = with_physical_invocation(expected_phys_id, target_call_id, async {
+            provider
+                .prepare_request(json!({ "value": 1 }), &route, None)
+                .ok()
+                .expect("prepare request")
+        })
+        .await;
+
+        assert_ne!(none_pending.call_id, expected_phys_id);
+        assert!(Uuid::parse_str(&none_pending.call_id).is_ok());
+
+        // Outside scope, generates fresh UUID
+        let default_pending = provider
+            .prepare_request(json!({ "value": 1 }), &route, Some(target_call_id))
+            .ok()
+            .expect("prepare request");
+        assert_ne!(default_pending.call_id, expected_phys_id);
+        assert!(Uuid::parse_str(&default_pending.call_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn prepared_request_headers_carry_active_trace_id() {
+        harnx_core::require_nextest();
+        let Some(server) = spawn_nats_server_without_jetstream() else {
+            eprintln!(
+                "skipping prepared_request_headers_carry_active_trace_id: nats-server missing"
+            );
+            return;
+        };
+        let (provider, route) = setup_test_provider_and_route(&server.url).await;
 
         global::set_text_map_propagator(TraceContextPropagator::new());
         let tracer_provider = SdkTracerProvider::builder().build();

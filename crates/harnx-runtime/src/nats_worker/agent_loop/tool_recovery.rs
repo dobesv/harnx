@@ -136,13 +136,14 @@ pub(super) fn index_rerun_results(
 }
 
 pub(super) fn preserves_hitl_pending(effective_entries: &[(u64, SessionLogEntry)]) -> bool {
-    find_orphan_tool_calls(effective_entries)
-        .iter()
-        .any(|orphan| {
-            let hitl_ids = hitl_managed_tool_call_ids(effective_entries, orphan.seq);
-            orphan
-                .calls
-                .iter()
-                .any(|call| call.id.as_deref().is_some_and(|id| hitl_ids.contains(id)))
-        })
+    crate::interaction_checkpoint::guard::log_is_parked(effective_entries)
+        || find_orphan_tool_calls(effective_entries)
+            .iter()
+            .any(|orphan| {
+                let hitl_ids = hitl_managed_tool_call_ids(effective_entries, orphan.seq);
+                orphan
+                    .calls
+                    .iter()
+                    .any(|call| call.id.as_deref().is_some_and(|id| hitl_ids.contains(id)))
+            })
 }

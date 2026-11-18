@@ -73,6 +73,7 @@ fn thinking_only_tool_round(thought: &str) -> Vec<(u64, SessionLogEntry)> {
         (
             3,
             SessionLogEntry::ToolResults {
+                handoff_selection: None,
                 results: vec![ToolOutput {
                     id: Some("call".into()),
                     name: "noop".into(),
@@ -93,6 +94,7 @@ fn thinking_only_tool_round(thought: &str) -> Vec<(u64, SessionLogEntry)> {
 
 fn stopped_progress() -> SubAgentProgress {
     SubAgentProgress {
+        pending_interaction: None,
         invocation_id: "invocation".into(),
         agent: "helper".into(),
         session_id: "child".into(),

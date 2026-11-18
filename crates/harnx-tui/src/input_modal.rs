@@ -204,6 +204,9 @@ impl Tui {
             | Some(crate::types::ModalState::SessionPicker { .. }) => {
                 self.handle_picker_key(key).await?;
             }
+            Some(crate::types::ModalState::ConfirmInteraction(_)) => {
+                self.handle_interaction_key(key).await;
+            }
             Some(crate::types::ModalState::ConfirmToolUse(_)) => {
                 self.handle_tool_confirmation_key(key).await;
             }

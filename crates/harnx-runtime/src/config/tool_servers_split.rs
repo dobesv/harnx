@@ -56,6 +56,13 @@ pub struct ToolServerConfig {
     /// Merged with global and agent hooks at runtime.
     #[serde(default)]
     pub hooks: Option<HooksConfig>,
+
+    /// Ordered middleware declarations, independent of tool-server process management.
+    #[serde(
+        default,
+        skip_serializing_if = "harnx_core::middleware::MiddlewareConfig::is_empty"
+    )]
+    pub middleware: harnx_core::middleware::MiddlewareConfig,
 }
 
 impl Config {
@@ -64,29 +71,45 @@ impl Config {
     /// Each `.yaml` file in `dir` defines one tool server. The file stem
     /// (basename without extension) becomes the server's `name`.
     pub fn load_tool_servers_from_dir(dir: &Path) -> Result<Vec<ToolServerConfig>> {
-        if !dir.exists() {
-            return Ok(vec![]);
-        }
+        Self::load_tool_servers_with_middleware_base(dir, None)
+    }
 
-        let mut servers = Vec::new();
-        for path in Self::sorted_yaml_files(dir)? {
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(stem) if !stem.is_empty() => stem.to_string(),
-                _ => continue,
-            };
+    pub(super) fn load_tool_servers_with_middleware_base(
+        dir: &Path,
+        package_dir: Option<&Path>,
+    ) -> Result<Vec<ToolServerConfig>> {
+        let files = dir
+            .exists()
+            .then(|| Self::sorted_yaml_files(dir))
+            .transpose()?
+            .unwrap_or_default();
+        files
+            .iter()
+            .filter_map(|path| Self::load_tool_server_file(path, package_dir).transpose())
+            .collect()
+    }
 
-            let content = read_to_string(&path).with_context(|| {
-                format!("Failed to read tool server config '{}'", path.display())
-            })?;
-            let mut server: ToolServerConfig =
-                serde_yaml::from_str(&content).with_context(|| {
-                    format!("Failed to parse tool server config '{}'", path.display())
-                })?;
-            server.name = stem;
-            servers.push(server);
-        }
-
-        Ok(servers)
+    fn load_tool_server_file(
+        path: &Path,
+        package_dir: Option<&Path>,
+    ) -> Result<Option<ToolServerConfig>> {
+        let Some(stem) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let content = read_to_string(path)
+            .with_context(|| format!("Failed to read tool server config '{}'", path.display()))?;
+        let mut server: ToolServerConfig = serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse tool server config '{}'", path.display()))?;
+        server.name = stem.to_owned();
+        middleware::bind_middleware(
+            &mut server.middleware,
+            middleware::file_origin(path, package_dir)?,
+        )?;
+        Ok(Some(server))
     }
 }
 

@@ -584,6 +584,7 @@ mod tests {
             event_activity(&AgentEvent::sub_agent(
                 Default::default(),
                 AgentEvent::Turn(TurnEvent::SubAgentProgress(SubAgentProgress {
+                    pending_interaction: None,
                     invocation_id: "prompt-1".into(),
                     agent: "helper".into(),
                     session_id: "child".into(),
@@ -599,6 +600,7 @@ mod tests {
         assert_eq!(
             event_activity(&AgentEvent::Turn(TurnEvent::SubAgentProgress(
                 harnx_core::event::SubAgentProgress {
+                    pending_interaction: None,
                     invocation_id: "prompt-1".into(),
                     agent: "helper".into(),
                     session_id: "child".into(),

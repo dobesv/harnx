@@ -3,7 +3,7 @@
 //! Each run starts in a fresh, in-memory `/tmp`, with `set -e` enabled. Scripts
 //! can opt out with `set +e`. Only registered commands can reach host services;
 //! Bash and embedded Monty Python have no host filesystem or network access.
-//! Python can process virtual files but cannot call registered tool commands.
+//! Python can call only explicitly registered host functions.
 
 mod bashkit_backend;
 pub mod cli_map;
@@ -11,6 +11,7 @@ pub mod commands;
 pub mod description;
 pub mod fs_attachments;
 pub mod help;
+mod host;
 mod schema;
 pub mod tool_inference;
 
@@ -19,9 +20,14 @@ use std::{collections::HashMap, path::Path, path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub use bashkit::{ExcType, ExtFunctionResult, MontyException, MontyObject};
 pub use bashkit::{FileSystem, FsLimits, InMemoryFs, ReadOnlyFs};
 pub use bashkit_backend::BashKitBackend;
+pub use host::{ScriptControl, ScriptHostContext, ScriptPythonFunctions, ScriptPythonHandler};
 pub use tokio_util::sync::CancellationToken;
+
+/// Maximum number of simultaneously nested interpreter runs (including the root).
+pub const MAX_SCRIPT_NESTING: usize = 16;
 
 /// Resource limits for one invocation. Other interpreter/VFS limits retain
 /// BashKit's defaults (including 10 MB per file and 100 MB total VFS storage).
@@ -57,6 +63,8 @@ pub enum ScriptStatus {
     Error,
     TimedOut,
     Cancelled,
+    /// A trusted host operation stopped the run, not a script error or exit code.
+    Stopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +98,8 @@ pub struct ScriptCommandContext<'a> {
     /// Commands that spawn work must arrange cleanup using this signal. Prefer
     /// inline futures: dropping a run drops all interpreter-owned job futures.
     pub cancel: CancellationToken,
+    /// Host-only stop signal and nesting context, shared with Python handlers.
+    pub control: ScriptControl,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -121,6 +131,8 @@ pub struct ScriptRequest<'a> {
     pub script: &'a str,
     pub limits: ScriptLimits,
     pub commands: Vec<Arc<dyn ScriptCommand>>,
+    /// Explicit Python capabilities. `None` preserves Python without host calls.
+    pub python_functions: Option<ScriptPythonFunctions>,
     pub fs_mounts: Vec<FsMount>,
     pub cancel: CancellationToken,
 }

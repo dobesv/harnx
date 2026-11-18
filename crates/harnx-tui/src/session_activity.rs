@@ -16,6 +16,7 @@ impl Tui {
         B::Error: std::error::Error + Send + Sync + 'static,
     {
         self.sync_session_activity_monitor();
+        self.sync_interaction_client();
         terminal.draw(|frame| self.draw(frame))?;
         Ok(())
     }
