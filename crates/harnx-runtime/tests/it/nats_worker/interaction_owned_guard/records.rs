@@ -22,6 +22,7 @@ pub(super) fn calls() -> SessionLogEntry {
 
 fn output(id: &str) -> ToolOutput {
     ToolOutput {
+        user_surfaces: Vec::new(),
         id: Some(id.into()),
         name: "guard_read".into(),
         output: json!({"ok":true}),
@@ -150,6 +151,7 @@ pub(super) async fn saved_journal(
         serde_json::from_value(json!({"operation_id":"guard-read", "call_id":"wire-saved",
         "tool":"read", "args":{}, "parent_session_id":log.storage_key(),
         "tool_call_id":"saved", "tool_round":round}))?;
+    // qual:allow(dry, fragment) reason: "Seed sequence (record then complete a saved reply) mirrors the sibling journal fixture by design: both journals must contain the same persisted shapes for replay reconciliation."
     journal
         .record(&request, ("guard_read", "guard-scope", "guard"))
         .await?;
@@ -157,6 +159,7 @@ pub(super) async fn saved_journal(
         .complete(
             &request,
             harnx_toolset::ToolReply {
+                input_required: None,
                 call_id: "wire-saved".into(),
                 result: Ok(json!({"raw":"pre-middleware reply"})),
                 final_progress: None,

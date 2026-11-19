@@ -604,14 +604,16 @@ Intentionally dropped today:
 - `Notice::Info` / `Notice::Warning` — not currently emitted in server flows worth surfacing; omitted to avoid custom-event spam.
 ## Operational Notes
 
-### Tool Approval Interrupts
+### Tool Confirmation and Interaction Interrupts
 
-When a `PreToolUse` hook returns `{"permissionDecision": "ask"}`, the lease-holding
-worker persists `HitlApprovalRequested`. The server derives `Interrupted` state
-from this durable log, including after reconnects and server restarts. Decisions
-are routed to the worker, which writes `HitlApprovalDecision` using lease fencing,
-stream-tail compare-and-set, and ownership revalidation. Only a winning durable
-decision can resume the tool round; the server does not retain a continuation.
+When tool middleware requests confirmation (`confirm`), or when replaying legacy
+tool approval requests, the lease-holding worker persists durable interaction
+requests (`InteractionRequested` or legacy `HitlApprovalRequested`). The server
+derives `Interrupted` state from this durable log, including after reconnects and
+server restarts. Decisions are routed to the worker, which writes `InteractionResponse`
+(or legacy `HitlApprovalDecision`) using lease fencing, stream-tail compare-and-set,
+and ownership revalidation. Only a winning durable decision can resume the tool
+round; the server does not retain a continuation.
 
 #### Wire format
 
@@ -700,7 +702,7 @@ Submit a response to the owning session's JSON-RPC endpoint:
 {"jsonrpc":"2.0","id":1,"method":"session/interaction_response","params":{"interaction_id":"...","request_seq":42,"response":{"action":"approve","data":{},"note":"Checked the command"}}}
 ```
 
-Phase 2 accepts `approve` or `deny`, empty `data`, and an optional string `note`.
+For `confirm` interactions, `action` is `approve` or `deny` with empty `data` and an optional string `note`. For `a2ui` interactions, `action` is any button action name declared on the surface with bound input `data` (or `deny` to dismiss) and an optional string `note`.
 The exact interaction ID and positive request sequence are required. Unknown
 fields and malformed responses return `-32602`. Normal session authorization
 runs before this method; clients never supply a worker fence.
@@ -754,6 +756,60 @@ are unchanged.
 For middleware `confirm` summaries, use `session/interaction_response` on the
 child URL with the displayed `interaction_id` and `request_seq`. Other kinds have
 an open-session link but no parent-row answer buttons.
+
+### Non-modal A2UI surfaces and actions
+
+Non-modal A2UI surfaces accompany completed tool results (`ToolResults.user_surfaces`). Unlike modal interactions, non-modal surfaces do not suspend the session or block the composer; multiple surfaces can remain active simultaneously.
+
+#### `a2ui_surface` custom event
+
+During promptless attach and live catch-up, `harnx-serve` emits an AG-UI `CUSTOM` event named `a2ui_surface` for each surface published in durable tool results:
+
+```json
+{"type":"CUSTOM","name":"a2ui_surface","value":{"surface_id":"deploy-form","publish_seq":42,"tool_call_id":"call_1","payload":{"version":"1.0","createSurface":{}}}}
+```
+
+When an action on a surface is accepted, the server emits another `a2ui_surface` event carrying the resolution:
+
+```json
+{"type":"CUSTOM","name":"a2ui_surface","value":{"surface_id":"deploy-form","publish_seq":42,"action":"deploy","visibility":"note","note_text":"Deploying release"}}
+```
+
+The marker identity is `(surface_id, publish_seq)`. Frontends deduplicate live and replayed events using this pair.
+
+#### Submit a surface action (`session/surface_action`)
+
+Frontends submit actions by calling the JSON-RPC method `session/surface_action`:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"session/surface_action","params":{"surface_id":"deploy-form","publish_seq":42,"response":{"action":"deploy","data":{"target":"staging"},"note":"Deploy to staging"},"user_message":"Deploy to staging"}}
+```
+
+Parameters:
+- `surface_id`: non-empty string identifying the surface.
+- `publish_seq`: positive integer of the enclosing `ToolResults` log sequence.
+- `response`: `{ "action": string, "data": object, "note"?: string }` built through the shared response contract.
+- `user_message`: optional string used as model-facing text for `note` or `turn` visibility. The backend reads `user_message` and does not use `response.note` for model input.
+
+Outcomes:
+- On success: Returns `{ "applied": true, "outcome": "applied" | "already_applied" }`. A retry with identical action and data returns `already_applied` without appending a new record. Resubmitting identical action and data with a different note is also treated as `already_applied`, and the second note is dropped.
+- On rejection: Returns JSON-RPC error `-32004` (`surface action rejected`) with data `{ "outcome": "<reason>" }`, where `<reason>` is one of:
+  - `conflicting`: a different action was already recorded for this generation.
+  - `unknown_surface`: no published surface matches `surface_id` at `publish_seq`.
+  - `undeclared_action`: the action is not a declared button on the surface (`deny` is also rejected; non-modal surfaces have no dismissal action).
+  - `invalid_visibility`: the button declares an unknown visibility value.
+  - `invalid_data`: submitted data keys or types conflict with surface input bindings.
+  - `unauthorized_tool`: the direct tool target is not permitted for this session.
+  - `tool_failed`: the direct target tool executed and returned a failure.
+  - `lease_lost`: the worker lost its session lease during execution.
+  - `append_failed`: the action record could not be appended after repeated CAS conflicts.
+- On malformed arguments: Returns JSON-RPC error `-32602` (`invalid params`).
+- On routing failure: Returns JSON-RPC error `-32003`.
+
+Execution semantics:
+- Direct tools follow an execute-then-record order: the tool runs before the action record is appended so its summary can be quoted in the note. If a crash happens after the tool runs but before the record lands, a retry will run the tool again (execute-then-record window).
+- At-most-once tool execution is owner-local: guaranteed by the active worker's in-memory gate. Submissions to an idle session without an active worker are not cross-process serialized; concurrent idle submissions may run a non-idempotent tool more than once before the first record commits.
+- Frontends and `harnx-serve` must upgrade before workers: older clients do not recognize the worker's early `Pending` acknowledgement and fall back to idle execution after 40 seconds, risking a duplicate tool run.
 
 ## Request Identity
 

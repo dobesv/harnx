@@ -160,13 +160,36 @@ impl Fixture {
     }
 
     pub async fn request(&self, id: &str, kind: &str) -> Result<u64> {
-        self.log.append_event_async(&SessionLogEntry::InteractionRequested {
-            tool_round_seq: self.round, tool_call_id: "call-1".into(), interaction_id: id.into(),
-            producer: "middleware:test".into(), step_path: vec![], key: id.into(), kind: kind.into(),
-            payload: json!({"message": format!("Public message for {id}?"), "private": "secret checkpoint input"}),
-            summary: "Summary fallback".into(), chain_version: "v1".into(), checkpoint: "private-checkpoint".into(),
-            fence_token: self.lease.fence_token(),
-        }).await
+        self.request_payload(
+            id,
+            kind,
+            json!({"message": format!("Public message for {id}?"), "private": "secret checkpoint input"}),
+        )
+        .await
+    }
+
+    pub async fn request_payload(
+        &self,
+        id: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<u64> {
+        self.log
+            .append_event_async(&SessionLogEntry::InteractionRequested {
+                tool_round_seq: self.round,
+                tool_call_id: "call-1".into(),
+                interaction_id: id.into(),
+                producer: "middleware:test".into(),
+                step_path: vec![],
+                key: id.into(),
+                kind: kind.into(),
+                payload,
+                summary: "Summary fallback".into(),
+                chain_version: "v1".into(),
+                checkpoint: "private-checkpoint".into(),
+                fence_token: self.lease.fence_token(),
+            })
+            .await
     }
 
     pub async fn ready(&self, ids: &[&str]) -> Result<()> {

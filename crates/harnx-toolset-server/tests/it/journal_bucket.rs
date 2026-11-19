@@ -176,12 +176,15 @@ async fn standalone_rows_expire_a_week_after_their_last_write() -> Result<()> {
     let week = Some("604800");
     let tool = ("echo", "scope", "srv");
     let reply = |call_id: &str| ToolReply {
+        input_required: None,
         call_id: call_id.into(),
         result: Ok(json!({"value": 42})),
         final_progress: None,
     };
 
     let standalone = ToolRequest {
+        input_responses: None,
+        request_state: None,
         parent_session_id: None,
         tool_call_id: None,
         ..common::request("unused", "direct")

@@ -48,8 +48,8 @@ impl ProviderSession {
         tokio::time::timeout(
             CI_SAFE_TIMEOUT,
             run_agent_loop_with_nats(RunAgentLoopArgs {
+                surface_notes: None,
                 cluster_key: "local",
-                manage_servers: false,
                 session_id: &self.key,
                 config: self.config.clone(),
                 instance_id: self.scope.clone(),

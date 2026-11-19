@@ -22,6 +22,7 @@
 //! | `HARNX_BASH_ENV_PASSTHROUGH` | Comma-separated names | Extra host env var names to pass through |
 
 mod cli;
+mod environment;
 #[cfg(unix)]
 mod grants;
 mod hooks;
@@ -86,54 +87,60 @@ fn parse_cli(args: &[String]) -> cli::Cli {
     }
 }
 
+#[derive(Default)]
+struct HookServices {
+    proxy_env: std::collections::HashMap<String, String>,
+    credential_env: std::collections::HashMap<String, String>,
+    runtime: Option<tokio::runtime::Runtime>,
+    manager: Option<hooks::ServiceManager>,
+}
+
+fn init_hooks(hook_defs: &[cli::HookDef]) -> Result<HookServices> {
+    if hook_defs.is_empty() {
+        return Ok(HookServices::default());
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    let cwd = std::env::current_dir()?;
+    let result = rt.block_on(hooks::run_hooks(hook_defs, &cwd))?;
+
+    Ok(HookServices {
+        proxy_env: result.proxy_env,
+        credential_env: result.credential_env,
+        runtime: Some(rt),
+        manager: Some(result.manager),
+    })
+}
+
 fn main() -> Result<()> {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
 
-    // Raw args (skip program name)
     let raw: Vec<String> = std::env::args().skip(1).collect();
-
-    // Pre-parse --hook groups before clap
     let (hook_defs, remaining) = cli::pre_parse_hooks(raw)?;
 
-    // Re-add program name for clap parsing
     let mut clap_args = vec!["harnx-sandbox-run".to_string()];
     clap_args.extend(remaining);
-
-    // Treat stale configuration as a startup failure with the same exit code as
-    // the tool servers. Help and version requests still exit successfully.
     let mut cli = parse_cli(&clap_args);
-
-    // Merge env var overrides (matching harnx-bash-tools behaviour).
     merge_environment(&mut cli);
 
-    // Run hooks if any, keeping the tokio runtime (and all sidecar processes,
-    // e.g. harnx-proxy-auth) alive for the full duration of the child.
-    let (hook_env, _rt, _manager) = if !hook_defs.is_empty() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let cwd = std::env::current_dir()?;
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let result = rt.block_on(hooks::run_hooks(
-            &hook_defs,
-            &session_id,
-            &cwd,
-            &cli.command,
-        ))?;
-        // Keep rt and manager alive (bound to these variables) until after
-        // setup_and_spawn returns — this keeps harnx-proxy-auth running.
-        (result.env, Some(rt), Some(result.manager))
-    } else {
-        (std::collections::HashMap::new(), None, None)
-    };
+    let HookServices {
+        proxy_env,
+        credential_env,
+        runtime,
+        mut manager,
+    } = init_hooks(&hook_defs)?;
 
-    // Delegate sandbox setup and spawn to harnx-sandbox-exec subprocess.
-    // The tokio runtime and hook manager stay alive (via _rt and _manager above)
-    // until this returns.
     let use_defaults = !cli.no_defaults;
-    let exit_code = sandbox::setup_and_spawn(&cli, hook_env, use_defaults)?;
+    let spawn_result = sandbox::setup_and_spawn(&cli, proxy_env, credential_env, use_defaults);
 
-    // _rt and _manager drop here, shutting down harnx-proxy-auth after child exits.
+    if let (Some(mgr), Some(rt)) = (manager.take(), runtime.as_ref()) {
+        rt.block_on(mgr.shutdown());
+    }
+    drop(runtime);
 
+    let exit_code = spawn_result?;
     std::process::exit(exit_code);
 }

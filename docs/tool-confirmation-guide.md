@@ -3,7 +3,7 @@
 Use middleware `confirm` to pause a tool call for an approve/deny decision. It runs
 inside the worker, including unmanaged/cloud workers; no hook-server process is
 needed. The script decides what approval runs and what denial returns to the model.
-Legacy `PreToolUse` approvals still work for existing configurations and sessions.
+Legacy `PreToolUse` configurations fail configuration loading with migration guidance; only saved pending approvals from existing sessions remain answerable.
 
 ## Quick start
 
@@ -54,8 +54,8 @@ all calls in the round finish, including siblings still awaiting input.
 
 ## What suspends and resumes
 
-1. The model requests a tool. Existing preparation and legacy PreToolUse policy
-   run before middleware.
+1. The model requests a tool. Tool preparation and argument validation run
+   before middleware.
 2. With no accepted answer, `confirm` stops the interpreter and requests a modal
    interaction tagged `harnx.kind: confirm`. Printing JSON cannot forge it.
 3. The worker persists the private checkpoint and request, settles or durably
@@ -325,9 +325,8 @@ repeat earlier effects. Ask the model to call the protected tool directly.
 
 Operator **root** calls (`harnx call tool`, TUI `.call tool`) auto-approve confirm
 under explicit operator consent. Denial and argument/result rewriting still apply.
-Other interaction kinds fail without an operator UI. Don't confuse this with
-legacy hook `ask`: legacy operator Bash inner calls auto-approve `ask`, but
-middleware inner calls can't suspend. Middleware's own `tools:` helpers bypass
+Other interaction kinds fail without an operator UI. Inner calls from operator
+Bash scripts can't suspend either. Middleware's own `tools:` helpers bypass
 the chain to prevent recursion, while retaining admission and cancellation checks.
 Operator consent doesn't grant approval to child agent sessions. Control tools
 such as `*_session_handoff` aren't available inside model scripts.
@@ -359,11 +358,13 @@ for limits, retention and recovery classification.
 
 ## Legacy hook approvals
 
-Existing `hooks:` entries returning `permissionDecision: ask` still use the legacy
-HITL path. Its durable readers stay supported for old sessions. New policies
-should use middleware; don't change old session records to interaction records.
-The legacy serve method `session/hitl_decision` is unchanged and must not receive
-middleware responses.
+Process-based hooks no longer run, and legacy `hooks:` command entries fail
+configuration loading. Pending approvals already recorded in old sessions still
+use the legacy HITL path. Their readers and decision APIs remain supported;
+approval resumes the saved call and denial produces a blocked result without
+running it. New policies use middleware. Don't rewrite old session records as
+interaction records. The legacy serve method `session/hitl_decision` is unchanged
+and must not receive middleware responses.
 
 The legacy TUI modal shows full arguments as multiline YAML and, when available,
 a rendered transcript template (`Ctrl+F` toggles). `PageUp`, `PageDown` and the
@@ -371,7 +372,7 @@ mouse wheel scroll. `Enter` approves after two seconds idle; `Ctrl+D` rejects;
 `Ctrl+C` rejects and interrupts, restoring text as a draft. Unlike middleware
 notes, a nonempty legacy note is durably queued as a user message before the
 confirmation reply. If enqueue fails, the modal keeps the draft for retry.
-Legacy hook `deny` remains enforced for model and operator calls.
+Saved legacy denials remain blocked during recovery.
 See the [Hooks Guide](hooks-guide.md) for compatibility details.
 
 ## Demo and verification

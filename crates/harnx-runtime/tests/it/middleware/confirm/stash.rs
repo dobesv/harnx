@@ -135,7 +135,7 @@ async fn middleware_confirm_missing_retained_snapshot_fails_before_dispatch() {
             .await,
     );
     harness.accept(&request, "approve");
-    harness.store.checkpoint.as_mut().unwrap().snapshots.clear();
+    harness.checkpoint_mut().unwrap().snapshots.clear();
     let result = completed(harness.attempt(json!({})).await);
     assert!(result
         .output
@@ -223,7 +223,7 @@ async fn middleware_confirm_checkpoint_limit_counts_retained_results() {
     let mut harness = Harness::new(vec![python(PYTHON_SAVE)]).await;
     let request = pending(harness.attempt(json!({})).await);
     harness.accept(&request, "approve");
-    let checkpoint = harness.store.checkpoint.as_mut().unwrap();
+    let checkpoint = harness.checkpoint_mut().unwrap();
     checkpoint
         .snapshots
         .values_mut()

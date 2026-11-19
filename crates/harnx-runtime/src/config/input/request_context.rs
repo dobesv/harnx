@@ -5,6 +5,7 @@ use super::{Input, Message, MessageContent, MessageRole};
 pub(super) fn append(input: &Input, messages: &mut Vec<Message>, with_session: bool) {
     append_sessionless_tool_calls(input, messages, with_session);
     append_injected_user_messages(input, messages);
+    append_hook_context(input, messages);
     append_timing_context(input, messages);
     append_transient_note(input, messages);
 }
@@ -35,6 +36,18 @@ fn append_injected_user_messages(input: &Input, messages: &mut Vec<Message>) {
         messages.push(Message::new(
             MessageRole::User,
             MessageContent::Text(text.clone()),
+        ));
+    }
+}
+
+fn append_hook_context(input: &Input, messages: &mut Vec<Message>) {
+    // The durable row begin_turn appended sits past the session_input_start
+    // truncation, so this request-only copy is the text's only appearance in
+    // the wire request this round.
+    if let Some(context) = input.hook_context() {
+        messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text(context.to_string()),
         ));
     }
 }

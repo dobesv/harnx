@@ -244,7 +244,8 @@ mod adapter_wire_tests {
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{ClientCapabilities, ErrorCode, InitializeRequestParams};
     use rmcp::service::{
-        serve_client, serve_server, RoleClient, RoleServer, RunningService, ServiceError,
+        serve_client, serve_client_with_lifecycle, serve_server, ClientLifecycleMode, RoleClient,
+        RoleServer, RunningService, ServiceError,
     };
     use tokio::io::duplex;
 
@@ -472,6 +473,219 @@ mod adapter_wire_tests {
             .as_ref()
             .and_then(|meta| meta.0.get(harnx_toolset::STOP_ON_NEW_MESSAGE_META_KEY));
         assert_eq!(opt_in, None);
+        client.cancel().await.unwrap();
+    }
+
+    /// Records what a toolset observed on each invocation: the arguments,
+    /// and the input responses and request state delivered beside them.
+    type ObservedInvocation = (
+        Value,
+        std::collections::BTreeMap<String, harnx_toolset::ToolInputResponse>,
+        Value,
+    );
+
+    #[derive(Default)]
+    struct RecordingInputRequiredToolset {
+        seen: std::sync::Mutex<Vec<ObservedInvocation>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Toolset for RecordingInputRequiredToolset {
+        fn name(&self) -> &str {
+            "input-required"
+        }
+
+        fn tools(&self) -> Vec<harnx_toolset::ToolSpec> {
+            vec![harnx_toolset::ToolSpec {
+                cancellation_guarantee: Default::default(),
+                name: "ask".to_owned(),
+                description: "challenges until answered".to_owned(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                idempotent_hint: false,
+                read_only_hint: true,
+                timeout_secs: None,
+                meta: None,
+            }
+            .with_input_required()]
+        }
+
+        async fn invoke(
+            &self,
+            tool: &str,
+            args: Value,
+            token: tokio_util::sync::CancellationToken,
+        ) -> Result<Value, ToolInvokeError> {
+            self.invoke_with_context(harnx_toolset::ToolInvocation {
+                tool: tool.to_owned(),
+                args,
+                context: Default::default(),
+                cancel: token,
+            })
+            .await
+        }
+
+        async fn invoke_with_context(
+            &self,
+            invocation: ToolInvocation,
+        ) -> Result<Value, ToolInvokeError> {
+            self.seen.lock().expect("invocation log").push((
+                invocation.args.clone(),
+                invocation.context.input_responses.clone(),
+                invocation.context.request_state.clone(),
+            ));
+            if invocation.context.input_responses.is_empty() {
+                return Err(ToolInvokeError::InputRequired(Box::new(
+                    harnx_toolset::ToolInputRequired::confirm(
+                        "ask-key",
+                        "Proceed?",
+                        serde_json::json!({"round": 1}),
+                    ),
+                )));
+            }
+            Ok(serde_json::json!({
+                "content": [{"type": "text", "text": "adapter done"}],
+                "isError": false
+            }))
+        }
+    }
+
+    /// Wire up the adapter over a duplex transport with the client's
+    /// discover-first lifecycle, so the pair negotiates the MRTR-capable
+    /// 2026-07-28 revision the way the bridge does with modern servers.
+    ///
+    /// The server-side future stays in its bootstrap loop until the first
+    /// non-discover request arrives (rmcp keeps the connection open to either
+    /// lifecycle), so it must not be awaited alongside the client handshake.
+    /// Spawn it and leak the resulting service, as the in-process mock server
+    /// does.
+    async fn setup_client_server_modern(toolset: std::sync::Arc<dyn Toolset>) -> TestClientService {
+        let (client_transport, server_transport) = duplex(65_536);
+        let adapter = McpToolsetAdapter { toolset };
+        tokio::spawn(async move {
+            if let Ok(service) = serve_server(adapter, server_transport).await {
+                std::mem::forget(service);
+            }
+        });
+        serve_client_with_lifecycle(
+            TestClientHandler,
+            client_transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::LATEST],
+            },
+        )
+        .await
+        .expect("discover handshake")
+    }
+
+    /// Issue one `tools/call` without driving MRTR follow-up rounds.
+    async fn call_tool_once(
+        client: &TestClientService,
+        params: rmcp::model::CallToolRequestParams,
+    ) -> Result<rmcp::model::CallToolResponse, ServiceError> {
+        client.call_tool_once(params).await
+    }
+
+    /// Modern peers (≥2026-07-28) see an MRTR `input_required` response for a
+    /// challenging tool, and a re-call carries the user's answers and the
+    /// echoed state beside the unchanged arguments.
+    #[tokio::test]
+    async fn tool_input_required_maps_to_mrtr_for_modern_peers() {
+        let toolset = std::sync::Arc::new(RecordingInputRequiredToolset::default());
+        let client = setup_client_server_modern(toolset.clone()).await;
+
+        let args: serde_json::Map<String, Value> =
+            serde_json::from_value(serde_json::json!({"value": "adapter"}))
+                .expect("arguments are a JSON object");
+        let params = rmcp::model::CallToolRequestParams::new("ask").with_arguments(args);
+        let first = call_tool_once(&client, params)
+            .await
+            .expect("the challenge round is a protocol response, not a transport error");
+
+        let rmcp::model::CallToolResponse::InputRequired(result) = first else {
+            panic!("modern peers see the MRTR input_required variant: {first:?}");
+        };
+        let (key, _) = result
+            .input_requests
+            .as_ref()
+            .and_then(|requests| requests.iter().next())
+            .expect("one input request");
+        assert_eq!(key, "ask-key");
+        assert_eq!(result.request_state.as_deref(), Some("{\"round\":1}"));
+
+        // Re-call with the user's answer and the echoed state.
+        let mut responses = rmcp::model::InputResponses::new();
+        responses.insert(
+            "ask-key".to_owned(),
+            serde_json::json!({
+                "action": "accept",
+                "_meta": {"harnx:action": "approve", "harnx:note": "go on"}
+            }),
+        );
+        let args: serde_json::Map<String, Value> =
+            serde_json::from_value(serde_json::json!({"value": "adapter"}))
+                .expect("arguments are a JSON object");
+        let params = rmcp::model::CallToolRequestParams::new("ask")
+            .with_arguments(args)
+            .with_input_responses(responses)
+            .with_request_state("{\"round\":1}".to_owned());
+        let second = call_tool_once(&client, params)
+            .await
+            .expect("the answered round completes");
+        let rmcp::model::CallToolResponse::Complete(result) = second else {
+            panic!("the answered round returns a completed result: {second:?}");
+        };
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            serde_json::to_value(&result.content).unwrap(),
+            serde_json::json!([{"type": "text", "text": "adapter done"}])
+        );
+
+        // The toolset saw the answers and state beside unchanged arguments.
+        let seen = toolset.seen.lock().expect("invocation log").clone();
+        assert_eq!(seen.len(), 2, "one challenge round and one answered round");
+        let (challenge_args, challenge_responses, _) = &seen[0];
+        assert_eq!(challenge_args, &serde_json::json!({"value": "adapter"}));
+        assert!(
+            challenge_responses.is_empty(),
+            "no answers on the first round"
+        );
+        let (rerun_args, rerun_responses, rerun_state) = &seen[1];
+        assert_eq!(
+            rerun_args,
+            &serde_json::json!({"value": "adapter"}),
+            "the re-call keeps the arguments unchanged"
+        );
+        let answer = rerun_responses.get("ask-key").expect("answer delivered");
+        assert_eq!(answer.action, "approve");
+        assert_eq!(answer.note.as_deref(), Some("go on"));
+        assert_eq!(rerun_state, &serde_json::json!({"round": 1}));
+        client.cancel().await.unwrap();
+    }
+
+    /// Legacy peers see the visible `INPUT_REQUIRED_COMPAT_ERROR` result, not
+    /// an MRTR response they cannot render.
+    #[tokio::test]
+    async fn tool_input_required_degrades_to_compat_error_for_legacy_peers() {
+        let toolset = std::sync::Arc::new(RecordingInputRequiredToolset::default());
+        let (client, _server) = setup_client_server(toolset.clone()).await;
+
+        let response = call_tool_once(&client, rmcp::model::CallToolRequestParams::new("ask"))
+            .await
+            .expect("the legacy round is a protocol response, not a transport error");
+        let rmcp::model::CallToolResponse::Complete(result) = response else {
+            panic!("legacy peers never see the MRTR variant: {response:?}");
+        };
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            serde_json::to_string(&result.content)
+                .expect("content serializes")
+                .contains(harnx_toolset::INPUT_REQUIRED_COMPAT_ERROR),
+            "the failure names the cap: {:?}",
+            result.content
+        );
+
+        // The tool challenged once; nobody drives a rerun for a legacy peer.
+        assert_eq!(toolset.seen.lock().expect("invocation log").len(), 1);
         client.cancel().await.unwrap();
     }
 }

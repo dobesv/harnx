@@ -65,6 +65,7 @@ async fn durable_reply_is_returned_without_reinvoking_after_cache_loss() -> Resu
         .context("nats-server required")?;
     let (journal, request) = interrupted_call(&harness, "echo").await?;
     let saved = ToolReply {
+        input_required: None,
         call_id: request.call_id.clone(),
         result: Ok(json!({"saved": true})),
         final_progress: None,
@@ -136,6 +137,7 @@ async fn ordinary_duplicate_must_match_the_journal_even_with_cached_reply() -> R
         .complete(
             &request,
             ToolReply {
+                input_required: None,
                 call_id: request.call_id.clone(),
                 result: Ok(json!("saved")),
                 final_progress: None,
@@ -166,6 +168,7 @@ async fn journal_separates_standalone_calls_and_requires_persisted_records() -> 
         .record(&request, ("test_echo", "test-scope", "____test"))
         .await?;
     let standalone = ToolReply {
+        input_required: None,
         call_id: request.call_id.clone(),
         result: Ok(json!("standalone")),
         final_progress: None,

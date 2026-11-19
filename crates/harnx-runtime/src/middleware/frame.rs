@@ -79,6 +79,18 @@ impl Frame {
         Ok(OperationGuard(self.clone()))
     }
 
+    /// Interaction key shared by `confirm` and `interact`: the
+    /// script-supplied id, or the per-middleware interaction ordinal.
+    pub(super) fn interaction_key(&self, id: Option<String>, operation: &str) -> Result<String> {
+        let key = {
+            let mut state = self.state.lock();
+            state.interaction_ordinal += 1;
+            id.unwrap_or_else(|| state.interaction_ordinal.to_string())
+        };
+        ensure!(!key.is_empty(), "{operation} id must not be empty");
+        Ok(key)
+    }
+
     fn step_key(&self, id: Option<String>) -> Result<String> {
         let mut state = self.state.lock();
         state.ordinal += 1;

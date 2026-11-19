@@ -8,7 +8,7 @@ pub(super) fn assert_backend_capture_notice(text: &str) {
 
 #[tokio::test]
 async fn presentation_truncation_keeps_output_control_guidance() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     let output = ok(bash
         .call_tool(
             "bash",
@@ -30,7 +30,7 @@ async fn presentation_truncation_keeps_output_control_guidance() {
 async fn bash_default_and_explicit_byte_budgets_bound_long_lines() {
     use harnx_core::safety::DEFAULT_MAX_BYTES;
 
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     for length in [5000, 100_000, (DEFAULT_MAX_BYTES / 5000 + 1) * 5000] {
         let line = format!("HEAD{}TAIL", "0".repeat(length));
         for max_output_bytes in [None, Some(65536)] {
@@ -73,7 +73,7 @@ async fn bash_default_and_explicit_byte_budgets_bound_long_lines() {
 
 #[tokio::test]
 async fn bash_explicit_byte_budget_keeps_line_window_and_byte_cap() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     let output = ok(bash
         .call_tool(
             "bash",
@@ -130,7 +130,7 @@ impl ToolProvider for FatalProvider {
 
 #[tokio::test]
 async fn backend_error_reaches_failure_payload_when_stderr_is_full() {
-    let (bash, _slot, _hooks, _ctx) = harness(Arc::new(FatalProvider), Vec::new());
+    let (bash, _slot, _ctx) = harness(Arc::new(FatalProvider), Vec::new());
     let error = recoverable(
         bash.call_tool(
             "bash",

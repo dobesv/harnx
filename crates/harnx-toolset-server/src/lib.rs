@@ -18,8 +18,10 @@ use invocation::{
     accepts_parent_session_id, add_parent_context_args, metric_tool_name, tool_exec_span,
 };
 mod mcp;
+pub mod mrtr;
 #[cfg(test)]
 use mcp::call_tool_result_from_value;
+pub use mcp::McpToolsetAdapter;
 mod lifecycle;
 mod runner;
 pub use runner::{
@@ -241,6 +243,7 @@ pub async fn serve_with_client_and_identity(
 /// Serve a toolset using an existing NATS connection, exiting cleanly (and
 /// running exit cleanup while the connection is still usable) when the
 /// lifecycle's shutdown token is cancelled, in addition to the usual failure exits.
+// qual:api
 pub async fn serve_with_shutdown(
     toolset: Arc<dyn Toolset>,
     instance_id: ServerScope,
@@ -662,12 +665,14 @@ async fn process_tool_request(
                 call_id: request.call_id.clone(),
                 result: Err(map_invoke_error(error)),
                 final_progress: None,
+                input_required: None,
             }),
     );
     complete_cache_entry(&context.reply_cache, key, reply.clone(), completion).await;
     serve_cached(context, reply_subject, reply).await
 }
 
+// qual:allow(complexity, max_function_lines=70) reason: "Request validation is one ordered gate list (headers, session, tool, args, limits, challenge fields); extracting sub-gates would hide the admission order the journal depends on."
 async fn validate_tool_request(
     context: &ToolRequestContext,
     message: async_nats::Message,
@@ -729,6 +734,7 @@ async fn validate_tool_request(
             call_id: request.call_id,
             result: Err(map_invoke_error(recovery::invoke_error(error))),
             final_progress: None,
+            input_required: None,
         };
         return publish_reply(&context.client, reply_subject, &reply)
             .await
@@ -804,6 +810,7 @@ async fn publish_recoverable_reply(
             call_id,
             result: Err(ToolErrorPayload::Recoverable(message)),
             final_progress: None,
+            input_required: None,
         },
     )
     .await
@@ -814,6 +821,13 @@ fn map_invoke_error(error: ToolInvokeError) -> ToolErrorPayload {
         ToolInvokeError::Recoverable(message) => ToolErrorPayload::Recoverable(message),
         ToolInvokeError::Fatal(message) => ToolErrorPayload::Fatal(message),
         ToolInvokeError::Interrupted(interrupted) => ToolErrorPayload::Interrupted(interrupted),
+        // Challenges are outcomes, not failures; record_outcome lifts them
+        // into `ToolReply::input_required`. Reaching this arm means the
+        // challenge could not be delivered, so degrade to the compatibility
+        // error rather than a silent success.
+        ToolInvokeError::InputRequired(_) => {
+            ToolErrorPayload::Recoverable(harnx_toolset::INPUT_REQUIRED_COMPAT_ERROR.to_string())
+        }
     }
 }
 

@@ -1,8 +1,7 @@
-//! Idle-session operator RPC. Reuses worker providers, server claims and hooks;
+//! Idle-session operator RPC. Reuses worker providers, server claims and middleware;
 //! does not acquire an inference turn or append a user prompt.
 
 use super::daemon_runtime::WorkerRuntime;
-use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use super::server_reconciler::ServerReconciler;
 use crate::operator_tools::{OperatorToolMessage, OperatorToolReply, OperatorToolRequest};
 use anyhow::{ensure, Context, Result};
@@ -39,6 +38,7 @@ pub(super) async fn subscribe(runtime: Arc<WorkerRuntime>) -> Result<AbortOnDrop
                     if tasks.len() >= MAX_PENDING {
                         send(&runtime.client, &reply, OperatorToolMessage::Finished(OperatorToolReply {
                             output: String::new(), error: Some("Worker is busy with operator tool commands".into()),
+                            error_kind: None,
                         })).await;
                         continue;
                     }
@@ -100,6 +100,7 @@ async fn handle(runtime: Arc<WorkerRuntime>, message: async_nats::Message) {
     let reply_value = result.unwrap_or_else(|error| OperatorToolReply {
         output: String::new(),
         error: Some(format!("{error:#}")),
+        error_kind: None,
     });
     send(
         &runtime.client,
@@ -291,28 +292,9 @@ async fn execute_claimed(
         let claimed = reconciler.claim_users(&claim.token, servers).await;
         WorkerRuntime::wait_for_tool_server_start(reconciler.clone(), claimed, &claim.token).await;
     }
-    // Invocation-owned agent hooks use a separate scope, so nested agents cannot
-    // discover their parent's policies. Stop them before releasing tool claims.
-    let mut hooks = if matches!(
-        request.command,
-        crate::operator_tools::OperatorToolCommand::Call { .. }
-            | crate::operator_tools::OperatorToolCommand::Bash { .. }
-    ) {
-        start_agent_hooks(runtime, config, &claim.token).await?
-    } else {
-        None
-    };
-    let result = execution
-        .execute_discovered(
-            &admission_selectors,
-            package,
-            hooks.as_ref().map(|(_, scope)| scope),
-        )
-        .await;
-    if let Some((hooks, _)) = &mut hooks {
-        hooks.shutdown().await;
-    }
-    result
+    execution
+        .execute_discovered(&admission_selectors, package)
+        .await
 }
 
 impl OperatorExecution<'_> {
@@ -320,7 +302,6 @@ impl OperatorExecution<'_> {
         &self,
         selectors: &[String],
         package: Option<String>,
-        hook_scope: Option<&harnx_core::instance::ServerScope>,
     ) -> Result<OperatorToolReply> {
         let Self {
             runtime,
@@ -344,11 +325,6 @@ impl OperatorExecution<'_> {
         .await
         .context("Operator tool discovery failed")?;
         *config.read().nats_tool_declarations.write() = provider.declarations().to_vec();
-        let hook_provider = self.discover_hooks(hook_scope).await?;
-        let params = crate::tool_context::BuildToolEvalContextParams {
-            nats_hook_provider: Some(hook_provider),
-            ..params
-        };
         let provider = Arc::new(provider);
         // #2630: Bash evaluates on a command-scoped context whose catalog,
         // executor allowlist and allowed names all derive from one admitted
@@ -421,9 +397,6 @@ impl OperatorExecution<'_> {
             bash_context_slot: Some(slot.clone()),
             command_bash: Some(crate::bash_provider::CommandBashInputs {
                 inner_declarations: admitted,
-                // The operator already consented to this script's inner
-                // calls; ordinary agent and child policies stay normal.
-                operator_inner_consent: true,
             }),
             ..params
         };
@@ -432,7 +405,6 @@ impl OperatorExecution<'_> {
         ctx.allowed_tool_names
             .insert(crate::config::BASH_TOOL_NAME.to_string());
         let root_call_id = uuid::Uuid::new_v4().to_string();
-        crate::operator_tools::approve_root_bash_call(&mut ctx, &root_call_id);
         let owner = slot.install(ctx);
         let reply = crate::operator_tools::evaluate_bash(
             &owner,
@@ -447,28 +419,6 @@ impl OperatorExecution<'_> {
         .await;
         drop(owner);
         reply
-    }
-
-    async fn discover_hooks(
-        &self,
-        hook_scope: Option<&harnx_core::instance::ServerScope>,
-    ) -> Result<Arc<crate::nats_hook_provider::NatsHookProvider>> {
-        let runtime = self.runtime;
-        let mut hook_provider = crate::nats_hook_provider::NatsHookProvider::discover_with_client(
-            runtime.client.clone(),
-            runtime.instance_id.clone(),
-        )
-        .await
-        .context("Operator hook provider discovery failed")?;
-        if let Some(scope) = hook_scope {
-            let own_hooks = crate::nats_hook_provider::NatsHookProvider::discover_with_client(
-                runtime.client.clone(),
-                scope.clone(),
-            )
-            .await?;
-            hook_provider = hook_provider.with_scoped_hooks(own_hooks);
-        }
-        Ok(Arc::new(hook_provider))
     }
 
     fn filtered_command(
@@ -494,49 +444,6 @@ impl OperatorExecution<'_> {
             command => command.clone(),
         }
     }
-}
-
-async fn start_agent_hooks(
-    runtime: &WorkerRuntime,
-    config: &crate::config::GlobalConfig,
-    label: &str,
-) -> Result<Option<(HookServerSupervisor, harnx_core::instance::ServerScope)>> {
-    let hooks = config
-        .read()
-        .agent
-        .as_ref()
-        .and_then(|agent| agent.hooks().cloned())
-        .unwrap_or_default();
-    if hooks.entries.is_empty() {
-        return Ok(None);
-    }
-    ensure!(
-        runtime.manage_servers,
-        "Worker cannot start the active agent's operator hooks"
-    );
-    let snapshot = config.read().clone();
-    let server = snapshot
-        .resolve_nats_server(snapshot.default_cluster_key())
-        .await?;
-    let token = server
-        .token
-        .clone()
-        .context("Operator agent hooks require a NATS token")?;
-    let scope = harnx_core::instance::ServerScope::new();
-    let start = HookServerStartConfig::new(
-        runtime.client.clone(),
-        scope.clone(),
-        server.url.clone(),
-        token,
-    )
-    .with_replicas(server.replicas)
-    .with_broker_settings(&harnx_nats_common::connect::NatsEndpoint::from(
-        server.as_ref(),
-    ));
-    Ok(Some((
-        HookServerSupervisor::start_local(start, &hooks, label).await?,
-        scope,
-    )))
 }
 
 #[cfg(test)]

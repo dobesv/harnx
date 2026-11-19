@@ -324,27 +324,13 @@ default) must return its first execution_id-bearing response instead of expiring
 60 s backstop. Direct stdio clients that ignore unknown `_meta` keys are unaffected.
 See `crates/harnx-mcp-bridge/README.md#request-timeout-policy`.
 
-### Session transcript and PreToolUse hook mutation
-
-### Hook command strings must use `shell_words::join`
-
-Hook command strings that embed binary paths or JSON expressions MUST use
-`shell_words::join` on all platforms, including Windows. Unquoted Windows paths
-(`C:\Program Files\...\hook-server.exe`) split on backslashes and spaces when
-passed through `shell_words::split` in the hook server, breaking execution.
-
-Precedent: `crates/harnx-runtime/src/nats_worker/operator_tools/tests.rs:761` and
-`crates/harnx-runtime/tests/it/nats_worker/tool_cli.rs:619`. Existing fixtures
-use `shell_words::join([binary, "--event", "PreToolUse", "--jaq", expression])`
-to preserve Windows paths with backslashes and JSON containing apostrophes.
-
-### Session transcript and PreToolUse hook mutation
+### Session transcript and middleware argument mutation
 
 Persisted `ToolCalls` entries hold the arguments as received from the LLM, before
-`PreToolUse` hooks run, except that `null`s for omitted optional parameters are
+tool middleware runs, except that `null`s for omitted optional parameters are
 already gone (see "Tool parameter schemas"). `execute_tool_round_with_persistence`
-(`crates/harnx-runtime/src/tool.rs`) appends calls before hooks apply
-`mutated_tool_input`. To assert hook-injected env or args, read `ToolResults`
+(`crates/harnx-runtime/src/tool.rs`) appends calls before middleware modifies
+arguments before `next`. To assert middleware-injected env or args, read `ToolResults`
 or process output instead.
 
 ### Test skips must probe capability, not timeout
@@ -1241,13 +1227,18 @@ suspended rounds must share it rather than copy the round-boundary logic. A
 private copy in `interaction_checkpoint/guard.rs` that skipped `Clear` let a
 pre-Clear suspended round be redispatched after `.empty session` (#2744 review),
 which also required `find_orphan_tool_calls` and
-`nats_worker/agent_loop/handoff_recovery.rs` to honor `Clear` separately. The
-durable interaction variants (`ToolCallCompleted`, `InteractionRequested`,
-`SuspensionReady`, `InteractionResponse`) follow the readers-before-writers rule
-above; their reader arms live in `config/session/replay.rs`, `session_history.rs`
-and `interaction_checkpoint/guard.rs`, and rollout order plus the
-`harnx_interaction_checkpoints` store are documented in
-`docs/middleware-guide.md`.
+`nats_worker/agent_loop/handoff_recovery.rs` to honor `Clear` separately. The durable interaction and surface variants (`ToolCallCompleted`, `InteractionRequested`,
+`SuspensionReady`, `InteractionResponse`, and `SurfaceAction`) follow the readers-before-writers
+rule above. For `SessionLogEntry::SurfaceAction`, the writers are `harnx surface act`, the TUI surface
+action modal, the `harnx-serve` `session/surface_action` RPC, and the worker control path.
+Readers across the cluster must be upgraded before producers write any `SurfaceAction` entries.
+Control clients must also upgrade before workers: older clients cannot parse the worker's
+early `Pending` acknowledgement and fall back to idle execution after 40 seconds, risking a
+duplicate tool run while the worker is still executing. Rollback below this release is one-way
+once any `SurfaceAction` exists in a transcript, because older readers hard-reject unknown log
+entry variants. Reader arms live in `config/session/replay.rs`, `session_history.rs`, and
+`interaction_checkpoint/guard.rs`, and rollout order plus the `harnx_interaction_checkpoints`
+store are documented in `docs/middleware-guide.md`.
 
 Mid-tool entries (arriving between `ToolCalls` and `ToolResults`) must be queued in
 `messages_queued_during_tool` during reconstruction so tool_use→tool_result adjacency is
@@ -1652,9 +1643,9 @@ the wrong branch (#1743). When adding arms or modifying this loop, keep them
 pure signal checks — no `.await` calls, no shared-state mutations inside select
 arms.
 
-Build the workspace before cross-process tests after changing tool or hook wire
+Build the workspace before cross-process tests after changing tool wire
 types. Those tests launch workspace sidecars as well as linked test code; a stale
-hook or tool binary can fail decoding even when a per-crate build succeeds.
+tool binary can fail decoding even when a per-crate build succeeds.
 
 ### TUI transcript items are TUI-local
 
@@ -2254,14 +2245,14 @@ The `ToolCallCard` component uses live fields when present: `title` overrides `t
 
 ### Tool confirmation modal ordering and delivery
 
-When a `PreToolUse` hook returns `permissionDecision: "ask"`, the TUI modal queues an optional user message via durable JetStream append before sending the approval reply. Worker reloads the session log at the tool seam, ensuring the agent sees `tool call → tool result (real or blocked) → queued message`.
+Worker-side tool-use confirmation — a middleware `confirm` interaction after durable suspension, or a saved legacy approval from a pre-middleware session — opens the TUI modal. A message-bearing decision queues the optional user message via a durable JetStream append, and the decision reply is sent only after that append commits.
 
-Key invariants (verified by `denied_zero_execution_round_injects_queued_messages_once_after_blocked_result` in `crates/harnx-runtime/tests/it/nats_tool_confirmation.rs`):
+Key invariants (verified by `tool_confirmation_waits_for_commit_and_uses_captured_origin`, `whitespace_confirmation_message_resolves_without_enqueue`, `tool_confirmation_enqueue_failure_keeps_reply_and_draft_for_retry`, and `stale_tool_confirmation_enqueue_completion_cannot_resolve_reply` in `crates/harnx-tui/src/tests.rs`):
 
-1. **Order-barrier** — frontend awaits JetStream PubAck before replying. Worker receives decision only after message is durable.
+1. **Order-barrier** — `submit_tool_confirm` (`harnx-tui/src/tool_confirmation.rs`) resolves the reply only on `ConfirmationEnqueueResult::Committed`; the worker receives the decision only after the message is durable. A stale enqueue completion for another modal cannot resolve the current reply.
 2. **Origin capture** — modal state captures `(session_id, cluster)` at open; enqueue targets that origin, not the currently-active session.
-3. **Idempotent dedup** — stable `submission_id` (UUID generated at modal open) reused on retry; duplicate JetStream appends are safe.
-4. **Fail-closed paths** — append failure keeps modal open with draft; route closure, dismissal, and Ctrl+C all resolve false without enqueue.
+3. **Idempotent dedup** — stable `submission_id` (UUID generated at modal open) becomes the appended row's message id and is reused on retry; duplicate appends under the same id are safe.
+4. **Fail-closed paths** — append failure keeps modal open with draft; route closure, dismissal, and Ctrl+C all resolve false without enqueue. Ctrl+C and dismissal restore the modal draft to the main composer.
 
 The 2-second keyboard-idle gate on approval (`TOOL_CONFIRM_IDLE_GATE` in `harnx-tui/src/tool_confirmation.rs`) resets on every keypress and paste into the message textarea. Ctrl+J is a newline fallback when Shift+Enter is unavailable.
 

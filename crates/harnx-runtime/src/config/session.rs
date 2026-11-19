@@ -333,6 +333,7 @@ fn relog_entries(msg: &Message) -> Vec<SessionLogEntry> {
                     output: r.output.clone(),
                     markdown: r.markdown.clone(),
                     content: r.content.clone(),
+                    user_surfaces: r.user_surfaces.clone(),
                     switch_agent: r.switch_agent.clone(),
                 })
                 .collect();
@@ -1476,6 +1477,7 @@ content: work complete
             SessionLogEntry::ToolResults {
                 handoff_selection: None,
                 results: vec![harnx_core::session::ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("call-1".to_string()),
                     name: "plato_session_prompt".to_string(),
                     output: serde_json::json!({"response": "done"}),

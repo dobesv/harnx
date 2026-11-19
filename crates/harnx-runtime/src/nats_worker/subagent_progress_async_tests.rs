@@ -81,6 +81,8 @@ async fn journaled_send_context(
         ..Default::default()
     };
     let request = harnx_toolset::ToolRequest {
+        input_responses: None,
+        request_state: None,
         operation_id: format!("{call_id}-operation"),
         call_id: call_id.into(),
         tool: "session_send".into(),

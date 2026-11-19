@@ -70,6 +70,7 @@ impl PendingReply {
         bail!("bounded terminal tool reply cannot fit durable completion budget ({budget} bytes)")
     }
 
+    // qual:allow(dry, boilerplate) reason: "The size error projects a bounded reply from the candidate: each field must mirror the original except the swapped payload, so cloning is the point, not noise."
     fn size_error(&self, message: String) -> ToolReply {
         let error = match &self.candidate.result {
             Err(ToolErrorPayload::Fatal(_)) => ToolErrorPayload::Fatal(message),
@@ -84,6 +85,7 @@ impl PendingReply {
             call_id: self.candidate.call_id.clone(),
             result: Err(error),
             final_progress: self.candidate.final_progress.clone(),
+            input_required: self.candidate.input_required.clone(),
         }
     }
 }

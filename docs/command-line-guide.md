@@ -13,6 +13,8 @@ Commands:
   delete   Delete resources
   list     List resources
   call     Call tools directly
+  interact Inspect or answer a session's pending interactions
+  surface  Inspect a session's published surfaces or act on one
   compact  Compact session logs to reduce history size
   help     Print this message or the help of the given subcommand(s)
 
@@ -53,6 +55,10 @@ harnx dump attachment cid:media:... --output file.bin  # Dump attachment to file
 harnx open attachment cid:media:...            # Open attachment in default viewer
 harnx list sessions                            # List sessions
 harnx compact session agent1 session1          # Compact session log
+harnx interact list agent1 session1             # Show pending interactions as text
+harnx interact answer agent1 session1 --id <id> --action deploy --data choice=prod --note "go"  # Answer one
+harnx surface list agent1 session1              # Show published surfaces as text
+harnx surface act agent1 session1 --id <id> --action deploy --data choice=prod --note "go"  # Act on one
 harnx delete session session1 --agent myagent --cluster local  # Delete session
 harnx list tools                               # List all available tools
 harnx list tools "fs_*"                        # List tools matching selector pattern
@@ -380,6 +386,66 @@ Exit status:
 - Exits **0** when there is nothing to compact (the session does not have enough uncompacted messages or tokens to warrant summarization).
 - Exits **nonzero** if compaction fails or the timeout expires.
 
+### `harnx interact list <agent-name> <session-id>`
+
+Lists a session's pending interactions, derived from the durable session log (only interactions listed in the latest `SuspensionReady` manifest). Each is printed with its exact identity — interaction ID, kind, and request sequence — and rendered as text: `a2ui` surfaces use the shared text fallback (headline, inputs with their options and defaults, then the actions), `confirm` interactions show their message. Other kinds state they cannot be answered from the CLI. With nothing pending, prints `No pending interactions.`
+
+### `harnx interact answer <agent-name> <session-id> --id <interaction-id> --action <action> [--request-seq <seq>] [--data KEY=VALUE ... | --data-json <json>] [--note <text>]`
+
+Submits an answer for one pending interaction through the same durable acceptance path as every other frontend (`InteractionResponse` control command over NATS, lease-fenced worker acceptance), bound to the exact interaction ID and request sequence shown by `harnx interact list`. `--request-seq` is optional when the ID matches one pending request and must match exactly otherwise; answering whatever happens to be pending is never implied.
+
+Options:
+- `--action <action>`: a declared action name of the surface, or `deny` to dismiss it. `confirm` interactions accept `approve`/`deny`.
+- `--data KEY=VALUE` (repeatable): input values keyed by input binding. The key may be bare or a full pointer (`/name=Ada`). A `ChoicePicker` value is a comma-separated list of option values or labels (`choice=Staging,Production`); a `TextField` value is a single string (spaces allowed, quote it for the shell).
+- `--data-json <json>`: alternative to `--data` for typed values, e.g. `--data-json '{"choice": ["prod"], "name": "rel-1"}'`. The two flags conflict.
+- `--note <text>`: optional operator remark recorded with the answer.
+
+Untouched inputs are answered with their declared defaults (the surface's `dataModel` value, else the kind's empty default). Invalid answers — an undeclared action, an unknown input key, an undeclared option — are rejected with the precise error before anything is journaled.
+
+Exit status:
+- Exits **0** when the response is accepted, or when an identical response was already recorded (`Already applied`).
+- Exits **1** with the outcome on `stderr` when the answer is invalid (nothing recorded), stale, conflicting, past a completed round, or the worker lost its lease.
+- Exits nonzero with an error when the interaction is not pending or the session cannot be reached.
+
+### `harnx surface list <agent-name> <session-id>`
+
+Lists a session's published non-modal surfaces from the durable session log (`ToolResults.user_surfaces`). Each surface is rendered using the shared plain-text fallback (headline, inputs with their options and defaults, followed by available actions) along with its exact identity and resolution state:
+- Identity and status: `Surface <id> (published at sequence <seq>, <status>)`
+- `<status>` is either `outstanding` or `answered: <action> (first-wins)`.
+- If no surfaces have been published, prints `No published surfaces.`
+- Includes a command hint showing how to act on the published surface.
+
+### `harnx surface act <agent-name> <session-id> --id <surface-id> [--publish-seq <seq>] --action <action> [--data KEY=VALUE ... | --data-json <json>] [--note <text>]`
+
+Submits an action for a published non-modal surface over the durable acceptance path (`NatsSession::submit_surface_action`). Surfaces do not suspend the turn, so submissions can occur while a turn is active or when the session is idle.
+
+Target resolution:
+- Resolves the surface by exact `(surface_id, publish_seq)` identity.
+- `--publish-seq` is optional when the surface ID has exactly one publication in the session log; if multiple publications share the same ID, `--publish-seq` is required to avoid ambiguity.
+
+Options:
+- `--id <surface-id>`: surface ID to act on, as shown by `harnx surface list`.
+- `--publish-seq <seq>`: publication sequence of the surface in the session log.
+- `--action <action>`: a declared button action name on the surface. Unlike modal interactions, non-modal surfaces have no dismissal action (`deny` is rejected).
+- `--data KEY=VALUE` (repeatable): input values keyed by input binding. A `ChoicePicker` value is a comma-separated list of option values or labels; a `TextField` value is a string.
+- `--data-json <json>`: alternative to `--data` for passing a JSON object of typed input values. Conflicts with `--data`.
+- `--note <text>`: optional user remark sent as `user_message`. The note provides the model-facing text for `note` and `turn` visibility actions.
+
+Input handling & secrets:
+- Untouched inputs use their declared defaults from `dataModel`.
+- `TextField` with `variant: obscured` provides visual masking in display renderers only. It is not encrypted. Data passed via `--data` or `--data-json` appears in process argument listings, durable logs, and generated action text. Do not pass secrets through surfaces.
+
+First-wins semantics:
+- The first accepted action for `(surface_id, publish_seq)` wins.
+- Resubmitting the identical action and data succeeds with exit code 0 (`Already applied`).
+- If an identical action and data is resubmitted with a different `--note`, it is still treated as `Already applied`, and the second note is dropped.
+- Submitting a different action or data on an answered generation is rejected with outcome `conflicting`.
+
+Exit status:
+- Exits **0** when the action is accepted, or when an identical action was already recorded (`Already applied`).
+- Exits **1** with the rejection message on `stderr` when rejected (`conflicting`, `unknown_surface`, `undeclared_action`, `invalid_visibility`, `invalid_data`, `unauthorized_tool`, `tool_failed`, `lease_lost`, `append_failed`).
+- Exits nonzero with an error when the surface is not published or the session cannot be reached.
+
 ### `harnx list tools [<pattern>] [--json]`
 
 Lists available tools, optionally filtered by a selector pattern.
@@ -456,7 +522,7 @@ harnx call tool bash_exec '["echo", "two words"]'
 
 #### Error Handling and Output Contracts
 
-- **Exit codes**: Returns **0** on successful execution; returns **1** on any failure (argument validation error, missing tool, tool execution error, hook rejection, timeout, or reservation failure).
+- **Exit codes**: Returns **0** on successful execution; returns **1** on any failure (argument validation error, missing tool, tool execution error, middleware rejection, timeout, or reservation failure).
 - **`--json` parseability**: In `--json` mode, stdout remains valid, parseable JSON on all exit paths:
   - If the tool provider returned an error or partial result, that exact JSON payload is written to stdout.
   - If failure occurred before a tool result was produced (for example, bad arguments, invalid configuration, or discovery errors), stdout contains `{"isError": true, "error": "<message>"}`.
@@ -467,9 +533,9 @@ harnx call tool bash_exec '["echo", "two words"]'
 
 Tool execution through `harnx call tool` runs with scoped operator consent:
 
-- **Root operator invocation auto-approval**: When an operator runs `harnx call tool`, any `PreToolUse` hook that requests approval (`"permissionDecision": "ask"`) is automatically approved for that specific tool call ID. Because the human operator directly initiated the call, no second interactive approval prompt is presented.
-- **Hook `deny` enforced**: A `PreToolUse` hook that returns `"deny"` (or exits with code 2) is strictly enforced. The tool is blocked immediately, returning a blocked tool result (`"blocked_by_hook": true`) and exiting with code 1.
-- **Hook mutations and schema validation**: Any argument mutations returned by hooks (`mutatedToolInput`) are applied before execution, and tool input schemas are validated normally.
+- **Root operator invocation auto-approval**: When an operator runs `harnx call tool`, any confirmation requested by tool middleware (`confirm`) is automatically approved for that specific tool call ID. Because the human operator directly initiated the call, no second interactive approval prompt is presented.
+- **Middleware `deny` enforced**: A middleware script that invokes `deny <reason>` (or exits nonzero with `on_error: deny`) is strictly enforced. The tool is blocked immediately, returning a blocked tool result and exiting with code 1.
+- **Middleware argument mutations and schema validation**: Any argument mutations performed before calling `next` in middleware are applied before execution, and tool input schemas are validated normally.
 - **Nested approval isolation**: Root consent applies only to the root tool call ID. If the invoked tool spawns nested sub-agents or secondary tool calls, those nested calls do not inherit root approval. In the non-interactive CLI environment, nested approval requests safely defer or decline rather than executing unconfirmed.
 
 ### `harnx call bash '<script>' [--tools <selectors>] [--json]`
@@ -528,9 +594,9 @@ Tool inference uses bounded static AST analysis via BashKit. It parses script st
 
 Scripts run under root operator consent:
 
-- **Operator inner call auto-approval**: When an operator runs `harnx call bash`, any `PreToolUse` hook that returns `"permissionDecision": "ask"` for an inner tool call is automatically approved. Unlike normal agent turns, the operator script does not prompt interactively for inner calls.
+- **Operator inner call auto-approval**: When an operator runs `harnx call bash`, any confirmation requested by tool middleware (`confirm`) for an inner tool call is automatically approved. Unlike normal agent turns, the operator script does not prompt interactively for inner calls.
 - **Contrast with agent scripts**: Normal agent Bash scripts fail closed with exit code 3 (`needs approval: <tool>; call it directly instead of from bash`) when an inner tool requires confirmation.
-- **Hook `deny` enforced**: A `PreToolUse` hook that returns `"deny"` (or exits with code 2) blocks the inner tool call. The inner command exits with status 4 and writes the rejection reason to stderr (with empty stdout); it does not return a JSON object to the script. By default, BashKit enables `set -e`, so an unhandled denial makes the outer CLI exit 1. Scripts can use `set +e` to handle the inner status; if a later command succeeds and the script finishes with status 0, the CLI exits 0.
+- **Middleware `deny` enforced**: A middleware that denies an inner tool call blocks it. The inner command exits with status 4 and writes the rejection reason to stderr (with empty stdout); it does not return a JSON object to the script. By default, BashKit enables `set -e`, so an unhandled denial makes the outer CLI exit 1. Scripts can use `set +e` to handle the inner status; if a later command succeeds and the script finishes with status 0, the CLI exits 0.
 - **Control tools excluded**: Control tools (`bash`, `switch_agent`, `ask_user`, and `*_session_handoff`) are excluded from the inner catalog and cannot be invoked from inside the script.
 - **Child agent isolation**: If an inner tool invokes a child agent or triggers delegated sub-agent turns, those child sessions retain their own normal confirmation policies and do not inherit operator auto-approval.
 

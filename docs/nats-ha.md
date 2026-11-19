@@ -93,10 +93,6 @@ Harnx automatically manages the following JetStream resources:
   - Invalidation subject: `harnx.session.{storage_key}.read.invalidated` (separate from metadata invalidation).
 - **KV Bucket**: `harnx_tool_registry` — tool server discovery, with a
   per-registration TTL.
-- **KV Buckets**: `harnx_hook_registry` and `harnx_hook_expectations` — hook
-  server discovery and its fail-closed fallback routes. The registration TTL
-  is set on the bucket and applies to all registrations, including those
-  opened by the worker daemon.
 - **Streams**: `SESSION_<sha256(id)>` (Subject: `sessions.{id}.log`) stores only the
   durable append-only conversation history. Agent identity, settings, rendered
   prompts, and titles do not belong in this stream. Hash the exact, case-sensitive
@@ -144,8 +140,7 @@ count (`None` means 1, no HA):
 
 - **Honour `replicas`**:
   - All KV buckets (`harnx_leases`, `harnx_sessions`, `harnx_tool_registry`,
-    `harnx_hook_registry`, `harnx_hook_expectations`, and
-    `harnx_tool_invocations`)
+    and `harnx_tool_invocations`)
   - Attachment object store (`harnx_attachments`)
   - Plans KV bucket (`harnx_plans`)
   - Session transcript streams (`SESSION_<sha256(id)>`)
@@ -514,10 +509,10 @@ harnx-worker --cluster local --worker-id worker-1
 
 - `--cluster`: The key from `nats_servers/`.
 - `--worker-id`: (Optional but recommended) A stable identity for the worker.
-- `--manage-servers`: Launch this worker's own tool and hook servers as child
+- `--manage-servers`: Launch this worker's own tool servers as child
   processes. Without it, the worker discovers independently deployed servers
   under `HARNX_SERVER_SCOPE` instead — see
-  [Independently Deployed Tool and Hook Servers](#independently-deployed-tool-and-hook-servers)
+  [Independently Deployed Tool Servers](#independently-deployed-tool-servers)
   below.
 
 For the default local cluster you don't run this yourself: `harnx` and
@@ -576,9 +571,9 @@ active worker for a session dies, another persistent worker will acquire the
 lease and resume execution. Local redundancy instead comes from the owning
 frontend respawning its worker on the same targeted route.
 
-### Independently Deployed Tool and Hook Servers
+### Independently Deployed Tool Servers
 
-By default a worker launches its own tool and hook servers as child processes
+By default a worker launches its own tool servers as child processes
 and assigns them a scope. To run them as their own containers instead, give
 every process the same `HARNX_SERVER_SCOPE` and leave `--manage-servers` off:
 
@@ -595,14 +590,14 @@ HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
 **`--cluster prod` alone is not enough for the worker container.** `--cluster`
 only tells the worker which `nats_servers/<cluster>.yaml` to use for the
 *session* connection (leases, session log, control plane). Discovering tool
-and hook servers is a separate connection that never reads that file — it
+servers is a separate connection that never reads that file — it
 always resolves from `HARNX_NATS_URL`/`HARNX_NATS_TOKEN` (and, on a TLS or
 mTLS cluster, `HARNX_NATS_TLS`, `HARNX_NATS_TLS_CERT`, `HARNX_NATS_TLS_KEY`,
 `HARNX_NATS_TLS_CA`, plus `HARNX_NATS_IGNORE_DISCOVERED_SERVERS` when that is
 set explicitly) in the worker's own environment. A worker pod must carry
 these env vars *in addition to* `--cluster`, even when `prod.yaml` already
 has the same URL and TLS settings — otherwise the worker connects fine for
-sessions but can't discover any tool or hook server, or (on a TLS cluster)
+sessions but can't discover any tool server, or (on a TLS cluster)
 can't discover them at all because that connection falls back to plaintext.
 
 Both sides must carry the same scope value. A mismatch is not an error — the
@@ -648,7 +643,7 @@ export HARNX_NATS_SERVER=remote
 The front-end reads connection settings from `nats_servers/<name>.yaml` (in this
 example, `nats_servers/remote.yaml`) and runs as a pure client:
 
-- It does not start a local `nats-server`, worker, or tool/hook servers.
+- It does not start a local `nats-server`, worker, or tool servers.
 - No local chat model or `clients/` directory is required. The model requirement
   belongs to the worker that runs the agent loop, not to the front-end. When the
   local catalog is empty, `setup_model` logs an informational message and
@@ -675,7 +670,7 @@ token: "${HARNX_NATS_TOKEN}"
 ```
 
 Note that `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` configure transport credentials
-for workers, standalone tool/hook servers, or `${VAR}` expansion in cluster configs.
+for workers, standalone tool servers, or `${VAR}` expansion in cluster configs.
 Setting them on a front-end does not join an external cluster on its own; use
 `HARNX_NATS_SERVER` with a corresponding `nats_servers/<name>.yaml` file.
 
@@ -1159,13 +1154,12 @@ activation and stops there; a wind-up with a steering message queued behind the
 pending input. An activation whose `requested_seq` names a `Cancel` already
 wound up is acknowledged as covered.
 
-### Cancelling tools, hooks and sub-agents
+### Cancelling tools and sub-agents
 
 Cancellation travels one level at a time through the tool protocol, never by
 inspecting a tree. `ControlMessage::cancel(server, session_id, call_id,
 cancellation_id)` goes to the server's control subject
-(`harnx.v1.{instance}.tools.control`, or
-`harnx.v1.{instance}.hook.{server}.control` for hooks) and is answered with a
+(`harnx.v1.{instance}.tools.control`) and is answered with a
 `CancelAcceptance`: `Accepted`, `AlreadyFinished`, `Rejected { reason }`, or
 `Unknown { reason }` meaning the cancel may have committed and should be retried
 with the same id. Acknowledgements are for logging; no caller blocks on one.
@@ -1221,12 +1215,6 @@ waits and replaced reservations do not schedule another cancel batch. Failover
 also suppresses cancellation so a replacement worker can resume the remote
 invocation.
 
-Hooks use the same mechanism. The hook server keeps no journal, so a call id it
-is not currently running is simply `AlreadyFinished` — nothing durable is left to
-consult once the future is gone. The worker-side hook provider registers
-controlled hook calls in the same in-flight registry as tools, so one interrupt
-path reaches both.
-
 Sub-agents are an ordinary tool whose checkpoint holds the child session id.
 Both the live cancel and the orphan `cancel` read that checkpoint and call
 `interrupt_session` on the child with `requested_by = "parent:<session_id>"`.
@@ -1264,14 +1252,10 @@ transcript that stops mid-turn while finished sub-agent rows keep appearing.
 
 ### Upgrading from the execution-control gate
 
-The internal tool protocol is **v5**, and the two server kinds fail differently
-on a mismatch. A tool server that registers under another version fails
-discovery loudly with "incompatible tool protocol … upgrade workers and tool
-servers together", so none of its tools load at all. A hook server still
-registers under its own unchanged protocol version and keeps working, but the
-cancel control messages are v5, so a mismatched one answers `Rejected` and
-quietly becomes uninterruptible. Deploy workers, tool servers, hook servers and
-frontends together.
+The internal tool protocol is **v5**. A tool server that registers under
+another version fails discovery loudly with "incompatible tool protocol … upgrade
+workers and tool servers together", so none of its tools load at all. Deploy
+workers, tool servers and frontends together.
 
 The `harnx_execution_control` KV bucket is never created or read again.
 Operators delete it once:
@@ -1501,7 +1485,7 @@ survivors elect one replacement. Existing workers keep their PIDs, environments,
 tool servers, and activation routes. Exiting a frontend still shuts down that
 frontend's own worker tree; this recovery contract covers surviving frontends.
 
-All production runtime, tool-server, and hook-server connections use
+All production runtime and tool-server connections use
 `harnx_nats_common::connect::NatsEndpoint`. It keeps reconnecting to the stable
 endpoint with bounded reconnect delay. Reusing the same `async_nats::Client`
 preserves Core subscription identity. Socket reconnection alone cannot recover
@@ -1518,7 +1502,7 @@ Use these operation-specific patterns when adding a NATS caller:
 | Append a transcript entry | Retain the same message ID, payload, and CAS expectation through `recovery::retry_until`. Retry timeout/broken-pipe errors; a CAS conflict is authoritative. |
 | Mutate session metadata | `cas::update` reads back an ambiguous acknowledgement from the stream leader. Matching persisted bytes confirm the write; an unchanged revision permits retrying the exact CAS. A different value or revision leaves the outcome unknown. |
 | Renew a session lease | Retry the same deduplicated CAS only until the previously confirmed lease deadline. A conflict or expired deadline fences the worker; reconnect never restores lost ownership. |
-| Invoke a tool or hook | `rpc::request`, `RequestActivity`, and `ReplyTarget` confirm activity and acknowledge replies. Resend a completed result until receipt, never rerun the handler. A NATS 503 is not a reply receipt. |
+| Invoke a tool | `rpc::request`, `RequestActivity`, and `ReplyTarget` confirm activity and acknowledge replies. Resend a completed result until receipt, never rerun the handler. A NATS 503 is not a reply receipt. |
 | Renew discovery registration | `registry::refreshes` retains a separate pending renewal future so broker latency cannot block serving requests, controls, or shutdown. |
 | Observe turn completion | Incremental transcript polling operates independently of live advisories. Durable coverage determines which prompt completed; a prior turn's advisory cannot complete an injected prompt. |
 | Consume worker activations | Reopen the durable pull stream after errors/closure; acknowledge according to the activation's durable admission and lease state. |
@@ -1531,7 +1515,7 @@ Loss of activity or exhausted recovery reports that the call's outcome is
 descendant stopped. Interruption never depends on that answer: the session log
 alone decides whether a turn ended.
 
-Deploy the frontend, worker, and tool/hook binaries together for this contract.
+Deploy the frontend, worker, and tool binaries together for this contract.
 Older clients still receive ordinary replies, but an older server cannot provide
 the activity receipts expected by a new long-running RPC caller. Restart all
 local frontends for the persistent endpoint policy: an old broker owner still
@@ -1881,7 +1865,7 @@ no TLS settings, pointed at a server that demands TLS in its INFO. Say
 `tls: true` (or use `tls://`) for such a cluster.
 
 Config-based TLS (`tls`/`tls_cert`/`tls_key`/`tls_ca` in `nats_servers/<cluster>.yaml`)
-covers the client and worker session connection. It does **not** cover tool/hook
+covers the client and worker session connection. It does **not** cover tool
 discovery — see
-[Independently Deployed Tool and Hook Servers](#independently-deployed-tool-and-hook-servers)
+[Independently Deployed Tool Servers](#independently-deployed-tool-servers)
 for the separate `HARNX_NATS_TLS*` env vars that connection needs.

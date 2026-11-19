@@ -10,7 +10,6 @@ use harnx_blob_store::{
 use harnx_core::{
     abort::create_abort_signal,
     cid_url::SessionRef,
-    hooks::{HookOutcome, HookResult, HookResultControl},
     instance::ServerScope,
     tool::{ToolError, ToolProvider},
 };
@@ -24,16 +23,7 @@ const PNG_BASE64: &str =
 
 fn provider(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> (BashProvider, Arc<ToolEvalContext>) {
     let slot = BashEvalContextSlot::new();
-    let provider = BashProvider::new(crate::bash_provider::BashProviderConfig {
-        active: true,
-        inner_declarations: vec![],
-        base_providers: vec![],
-        slot: Some(slot.clone()),
-        payload_limit: None,
-        operator_inner_consent: false,
-    })
-    .with_attachment_fetcher(fetcher);
-    let ctx = Arc::new(ToolEvalContext {
+    let ctx = slot.install(ToolEvalContext {
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,
@@ -50,18 +40,33 @@ fn provider(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> (BashProvider, Arc<T
         emit_tool_blocked_fn: Arc::new(|_, _| {}),
         emit_tool_update_fn: Arc::new(|_, _| {}),
         confirm_tool_use_fn: Arc::new(|_, _, _| panic!("no tool calls expected")),
-        dispatch_hook_fn: Arc::new(|_| {
-            Box::pin(async {
-                HookOutcome {
-                    control: HookResultControl::Continue,
-                    result: HookResult::default(),
-                }
-            })
-        }),
         prepare_handoff_fn: None,
     });
-    slot.set(&ctx);
+    let provider = BashProvider::new(crate::bash_provider::BashProviderConfig {
+        active: true,
+        inner_declarations: vec![],
+        base_providers: vec![],
+        slot: Some(slot),
+        payload_limit: None,
+    })
+    .with_attachment_fetcher(fetcher);
     (provider, ctx)
+}
+
+async fn setup_nats_attachments() -> anyhow::Result<
+    Option<(
+        harnx_test_bins::NatsServerHandle,
+        async_nats::jetstream::Context,
+        async_nats::jetstream::object_store::ObjectStore,
+    )>,
+> {
+    harnx_core::require_nextest();
+    let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+        return Ok(None);
+    };
+    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let store = ensure_attachments_bucket(&js, 1).await?;
+    Ok(Some((server, js, store)))
 }
 
 async fn run(provider: &BashProvider, script: String) -> Value {
@@ -80,12 +85,9 @@ async fn run(provider: &BashProvider, script: String) -> Value {
 #[tokio::test(flavor = "multi_thread")]
 async fn nats_attachment_mount_reads_binary_is_readonly_and_resets_cache_per_run(
 ) -> anyhow::Result<()> {
-    harnx_core::require_nextest();
-    let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+    let Some((_server, js, store)) = setup_nats_attachments().await? else {
         return Ok(());
     };
-    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let store = ensure_attachments_bucket(&js, 1).await?;
     // Cross-session explicit references work just as attachment_read does. The
     // percent-encoded namespaced agent remains encoded in the VFS path.
     let url = media_cid_url(
@@ -222,12 +224,9 @@ async fn mount_is_empty_and_fails_clearly_without_a_broker() {
 
 #[tokio::test]
 async fn python_heredoc_reads_tmp_and_real_nats_attachment() -> anyhow::Result<()> {
-    harnx_core::require_nextest();
-    let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+    let Some((_server, js, store)) = setup_nats_attachments().await? else {
         return Ok(());
     };
-    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let store = ensure_attachments_bucket(&js, 1).await?;
     let url = media_cid_url(
         &SessionRef::new(Some("pantheon/atlas".into()), "python1".into())?,
         HASH,
@@ -254,12 +253,9 @@ async fn python_heredoc_reads_tmp_and_real_nats_attachment() -> anyhow::Result<(
 #[tokio::test]
 async fn nats_metadata_miss_sees_later_upload_and_deleted_blobs_are_missing() -> anyhow::Result<()>
 {
-    harnx_core::require_nextest();
-    let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+    let Some((_server, js, store)) = setup_nats_attachments().await? else {
         return Ok(());
     };
-    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let store = ensure_attachments_bucket(&js, 1).await?;
     let url = media_cid_url(
         &SessionRef::new(Some("agent".into()), "late01".into())?,
         HASH,

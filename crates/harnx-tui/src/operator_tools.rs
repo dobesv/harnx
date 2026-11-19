@@ -29,6 +29,7 @@ impl Tui {
             let reply = result.unwrap_or_else(|error| OperatorToolReply {
                 output: String::new(),
                 error: Some(format!("{error:#}")),
+                error_kind: None,
             });
             let _ = event_tx.send(TuiEvent::OperatorToolFinished {
                 task: abort,

@@ -37,6 +37,7 @@ pub(super) async fn complete_after_first_read(
                     .complete(
                         &invocation,
                         ToolReply {
+                            input_required: None,
                             call_id: invocation.call_id.clone(),
                             result: Err(ToolErrorPayload::Recoverable("job failed".into())),
                             final_progress: None,

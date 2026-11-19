@@ -25,6 +25,8 @@ impl Fixture {
         let metadata = SessionMetadataStore::ensure(&js, 1).await?;
         let toolset = make_toolset(&js, metadata);
         let request = ToolRequest {
+            input_responses: None,
+            request_state: None,
             run_context: Some(crate::nats_session::test_support::inherited_tool_context()),
             replay: None,
             operation_id: "operation".into(),

@@ -39,8 +39,9 @@ Legacy task CRUD is refused on activated contexts.
 A2A uses durable deferred approval, with no live confirmation route or automatic
 denial. `follow_admitted_prompt_until_boundary` always uses a `None` confirmation
 subject. An `InputRequired` boundary drains runtime text, reconciles persisted
-assistant output, flushes the answer artifact, then atomically stages the plain
-challenge, `HitlCheckpoint { phase: Waiting, ... }` and status event through one
+assistant output, flushes the answer artifact, then atomically stages the
+challenge (shared text plus a DataPart for `a2ui`),
+`HitlCheckpoint { phase: Waiting, ... }` and status event through one
 `OwnedTask::update`. Its event ID is `{task_id}:hitl:{request_seq}:input-required`.
 After publication/checkpoint, the detached supervisor CAS-releases the context
 owner, releases the scoped lease and removes only its own fenced local handle.
@@ -62,9 +63,12 @@ They must retain the exact original `ApprovalRef`; don't use a new prompt or cal
 
 For a caller already holding `OwnedTask` in a runner module:
 
-1. Deliver the saved decision with `hitl::interaction::decide(session, &request,
-   approved, note)`. Query `hitl::interaction::fixed_progress(session, ticket)` after the outcome;
-   stale/conflicting decisions must not target a newer request.
+1. Deliver the exact saved message with `reply_delivery::deliver_saved(session,
+   authority)`. It verifies the receipt's history fingerprint, parses text or an
+   A2UI DataPart against the bound request, and calls `hitl::interaction::decide`
+   with those original parts. Query `hitl::interaction::fixed_progress(session,
+   ticket)` after the outcome; stale/conflicting decisions must not target a
+   newer request.
 2. Drain the old outbox, persist reply dedupe if applicable, then use
    `advance_hitl_to_following(storage, version, params)`. Refresh the
    owned context after this helper's CAS. It stages the `Working` event.
@@ -145,9 +149,11 @@ from the reservation, then closes it; that isn't prompt replay.
 - An undecided request reconstructs the challenge and stable status outbox, drains
   publication, and releases ownership without stop or terminal proof.
 - An accepted reply repairs durable dedupe first. Only its exact pending reference
-  can receive its decision. The full note is parsed from saved task history, never
-  from the bounded inline receipt. Missing or inconsistent history leaves intent
-  unresolved for a later sweep.
+  can receive its decision. The full response (including DataPart values and note)
+  is parsed from saved task history, never from the bounded inline receipt.
+  Missing or inconsistent history leaves intent unresolved for a later sweep.
+  An invalid response clears only its decision intent, keeps receipt dedupe, and
+  restores `Waiting` with a visible correction so a new message can answer.
 - A durable decision stages `Following`/`Working` and attaches the typed follower
   from `fixed_prompt_handle(original_ticket)`. Its normal activation is pinned to
   the original prompt. No new admission, message, run or deadline is created.
@@ -331,7 +337,7 @@ through the progress classification above.
 
 Tests under `tests/it/` use real admission, JetStream and a worker, not only seeded
 context documents. `support.rs::Script::SameRoundTools` emits two native time-tool
-calls in one model completion and uses a real `PreToolUse` hook to defer them.
+calls in one model completion and uses middleware confirmation to defer them.
 
 - `unary/hitl.rs` covers approval, model-visible full rejection reasons, context-only
   replies, unrecognized messages, parked cancellation and same-round approval identity.

@@ -90,7 +90,7 @@ jobs:
         - name: worker
           packages: >-
             harnx-worker harnx-k8s-sandbox-tools harnx-grep-tools harnx-mcp-bridge
-            harnx-time-tools harnx-pkg
+            harnx-time-tools harnx-pkg harnx-claude-hook-tools
 
     runs-on: ${{ matrix.platform.os }}
     env:
@@ -389,7 +389,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-worker harnx-attachment-tools harnx-bash-tools harnx-fs-tools harnx-exa-tools harnx-fetch-tools harnx-grep-tools harnx-plans-tools harnx-mcp-bridge harnx-mcp-remote harnx-a2a-server harnx-time-tools harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
+            for bin in harnx harnx-serve harnx-worker harnx-attachment-tools harnx-bash-tools harnx-fs-tools harnx-exa-tools harnx-fetch-tools harnx-grep-tools harnx-plans-tools harnx-mcp-bridge harnx-mcp-remote harnx-a2a-server harnx-time-tools harnx-claude-hook-tools harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1

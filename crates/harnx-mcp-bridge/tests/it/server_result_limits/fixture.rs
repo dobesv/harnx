@@ -137,6 +137,7 @@ impl Fixture {
 
     pub async fn assert_original_reply(&self, original: &Value) -> Result<()> {
         let reply = ToolReply {
+            input_required: None,
             call_id: self.request.call_id.clone(),
             result: Ok(original.clone()),
             final_progress: None,

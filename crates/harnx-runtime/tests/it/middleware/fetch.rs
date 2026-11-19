@@ -248,7 +248,9 @@ async fn middleware_fetch_allow_policy_on_error_and_entry_isolation() {
 async fn middleware_fetch_documentation_examples_execute_verbatim() {
     let server = Server::start().await;
     let examples = super::documentation::blocks();
-    for (_, source) in examples.iter().skip(10) {
+    // The guide's fetch yaml examples follow the interact section's two
+    // bash/python examples.
+    for (_, source) in examples.iter().skip(12) {
         for path in ["allowed", "status"] {
             let yaml = source
                 .replace("https://policy.example.com/allowed", &server.endpoint(path))

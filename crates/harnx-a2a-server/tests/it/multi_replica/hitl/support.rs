@@ -45,6 +45,15 @@ pub(super) async fn assert_undecided_gate(
                 note,
                 ..
             } => Some((tool_call_id.as_str(), *approved, note.as_deref())),
+            SessionLogEntry::InteractionResponse {
+                tool_call_id,
+                response,
+                ..
+            } => Some((
+                tool_call_id.as_str(),
+                response.action == "approve",
+                response.note.as_deref(),
+            )),
             _ => None,
         })
         .collect();
@@ -108,7 +117,11 @@ pub(super) async fn complete_on_loser(
         log.load_events_latest_required_async()
             .await?
             .iter()
-            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .filter(|(_, e)| matches!(
+                e,
+                SessionLogEntry::HitlApprovalDecision { .. }
+                    | SessionLogEntry::InteractionResponse { .. }
+            ))
             .count(),
         2
     );

@@ -41,7 +41,12 @@ fn needs_hold(script: Script, counted_tool: bool) -> bool {
 fn needs_counted_tool(script: Script, body: &Value) -> bool {
     matches!(
         script,
-        Script::CountedTool | Script::ConfirmTool | Script::ConfirmHeld | Script::ConfirmSerial
+        Script::CountedTool
+            | Script::ConfirmTool
+            | Script::ConfirmHeld
+            | Script::ConfirmSerial
+            | Script::A2uiTool
+            | Script::A2uiSerial
     ) && body["messages"]
         .as_array()
         .and_then(|m| m.last())
@@ -69,7 +74,7 @@ fn select_frames(llm: &Llm, first: bool, many: bool, counted_tool: bool) -> Vec<
     }
     if matches!(
         llm.script,
-        Script::SameRoundTools | Script::ConfirmSameRound
+        Script::SameRoundTools | Script::ConfirmSameRound | Script::A2uiSameRound
     ) && first
     {
         return same_round_frames();

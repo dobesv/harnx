@@ -14,6 +14,7 @@ mod hitl_legacy;
 mod interaction;
 mod registry;
 mod snapshot;
+mod surface_action;
 mod web_address;
 
 pub use crate::session_actor_types::*;
@@ -608,6 +609,9 @@ impl SessionActor {
                 response,
                 reply,
             } => self.answer_interaction(interaction_id, request_seq, response, reply),
+            SessionCommand::SurfaceAction { submission, reply } => {
+                self.answer_surface_action(submission, reply)
+            }
             SessionCommand::Get { reply } => {
                 self.refresh_history_snapshot().await;
                 let _ = reply.send(self.session_info());

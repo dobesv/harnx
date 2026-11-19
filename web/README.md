@@ -58,6 +58,8 @@ The proxy is configured to be **SSE-safe**. It disables buffering for `text/even
   - Session switching.
   - Turn cancellation.
   - Tool approval and session handoff confirmations (approve/deny responses and reconnect replay).
+  - Middleware interactions: `confirm` approve/deny dialogs and `a2ui` modal forms (Text, Button, ChoicePicker, TextField, Card, Column) with interactive editing, canonical response mapping, server rejection display, and deny dismissal.
+  - Non-modal A2UI surfaces: inline interactive surfaces attached to tool-call cards or rendered directly in the thread without blocking the composer or conversation flow. Operators submit actions via `session/surface_action` with pending, resolved, and error states; resolved surfaces hydrate from durable log events.
   - Thinking rendering: live reasoning (AG-UI THINKING_* events) and hydrated
     `<think>`/`<thinking>` blocks from session history render as collapsible
     "Thinking" `<details>` blocks (`web/src/components/ThinkingBlock.tsx`), open

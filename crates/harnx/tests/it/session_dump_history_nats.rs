@@ -4,7 +4,9 @@ use harnx_runtime::nats_session_log::NatsSessionLog;
 use harnx_runtime::nats_session_metadata::{
     SessionInitializer, SessionMetadata, SessionMetadataStore,
 };
-use std::process::{Command, Output};
+use std::process::Output;
+
+use crate::cli_runner::run_harnx;
 
 struct DumpFixture {
     root: tempfile::TempDir,
@@ -39,27 +41,10 @@ impl DumpFixture {
         Ok(Self { root, log, entries })
     }
 
-    fn run(&self, args: &[String]) -> Result<Output> {
-        Command::new(env!("CARGO_BIN_EXE_harnx"))
-            .args(args)
-            .env("HARNX_CONFIG_DIR", self.root.path().join("config"))
-            .env("HARNX_DATA_DIR", self.root.path().join("data"))
-            .env("HARNX_STATE_DIR", self.root.path().join("state"))
-            .env("HARNX_NATS_SERVER", "fixture")
-            .env("NO_COLOR", "1")
-            .env_remove("HARNX_NATS_URL")
-            .env_remove("HARNX_NATS_TOKEN")
-            .output()
-            .context("run harnx dump session")
-    }
-
     fn dump(&self, extra: &[&str]) -> Result<Output> {
-        let args = ["dump", "session", "plain@fixture", "history"]
-            .into_iter()
-            .chain(extra.iter().copied())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        self.run(&args)
+        let mut args = vec!["dump", "session", "plain@fixture", "history"];
+        args.extend_from_slice(extra);
+        run_harnx(self.root.path(), &args, &[("NO_COLOR", "1")]).context("run harnx dump session")
     }
 
     fn follow_hint(&self, output: &Output, seq: u64) -> Result<Output> {
@@ -71,7 +56,12 @@ impl DumpFixture {
         );
         let (_, printed) = stdout.lines().next().unwrap().split_once(": ").unwrap();
         let args = shell_words::split(printed.strip_suffix(" ──").unwrap())?;
-        Ok(successful_output(self.run(&args[1..])?))
+        let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+        Ok(successful_output(run_harnx(
+            self.root.path(),
+            &rest,
+            &[("NO_COLOR", "1")],
+        )?))
     }
 
     async fn assert_read_only(&self) -> Result<()> {

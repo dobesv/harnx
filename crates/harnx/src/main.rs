@@ -3,11 +3,15 @@ mod cli;
 mod cli_event_sink;
 mod cli_replay_sink;
 mod compact;
+mod interact;
 mod main_runtime;
 mod oneshot_nats;
 mod orphan_streams_cmd;
+mod response_inputs;
+mod session_attach;
 mod session_dump;
 mod streaming_think_segmenter;
+mod surface;
 mod tool_cmd;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
@@ -177,6 +181,8 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
             | Commands::Delete(_)
             | Commands::List(_)
             | Commands::Call(_)
+            | Commands::Interact(_)
+            | Commands::Surface(_)
             | Commands::Compact(_)),
         ) => {
             let exit_code = run_command(command, &cli).await?;
@@ -224,6 +230,8 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
         Commands::Open(open_args) => run_open_command(open_args).await.map(|()| 0),
         Commands::Delete(delete_args) => run_delete_command(delete_args).await.map(|()| 0),
         Commands::List(list_args) => run_list_command(list_args, cli).await,
+        Commands::Interact(interact_args) => interact::run_interact_command(interact_args).await,
+        Commands::Surface(surface_args) => surface::run_surface_command(surface_args).await,
         Commands::Compact(compact_args) => compact::run_compact_command(compact_args, cli).await,
     }
 }
@@ -1279,6 +1287,7 @@ mod tests {
                     markdown: None,
                     content: vec![],
                     switch_agent: None,
+                    user_surfaces: Vec::new(),
                 }],
                 timestamp: None,
             },

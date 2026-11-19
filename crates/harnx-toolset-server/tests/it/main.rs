@@ -22,3 +22,4 @@ mod replay;
 mod reply_projection;
 mod result_limits;
 mod stale_replica;
+mod tool_input_required;

@@ -38,32 +38,17 @@ fn apply_server_level(
     entries: &mut Vec<ResolvedMiddleware>,
     servers: &[ToolServerConfig],
 ) -> Result<()> {
-    let mut names = HashSet::new();
+    // Server files fold in deterministic load order, so a same-name entry in a
+    // later server replaces an earlier one in place — the same rule levels use.
+    // Packages may ship the same middleware name (e.g. proxy-auth on bash), and
+    // the chain must stay unique across servers, not error on the overlap.
     servers
         .iter()
         .filter(|server| server.enabled)
         .try_for_each(|server| {
             let origin = server_origin(server)?;
-            validate_server_names(&server.middleware, &origin, &mut names)?;
             apply_level(entries, &server.middleware, &origin)
         })
-}
-
-fn validate_server_names(
-    config: &MiddlewareConfig,
-    origin: &MiddlewareOrigin,
-    names: &mut HashSet<String>,
-) -> Result<()> {
-    for entry in &config.entries {
-        if !names.insert(entry.name().to_owned()) {
-            bail!(
-                "middleware '{}': duplicate name at tool-server/package level in '{}'",
-                entry.name(),
-                origin.file.display()
-            );
-        }
-    }
-    Ok(())
 }
 
 fn server_origin(server: &ToolServerConfig) -> Result<MiddlewareOrigin> {

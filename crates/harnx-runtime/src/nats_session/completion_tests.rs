@@ -218,6 +218,7 @@ fn durable_child_completion_repairs_a_lost_event_once_without_ending_parent_turn
         SessionLogEntry::ToolResults {
             handoff_selection: None,
             results: vec![ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some("call".into()),
                 name: "session_prompt".into(),
                 output: json!({"response": "done", "sub_agent_progress": progress}),
@@ -269,6 +270,7 @@ fn terminal_tool_result_recovery_preserves_title_and_tool_call_id() {
             SessionLogEntry::ToolResults {
                 handoff_selection: None,
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: result_id.map(String::from),
                     name: "session_prompt".into(),
                     output: json!({"response": "done", "sub_agent_progress": progress}),

@@ -14,11 +14,13 @@ async fn first_reply_wins_and_later_replies_are_dropped() {
         .await
         .unwrap();
     let first = ToolReply {
+        input_required: None,
         call_id: "call-1".into(),
         result: Ok(serde_json::json!({"n": 1})),
         final_progress: None,
     };
     let second = ToolReply {
+        input_required: None,
         call_id: "call-1".into(),
         result: Ok(serde_json::json!({"n": 2})),
         final_progress: None,

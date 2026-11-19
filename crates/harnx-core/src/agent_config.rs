@@ -385,6 +385,11 @@ impl AgentConfig {
         self.hooks.as_ref()
     }
 
+    /// Mutable hooks access for load-time origin binding.
+    pub fn hooks_mut(&mut self) -> Option<&mut HooksConfig> {
+        self.hooks.as_mut()
+    }
+
     pub fn loop_detection(&self) -> Option<&LoopDetectionOverride> {
         self.loop_detection.as_ref()
     }

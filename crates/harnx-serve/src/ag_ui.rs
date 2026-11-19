@@ -1701,7 +1701,9 @@ pub(crate) fn control_snapshot_events(
     entries: &[(u64, harnx_core::session::SessionLogEntry)],
     tokens_usage: Option<&UsageContextSnapshot>,
 ) -> Vec<Event> {
-    let mut events = Vec::new();
+    // Durable non-modal A2UI surfaces and their accepted actions hydrate
+    // frontends on promptless attach (plan T5.1).
+    let mut events = crate::ag_ui_surfaces::surface_snapshot_events(entries);
     let last_turn_end_seq = entries.iter().rev().find_map(|(seq, entry)| {
         matches!(entry, harnx_core::session::SessionLogEntry::TurnEnd { .. }).then_some(*seq)
     });
@@ -1732,47 +1734,56 @@ pub(crate) fn control_snapshot_events(
             harnx_core::session::SessionLogEntry::TurnEnd {
                 usage: Some(usage), ..
             } => {
-                // Hydrate usage as "usage" CUSTOM event matching live path shape.
-                // Context fields (context_tokens, max_context_tokens, context_percent)
-                // are recomputed server-side from the reconstructed session state.
-                let mut value = json!({
-                    "input": usage.input_tokens,
-                    "output": usage.output_tokens,
-                    "cached": usage.cached_tokens,
-                    "cache_write": usage.cache_write_tokens,
-                });
                 // Final context belongs only with the final replayed turn.
-                if Some(*seq) == last_turn_end_seq {
-                    if let Some(context) = tokens_usage {
-                        value["context_tokens"] = json!(context.context_tokens);
-                        if let Some(max) = context.max_context_tokens {
-                            value["max_context_tokens"] = json!(max);
-                        }
-                        if let Some(percent) = context.context_percent {
-                            value["context_percent"] = json!(percent);
-                        }
-                    }
-                }
-                events.push(Event::Custom(CustomEvent {
-                    base: BaseEvent {
-                        timestamp: None,
-                        raw_event: None,
-                    },
-                    name: "usage".to_string(),
-                    value,
-                }));
+                let final_turn = Some(*seq) == last_turn_end_seq;
+                events.push(turn_end_usage_event(usage, final_turn, tokens_usage));
             }
             // Extension point for additional SessionLogEntry variants handled here.
             _ => {}
         }
     }
-
     // Derive pending HITL approvals by pairing each decision with the latest
     // preceding unmatched request occurrence for that provider tool-call ID.
     events.extend(derive_pending_hitl_approvals(entries));
     events.extend(crate::ag_ui_interactions::pending_event(entries));
 
     events
+}
+
+/// Hydrate a `TurnEnd` usage record as a "usage" CUSTOM event matching the
+/// live path's shape. Context fields (context_tokens, max_context_tokens,
+/// context_percent) are recomputed server-side from the reconstructed session
+/// state, and belong only to the final replayed turn.
+fn turn_end_usage_event(
+    usage: &harnx_core::api_types::CompletionTokenUsage,
+    final_turn: bool,
+    tokens_usage: Option<&UsageContextSnapshot>,
+) -> Event {
+    let mut value = json!({
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "cached": usage.cached_tokens,
+        "cache_write": usage.cache_write_tokens,
+    });
+    if final_turn {
+        if let Some(context) = tokens_usage {
+            value["context_tokens"] = json!(context.context_tokens);
+            if let Some(max) = context.max_context_tokens {
+                value["max_context_tokens"] = json!(max);
+            }
+            if let Some(percent) = context.context_percent {
+                value["context_percent"] = json!(percent);
+            }
+        }
+    }
+    Event::Custom(CustomEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        name: "usage".to_string(),
+        value,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

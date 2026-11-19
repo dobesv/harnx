@@ -219,6 +219,7 @@ pub(super) fn decide_compact_submit(entries: &[(u64, SessionLogEntry)]) -> Optio
         | SessionLogEntry::InteractionRequested { .. }
         | SessionLogEntry::SuspensionReady { .. }
         | SessionLogEntry::InteractionResponse { .. }
+        | SessionLogEntry::SurfaceAction { .. }
         | SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Clear
         | SessionLogEntry::EditEntries { .. }

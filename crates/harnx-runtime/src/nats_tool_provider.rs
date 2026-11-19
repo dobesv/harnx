@@ -113,6 +113,10 @@ struct RegisteredTool {
     request_timeout: Option<Duration>,
     /// The tool ends its wait when a new message arrives for the session.
     stop_on_new_message: bool,
+    /// The tool declared `harnx:input_required`, so the runtime opens the
+    /// durable interaction path for rounds containing it even with no
+    /// middleware configured (T4.3).
+    requests_input: bool,
 }
 
 struct PendingToolRequest {
@@ -335,6 +339,7 @@ impl NatsToolProvider {
                 raw_name,
                 request_timeout: request_timeout(spec.timeout_secs),
                 stop_on_new_message: spec.stops_on_new_message(),
+                requests_input: spec.requests_input(),
             });
         }
 
@@ -540,6 +545,7 @@ fn registered_tool(
     // Extract kind before moving spec
     let kind = spec.kind().map(|k| k.into());
     let stop_on_new_message = spec.stops_on_new_message();
+    let requests_input = spec.requests_input();
     let parameters = match JsonSchema::from_tool_schema(spec.input_schema) {
         Ok(parameters) => parameters,
         Err(error) => {
@@ -559,6 +565,7 @@ fn registered_tool(
         raw_name,
         request_timeout: request_timeout(spec.timeout_secs),
         stop_on_new_message,
+        requests_input,
     };
     let declaration = ToolDeclaration {
         name: name.clone(),
@@ -638,6 +645,11 @@ impl ToolProvider for NatsToolProvider {
         self.resolve_route(tool_name).is_some()
     }
 
+    fn may_request_input(&self, tool_name: &str) -> bool {
+        self.resolve_route(tool_name)
+            .is_some_and(|route| route.requests_input)
+    }
+
     async fn call_tool(
         &self,
         tool_name: &str,
@@ -704,10 +716,7 @@ impl ToolProvider for NatsToolProvider {
 /// to) turns any of those into "zero tools registered", silently, which is
 /// the exact failure class the zero-registration warning exists to catch.
 /// Check the stream directly first and match the specific JetStream
-/// STREAM_NOT_FOUND error code instead, the same way
-/// `nats_hook_provider::optional_bucket_snapshot` already does for hooks —
-/// that check is the narrower, correct one; this makes the tool side match
-/// it rather than the other way around.
+/// STREAM_NOT_FOUND error code instead. Other failures must remain visible.
 async fn open_registry_store(
     jetstream: &async_nats::jetstream::Context,
 ) -> anyhow::Result<Option<async_nats::jetstream::kv::Store>> {
@@ -1548,6 +1557,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // qual:allow(complexity, max_function_lines=185) reason: "One end-to-end wiring test walks a call through dispatch, progress coalescing, reply racing and cleanup; splitting it would leave the ordering race untested."
     async fn progress_routes_parallel_calls_reconciles_fast_reply_and_cleans_up_cancel() {
         use futures_util::StreamExt;
         use harnx_core::abort::create_abort_signal;
@@ -1620,6 +1630,7 @@ mod tests {
                             ..Default::default()
                         });
                     let reply = ToolReply {
+                        input_required: None,
                         call_id: request.call_id,
                         result: Ok(json!({"label": label})),
                         final_progress,

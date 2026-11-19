@@ -1,4 +1,6 @@
 //! Middleware confirms use durable ready manifests and exact response acceptance over ACP.
+#[path = "interaction_permission/a2ui.rs"]
+mod a2ui;
 #[path = "interaction_permission/harness.rs"]
 mod harness;
 #[path = "interaction_permission/live.rs"]

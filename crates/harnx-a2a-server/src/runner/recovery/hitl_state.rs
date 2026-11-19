@@ -67,10 +67,10 @@ pub(super) async fn park_recovered_hitl(
     if is_already_parked_waiting(active, &request) {
         return Ok(());
     }
-    let challenge = crate::hitl::interaction::render_challenge(session, pending).await?;
+    let challenge = crate::hitl::interaction::challenge_status(session, pending).await?;
     authority
         .update(&runner.store, session.storage_key(), |active| {
-            active.snapshot.task.status = status(TaskState::InputRequired, Some(&challenge));
+            active.snapshot.task.status = challenge.clone();
             active.hitl_checkpoint = Some(HitlCheckpoint {
                 request: request.clone(),
                 phase: HitlPhase::Waiting,

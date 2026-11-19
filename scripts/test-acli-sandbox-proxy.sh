@@ -9,7 +9,7 @@
 # sandboxed payload simply dumps its env and runs acli:
 #
 #   harnx-sandbox-run \
-#     --hook claude-command-persistent harnx-proxy-auth <flags...> \; \
+#     --hook environment harnx-proxy-auth <flags...> \; \
 #     -- bash -c 'env; acli --help; acli jira auth status'
 #
 # harnx-sandbox-run itself spawns the proxy hook, captures the env it injects
@@ -98,7 +98,7 @@ echo "== Running acli inside harnx-sandbox-run (proxy attached as a hook) =="
 OUT="$(mktemp)"
 set +e
 "$SANDBOX_BIN" \
-  --hook claude-command-persistent "$PROXY_BIN" \
+  --hook environment "$PROXY_BIN" \
     --log-file "$PROXY_LOG" \
     --load-yaml acli_cfg="$HOST_ACLI_CFG" \
     --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" '"$HOST_ACLI_CFG"'); test -n "$p" && secret-tool lookup service acli username "jira:$p"' \

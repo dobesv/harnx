@@ -111,9 +111,10 @@ async fn assert_decision_log(http: &Http, session: &NatsSession, canceled: bool)
         NatsSessionLog::new_with_replicas(http.h.jetstream.clone(), session.storage_key(), 1)
             .load_events_latest_required_async()
             .await?;
-    assert!(!entries
-        .iter()
-        .any(|(_, entry)| matches!(entry, SessionLogEntry::HitlApprovalDecision { .. })));
+    assert!(!entries.iter().any(|(_, entry)| matches!(
+        entry,
+        SessionLogEntry::HitlApprovalDecision { .. } | SessionLogEntry::InteractionResponse { .. }
+    )));
     assert_eq!(
         entries
             .iter()
@@ -129,10 +130,14 @@ async fn assert_saved_intent_undelivered(
     original: &ContextSnapshot,
 ) -> Result<()> {
     let original_ticket = ticket(original, session.storage_key())?;
-    assert!(matches!(
-        session.fixed_prompt_progress(&original_ticket).await?,
-        PromptProgress::InputRequired(_)
-    ));
+    let progress = session.fixed_prompt_progress(&original_ticket).await?;
+    assert!(
+        matches!(
+            progress,
+            PromptProgress::Parked | PromptProgress::InputRequired(_)
+        ),
+        "unexpected fixed prompt progress: {progress:?}"
+    );
     let current = http
         .h
         .store

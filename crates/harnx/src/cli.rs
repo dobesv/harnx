@@ -1,3 +1,4 @@
+// qual:allow(srp, file_length=306) reason: "the clap command surface already splits subcommand arg structs into modules; registering the interact and surface commands leaves it a few lines over the module limit"
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use harnx_runtime::config::SessionFormat;
@@ -7,6 +8,10 @@ use std::path::PathBuf;
 
 mod compaction_selector;
 pub use compaction_selector::CompactionSelector;
+mod interact_args;
+mod surface_args;
+pub use interact_args::*;
+pub use surface_args::*;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -120,6 +125,10 @@ pub enum Commands {
     List(ListArgs),
     /// Call tools directly
     Call(CallArgs),
+    /// Inspect or answer a session's pending interactions
+    Interact(InteractArgs),
+    /// Inspect a session's published surfaces or act on one
+    Surface(SurfaceArgs),
     /// Compact session logs to reduce history size.
     ///
     /// Blocks until compaction finishes and streams progress. A "nothing to compact"
@@ -961,6 +970,14 @@ mod compact_command_tests {
         assert!(help.contains("session"));
     }
 }
+
+#[cfg(test)]
+#[path = "cli/interact_command_tests.rs"]
+mod interact_command_tests;
+
+#[cfg(test)]
+#[path = "cli/surface_command_tests.rs"]
+mod surface_command_tests;
 
 #[cfg(test)]
 #[path = "cli/tool_tests.rs"]

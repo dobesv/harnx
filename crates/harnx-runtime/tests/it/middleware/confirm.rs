@@ -5,86 +5,9 @@ mod stash;
 mod traversal;
 
 use super::fixture::{bash, call, python, Fixture};
-use harnx_core::{abort::create_abort_signal, interaction::InteractionResponse, tool::ToolResult};
-use harnx_engine::tool::{
-    eval_tool_round, PendingToolInteraction, ToolCallCheckpoint, ToolRoundOutcome,
-};
-use harnx_runtime::middleware::{with_resume, AcceptedInteraction, MiddlewareResume};
+use super::interaction_harness::{completed, pending, Harness};
+use harnx_core::abort::create_abort_signal;
 use serde_json::{json, Value};
-use std::sync::Arc;
-
-#[derive(Default)]
-struct MemoryStore {
-    checkpoint: Option<ToolCallCheckpoint>,
-    responses: Vec<AcceptedInteraction>,
-}
-
-struct Harness {
-    fixture: Fixture,
-    store: MemoryStore,
-}
-
-impl Harness {
-    async fn new(entries: Vec<Value>) -> Self {
-        let mut fixture = Fixture::new(entries).await;
-        fixture.ctx.on_interaction = Some(Arc::new(|_| Box::pin(async { Ok(()) })));
-        Self {
-            fixture,
-            store: MemoryStore::default(),
-        }
-    }
-
-    async fn attempt(&mut self, args: Value) -> ToolRoundOutcome {
-        let abort = create_abort_signal();
-        let future = eval_tool_round(&self.fixture.ctx, vec![call(args)], vec![], &abort);
-        let outcome = match &self.store.checkpoint {
-            Some(checkpoint) => {
-                with_resume(
-                    MiddlewareResume {
-                        checkpoint: checkpoint.clone(),
-                        responses: self.store.responses.clone(),
-                    },
-                    future,
-                )
-                .await
-            }
-            None => future.await,
-        }
-        .unwrap();
-        if let ToolRoundOutcome::InputRequired(suspension) = &outcome {
-            assert!(suspension.completed.is_empty());
-            assert_eq!(suspension.pending.len(), 1);
-            self.store.checkpoint = Some(suspension.pending[0].checkpoint.clone());
-        }
-        outcome
-    }
-
-    fn accept(&mut self, pending: &PendingToolInteraction, action: &str) {
-        self.store.responses.push(AcceptedInteraction {
-            request: pending.interaction.clone(),
-            response: InteractionResponse {
-                action: action.into(),
-                data: Default::default(),
-                note: Some("human response".into()),
-            },
-        });
-    }
-}
-
-fn pending(outcome: ToolRoundOutcome) -> PendingToolInteraction {
-    let ToolRoundOutcome::InputRequired(mut suspension) = outcome else {
-        panic!("expected suspension: {outcome:?}")
-    };
-    suspension.pending.remove(0)
-}
-
-fn completed(outcome: ToolRoundOutcome) -> ToolResult {
-    let ToolRoundOutcome::Completed(mut results) = outcome else {
-        panic!("expected completion: {outcome:?}")
-    };
-    assert_eq!(results.len(), 1);
-    results.remove(0)
-}
 
 async fn decision(entry: Value, action: &str) {
     let mut harness = Harness::new(vec![entry]).await;

@@ -24,6 +24,7 @@ COPY linux-${TARGETARCH}/harnx-fetch-tools /usr/local/bin/harnx-fetch-tools
 COPY linux-${TARGETARCH}/harnx-grep-tools /usr/local/bin/harnx-grep-tools
 COPY linux-${TARGETARCH}/harnx-plans-tools /usr/local/bin/harnx-plans-tools
 COPY linux-${TARGETARCH}/harnx-time-tools /usr/local/bin/harnx-time-tools
+COPY linux-${TARGETARCH}/harnx-claude-hook-tools /usr/local/bin/harnx-claude-hook-tools
 COPY linux-${TARGETARCH}/harnx-mcp-bridge /usr/local/bin/harnx-mcp-bridge
 COPY linux-${TARGETARCH}/harnx-mcp-remote /usr/local/bin/harnx-mcp-remote
 COPY linux-${TARGETARCH}/harnx-a2a-server /usr/local/bin/harnx-a2a-server

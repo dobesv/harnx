@@ -211,6 +211,7 @@ mod durable_tests {
         let results = |text: String| SessionLogEntry::ToolResults {
             handoff_selection: None,
             results: vec![harnx_core::session::ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some("call".into()),
                 name: "artifact".into(),
                 output: serde_json::json!({"uri": text}),

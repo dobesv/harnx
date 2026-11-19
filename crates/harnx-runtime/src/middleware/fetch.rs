@@ -33,16 +33,26 @@ static CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
 impl Frame {
     pub async fn fetch(self: &Arc<Self>, text: &str, host: &ScriptHostContext) -> Result<Value> {
         let _operation = self.begin()?;
-        ensure!(
-            !self.fetch_hosts.is_empty(),
-            "fetch denied: middleware has no fetch host allowlist"
-        );
-        let url = checked_url(text, &self.fetch_hosts)?;
-        tokio::select! {
-            () = host.cancel.cancelled() => bail!("fetch cancelled"),
-            result = tokio::time::timeout(FETCH_TIMEOUT, get(url)) => {
-                result.map_err(|_| anyhow!("fetch timed out after 10s"))?
-            }
+        fetch_url(text, &self.fetch_hosts, &host.cancel).await
+    }
+}
+
+/// GET one allowlisted URL. Shared by tool middleware and event hooks: both
+/// gate on the entry's host allowlist and block metadata/link-local addresses.
+pub(crate) async fn fetch_url(
+    text: &str,
+    hosts: &[String],
+    cancel: &harnx_script::CancellationToken,
+) -> Result<Value> {
+    ensure!(
+        !hosts.is_empty(),
+        "fetch denied: no fetch host allowlist configured"
+    );
+    let url = checked_url(text, hosts)?;
+    tokio::select! {
+        () = cancel.cancelled() => bail!("fetch cancelled"),
+        result = tokio::time::timeout(FETCH_TIMEOUT, get(url)) => {
+            result.map_err(|_| anyhow!("fetch timed out after 10s"))?
         }
     }
 }

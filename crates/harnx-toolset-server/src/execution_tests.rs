@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn tool_request(session: &str, call_id: &str) -> ToolRequest {
     ToolRequest {
+        input_responses: None,
+        request_state: None,
         run_context: None,
         replay: None,
         operation_id: call_id.into(),

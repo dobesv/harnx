@@ -6,7 +6,7 @@ use serde_json::{Number, Value};
 
 const MAX_JSON_DEPTH: usize = 64;
 
-pub(super) fn to_python(value: Value) -> Result<MontyObject> {
+pub(crate) fn to_python(value: Value) -> Result<MontyObject> {
     json_to_python(value, 0)
 }
 
@@ -46,7 +46,7 @@ fn number_to_python(number: Number) -> Result<MontyObject> {
     }
 }
 
-pub(super) fn from_python(value: MontyObject) -> Result<Value> {
+pub(crate) fn from_python(value: MontyObject) -> Result<Value> {
     convert(value, 0)
 }
 

@@ -37,7 +37,7 @@ pub(in crate::tool) async fn materialize_dispatch_result(
     evaluation: &ToolEvaluation<'_>,
     approved: &ApprovedToolCall,
     output: Result<ToolProviderOutput, ToolError>,
-) -> Result<MaterializedToolResult, ToolError> {
+) -> Result<ToolMiddlewareOutcome, ToolError> {
     if let Err(error @ ToolError::Fatal(_)) = output {
         return Err(error);
     }
@@ -51,14 +51,21 @@ pub(in crate::tool) async fn materialize_dispatch_result(
     .map_err(ToolError::Fatal)?;
     match output {
         Ok(output) => {
+            if let Some(input) = output.input_required {
+                // A suspended challenge is not a result: it carries no output
+                // and never reaches error normalization. The runtime's
+                // durable layer completes its identity; without one it
+                // degrades to an error result in finalize_dispatch.
+                return Ok(ToolMiddlewareOutcome::ToolInputRequired(input));
+            }
             let (result, was_null) = materialize_successful_tool_call(evaluation, approved, output)
                 .await
                 .map_err(ToolError::Fatal)?;
-            Ok(MaterializedToolResult {
+            Ok(ToolMiddlewareOutcome::Completed(MaterializedToolResult {
                 result,
                 status: InnerToolCallStatus::Ok,
                 normalized_null: was_null && !evaluation.lossless,
-            })
+            }))
         }
         Err(ToolError::Recoverable(error)) => {
             let result = materialize_failed_tool_call(
@@ -69,9 +76,8 @@ pub(in crate::tool) async fn materialize_dispatch_result(
             )
             .await
             .map_err(ToolError::Fatal)?;
-            Ok(MaterializedToolResult::new(
-                result,
-                InnerToolCallStatus::ToolError,
+            Ok(ToolMiddlewareOutcome::Completed(
+                MaterializedToolResult::new(result, InnerToolCallStatus::ToolError),
             ))
         }
         Err(error @ ToolError::Fatal(_)) => Err(error),

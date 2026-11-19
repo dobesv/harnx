@@ -7,15 +7,15 @@ fn request_size(_tool: &str, args: &Value) -> usize {
     serde_json::to_vec(args).expect("args serialize").len() + 64
 }
 
-fn mutating_context(arguments: Value) -> (Arc<FakeToolProvider>, ToolEvalContext, HookEvents) {
+fn payload_context() -> (Arc<FakeToolProvider>, ToolEvalContext) {
     let provider = Arc::new(FakeToolProvider {
         log: Arc::new(DispatchLog::default()),
         handles: None,
         progress_title: None,
         behavior: Behavior::Ok(json!("done")),
     });
-    let (ctx, hooks) = outer_context(shared(&provider), HookControl::Mutate(arguments));
-    (provider, ctx, hooks)
+    let ctx = outer_context(shared(&provider));
+    (provider, ctx)
 }
 
 fn limited_executor(provider: &Arc<FakeToolProvider>) -> InnerCallExecutor {
@@ -53,61 +53,50 @@ fn assert_rejected_trace(run: &InnerCallRun, bytes: usize) {
 }
 
 #[tokio::test]
-async fn hook_expanded_payload_is_rejected_before_dispatch() {
+async fn oversized_payload_is_rejected_before_dispatch() {
     let expanded = json!({"blob": "x".repeat(200)});
     let bytes = request_size("tool_a", &expanded);
     assert!(request_size("tool_a", &json!({})) < MAX_BYTES);
-    let (provider, ctx, hooks) = mutating_context(expanded);
+    let (provider, ctx) = payload_context();
     let executor = limited_executor(&provider);
     let progress = Arc::new(RecordingProgress::default());
     let observer = Arc::new(InnerProgressAggregator::new(progress.clone()));
     let run = executor.begin_run(&ctx, PARENT_ROUND, Some(observer));
 
-    let outcome = run.call("tool_a", json!({}), &create_abort_signal()).await;
+    let outcome = run.call("tool_a", expanded, &create_abort_signal()).await;
 
     assert_payload_rejection(outcome, bytes);
     assert_rejected_trace(&run, bytes);
     assert_eq!(provider.log.count(), 0, "oversized input must not dispatch");
-    assert!(matches!(
-        hooks.lock().unwrap().as_slice(),
-        [HookEvent::PreToolUse { .. }]
-    ));
     let patches = progress.patches.lock().unwrap();
     let title = patches.last().unwrap().title.as_deref().unwrap();
     assert_eq!(title_counts(title), (1, 0), "no stranded running call");
 }
 
-fn assert_mutated_dispatch(provider: &FakeToolProvider, hooks: &[HookEvent], arguments: &Value) {
+fn assert_dispatched_arguments(provider: &FakeToolProvider, arguments: &Value) {
     let calls = provider.log.calls.lock().unwrap();
     let [call] = calls.as_slice() else {
         panic!("expected one provider dispatch: {calls:?}");
     };
     assert_eq!(&call.args, arguments);
-    let [HookEvent::PreToolUse { tool_input, .. }, HookEvent::PostToolUse {
-        tool_input: post_input,
-        ..
-    }] = hooks
-    else {
-        panic!("expected one pre and one post hook: {hooks:?}");
-    };
-    assert_eq!(tool_input, &json!({}));
-    assert_eq!(post_input, arguments);
 }
 
 #[tokio::test]
-async fn hook_mutated_payload_at_or_below_limit_dispatches_final_arguments() {
+async fn payload_at_or_below_limit_dispatches_final_arguments() {
     let overhead = request_size("tool_a", &json!({"blob": ""}));
     for bytes in [MAX_BYTES - 1, MAX_BYTES] {
         let arguments = json!({"blob": "x".repeat(bytes - overhead)});
         assert_eq!(request_size("tool_a", &arguments), bytes);
-        let (provider, ctx, hooks) = mutating_context(arguments.clone());
+        let (provider, ctx) = payload_context();
         let executor = limited_executor(&provider);
         let run = executor.begin_run(&ctx, PARENT_ROUND, None);
 
-        let outcome = run.call("tool_a", json!({}), &create_abort_signal()).await;
+        let outcome = run
+            .call("tool_a", arguments.clone(), &create_abort_signal())
+            .await;
 
         assert!(matches!(outcome, InnerOutcome::Ok { .. }), "{outcome:?}");
-        assert_mutated_dispatch(&provider, &hooks.lock().unwrap(), &arguments);
+        assert_dispatched_arguments(&provider, &arguments);
     }
 }
 
@@ -115,7 +104,7 @@ async fn hook_mutated_payload_at_or_below_limit_dispatches_final_arguments() {
 async fn payload_check_preserves_existing_work_boundary_and_fatal_errors() {
     for fail_start in [false, true] {
         let arguments = json!({"injected": true});
-        let (provider, mut ctx, _) = mutating_context(arguments.clone());
+        let (provider, mut ctx) = payload_context();
         let boundaries = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&boundaries);
         ctx.work_boundary = Some(Arc::new(move |boundary, call| {
@@ -130,7 +119,9 @@ async fn payload_check_preserves_existing_work_boundary_and_fatal_errors() {
         let executor = limited_executor(&provider);
         let run = executor.begin_run(&ctx, PARENT_ROUND, None);
 
-        let outcome = run.call("tool_a", json!({}), &create_abort_signal()).await;
+        let outcome = run
+            .call("tool_a", arguments.clone(), &create_abort_signal())
+            .await;
 
         assert_boundary_outcome(outcome, fail_start);
         assert_eq!(provider.log.count(), usize::from(!fail_start));
@@ -148,7 +139,7 @@ fn assert_boundary_outcome(outcome: InnerOutcome, fail_start: bool) {
 }
 
 fn assert_boundary_arguments(boundaries: &[(bool, Value)], arguments: &Value) {
-    assert_eq!(boundaries.first(), Some(&(false, json!({}))));
+    assert_eq!(boundaries.first(), Some(&(false, arguments.clone())));
     let starts: Vec<_> = boundaries
         .iter()
         .filter_map(|(start, args)| start.then_some(args))
@@ -157,14 +148,16 @@ fn assert_boundary_arguments(boundaries: &[(bool, Value)], arguments: &Value) {
 }
 
 #[tokio::test]
-async fn hook_expanded_payload_without_limit_is_unchanged() {
+async fn expanded_payload_without_limit_is_unchanged() {
     let arguments = json!({"blob": "x".repeat(200)});
-    let (provider, ctx, hooks) = mutating_context(arguments.clone());
+    let (provider, ctx) = payload_context();
     let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
     let run = executor.begin_run(&ctx, PARENT_ROUND, None);
 
-    let outcome = run.call("tool_a", json!({}), &create_abort_signal()).await;
+    let outcome = run
+        .call("tool_a", arguments.clone(), &create_abort_signal())
+        .await;
 
     assert!(matches!(outcome, InnerOutcome::Ok { .. }), "{outcome:?}");
-    assert_mutated_dispatch(&provider, &hooks.lock().unwrap(), &arguments);
+    assert_dispatched_arguments(&provider, &arguments);
 }

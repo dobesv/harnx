@@ -13,12 +13,12 @@
 
 use crate::{
     config::{Config, GlobalConfig, Input, SessionSaveRequest},
-    nats_hook_provider::{dispatch_hook_event, HookDispatchMeta, HookEventDispatch},
+    event_hooks::{run_event_hooks, EventHookInput, EventHookOutcome},
     tool::{execute_tool_round, CompletionText, ToolResult},
     utils::dimmed_text,
 };
 use anyhow::{bail, Result};
-use harnx_hooks::{inject_pending_async_context, HookEvent, HookResultControl};
+use harnx_core::hooks::HookEventKind;
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use crate::client::retry::call_with_retry_and_fallback;
@@ -78,10 +78,6 @@ pub type OnTextResponseFn = Arc<
     dyn Fn(String, CompletionTokenUsage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
 
-/// Worker callback that durably records the first deferred tool call.
-pub type OnHitlApprovalRequiredFn =
-    Arc<dyn Fn(&crate::tool::DeferredToolCall) -> Result<String> + Send + Sync>;
-
 /// Context for running the unified agent loop.
 ///
 /// Construct one and pass to [`run_agent_loop`]. All fields are `Send` so
@@ -99,9 +95,6 @@ pub struct AgentLoopContext {
     /// Optional callback after each tool round. TUI uses this to emit
     /// `ToolRoundComplete` and inject pending messages.
     pub on_tool_round: Option<OnToolRoundFn>,
-    /// Worker-only callback for converting a deferred confirmation into a
-    /// durable request and clean end-of-activation outcome.
-    pub on_hitl_approval_required: Option<OnHitlApprovalRequiredFn>,
     /// Optional callback on text-only turn end. TUI uses this to emit
     /// `ModelEvent::Final`.
     pub on_text_response: Option<OnTextResponseFn>,
@@ -111,8 +104,14 @@ pub struct AgentLoopContext {
     pub max_resume: Option<u32>,
     /// Runtime-owned, lazy handoff identity preparation before result persistence.
     pub prepare_handoff_fn: Option<Arc<crate::tool::PrepareHandoffFn>>,
-    pub nats_hook_provider: Option<Arc<crate::nats_hook_provider::NatsHookProvider>>,
+
     pub pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+    /// Mid-turn `note`-visibility surface actions, drained into
+    /// `Input::hook_context` at the next model call. Deliberately separate
+    /// from `pending_async_context`: that queue also feeds the turn-end
+    /// resume path, which would turn a passive note into a new user prompt
+    /// (and so an extra turn) instead of passive context.
+    pub surface_notes: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
     /// Optional per-session working directory. When unset, runtime falls back
     /// to process cwd for CLI compatibility.
     pub working_dir: Option<PathBuf>,
@@ -140,31 +139,18 @@ impl AgentLoopContext {
     }
 }
 
-// qual:allow(coupling, deh) reason: "The anyhow boundary carries typed engine suspension; keep it separate from legacy approval callbacks and ordinary failures."
+// qual:allow(coupling, deh) reason: "Engine suspension crosses the anyhow tool boundary; distinguish it from provider failures."
 async fn defer_tool_approval(ctx: &AgentLoopContext, error: anyhow::Error) -> Result<LoopResult> {
     ctx.check_generation("completion-error")?;
-    if let Some(suspended) = error.downcast_ref::<harnx_engine::tool::ToolInputRequiredError>() {
-        let tool_call_id = suspended
-            .0
-            .pending
-            .first()
-            .and_then(|p| p.call.id.clone())
-            .ok_or_else(|| anyhow::anyhow!("durable suspension has no pending call"))?;
-        return Ok(LoopResult::AwaitingHitlApproval { tool_call_id });
-    }
-    let Some(callback) = &ctx.on_hitl_approval_required else {
+    let Some(suspended) = error.downcast_ref::<harnx_engine::tool::ToolInputRequiredError>() else {
         return Err(error);
     };
-    let Some(interrupt) = crate::tool::ToolApprovalInterrupt::from_error(&error) else {
-        return Err(error);
-    };
-    let Some(first) = interrupt.deferred_calls.first() else {
-        return Err(error);
-    };
-    if interrupt.deferred_calls.len() > 1 {
-        log::warn!("multiple tool calls requested approval in one round; deferring only the first");
-    }
-    let tool_call_id = callback(first)?;
+    let tool_call_id = suspended
+        .0
+        .pending
+        .first()
+        .and_then(|p| p.call.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("durable suspension has no pending call"))?;
     Ok(LoopResult::AwaitingHitlApproval { tool_call_id })
 }
 
@@ -174,9 +160,15 @@ async fn defer_tool_approval(ctx: &AgentLoopContext, error: anyhow::Error) -> Re
 /// - Takes the interrupted round: its `ToolCalls` entry's sequence, the saved
 ///   assistant output/thought, and the calls that were deferred
 /// - Takes resolved approve/deny decisions for each call
-/// - Executes the approved calls with a preseeded confirm function
+/// - Executes approved calls and supplies synthetic results for saved denials
 /// - Persists ToolResults via existing session helpers
 /// - Continues the canonical loop from the post-tool state
+///
+/// `pending_interrupt_ids` must contain only tool-call ids that still have an
+/// unanswered `HitlApprovalRequested` entry for this round: an id with no
+/// decision parks the round as still awaiting approval. This entry point also
+/// serves middleware-interaction recovery, whose calls have no legacy request —
+/// passing every round call id would park those resumes forever.
 pub async fn continue_agent_loop_from_tool_round(
     ctx: &AgentLoopContext,
     mut input: Input,
@@ -186,42 +178,34 @@ pub async fn continue_agent_loop_from_tool_round(
 ) -> Result<LoopResult> {
     let config = &ctx.config;
 
-    // Build a preseeded confirm function that returns decisions for known call IDs.
-    let decisions = std::sync::Arc::new(decisions);
-    let decisions_for_confirm = std::sync::Arc::clone(&decisions);
-    let confirm_override: std::sync::Arc<crate::tool::ConfirmToolUseFn> = std::sync::Arc::new(
-        move |call: &ToolCall, _args: &serde_json::Value, reason: Option<&str>| {
-            if let Some(call_id) = call.id.as_deref() {
-                if let Some(decision) = decisions_for_confirm
-                    .iter()
-                    .find(|d| d.tool_call_id == call_id)
-                {
-                    return if decision.approved {
-                        crate::tool::ToolUseConfirmation::Approve
-                    } else {
-                        crate::tool::ToolUseConfirmation::Deny {
-                            reason: decision
-                                .reason
-                                .clone()
-                                .or_else(|| reason.map(str::to_string)),
-                        }
-                    };
-                }
-                if !pending_interrupt_ids.contains(call_id) {
-                    return crate::tool::ToolUseConfirmation::Approve;
-                }
-            }
-            crate::tool::ToolUseConfirmation::Defer
-        },
-    );
-
-    let previous_confirmation = config.read().tui_confirm_tool_use.clone();
-    config
-        .write()
-        .set_tui_confirm_tool_use(Some(confirm_override));
-
-    // Resume through the same boxed dispatch frame as new rounds. Deferred calls
-    // use preseeded decisions; already-approved calls execute normally.
+    // Old approvals are transcript authority even though process hooks no
+    // longer run. Do not let removing the hook turn a saved denial into dispatch.
+    if let Some(tool_call_id) = pending_interrupt_ids.iter().find(|id| {
+        !decisions
+            .iter()
+            .any(|decision| decision.tool_call_id == **id)
+    }) {
+        return Ok(LoopResult::AwaitingHitlApproval {
+            tool_call_id: tool_call_id.clone(),
+        });
+    }
+    let denied = round
+        .calls
+        .iter()
+        .filter_map(|call| {
+            let decision = decisions.iter().find(|decision| {
+                call.id.as_deref() == Some(&decision.tool_call_id) && !decision.approved
+            })?;
+            Some(ToolResult::new(
+                call.clone(),
+                serde_json::json!({
+                    "error": decision.reason.as_deref().unwrap_or("Denied by user"),
+                    "blocked_by_hook": true,
+                    "is_error": true,
+                }),
+            ))
+        })
+        .collect();
     let tool_round = Box::pin(crate::tool::execute_tool_round_with_persistence(
         ctx.tool_round_params(
             config,
@@ -232,12 +216,12 @@ pub async fn continue_agent_loop_from_tool_round(
             },
         ),
         round.calls,
-        crate::tool::ToolRoundPersistence::ExistingCalls { seq: round.seq },
+        crate::tool::ToolRoundPersistence::LegacyApprovals {
+            seq: round.seq,
+            denied,
+        },
     ))
     .await;
-    config
-        .write()
-        .set_tui_confirm_tool_use(previous_confirmation);
     let tool_results = match tool_round {
         Ok(results) => results,
         Err(error) => return defer_tool_approval(ctx, error).await,
@@ -438,45 +422,20 @@ async fn apply_local_handoff(
     Ok(())
 }
 
-struct AgentHookDispatch<'a> {
-    ctx: &'a AgentLoopContext,
-    event: HookEvent,
-    session_id: &'a str,
-    cwd: &'a std::path::Path,
-    resume_count: u32,
-}
-
-async fn dispatch_agent_loop_hook(params: AgentHookDispatch<'_>) -> harnx_core::hooks::HookOutcome {
-    let AgentHookDispatch {
-        ctx,
-        event,
-        session_id,
-        cwd,
-        resume_count,
-    } = params;
-    dispatch_hook_event(HookEventDispatch {
-        event,
-        provider: ctx.nats_hook_provider.as_deref(),
-        meta: HookDispatchMeta {
-            abort: Some(ctx.abort_signal.clone()),
-            session_id: session_id.to_string(),
-            cwd: cwd.to_path_buf(),
-            resume_count,
-        },
-        pending_async_context: ctx.pending_async_context.clone(),
-    })
-    .await
-}
-
 async fn inject_shared_pending_context(
     input: &mut Input,
     shared_pending: Option<&Arc<tokio::sync::Mutex<Option<String>>>>,
 ) {
     if let Some(shared_pending) = shared_pending {
-        let mut pending_guard = shared_pending.lock().await;
-        let mut pending = pending_guard.take();
-        inject_pending_async_context(input, &mut pending);
-        *pending_guard = pending;
+        let pending = shared_pending.lock().await.take();
+        if let Some(context) = pending.filter(|value| !value.is_empty()) {
+            // Hook-added context has no other durable copy, so it rides
+            // `hook_context` — durably appended as its own user message even
+            // on tool continuations and worker turns (issue #2198). It used to
+            // be prepended to `Input.text`, which mid-turn and worker rounds
+            // dropped on the floor.
+            input.push_hook_context(&context);
+        }
     }
 }
 
@@ -533,48 +492,137 @@ async fn apply_round_embeddings(
     Ok(())
 }
 
-async fn user_prompt_block_reason(
+/// The UserPromptSubmit chain for fresh prompts: `block` rejects the turn
+/// before anything is persisted, `rewrite_prompt` replaces the prompt the
+/// model sees, and context rides `hook_context` into the request. A `deny`
+/// failure blocks with the error naming the hook. Tool-round continuations
+/// re-enter with `tool_calls` set and skip this chain; a crash-resumed,
+/// orphan-repaired tool round rebuilds its input without tool calls
+/// (`derive_resumable_turn_input`), so its chain re-runs — a known gap.
+// qual:allow(iosp) — one seam gates fresh prompts and folds the hook chain's block/rewrite/context effects onto the input; splitting it would re-thread the outcome.
+async fn apply_user_prompt_hooks(
     ctx: &AgentLoopContext,
-    input: &Input,
+    input: &mut Input,
     turn: &TurnHookContext,
     resume_count: u32,
-) -> Option<String> {
-    let outcome = dispatch_agent_loop_hook(AgentHookDispatch {
-        ctx,
-        event: HookEvent::UserPromptSubmit {
-            prompt: input.text().to_string(),
-        },
-        session_id: &turn.session_id,
-        cwd: &turn.cwd,
-        resume_count,
-    })
-    .await;
-    match outcome.control {
-        HookResultControl::Block { reason } => Some(reason),
-        _ => None,
+) -> Result<bool> {
+    if input.tool_calls.is_some() || input.is_empty() {
+        return Ok(true);
     }
+    let outcome = run_event_hooks(
+        &ctx.config,
+        &EventHookInput {
+            event: HookEventKind::UserPromptSubmit,
+            session_id: turn.session_id.clone(),
+            cwd: turn.cwd.clone(),
+            resume_count,
+            prompt: Some(input.text().to_string()),
+            ..Default::default()
+        },
+        &ctx.abort_signal,
+    )
+    .await;
+    match outcome {
+        Ok(outcome) => {
+            if let Some(reason) = outcome.block {
+                emit_user_prompt_block_notice(reason);
+                return Ok(false);
+            }
+            if let Some(prompt) = outcome.rewrite.clone() {
+                apply_prompt_rewrite(ctx, input, &prompt);
+            }
+            if let Some(context) = outcome.context_text() {
+                input.push_hook_context(&context);
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            emit_user_prompt_block_notice(format!("{error:#}"));
+            Ok(false)
+        }
+    }
+}
+
+/// Apply a `rewrite_prompt` to the input, and on worker turns to the durable
+/// rows the request is built from. The prompt the hook saw is captured before
+/// the rewrite replaces it, so the durable-row matching below can find the
+/// original text.
+fn apply_prompt_rewrite(ctx: &AgentLoopContext, input: &mut Input, prompt: &str) {
+    let original = input.text();
+    input.clear_patch();
+    input.set_text(prompt.to_string());
+    if input.skip_user_log_append {
+        rewrite_durable_prompt_rows(ctx, input, &original, prompt);
+    }
+}
+
+/// A NATS worker folds its turn input out of admitted durable user rows and
+/// suppresses re-appending them (`skip_user_log_append`), so request building
+/// uses the session's durable rows and `Input::set_text` alone never reaches
+/// the model: the turn would answer the original client text. Rewrite the
+/// folded rows in place — ids (and therefore their prompt admissions)
+/// unchanged — in both the input's selected rows and the in-memory session,
+/// so every request this turn builds carries the rewritten prompt without
+/// appending a second unanswered user row.
+///
+/// The durable log keeps the original text: it is append-only, and a worker
+/// that re-enters the loop for this prompt re-runs the hook chain, re-deriving
+/// the rewrite instead of persisting a duplicate prompt row.
+fn rewrite_durable_prompt_rows(
+    ctx: &AgentLoopContext,
+    input: &mut Input,
+    original: &str,
+    rewritten: &str,
+) {
+    // The submitted prompt is the newest folded row; older folded rows are
+    // separate queued messages the hook saw only as part of the joined text.
+    let selected = input.durable_user_messages.last().cloned();
+    let mut session = ctx.config.write();
+    let Some(session) = session.session.as_mut() else {
+        log::warn!(
+            "UserPromptSubmit rewrite has no session to apply to; the model sees the original prompt"
+        );
+        return;
+    };
+    let mut rewritten_any = false;
+    for message in session.messages.iter_mut() {
+        // `same_identity` matches the selected row's id wherever it appears —
+        // the live row and any compaction copy — so a later compaction re-log
+        // carries the rewrite too, and it cannot bleed into unrelated rows.
+        let matches = match &selected {
+            Some(selected) => message.same_identity(selected),
+            // No selected rows (e.g. a resumed turn): without an identity to
+            // pin the rewrite to, every user row carrying the exact text the
+            // hook rewrote matches — older duplicates with the same text are
+            // rewritten too.
+            None => message.role.is_user() && message.content.to_text() == original,
+        };
+        if matches {
+            message.content = harnx_core::message::MessageContent::Text(rewritten.to_string());
+            rewritten_any = true;
+        }
+    }
+    if let Some(last) = input.durable_user_messages.last_mut() {
+        last.content = harnx_core::message::MessageContent::Text(rewritten.to_string());
+    }
+    if !rewritten_any {
+        log::warn!(
+            "UserPromptSubmit rewrite found no durable row for the original prompt; \
+             the model may see the original text"
+        );
+    }
+}
+
+async fn pre_model_call_boundary_passes(ctx: &AgentLoopContext) -> Result<bool> {
+    ctx.check_generation("model-handoff")?;
+    enforce_token_budget(ctx)?;
+    Ok(true)
 }
 
 fn emit_user_prompt_block_notice(reason: String) {
     harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Notice(
         harnx_core::event::NoticeEvent::Error(reason),
     ));
-}
-
-async fn pre_model_call_boundary_passes(
-    ctx: &AgentLoopContext,
-    input: &Input,
-    turn: &TurnHookContext,
-    resume_count: u32,
-) -> Result<bool> {
-    if let Some(reason) = user_prompt_block_reason(ctx, input, turn, resume_count).await {
-        emit_user_prompt_block_notice(reason);
-        return Ok(false);
-    }
-
-    ctx.check_generation("model-handoff")?;
-    enforce_token_budget(ctx)?;
-    Ok(true)
 }
 
 type AgentModelResult = Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>;
@@ -618,17 +666,25 @@ async fn fail_model_turn(params: FailedModelTurn<'_>) -> Result<LoopResult> {
         return Err(error);
     }
     ctx.check_generation("model-failure")?;
-    let _ = dispatch_agent_loop_hook(AgentHookDispatch {
-        ctx,
-        event: HookEvent::StopFailure {
-            error: error.to_string(),
-            error_type: "api_error".to_string(),
+    // StopFailure hooks only observe. `deny` is a config error on this event,
+    // so failures are logged and the turn still fails with the model error.
+    let outcome = run_event_hooks(
+        &ctx.config,
+        &EventHookInput {
+            event: HookEventKind::StopFailure,
+            session_id: turn.session_id.clone(),
+            cwd: turn.cwd.clone(),
+            resume_count,
+            error: Some(error.to_string()),
+            error_type: Some("api_error".to_string()),
+            ..Default::default()
         },
-        session_id: &turn.session_id,
-        cwd: &turn.cwd,
-        resume_count,
-    })
+        &ctx.abort_signal,
+    )
     .await;
+    if let Err(hook_error) = outcome {
+        log::warn!("StopFailure event hooks skipped: {hook_error:#}");
+    }
     let request = SessionSaveRequest::new(input, "", None);
     let persistence = {
         ctx.config
@@ -763,32 +819,33 @@ struct TextStopDispatch<'a> {
     has_tool_results: bool,
 }
 
-async fn dispatch_text_stop(
-    params: TextStopDispatch<'_>,
-) -> Option<harnx_core::hooks::HookOutcome> {
+// qual:allow(iosp) — assembles the Stop event input and maps the single run result; the input fields and the error mapping belong to the same seam.
+async fn dispatch_text_stop(params: TextStopDispatch<'_>) -> Option<EventHookOutcome> {
     if params.has_tool_results {
         return None;
     }
-    let outcome = dispatch_agent_loop_hook(AgentHookDispatch {
-        ctx: params.ctx,
-        event: HookEvent::Stop {
-            stop_hook_active: true,
+    let outcome = run_event_hooks(
+        &params.ctx.config,
+        &EventHookInput {
+            event: HookEventKind::Stop,
+            session_id: params.turn.session_id.clone(),
+            cwd: params.turn.cwd.clone(),
+            resume_count: params.resume_count,
             last_assistant_message: Some(params.output.to_string()),
+            ..Default::default()
         },
-        session_id: &params.turn.session_id,
-        cwd: &params.turn.cwd,
-        resume_count: params.resume_count,
-    })
+        &params.ctx.abort_signal,
+    )
     .await;
-    if let Some(context) = outcome
-        .result
-        .additional_context
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        debug!("Captured Stop hook additional context for later auto-continue: {context}");
+    match outcome {
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            // Stop hooks are allow-only by construction (deny is a config
+            // error), so this is a resolution failure, not a hook failure.
+            log::warn!("Stop event hooks skipped: {error:#}");
+            None
+        }
     }
-    Some(outcome)
 }
 
 struct ToolRoundOutput {
@@ -852,24 +909,27 @@ fn stop_resume_action(
     ctx: &AgentLoopContext,
     turn: &TurnHookContext,
     resume_count: u32,
-    outcome: Option<harnx_core::hooks::HookOutcome>,
+    outcome: Option<EventHookOutcome>,
 ) -> ResumeAction {
     let Some(outcome) = outcome else {
         return ResumeAction::None;
     };
-    if !outcome.result.resume.unwrap_or(false) || resume_count >= turn.max_resume {
+    // First resume wins: the runner stops the chain after the first hook that
+    // called `resume`, so `outcome.resume` is already the winning message.
+    let Some(message) = outcome.resume else {
+        return ResumeAction::None;
+    };
+    if resume_count >= turn.max_resume {
         return ResumeAction::None;
     }
     if ctx.abort_signal.aborted() {
         return ResumeAction::Abort;
     }
-    ResumeAction::Context(
-        outcome
-            .result
-            .additional_context
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "Continue working on pending tasks.".to_string()),
-    )
+    ResumeAction::Context(if message.trim().is_empty() {
+        "Continue working on pending tasks.".to_string()
+    } else {
+        message
+    })
 }
 
 async fn pending_resume_action(
@@ -957,6 +1017,7 @@ async fn prepare_round_input(
     wait_for_session_compaction(&ctx.config).await;
     apply_round_embeddings(input, &ctx.config, &ctx.abort_signal, with_embeddings).await?;
     inject_shared_pending_context(input, ctx.pending_async_context.as_ref()).await;
+    inject_shared_pending_context(input, ctx.surface_notes.as_ref()).await;
     compaction::preflight(ctx, input).await?;
     ctx.check_generation("before-model")?;
     ctx.config.write().before_chat_completion(input)?;
@@ -977,6 +1038,7 @@ fn clear_persisted_round_context(input: &mut Input) {
     // on_tool_round supplies the next pending user message.
     input.injected_user_text = None;
     input.injected_user_messages.clear();
+    input.hook_context = None;
     input.timing_context = None;
 }
 
@@ -989,6 +1051,9 @@ fn clear_persisted_round_context(input: &mut Input) {
         harnx.agent.name = tracing::field::Empty,
     )
 )]
+// qual:allow(complexity, max_cognitive=19) reason: "Lifecycle dispatch (Stop/StopFailure hooks, resume bounds, per-round hook context) lives in the loop body beside the turn state machine it drives; hoisting it out would re-thread the mutable input and resume counters."
+// qual:allow(complexity, max_cyclomatic=12) reason: "Branches map one-to-one to turn states (resume, block, failure) plus the Stop-hook resume check; a match-heavy refactor would hide the state order."
+// qual:allow(complexity, max_function_lines=129) reason: "One function owns one durable turn: prompt preparation, model rounds, event-hook seams and terminal handling read as a sequence; extracting sub-steps splits the shared Input state."
 async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> Result<LoopResult> {
     let config = &ctx.config;
     let abort_signal = &ctx.abort_signal;
@@ -998,6 +1063,13 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
     let mut emitted_text_turns: u32 = 0;
     let mut turn_usage = CompletionTokenUsage::default();
 
+    let turn = turn_hook_context(ctx);
+    // Hook block/rewrite effects happen before input preparation.
+    if !apply_user_prompt_hooks(ctx, &mut input, &turn, resume_count).await? {
+        ctx.check_generation("loop-completed")?;
+        return finish_agent_loop(config, abort_signal);
+    }
+
     loop {
         if input.is_empty() {
             break;
@@ -1005,8 +1077,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
 
         prepare_round_input(ctx, &mut input, with_embeddings).await?;
 
-        let turn = turn_hook_context(ctx);
-        if !pre_model_call_boundary_passes(ctx, &input, &turn, resume_count).await? {
+        if !pre_model_call_boundary_passes(ctx).await? {
             break;
         }
 
@@ -1114,6 +1185,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
 #[cfg(test)]
 mod tests {
     mod compaction_tests;
+    mod event_hook_loop_tests;
     mod future_size_tests;
     mod input_persistence_tests;
     mod overflow_tests;
@@ -1555,14 +1627,14 @@ mod tests {
             usage_at_start: CompletionTokenUsage::default(),
             call_fn: None,
             on_tool_round: None,
-            on_hitl_approval_required: None,
             on_text_response: None,
             initial_with_embeddings: false,
             initial_resume_count: 0,
             max_resume: Some(0),
             prepare_handoff_fn: None,
-            nats_hook_provider: None,
+
             pending_async_context: None,
+            surface_notes: None,
             working_dir: None,
             tool_loop_guard: Default::default(),
         }
@@ -1782,15 +1854,15 @@ mod tests {
             usage_at_start: CompletionTokenUsage::default(),
             call_fn: Some(call_fn),
             on_tool_round: Some(on_tool_round),
-            on_hitl_approval_required: None,
             on_text_response: None,
             working_dir: None,
             initial_with_embeddings: false,
             initial_resume_count: 0,
             max_resume: Some(0),
             prepare_handoff_fn: None,
-            nats_hook_provider: None,
+
             pending_async_context: None,
+            surface_notes: None,
             tool_loop_guard: Default::default(),
         }
     }
@@ -1827,12 +1899,10 @@ mod tests {
 
         inject_shared_pending_context(&mut input, Some(&pending)).await;
 
-        assert_eq!(
-            input.text(),
-            "context queued over NATS
-
-user prompt"
-        );
+        // Hook context rides `hook_context` (issue #2198): prepending it to
+        // the prompt text used to be dropped mid-turn and on worker turns.
+        assert_eq!(input.text(), "user prompt");
+        assert_eq!(input.hook_context(), Some("context queued over NATS"));
         assert!(pending.lock().await.is_none());
     }
 

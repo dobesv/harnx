@@ -61,6 +61,7 @@ impl ChildRequest {
                 self.summary.tool_name,
                 self.summary.message,
             ),
+            payload: serde_json::Value::Null,
             pending_count: self.summary.pending_count,
         }
     }
@@ -228,6 +229,7 @@ impl Tui {
                 generation: self.interactions.generation,
                 pending: request.confirmation(),
                 child: Some(request),
+                a2ui: None,
                 note: TextArea::default(),
                 last_key_at: Instant::now(),
                 scroll: 0,

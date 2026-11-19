@@ -14,6 +14,7 @@ futures-util = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 harnx-core = { path = "../harnx-core" }
 harnx-runtime = { path = "../harnx-runtime" }
+harnx-toolset = { path = "../harnx-toolset" }
 parking_lot = { workspace = true }
 rmcp = { workspace = true }
 serde_json = { workspace = true }
@@ -29,7 +30,6 @@ assert_cmd = "2"
 async-nats = { workspace = true }
 harnx-healthz = { path = "../harnx-healthz" }
 harnx-test-bins = { path = "../harnx-test-bins" }
-harnx-toolset = { path = "../harnx-toolset" }
 harnx-toolset-server = { path = "../harnx-toolset-server" }
 predicates = "3"
 tempfile = { workspace = true }

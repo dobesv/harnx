@@ -101,8 +101,8 @@ Harnx propagates W3C `traceparent` context across process boundaries to construc
 Tracing support across workspace binaries falls into four tiers:
 
 - **Full instrumentation** (tracer initialization and custom spans): `harnx`, `harnx-worker`, `harnx-serve`, `harnx-mcp-bridge`.
-- **Tool servers** (tracer initialization and inbound `tool_exec` server spans): all toolset-server binaries using the shared bootstrap (`harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, etc.).
-- **Init-only** (tracer initialization to export telemetry if `OTEL_*` is set, without custom spans): `harnx-pkg`, `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`.
+- **Tool servers** (tracer initialization and inbound `tool_exec` server spans): all toolset-server binaries using the shared bootstrap (`harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`, `harnx-claude-hook-tools`, etc.).
+- **Init-only** (tracer initialization to export telemetry if `OTEL_*` is set, without custom spans): `harnx-pkg`, `harnx-mcp-remote`.
 - **Out of scope (untraced)**:
   - `harnx-sandbox-exec`: Short-lived command execution helper without a persistent Tokio runtime required by the batch log exporter.
   - `harnx_tty_probe`: Brief terminal probe utility without a Tokio runtime.

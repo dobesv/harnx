@@ -170,7 +170,7 @@ async fn session_delete_removes_attachments_and_is_idempotent() -> Result<()> {
 }
 
 /// Raising replicas on the session metadata bucket after it already exists
-/// must not fail startup, same as the lease and tool/hook registry buckets.
+/// must not fail startup, same as the lease and tool registry buckets.
 /// Does not exercise a genuine "the cluster refused the raise" rejection —
 /// see `harnx-nats-common`'s `registry_ttl.rs` tests for why a single-node
 /// test server can't demonstrate that for an existing stream.

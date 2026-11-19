@@ -109,6 +109,9 @@ impl Config {
             &mut server.middleware,
             middleware::file_origin(path, package_dir)?,
         )?;
+        if let Some(hooks) = &mut server.hooks {
+            event_hooks::bind_event_hooks(hooks, middleware::file_origin(path, package_dir)?)?;
+        }
         Ok(Some(server))
     }
 }
@@ -141,39 +144,35 @@ command: harnx-time-tools
 command: harnx-time-tools
 hooks:
   max_resume: 3
-  entries:
-    - command: "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 -- /path/to/hook.sh"
-      status_message: "Checking time tool"
+  Stop:
+    - name: audit
+      bash: 'event_input | add_context "stopped"'
 "#;
         let config: ToolServerConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.command, "harnx-time-tools");
         let hooks = config.hooks.as_ref().expect("hooks should be parsed");
         assert_eq!(hooks.max_resume, Some(3));
-        assert_eq!(hooks.entries.len(), 1);
-        let entry = &hooks.entries[0];
-        assert_eq!(
-            entry.command,
-            "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 -- /path/to/hook.sh"
-        );
-        assert_eq!(entry.status_message.as_deref(), Some("Checking time tool"));
-        assert!(entry.async_hook.is_none());
+        let chain = hooks.list(harnx_core::hooks::HookEventKind::Stop);
+        assert_eq!(chain.entries.len(), 1);
+        assert_eq!(chain.entries[0].name(), "audit");
     }
 
     #[test]
-    fn shipped_bash_config_launches_proxy_auth_as_tool_hook() {
+    fn shipped_bash_config_uses_proxy_auth_middleware() {
         let coding = include_str!("../../../../packages/coding/tool_servers/bash.yaml");
         let pantheon = include_str!("../../../../packages/pantheon/tool_servers/bash.yaml");
         assert_eq!(coding, pantheon);
 
         let config: ToolServerConfig = serde_yaml::from_str(coding).expect("parse bash config");
-        let hooks = config.hooks.expect("bash hooks");
-        assert_eq!(hooks.entries.len(), 1);
-        let hook = &hooks.entries[0];
-        assert!(hook.command.starts_with("harnx-proxy-auth --hook "));
-        assert!(hook
-            .command
-            .contains("$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"));
-        assert!(hook.command.contains("$temp_file_root"));
+        assert!(config.hooks.is_none());
+        assert_eq!(config.middleware.entries.len(), 1);
+        let middleware = serde_json::to_value(&config.middleware).unwrap();
+        assert_eq!(middleware[0]["match"], "^bash_(exec|spawn)$");
+        assert_eq!(
+            middleware[0]["tools"],
+            serde_json::json!(["proxy_auth_environment"])
+        );
+        assert_eq!(middleware[0]["script"], "middleware/proxy-auth.py");
     }
 
     #[test]

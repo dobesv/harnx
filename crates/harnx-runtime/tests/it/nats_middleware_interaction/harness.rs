@@ -331,9 +331,9 @@ models:
     )?;
 
     let use_tools = if handoff_targets {
-        "[probe_run, probe_aux, target_agent_session_handoff, other_agent_session_handoff]"
+        "[probe_run, probe_aux, probe_challenge, ask_mcp, target_agent_session_handoff, other_agent_session_handoff]"
     } else {
-        "[probe_run, probe_aux]"
+        "[probe_run, probe_aux, probe_challenge, ask_mcp]"
     };
     let agent_content = format!(
         "---
@@ -618,9 +618,9 @@ impl Harness {
     pub fn update_agent_middleware(&self, middleware_yaml: &str) -> Result<()> {
         let has_handoff = self.config_dir.join("agents/target_agent.md").exists();
         let use_tools = if has_handoff {
-            "[probe_run, probe_aux, target_agent_session_handoff, other_agent_session_handoff]"
+            "[probe_run, probe_aux, probe_challenge, target_agent_session_handoff, other_agent_session_handoff]"
         } else {
-            "[probe_run, probe_aux]"
+            "[probe_run, probe_aux, probe_challenge]"
         };
         let agent_content = format!(
             "---

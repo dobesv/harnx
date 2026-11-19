@@ -27,6 +27,7 @@ fn result(seq: u64, request_seq: Option<u64>) -> (u64, SessionLogEntry) {
     }});
     let entry = SessionLogEntry::ToolResults {
         results: vec![harnx_core::session::ToolOutput {
+            user_surfaces: Vec::new(),
             id: Some("call".into()),
             name: "session_wait".into(),
             output,

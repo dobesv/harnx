@@ -252,10 +252,10 @@ async fn assert_serial_first_reply(http: &Http, task: &Value, first: &Value) -> 
         "{second}"
     );
     assert_eq!(second["id"], task["id"]);
-    assert!(second["status"]["message"]["parts"][0]["text"]
+    let challenge = second["status"]["message"]["parts"][0]["text"]
         .as_str()
-        .unwrap()
-        .contains("Reply `y`"));
+        .unwrap();
+    assert!(challenge.contains("Reply `yes`") || challenge.contains("Reply `y`"));
     let log = entries(http, task).await?;
     assert_eq!(decisions(&log), 1);
     let retry = http.rpc("SendMessage", json!({"message": first})).await?;

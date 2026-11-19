@@ -15,7 +15,7 @@ async fn start_ready(script: Script) -> Result<(TwoBackends, NatsSession, Contex
     Ok((backends, session, context))
 }
 
-async fn begin(t: &TwoBackends) -> Result<(NatsSession, Value)> {
+pub(super) async fn begin(t: &TwoBackends) -> Result<(NatsSession, Value)> {
     let first = t.a.rpc("alice", "SendMessage", first_message()).await?;
     let task = result_task(&first)?.clone();
     let session = session_for(&t.b, &t.h, task["contextId"].as_str().unwrap()).await?;
@@ -35,7 +35,7 @@ async fn pending(
         .context("pending interaction")
 }
 
-async fn assert_completed(
+pub(super) async fn assert_completed(
     t: &TwoBackends,
     session: &NatsSession,
     before: &ContextSnapshot,

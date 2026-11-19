@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 fn output(value: Value) -> ToolOutput {
     ToolOutput {
+        user_surfaces: Vec::new(),
         id: None,
         name: "media".into(),
         output: value,

@@ -1134,6 +1134,250 @@ body {
   background: var(--surface-hover);
 }
 
+/* A2UI Component Styles */
+.a2ui-form-root {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.a2ui-card {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-sizing: border-box;
+}
+
+.a2ui-column {
+  box-sizing: border-box;
+}
+
+.a2ui-text {
+  margin: 0;
+  line-height: 1.5;
+  color: var(--text-h);
+}
+
+.a2ui-text-body {
+  font-size: 0.95em;
+}
+
+.a2ui-text-caption {
+  font-size: 0.85em;
+  color: var(--text);
+}
+
+.a2ui-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+.a2ui-label {
+  font-size: 0.9em;
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+.a2ui-input,
+.a2ui-textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  color: var(--text-h);
+  font-family: inherit;
+  font-size: 0.9em;
+  box-sizing: border-box;
+}
+
+.a2ui-input:focus,
+.a2ui-textarea:focus,
+.a2ui-filter-input:focus {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-color: var(--accent);
+}
+
+.a2ui-textarea {
+  min-height: 70px;
+  resize: vertical;
+}
+
+.a2ui-filter-input {
+  width: 100%;
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  color: var(--text-h);
+  font-family: inherit;
+  font-size: 0.85em;
+  box-sizing: border-box;
+}
+
+.a2ui-choice-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.a2ui-choice-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.a2ui-choice-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9em;
+  color: var(--text-h);
+  cursor: pointer;
+  user-select: none;
+}
+
+.a2ui-choice-option input {
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.a2ui-btn {
+  padding: 6px 14px;
+  border-radius: var(--radius-md);
+  font-size: 0.9em;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.a2ui-btn-primary {
+  background-color: #2e7d32;
+  color: #fff;
+  border-color: #2e7d32;
+}
+
+.a2ui-btn-primary:not(:disabled):hover {
+  background-color: #1b5e20;
+  border-color: #1b5e20;
+}
+
+.a2ui-btn-default {
+  background-color: var(--surface);
+  color: var(--text-h);
+}
+
+.a2ui-btn-default:not(:disabled):hover {
+  background-color: var(--surface-hover);
+}
+
+.a2ui-btn-borderless {
+  background: transparent;
+  border-color: transparent;
+  color: var(--accent);
+}
+
+.a2ui-btn-borderless:not(:disabled):hover {
+  background: var(--surface-hover);
+}
+
+/* Non-modal A2UI Surface Styles (T5.1) */
+.a2ui-surface-card {
+  margin: 8px 12px 12px 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-sizing: border-box;
+}
+
+.a2ui-surface-card-resolved {
+  background: var(--bg);
+  border-color: rgba(46, 125, 50, 0.4);
+}
+
+.a2ui-surface-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 0.85em;
+  font-weight: 500;
+  width: fit-content;
+}
+
+.a2ui-surface-status-resolved {
+  background: var(--success-bg);
+  color: var(--success);
+  border: 1px solid var(--success-border);
+}
+
+.a2ui-surface-status-pending {
+  background: rgba(2, 136, 209, 0.12);
+  color: #0288d1;
+  border: 1px solid rgba(2, 136, 209, 0.3);
+}
+
+.a2ui-surface-visibility {
+  font-size: 0.85em;
+  opacity: 0.8;
+}
+
+.a2ui-surface-note-text {
+  font-size: 0.9em;
+  color: var(--text);
+}
+
+.a2ui-surface-error {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: 0.88em;
+}
+
+.a2ui-surface-note-input {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.a2ui-surface-note-input label {
+  font-size: 0.8em;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.a2ui-surface-note-input input {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text-h);
+  font-size: 0.85em;
+}
+
+.a2ui-surface-note-input input:focus {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-color: var(--accent);
+}
+
 .aui-tool-call {
   display: flex;
   flex-direction: column;

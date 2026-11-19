@@ -14,6 +14,8 @@ use crate::AcpConnection;
 
 pub const ALLOW_OPTION_ID: &str = "allow";
 pub const REJECT_OPTION_ID: &str = "reject";
+/// Option-ID prefix for an `a2ui` button action: `action:<event name>`.
+pub const A2UI_ACTION_OPTION_PREFIX: &str = "action:";
 
 pub(crate) fn tool_confirmation_handler(
     connection: Option<AcpConnection>,

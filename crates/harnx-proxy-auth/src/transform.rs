@@ -18,7 +18,11 @@ pub enum HookStageKind {
 pub fn stage_kind(hook: &str) -> HookStageKind {
     if hook.as_bytes().starts_with(b"#!") {
         HookStageKind::ExecInline
-    } else if hook.starts_with("/") || hook.starts_with("./") || hook.starts_with("../") {
+    } else if std::path::Path::new(hook).is_absolute()
+        || hook.starts_with('/')
+        || hook.starts_with("./")
+        || hook.starts_with("../")
+    {
         HookStageKind::ExecFile
     } else {
         HookStageKind::Jaq
@@ -179,6 +183,11 @@ mod tests {
             HookStageKind::ExecFile
         );
         assert_eq!(stage_kind("/tmp/hook.py"), HookStageKind::ExecFile);
+        let native_absolute = std::env::current_dir().unwrap().join("hook.py");
+        assert_eq!(
+            stage_kind(&native_absolute.to_string_lossy()),
+            HookStageKind::ExecFile
+        );
         assert_eq!(stage_kind(".headers.auth = \"x\""), HookStageKind::Jaq);
         assert_eq!(
             stage_kind("if .host == \"x\" then . else . end"),

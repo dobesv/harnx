@@ -467,7 +467,7 @@ compress_threshold: 100000
 rag_top_k: 3
 highlight: false
 hooks:
-  entries: []
+  max_resume: 2
 "#;
         let got: ConfigData = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(got.model_id, "claude-sonnet-4-6");

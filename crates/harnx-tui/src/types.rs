@@ -127,6 +127,7 @@ pub struct Tui {
     /// and busy-enqueue paths share it so queued continuations keep a live modal.
     pub(super) tool_confirmation_route: SharedToolConfirmationRoute,
     pub(super) interactions: crate::interaction_confirmation::InteractionClient,
+    pub(super) surfaces: crate::surfaces::SurfaceClient,
     /// Deterministic enqueue seam for confirmation orchestration tests.
     #[cfg(test)]
     pub(super) confirmation_enqueue_override:
@@ -625,11 +626,14 @@ pub(super) enum ModalState {
         seq: usize,
         user_text: Option<String>,
     },
-    /// Confirmation for a tool call gated by a `PreToolUse` "ask" hook.
+    /// Confirmation for a tool call gated by tool confirmation or legacy approvals.
     /// The reply channel lives in `App::pending_confirm_reply`.
     ConfirmToolUse(Box<ConfirmToolUseState>),
     /// Durable middleware request; never answered through the legacy bool route.
     ConfirmInteraction(Box<crate::interaction_confirmation::InteractionModal>),
+    /// Non-modal A2UI surface action form (plan T5.1). User-initiated only;
+    /// never auto-presented, and closing it cancels nothing.
+    SurfaceAction(Box<crate::surfaces::SurfaceActionModal>),
     /// Agent is still working when user tries to exit.
     ConfirmExit {
         worker_state: ExitWorkerState,
@@ -678,6 +682,10 @@ impl std::fmt::Debug for ModalState {
             Self::ConfirmInteraction(state) => {
                 f.debug_tuple("ConfirmInteraction").field(state).finish()
             }
+            Self::SurfaceAction(state) => f
+                .debug_tuple("SurfaceAction")
+                .field(&state.snapshot.surface_id)
+                .finish(),
             Self::ConfirmToolUse(state) => std::fmt::Debug::fmt(state, f),
             Self::ConfirmExit {
                 worker_state,
@@ -727,6 +735,7 @@ impl Clone for ModalState {
                 user_text: user_text.clone(),
             },
             Self::ConfirmInteraction(state) => Self::ConfirmInteraction(state.clone()),
+            Self::SurfaceAction(state) => Self::SurfaceAction(state.clone()),
             Self::ConfirmToolUse(state) => Self::ConfirmToolUse(state.clone()),
 
             Self::ConfirmExit {
@@ -800,6 +809,7 @@ fn same_tool_confirmation(a: &ConfirmToolUseState, b: &ConfirmToolUseState) -> b
 }
 
 impl PartialEq for ModalState {
+    // qual:allow(complexity, max_function_lines=73) reason: "the eq match grows one arm per modal variant"
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -823,6 +833,7 @@ impl PartialEq for ModalState {
                 },
             ) => a_seq == b_seq && a_user_text == b_user_text,
             (Self::ConfirmInteraction(a), Self::ConfirmInteraction(b)) => a.same_request(b),
+            (Self::SurfaceAction(a), Self::SurfaceAction(b)) => a.same_form(b),
             (Self::ConfirmToolUse(a), Self::ConfirmToolUse(b)) => same_tool_confirmation(a, b),
             (
                 Self::ConfirmExit {
@@ -993,6 +1004,15 @@ pub enum TranscriptItem {
         text: String,
         url: String,
     },
+    /// A published non-modal A2UI surface from a completed tool result
+    /// (plan T5.1). Rendered inline; Enter on a focused row opens the action
+    /// form. `resolved` is the accepted action name once a submission was
+    /// durably accepted (first-wins), refreshed from the session log.
+    UserSurface {
+        surface_id: String,
+        payload: serde_json::Value,
+        resolved: Option<String>,
+    },
     /// Static navigable handoff row produced from the `handoff` marker in a
     /// handoff tool result. Links to the child session without live status/timer.
     /// Distinct from SubAgentSession (which carries status, metrics, cancellation).
@@ -1100,6 +1120,7 @@ impl TranscriptItem {
                 | TranscriptItem::SubAgentSession { .. }
                 | TranscriptItem::MarkdownLink { .. }
                 | TranscriptItem::HandoffSession { .. }
+                | TranscriptItem::UserSurface { .. }
         )
     }
 }
@@ -1199,7 +1220,7 @@ impl App {
 }
 
 pub(crate) enum ToolConfirmationEvent {
-    /// A worker-side `PreToolUse` hook asked for confirmation via NATS. The
+    /// A worker requested tool confirmation via NATS. The
     /// async task waits on `reply`; the main loop shows a modal and sends the decision back.
     Show {
         confirmation_id: u64,
@@ -1229,6 +1250,8 @@ pub(super) struct SubAgentSnapshot {
 }
 
 pub(crate) enum TuiEvent {
+    /// Durable non-modal surface snapshot / action outcome (plan T5.1).
+    Surface(crate::surfaces::SurfaceEvent),
     OperatorToolFinished {
         task: AbortSignal,
         output: String,

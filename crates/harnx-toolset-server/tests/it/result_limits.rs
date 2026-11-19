@@ -122,6 +122,7 @@ async fn exact_row_boundary_counts_cas_headers() -> Result<()> {
         let revision = fixture.store.entry(key(&request)).await?.unwrap().revision;
         let header_bytes = 51 + revision.to_string().len();
         let mut original = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(json!("")),
             final_progress: None,
@@ -213,11 +214,13 @@ async fn competing_completions_return_the_same_authoritative_bounded_winner() ->
         .record(&request, ("echo", fixture.scope.as_str(), "____test"))
         .await?;
     let first = ToolReply {
+        input_required: None,
         call_id: request.call_id.clone(),
         result: Ok(json!("a".repeat(32 * 1024))),
         final_progress: None,
     };
     let second = ToolReply {
+        input_required: None,
         result: Ok(json!("b".repeat(48 * 1024))),
         ..first.clone()
     };
@@ -275,6 +278,7 @@ async fn stale_losing_candidate_never_replaces_or_rebounds_a_stored_winner() -> 
             _ = tokio::time::sleep(Duration::from_secs(60)) => anyhow::bail!("tool did not enter"),
         }
         let winner = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(json!({"winning": true})),
             final_progress: None,
@@ -357,6 +361,7 @@ async fn execution_metadata_overhead_is_bounded_and_raw_original_is_retained() -
         .await?;
     let row = fixture.journal.get(&request).await?.unwrap();
     let mut original = ToolReply {
+        input_required: None,
         call_id: request.call_id.clone(),
         result: Ok(json!({"output": "", "_meta": {EXECUTION_CONTEXT_NAMESPACE: observation}})),
         final_progress: None,
@@ -436,6 +441,7 @@ async fn raw_journal_metadata_contract_survives_while_legacy_wire_reply_is_sanit
             .record(&request, ("echo", fixture.scope.as_str(), "____test"))
             .await?;
         let original = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(
                 json!({"answer": "legacy", "_meta": {EXECUTION_CONTEXT_NAMESPACE: observation}}),

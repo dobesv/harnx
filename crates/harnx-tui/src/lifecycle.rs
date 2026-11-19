@@ -101,6 +101,7 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
             TranscriptItem::MarkdownLink { text, url } => text.len() + url.len(),
             TranscriptItem::Plan(_) | TranscriptItem::SourceHeading(_) => 0,
             TranscriptItem::HandoffSession { agent, session_id } => agent.len() + session_id.len(),
+            TranscriptItem::UserSurface { surface_id, .. } => surface_id.len(),
         })
         .sum();
     (items.len(), bytes)
@@ -282,6 +283,7 @@ impl Tui {
         Ok(())
     }
 
+    // qual:allow(complexity, max_function_lines=69) reason: "the constructor's field list grows one line per frontend concern (surfaces here)"
     pub async fn init(config: &GlobalConfig) -> Result<Self> {
         // Use display names for TUI picker; in cluster-client mode, this omits
         // local/package agents and strips default-cluster suffix.
@@ -328,6 +330,7 @@ impl Tui {
             exit_interrupt_error: None,
             tool_confirmation_route: Arc::new(parking_lot::Mutex::new(None)),
             interactions: Default::default(),
+            surfaces: Default::default(),
             #[cfg(test)]
             confirmation_enqueue_override: None,
             #[cfg(test)]
@@ -927,6 +930,7 @@ pub(crate) fn messages_to_transcript_items(
     messages_to_transcript_items_for_cluster(messages, decl_map, None)
 }
 
+// qual:allow(complexity, max_function_lines=135) reason: "one arm per transcript message kind; surfaces add one row push beside the tool result"
 pub(crate) fn messages_to_transcript_items_for_cluster(
     messages: &[Message],
     decl_map: &HashMap<String, ToolDeclaration>,
@@ -1056,6 +1060,9 @@ pub(crate) fn messages_to_transcript_items_for_cluster(
                             &r.output,
                             rendered_result.as_deref(),
                         ));
+                        // Published surfaces ride the reconstructed tool
+                        // result; place their rows next to it.
+                        push_published_surface_items(&mut items, &r.user_surfaces);
                     }
                 }
             }
@@ -1175,6 +1182,41 @@ fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mu
         TranscriptItem::HandoffSession { agent, session_id } => {
             lines.push(format!("handoff {} [{session_id}]", agent));
         }
+        TranscriptItem::UserSurface {
+            surface_id,
+            payload,
+            resolved,
+        } => push_surface_compaction_lines(surface_id, payload, resolved.as_deref(), lines),
+    }
+}
+
+/// Transcript rows for surfaces carried by a reconstructed tool result, so
+/// history rebuild places them next to their tool result like the live path.
+fn push_published_surface_items(items: &mut Vec<TranscriptItem>, payloads: &[serde_json::Value]) {
+    for payload in payloads {
+        if let Some(surface_id) = harnx_runtime::surfaces::surface_id_of(payload) {
+            items.push(TranscriptItem::UserSurface {
+                surface_id,
+                payload: payload.clone(),
+                resolved: None,
+            });
+        }
+    }
+}
+
+/// Compaction-view lines for one surface row: headline plus resolution.
+fn push_surface_compaction_lines(
+    surface_id: &str,
+    payload: &serde_json::Value,
+    resolved: Option<&str>,
+    lines: &mut Vec<String>,
+) {
+    lines.push(format!(
+        "surface {surface_id}: {}",
+        crate::surfaces::surface_headline(payload)
+    ));
+    if let Some(resolved) = resolved {
+        lines.push(format!("answered: {resolved}"));
     }
 }
 

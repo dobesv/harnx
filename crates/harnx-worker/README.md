@@ -19,7 +19,7 @@ harnx-worker --cluster prod --worker-id worker-1
   workers share one durable activation consumer, so the ID no longer names a
   per-worker consumer. It defaults to a generated ID; a stable value is
   recommended in production.
-- `--manage-servers` launches this worker's tool and hook servers. Without it,
+- `--manage-servers` launches this worker's tool servers. Without it,
   the worker discovers independently deployed servers under
   `HARNX_SERVER_SCOPE`.
 - `-x KEY VALUE` / `--agent-variable KEY VALUE` sets an agent variable and may
@@ -74,7 +74,7 @@ The frontend finds `harnx-worker` in this order:
 2. A sibling of the running frontend binary.
 3. `harnx-worker` on `PATH`.
 
-Worker, tool-server, and hook-server output goes to the frontend's log file,
+Worker and tool-server output goes to the frontend's log file,
 `~/.local/state/harnx/harnx.log` by default.
 
 Local tool-server diagnostics remain available with:

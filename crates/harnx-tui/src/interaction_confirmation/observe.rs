@@ -2,7 +2,6 @@
 use super::{pending_confirmation, InteractionEvent, Target};
 use crate::types::TuiEvent;
 use harnx_runtime::config::GlobalConfig;
-use harnx_runtime::nats_event_sink::SessionEventStream;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -37,14 +36,7 @@ async fn observe_connection(
     target: &Target,
     generation: u64,
 ) -> anyhow::Result<()> {
-    let snapshot = config.read().clone();
-    let client = snapshot.nats_client(&target.1).await?;
-    let mut stream = SessionEventStream::attach(
-        async_nats::jetstream::new(client.clone()),
-        client,
-        &target.0,
-    )
-    .await?;
+    let mut stream = super::attach_event_stream(config, target).await?;
     let mut last = None;
     loop {
         let pending = pending_confirmation(stream.history())?;

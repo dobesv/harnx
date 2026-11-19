@@ -3,14 +3,13 @@
 //! dropped by compaction stays recoverable. Pure query core here; the
 //! `ToolProvider` wiring reads the active session's NATS stream.
 
-use crate::config::GlobalConfig;
 use anyhow::Result;
-use async_trait::async_trait;
 use fancy_regex::Regex;
-use harnx_core::abort::AbortSignal;
 use harnx_core::session::SessionLogEntry;
-use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider, ToolProviderOutput};
 use serde_json::{json, Value};
+
+mod provider;
+pub use provider::{tool_declaration, SessionHistoryProvider};
 
 /// The tool name exposed to agents.
 pub const TOOL_NAME: &str = "harnx_agent_session_history_read";
@@ -48,6 +47,7 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::InteractionRequested { .. } => "interaction_requested",
         SessionLogEntry::SuspensionReady { .. } => "suspension_ready",
         SessionLogEntry::InteractionResponse { .. } => "interaction_response",
+        SessionLogEntry::SurfaceAction { .. } => "surface_action",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
         SessionLogEntry::CompactRequest { .. } => "compact_request",
@@ -62,18 +62,8 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
 pub(crate) fn entry_searchable_text(entry: &SessionLogEntry) -> String {
     match entry {
         SessionLogEntry::Message { content, .. } => content.to_transcript_text(),
-        SessionLogEntry::ToolCalls { text, calls, .. } => {
-            let calls_text: Vec<String> = calls
-                .iter()
-                .map(|c| format!("{}({})", c.name, c.arguments))
-                .collect();
-            format!("{text}\n{}", calls_text.join("\n"))
-        }
-        SessionLogEntry::ToolResults { results, .. } => results
-            .iter()
-            .map(|r| format!("{}: {}", r.name, r.output))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        SessionLogEntry::ToolCalls { text, calls, .. } => tool_calls_text(text, calls),
+        SessionLogEntry::ToolResults { results, .. } => tool_results_text(results),
         SessionLogEntry::Compress { prompt } => prompt.clone(),
         SessionLogEntry::Cancel {
             fence_token,
@@ -90,24 +80,22 @@ pub(crate) fn entry_searchable_text(entry: &SessionLogEntry) -> String {
             invocation_id,
             tool_call_id,
             started_at,
-        } => format!(
-            "{agent}\n{session_id}\n{}\n{}\n{}",
-            invocation_id.as_deref().unwrap_or_default(),
-            tool_call_id.as_deref().unwrap_or_default(),
-            started_at
-                .map(|value| value.to_rfc3339())
-                .unwrap_or_default()
+        } => sub_agent_started_text(
+            agent,
+            session_id,
+            invocation_id.as_deref(),
+            tool_call_id.as_deref(),
+            *started_at,
         ),
         SessionLogEntry::HandoffCommitted {
             target_agent,
             target_session_id,
             handoff_tool_call_id,
-        } => match handoff_tool_call_id {
-            Some(tool_call_id) => {
-                format!("{target_agent}\n{target_session_id}\n{tool_call_id}")
-            }
-            None => format!("{target_agent}\n{target_session_id}"),
-        },
+        } => handoff_committed_text(
+            target_agent,
+            target_session_id,
+            handoff_tool_call_id.as_deref(),
+        ),
         SessionLogEntry::HitlApprovalRequested {
             tool_call_id,
             summary,
@@ -122,7 +110,60 @@ pub(crate) fn entry_searchable_text(entry: &SessionLogEntry) -> String {
             "{tool_call_id}\n{approved}\n{}",
             note.as_deref().unwrap_or_default()
         ),
+        SessionLogEntry::SurfaceAction {
+            surface_id,
+            action,
+            note_text,
+            ..
+        } => format!(
+            "{surface_id}\n{action}\n{}",
+            note_text.as_deref().unwrap_or_default()
+        ),
         _ => String::new(),
+    }
+}
+
+fn tool_calls_text(text: &str, calls: &[harnx_core::tool::ToolCall]) -> String {
+    let calls_text: Vec<String> = calls
+        .iter()
+        .map(|c| format!("{}({})", c.name, c.arguments))
+        .collect();
+    format!("{text}\n{}", calls_text.join("\n"))
+}
+
+fn tool_results_text(results: &[harnx_core::session::ToolOutput]) -> String {
+    results
+        .iter()
+        .map(|r| format!("{}: {}", r.name, r.output))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn sub_agent_started_text(
+    agent: &str,
+    session_id: &str,
+    invocation_id: Option<&str>,
+    tool_call_id: Option<&str>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    format!(
+        "{agent}\n{session_id}\n{}\n{}\n{}",
+        invocation_id.unwrap_or_default(),
+        tool_call_id.unwrap_or_default(),
+        started_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_default()
+    )
+}
+
+fn handoff_committed_text(
+    target_agent: &str,
+    target_session_id: &str,
+    handoff_tool_call_id: Option<&str>,
+) -> String {
+    match handoff_tool_call_id {
+        Some(tool_call_id) => format!("{target_agent}\n{target_session_id}\n{tool_call_id}"),
+        None => format!("{target_agent}\n{target_session_id}"),
     }
 }
 
@@ -220,132 +261,9 @@ pub fn query_log_content(content: &str, session_name: &str, query: &HistoryQuery
     query_entries_with_jaq(&entries, query)
 }
 
-/// Build the tool declaration (name, description, JSON-schema parameters).
-pub fn tool_declaration() -> ToolDeclaration {
-    let schema = json!({
-        "type": "object",
-        "properties": {
-            "index_min": {"type": "integer", "description": "Minimum log entry seq (inclusive)."},
-            "index_max": {"type": "integer", "description": "Maximum log entry seq (inclusive)."},
-            "type": {"type": "string", "description": "Filter by entry type: message, tool_calls, tool_results, sub_agent_started, handoff_committed, hitl_approval_requested, hitl_approval_decision, compress, data_urls, clear, cancel, error, turn_end, admission_closed, edit_entries, rewind, unknown."},
-            "tool_name": {"type": "string", "description": "Keep only entries referencing this tool name."},
-            "text_regex": {"type": "string", "description": "Keep entries whose rendered text matches this regular expression."},
-            "limit": {"type": "integer", "description": "Maximum number of rows to return."},
-            "jaq": {"type": "string", "description": "Optional jq/jaq expression applied to the array of matched rows for arbitrary filtering or projection. Invalid expressions return an error."}
-        }
-    });
-    ToolDeclaration {
-        name: TOOL_NAME.to_string(),
-        description: "Search this session's own history log, including detail dropped by compaction. \
-Filter by entry index range, type, tool name, or a text regex; optionally refine with a jaq expression. \
-Returns a JSON array of matching log entries (seq, type, text, tool names)."
-            .to_string(),
-        parameters: serde_json::from_value::<JsonSchema>(schema)
-            .expect("session-history tool schema is valid"),
-        mcp_tool_name: None,
-        mcp_server_name: None,
-        call_template: None,
-        result_template: None,
-        idempotent_hint: None,
-        read_only_hint: None,
-        kind: None,
-    }
-}
-
-/// Parse the tool-call arguments JSON into a `HistoryQuery`.
-fn parse_query(arguments: &Value) -> HistoryQuery {
-    let s = |k: &str| {
-        arguments
-            .get(k)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    };
-    let u = |k: &str| {
-        arguments
-            .get(k)
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-    };
-    HistoryQuery {
-        index_min: u("index_min"),
-        index_max: u("index_max"),
-        entry_type: s("type"),
-        tool_name: s("tool_name"),
-        text_regex: s("text_regex"),
-        limit: u("limit"),
-        jaq: s("jaq"),
-    }
-}
-
-/// `ToolProvider` for the session-history tool. Resolves the active session's
-/// NATS log from the captured config at call time (own session only).
-pub struct SessionHistoryProvider {
-    config: GlobalConfig,
-}
-
-impl SessionHistoryProvider {
-    pub fn new(config: GlobalConfig) -> Self {
-        Self { config }
-    }
-}
-
-#[async_trait]
-impl ToolProvider for SessionHistoryProvider {
-    fn name(&self) -> &str {
-        "session_history"
-    }
-
-    fn has_tool(&self, tool_name: &str) -> bool {
-        tool_name == TOOL_NAME
-    }
-
-    async fn call_tool(
-        &self,
-        _tool_name: &str,
-        arguments: Value,
-        abort: &AbortSignal,
-    ) -> Result<ToolProviderOutput, ToolError> {
-        let (config, name, cluster) = {
-            let guard = self.config.read();
-            let session = guard
-                .session
-                .as_ref()
-                .ok_or_else(|| ToolError::Recoverable(anyhow::anyhow!("no active session")))?;
-            let cluster = guard
-                .remote_agent
-                .as_ref()
-                .map(|(_, cluster)| cluster.clone())
-                .unwrap_or_else(|| guard.default_cluster_key().to_string());
-            (guard.clone(), session.storage_key(), cluster)
-        };
-        let operation = async {
-            let jetstream = config.nats_jetstream(&cluster).await?;
-            crate::nats_session_log::NatsSessionLog::new(jetstream, name)
-                .load_events_async()
-                .await
-        };
-        let entries = tokio::select! {
-            _ = harnx_core::abort::wait_abort_signal(abort) => {
-                return Err(ToolError::Recoverable(anyhow::anyhow!("session history request aborted")));
-            }
-            result = tokio::time::timeout(std::time::Duration::from_secs(30), operation) => {
-                result
-                    .map_err(|_| ToolError::Recoverable(anyhow::anyhow!("session history request timed out")))?
-                    .map_err(ToolError::Recoverable)?
-            }
-        };
-        let query = parse_query(&arguments);
-        let entries: Vec<_> = entries
-            .into_iter()
-            .map(|(seq, entry)| (seq as usize, entry))
-            .collect();
-        let rows = query_entries_with_jaq(&entries, &query).map_err(ToolError::Recoverable)?;
-        Ok(json!({ "content": [{ "type": "text", "text": rows.to_string() }] }).into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::provider::parse_query;
     use super::*;
     use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart, MessageRole};
 
@@ -516,6 +434,7 @@ mod tests {
                 SessionLogEntry::ToolResults {
                     handoff_selection: None,
                     results: vec![harnx_core::session::ToolOutput {
+                        user_surfaces: Vec::new(),
                         id: Some("c1".into()),
                         name: "bash".into(),
                         output: json!({"content":[{"type":"text","text":"build ok"}]}),

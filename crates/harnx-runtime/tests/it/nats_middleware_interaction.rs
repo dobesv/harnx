@@ -20,3 +20,6 @@ mod decision_receipt_cases;
 
 #[path = "nats_middleware_interaction/clear_cases.rs"]
 mod clear_cases;
+
+#[path = "nats_middleware_interaction/tool_input_required_cases.rs"]
+mod tool_input_required_cases;

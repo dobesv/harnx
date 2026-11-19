@@ -52,6 +52,11 @@ pub(super) fn apply_tool_server_patch(
     if let Some(origin) = &server.middleware.origin {
         middleware::bind_middleware(&mut patched.middleware, origin.clone())?;
     }
+    if let Some(hooks) = &mut patched.hooks {
+        if let Some(origin) = server.hooks.as_ref().and_then(|h| h.origin.clone()) {
+            event_hooks::bind_event_hooks(hooks, origin)?;
+        }
+    }
     *server = patched;
     Ok(())
 }

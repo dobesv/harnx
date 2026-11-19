@@ -20,6 +20,8 @@ import remarkGfm from 'remark-gfm';
 import { parseHandoffMarker } from './handoffMarker';
 import { HandoffRow } from './HandoffRow';
 import { SessionNavigationContext, type SessionNavigateFn } from './SessionNavigationContext';
+import { useA2uiSurfaces } from './a2ui/A2uiSurfacesContext';
+import { A2uiSurfaceCard } from './a2ui/A2uiSurfaceCard';
 
 const markdownComponents = {
   a: MarkdownLink,
@@ -709,10 +711,19 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = (props) => {
   });
   const isDarkMode = typeof document !== 'undefined' && document.body.classList.contains('dark');
   const jsonStyles = isDarkMode ? darkStyles : defaultStyles;
+  const { getSurfacesForToolCall } = useA2uiSurfaces();
+  const surfaces = getSurfacesForToolCall(effectiveId);
 
   return (
     <div className="aui-tool-call" style={{ borderLeft: `4px solid ${borderColor}` }}>
       <ToolCallHeader {...headerProps} />
+
+      {surfaces.map((surface) => (
+        <A2uiSurfaceCard
+          key={`${surface.surfaceId}:${surface.publishSeq}`}
+          surface={surface}
+        />
+      ))}
 
       {handoff && (
         <HandoffRow

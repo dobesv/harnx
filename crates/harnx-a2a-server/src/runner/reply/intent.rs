@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 
 use super::target::ReplyTarget;
 use crate::{
-    hitl::{parse_reply, ReplyParse},
     runner::{authority::OwnedTask, Runner, RunnerError},
     store::{
         context::{
@@ -56,12 +55,7 @@ pub(super) async fn persist_reply_intent(
     target: &ReplyTarget<'_>,
     authority: &mut OwnedTask,
 ) -> Result<()> {
-    let receipt = build_reply_receipt(target)?;
-    anyhow::ensure!(
-        !receipt.approved
-            || crate::hitl::interaction::can_approve(target.session, target.request).await?,
-        "interaction kind not supported by this client"
-    );
+    let receipt = build_reply_receipt(target).await?;
     for _ in 0..8 {
         if try_persist_intent_attempt(runner, target, authority, &receipt).await? {
             return Ok(());
@@ -70,18 +64,19 @@ pub(super) async fn persist_reply_intent(
     anyhow::bail!(AuthorityError::Conflict)
 }
 
-fn build_reply_receipt(target: &ReplyTarget<'_>) -> Result<ReplyReceipt> {
-    let (approved, note) = match parse_reply(&target.message.parts) {
-        ReplyParse::Approve(note) => (true, note),
-        ReplyParse::Reject(note) => (false, note),
-        ReplyParse::Unrecognized => anyhow::bail!("reply not recognized"),
-    };
+async fn build_reply_receipt(target: &ReplyTarget<'_>) -> Result<ReplyReceipt> {
+    let response = crate::hitl::interaction::parse_response(
+        target.session,
+        target.request,
+        &target.message.parts,
+    )
+    .await?;
     Ok(ReplyReceipt::new(ReplyReceiptParams {
         message_id: target.message.message_id.clone(),
         fingerprint: target.fingerprint.into(),
         request: target.request.clone(),
-        approved,
-        note,
+        approved: response.action != "deny",
+        note: response.note,
     }))
 }
 

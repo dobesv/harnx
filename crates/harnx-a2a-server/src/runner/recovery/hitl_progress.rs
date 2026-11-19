@@ -7,34 +7,8 @@ use crate::{
     store::context::HitlPhase,
 };
 
-async fn redeliver_saved_decision_if_pending(
-    session: &NatsSession,
-    active: &crate::store::context::ActiveTask,
-    checkpoint: &crate::store::context::HitlCheckpoint,
-) -> Result<bool> {
-    if let Some(receipt) = &checkpoint.reply {
-        anyhow::ensure!(
-            checkpoint.phase == HitlPhase::DecisionIntent,
-            "accepted HITL request is not DecisionIntent"
-        );
-        let note = crate::runner::reply_note::saved_reply_note(
-            active.snapshot.task.history.as_deref(),
-            receipt,
-        )?;
-        crate::hitl::interaction::decide(session, &receipt.request, receipt.approved, note).await?;
-        Ok(true)
-    } else {
-        anyhow::ensure!(
-            checkpoint.phase == HitlPhase::Waiting,
-            "HITL Following request still undecided"
-        );
-        Ok(false)
-    }
-}
-
 async fn reconcile_pending_request_checkpoint(
     session: &NatsSession,
-    active: &crate::store::context::ActiveTask,
     checkpoint: &crate::store::context::HitlCheckpoint,
     request: &ApprovalRef,
 ) -> Result<bool> {
@@ -50,7 +24,11 @@ async fn reconcile_pending_request_checkpoint(
         "HITL runtime request regressed or changed identity"
     );
     if checkpoint.request == *request {
-        redeliver_saved_decision_if_pending(session, active, checkpoint).await
+        anyhow::ensure!(
+            checkpoint.phase == HitlPhase::DecisionIntent || checkpoint.phase == HitlPhase::Waiting,
+            "HITL Following request still undecided"
+        );
+        Ok(checkpoint.reply.is_some())
     } else {
         Ok(false)
     }
@@ -75,8 +53,17 @@ pub(super) async fn evaluate_input_required_progress(
         .as_ref()
         .context("recovery task missing")?;
     if let Some(checkpoint) = &active.hitl_checkpoint {
-        if reconcile_pending_request_checkpoint(session, active, checkpoint, &request).await? {
-            return Ok(None);
+        if reconcile_pending_request_checkpoint(session, checkpoint, &request).await? {
+            match crate::runner::reply_delivery::deliver_saved(session, authority).await {
+                Ok(_) => return Ok(None),
+                Err(error) => {
+                    crate::runner::reply_delivery::reject_invalid(
+                        runner, session, authority, error,
+                    )
+                    .await?;
+                    return Ok(Some(RecoveryAction::Parked));
+                }
+            }
         }
     }
     hitl_state::park_recovered_hitl(runner, session, authority, pending).await?;

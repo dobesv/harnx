@@ -30,6 +30,10 @@ pub enum InteractionDecisionOutcome {
     Stale,
     /// The round was already completed with ToolResults or cancelled/cleared.
     AfterComplete,
+    /// Response failed validation against the requested surface (`a2ui`
+    /// only): undeclared action, or `data` keys/types inconsistent with the
+    /// surface's bound inputs and action context. Nothing was appended.
+    InvalidResponse,
     /// The lease is not held or fence CAS failed.
     LeaseLost,
 }
@@ -49,6 +53,9 @@ impl InteractionDecisionOutcome {
 /// - Request sequence must match the `InteractionRequested` entry exactly
 /// - Identical retry is acknowledged without append (`AlreadyApplied`) even across manifest changes
 /// - Unanswered request must be listed in latest `SuspensionReady.pending` manifest for the round
+/// - `a2ui` responses are validated against the requested surface (declared
+///   action, data shape): a violation is `InvalidResponse` and is never
+///   appended. `confirm` and other kinds keep their existing acceptance.
 /// - Conflicting, stale, mismatched replies are rejected
 pub async fn accept_interaction_response(
     backend: &NatsSessionLogBackend,
@@ -87,6 +94,16 @@ pub async fn accept_interaction_response(
         });
     }
 
+    // `a2ui` responses are validated against the requested surface before
+    // the manifest check, so nothing invalid is ever appended.
+    if let Err(reason) = validate_surface_response(&requested.request, response) {
+        log::warn!(
+            "rejected interaction response for '{}': {reason}",
+            requested.interaction_id
+        );
+        return Ok(InteractionDecisionOutcome::InvalidResponse);
+    }
+
     // Unanswered request must be present in latest SuspensionReady manifest
     let Some(manifest) = latest_suspension_ready(round_entries, round_seq) else {
         return Ok(InteractionDecisionOutcome::Stale);
@@ -107,6 +124,18 @@ pub async fn accept_interaction_response(
 
 /// Alias for `accept_interaction_response`.
 pub use accept_interaction_response as apply_interaction_response;
+
+/// The one surface check every frontend's `a2ui` answer passes through. Other
+/// kinds (`confirm`, and the pre-T4.2 kinds) keep their existing acceptance.
+fn validate_surface_response(
+    request: &harnx_core::interaction::InteractionRequest,
+    response: &InteractionResponse,
+) -> Result<(), String> {
+    if request.kind != "a2ui" {
+        return Ok(());
+    }
+    harnx_core::interaction::response::validate_response(&request.payload, response)
+}
 
 async fn commit_response_cas(
     backend: &NatsSessionLogBackend,

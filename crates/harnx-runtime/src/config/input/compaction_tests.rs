@@ -118,6 +118,7 @@ fn tool_suffix() -> Vec<SessionLogEntry> {
         SessionLogEntry::ToolResults {
             handoff_selection: None,
             results: vec![harnx_core::session::ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some("edit-1".into()),
                 name: "edit".into(),
                 output: json!({"ok": true}),

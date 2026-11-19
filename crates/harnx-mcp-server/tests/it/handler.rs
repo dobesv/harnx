@@ -279,6 +279,7 @@ impl Peer {
         marker: &str,
     ) -> Result<()> {
         let reply = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(json!({"content":[{"type":"text", "text":marker}], "isError":false})),
             final_progress: None,

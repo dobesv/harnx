@@ -74,6 +74,7 @@ impl Config {
             ret?;
         }
         config.resolved_middleware()?;
+        config.resolved_event_hooks()?;
         Ok(config)
     }
 
@@ -97,6 +98,9 @@ impl Config {
             &mut config.middleware,
             middleware::file_origin(config_path, None)?,
         )?;
+        if let Some(hooks) = &mut config.data.hooks {
+            event_hooks::bind_event_hooks(hooks, middleware::file_origin(config_path, None)?)?;
+        }
         let config_dir = config_path.parent().unwrap_or(config_path);
         config.clients = Self::load_clients_from_dir(&config_dir.join(paths::CLIENTS_DIR_NAME))?;
         config.nats_servers =
@@ -109,6 +113,7 @@ impl Config {
         }
 
         config.resolved_middleware()?;
+        config.resolved_event_hooks()?;
         Ok(config)
     }
 
@@ -292,6 +297,7 @@ impl Config {
         config.tool_servers =
             Self::load_tool_servers_from_dir(&config_dir.join(paths::TOOL_SERVERS_DIR_NAME))?;
         config.resolved_middleware()?;
+        config.resolved_event_hooks()?;
         Ok(config)
     }
 

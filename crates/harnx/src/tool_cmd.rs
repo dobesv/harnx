@@ -120,6 +120,7 @@ async fn bounded_operation(
         .unwrap_or(OperatorToolReply {
             output: String::new(),
             error: None,
+            error_kind: None,
         });
     reply.error = Some(reason.into());
     Ok(reply)
@@ -272,6 +273,7 @@ pub(crate) async fn run(cli: &Cli, command: OperatorToolCommand, json: bool) -> 
         .unwrap_or_else(|error| OperatorToolReply {
             output: String::new(),
             error: Some(format!("{error:#}")),
+            error_kind: None,
         });
     let failed = reply.error.is_some();
     if !reply.output.is_empty() {
@@ -362,6 +364,7 @@ mod tests {
             Ok(OperatorToolReply {
                 output: r#"{"partial":true,"data":[1]}"#.into(),
                 error: None,
+                error_kind: None,
             })
         };
         let reply = bounded_operation(operation, Duration::from_millis(1), &abort)

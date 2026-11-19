@@ -80,16 +80,16 @@ pub fn prompt_interrupted_at(entries: &[(u64, SessionLogEntry)], user_msg_seq: u
 }
 
 fn is_queued_user_message(entry: &SessionLogEntry) -> bool {
-    // Timing notices and runtime notes are non-executable context, not queued
-    // user prompts. Both use structured classifiers; reserved-prefix
-    // lookalikes stay executable.
+    // Timing notices, runtime notes and hook-added context are
+    // non-executable context, not queued user prompts. All use structured
+    // classifiers; reserved-prefix lookalikes stay executable.
     if let SessionLogEntry::Message {
         id, role, content, ..
     } = entry
     {
         if role.is_user() {
             return !crate::timing_identity::is_timing_notice(&content.to_text())
-                && !crate::runtime_note::is_runtime_note_id(id.as_deref());
+                && !crate::runtime_note::is_runtime_context_id(id.as_deref());
         }
     }
     false
@@ -119,8 +119,9 @@ pub fn latest_prompt_seq(entries: &[(u64, SessionLogEntry)]) -> Option<u64> {
         if crate::timing_identity::is_timing_notice(&content.to_text()) {
             continue;
         }
-        // Runtime notes are context, not prompts: they never hold pending work.
-        if crate::runtime_note::is_runtime_note_id(id.as_deref()) {
+        // Runtime notes and hook-added context are context, not prompts:
+        // they never hold pending work.
+        if crate::runtime_note::is_runtime_context_id(id.as_deref()) {
             continue;
         }
         let is_copy = id.as_deref().is_some_and(|id| !seen_ids.insert(id));

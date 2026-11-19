@@ -67,8 +67,9 @@ impl DurableRound {
         config: &GlobalConfig,
         seq: Option<u64>,
         calls: &[ToolCall],
+        input_declared: bool,
     ) -> Result<Option<Self>> {
-        Self::open_inner(config, seq, calls, false).await
+        Self::open_inner(config, seq, calls, input_declared, false).await
     }
 
     pub(crate) async fn open_recovery(
@@ -76,7 +77,7 @@ impl DurableRound {
         seq: u64,
         calls: &[ToolCall],
     ) -> Result<Self> {
-        Self::open_inner(config, Some(seq), calls, true)
+        Self::open_inner(config, Some(seq), calls, false, true)
             .await?
             .context("recovery requires a fenced NATS session")
     }
@@ -86,6 +87,7 @@ impl DurableRound {
         config: &GlobalConfig,
         seq: Option<u64>,
         calls: &[ToolCall],
+        input_declared: bool,
         recovery: bool,
     ) -> Result<Option<Self>> {
         if config.read().dry_run {
@@ -98,7 +100,7 @@ impl DurableRound {
         };
         let seq = seq.context("durable tool round has no sequence")?;
         let chain = config.read().resolved_middleware()?;
-        if !recovery && chain.entries.is_empty() {
+        if !recovery && chain.entries.is_empty() && !input_declared {
             // Worker preflight classifies orphaned records before continuation.
             // Restore those slots even after middleware removal. If ToolCalls
             // is still the tail, no interaction records can follow it; only the

@@ -95,7 +95,9 @@ pub(super) async fn assert_deferred_intent(t: &TwoBackends, session: &NatsSessio
         .await?;
     assert!(!entries.iter().any(|(_, e)| matches!(
         e,
-        SessionLogEntry::HitlApprovalDecision { .. } | SessionLogEntry::Cancel { .. }
+        SessionLogEntry::HitlApprovalDecision { .. }
+            | SessionLogEntry::InteractionResponse { .. }
+            | SessionLogEntry::Cancel { .. }
     )));
     Ok(())
 }
@@ -223,7 +225,11 @@ pub(super) async fn assert_next_request_parked(
     assert_eq!(
         entries
             .iter()
-            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .filter(|(_, e)| matches!(
+                e,
+                SessionLogEntry::HitlApprovalDecision { .. }
+                    | SessionLogEntry::InteractionResponse { .. }
+            ))
             .count(),
         1
     );

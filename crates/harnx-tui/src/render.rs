@@ -152,6 +152,7 @@ impl Tui {
         entry
     }
 
+    // qual:allow(complexity, max_function_lines=294) reason: "one arm per transcript item kind; the surface arm delegates to render_surface_row"
     pub(super) fn render_entry(
         entry: &mut TranscriptItem,
         show_seq: bool,
@@ -451,6 +452,7 @@ impl Tui {
             TranscriptItem::MarkdownLink { text, url } => {
                 Self::render_markdown_link(text, url, width)
             }
+            item @ TranscriptItem::UserSurface { .. } => Self::render_surface_row(item, width),
         }
     }
 
@@ -601,6 +603,11 @@ impl Tui {
                 .max(crate::interaction_confirmation::MIN_MODAL_HEIGHT)
                 .min(screen_height);
         }
+        if let Some(ModalState::SurfaceAction(state)) = &self.app.modal {
+            return crate::surfaces::render::surface_modal_height(input_width, state)
+                .max(crate::interaction_confirmation::MIN_MODAL_HEIGHT)
+                .min(screen_height);
+        }
         if let Some(modal @ ModalState::ConfirmToolUse(_)) = &self.app.modal {
             return self
                 .confirm_tool_modal_height(input_width, modal)
@@ -636,6 +643,13 @@ impl Tui {
             if let Some(ModalState::ConfirmInteraction(mut state)) = self.app.modal.take() {
                 self.render_interaction_modal(frame, area, &mut state);
                 self.app.modal = Some(ModalState::ConfirmInteraction(state));
+            }
+            return true;
+        }
+        if matches!(self.app.modal, Some(ModalState::SurfaceAction(_))) {
+            if let Some(ModalState::SurfaceAction(mut state)) = self.app.modal.take() {
+                crate::surfaces::render::render_surface_modal(frame, area, &mut state);
+                self.app.modal = Some(ModalState::SurfaceAction(state));
             }
             return true;
         }
@@ -1053,6 +1067,7 @@ impl Tui {
     }
 
     /// Render a centered confirmation modal overlay.
+    // qual:allow(complexity, max_function_lines=62) reason: "one arm per modal variant; the surface arm delegates to render_surface_modal"
     fn render_modal(
         &self,
         frame: &mut Frame<'_>,
@@ -1066,6 +1081,13 @@ impl Tui {
         match modal {
             ModalState::ConfirmInteraction(state) => {
                 self.render_interaction_modal(frame, screen_size, &mut state.clone());
+            }
+            ModalState::SurfaceAction(state) => {
+                crate::surfaces::render::render_surface_modal(
+                    frame,
+                    screen_size,
+                    &mut state.clone(),
+                );
             }
             ModalState::ConfirmToolUse(_) => {
                 let mut modal = modal.clone();
@@ -1252,6 +1274,7 @@ impl Tui {
 
     /// Render the detail view overlay for the selected transcript range.
     /// Called from draw() when self.app.detail_view_open is true.
+    // qual:allow(complexity, max_function_lines=196) reason: "one detail arm per transcript item kind; the surface arm delegates to push_surface_detail_lines"
     pub(super) fn render_entry_detail(entry: &TranscriptItem) -> Vec<Line<'static>> {
         let label_style = Style::default().fg(Color::DarkGray);
         let mut lines = Vec::new();
@@ -1434,6 +1457,17 @@ impl Tui {
                 push_field!("agent", agent);
                 push_field!("session_id", session_id);
             }
+            TranscriptItem::UserSurface {
+                surface_id,
+                payload,
+                resolved,
+            } => push_surface_detail_lines(
+                &mut lines,
+                label_style,
+                surface_id,
+                payload,
+                resolved.as_deref(),
+            ),
         }
         lines
     }
@@ -1733,6 +1767,27 @@ impl Tui {
         };
         let shortcuts_para = Paragraph::new(shortcuts_text).style(Style::default().fg(color));
         frame.render_widget(shortcuts_para, footer_chunks[1]);
+    }
+}
+
+/// Detail-view lines for one surface row (render_entry_detail's surface arm).
+fn push_surface_detail_lines(
+    lines: &mut Vec<Line<'static>>,
+    label_style: Style,
+    surface_id: &str,
+    payload: &serde_json::Value,
+    resolved: Option<&str>,
+) {
+    lines.push(Line::from(Span::styled("── surface ──", label_style)));
+    runtime_note::push_detail_field(
+        lines,
+        label_style,
+        "headline",
+        &crate::surfaces::surface_headline(payload),
+    );
+    runtime_note::push_detail_field(lines, label_style, "surface_id", surface_id);
+    if let Some(resolved) = resolved {
+        runtime_note::push_detail_field(lines, label_style, "answered", resolved);
     }
 }
 

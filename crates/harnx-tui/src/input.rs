@@ -907,6 +907,14 @@ impl Tui {
             TranscriptItem::HandoffSession { agent, session_id } => {
                 Some(format!("@ {} [{}]", agent, session_id))
             }
+            TranscriptItem::UserSurface {
+                surface_id,
+                payload,
+                ..
+            } => Some(format!(
+                "surface {surface_id}: {}",
+                crate::surfaces::surface_headline(payload)
+            )),
             _ => None,
         }
     }

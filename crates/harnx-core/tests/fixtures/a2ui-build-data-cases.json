@@ -1,0 +1,291 @@
+[
+  {
+    "name": "maps inputs and resolves action context",
+    "surface": {
+      "version": "1.0",
+      "createSurface": {
+        "dataModel": {
+          "choice": [],
+          "name": "",
+          "region": "eu"
+        },
+        "components": [
+          { "id": "root", "component": "Card", "child": "col" },
+          {
+            "id": "col",
+            "component": "Column",
+            "children": ["title", "choice", "name", "submit_label", "submit"]
+          },
+          { "id": "title", "component": "Text", "text": "Pick a deployment target" },
+          {
+            "id": "choice",
+            "component": "ChoicePicker",
+            "variant": "mutuallyExclusive",
+            "options": [
+              { "label": "Staging", "value": "staging" },
+              { "label": "Production", "value": "prod" }
+            ],
+            "value": { "@path": "/choice" }
+          },
+          {
+            "id": "name",
+            "component": "TextField",
+            "label": "Release name",
+            "value": { "@path": "/name" }
+          },
+          { "id": "submit_label", "component": "Text", "text": "Deploy" },
+          {
+            "id": "submit",
+            "component": "Button",
+            "child": "submit_label",
+            "action": {
+              "event": {
+                "name": "deploy",
+                "context": {
+                  "choice": { "@path": "/choice" },
+                  "mode": "fast",
+                  "region": { "@path": "/region" }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "action": "deploy",
+    "values": {
+      "choice": ["prod"],
+      "name": "rel-1"
+    },
+    "expected": {
+      "choice": ["prod"],
+      "name": "rel-1",
+      "mode": "fast",
+      "region": "eu"
+    }
+  },
+  {
+    "name": "defaults untouched inputs from dataModel",
+    "surface": {
+      "version": "1.0",
+      "createSurface": {
+        "dataModel": {
+          "choice": [],
+          "name": "",
+          "region": "eu"
+        },
+        "components": [
+          { "id": "root", "component": "Card", "child": "col" },
+          {
+            "id": "col",
+            "component": "Column",
+            "children": ["title", "choice", "name", "submit_label", "submit"]
+          },
+          { "id": "title", "component": "Text", "text": "Pick a deployment target" },
+          {
+            "id": "choice",
+            "component": "ChoicePicker",
+            "variant": "mutuallyExclusive",
+            "options": [
+              { "label": "Staging", "value": "staging" },
+              { "label": "Production", "value": "prod" }
+            ],
+            "value": { "@path": "/choice" }
+          },
+          {
+            "id": "name",
+            "component": "TextField",
+            "label": "Release name",
+            "value": { "@path": "/name" }
+          },
+          { "id": "submit_label", "component": "Text", "text": "Deploy" },
+          {
+            "id": "submit",
+            "component": "Button",
+            "child": "submit_label",
+            "action": {
+              "event": {
+                "name": "deploy",
+                "context": {
+                  "choice": { "@path": "/choice" },
+                  "mode": "fast",
+                  "region": { "@path": "/region" }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "action": "deploy",
+    "values": {},
+    "expected": {
+      "choice": [],
+      "name": "",
+      "mode": "fast",
+      "region": "eu"
+    }
+  },
+  {
+    "name": "deny carries nothing",
+    "surface": {
+      "version": "1.0",
+      "createSurface": {
+        "components": [
+          { "id": "root", "component": "Card", "child": "col" },
+          { "id": "col", "component": "Column", "children": ["name", "submit_label", "submit"] },
+          {
+            "id": "name",
+            "component": "TextField",
+            "label": "Name",
+            "value": { "@path": "/name" }
+          },
+          { "id": "submit_label", "component": "Text", "text": "Submit" },
+          {
+            "id": "submit",
+            "component": "Button",
+            "child": "submit_label",
+            "action": {
+              "event": {
+                "name": "submit"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "action": "deny",
+    "values": {
+      "name": "ignored"
+    },
+    "expected": {}
+  },
+  {
+    "name": "multiple selection pickers and nested paths",
+    "surface": {
+      "version": "1.0",
+      "createSurface": {
+        "dataModel": {
+          "a": {
+            "b": "default_nested"
+          }
+        },
+        "components": [
+          { "id": "root", "component": "Column", "children": ["pick", "field", "go_label", "go"] },
+          {
+            "id": "pick",
+            "component": "ChoicePicker",
+            "variant": "multipleSelection",
+            "options": [
+              { "label": "A", "value": "a" },
+              { "label": "B", "value": "b" }
+            ],
+            "value": { "@path": "/picks" }
+          },
+          {
+            "id": "field",
+            "component": "TextField",
+            "label": "Nested",
+            "value": { "@path": "/a/b" }
+          },
+          { "id": "go_label", "component": "Text", "text": "Go" },
+          {
+            "id": "go",
+            "component": "Button",
+            "child": "go_label",
+            "action": { "event": { "name": "go" } }
+          }
+        ]
+      }
+    },
+    "action": "go",
+    "values": {
+      "picks": ["a", "b"],
+      "a/b": "custom_nested"
+    },
+    "expected": {
+      "picks": ["a", "b"],
+      "a/b": "custom_nested"
+    }
+  },
+  {
+    "name": "action context overrides input value on collision",
+    "surface": {
+      "version": "1.0",
+      "createSurface": {
+        "components": [
+          { "id": "root", "component": "Column", "children": ["field", "btn_label", "btn"] },
+          {
+            "id": "field",
+            "component": "TextField",
+            "label": "Mode",
+            "value": { "@path": "/mode" }
+          },
+          { "id": "btn_label", "component": "Text", "text": "Submit" },
+          {
+            "id": "btn",
+            "component": "Button",
+            "child": "btn_label",
+            "action": {
+              "event": {
+                "name": "submit",
+                "context": {
+                  "mode": "override"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "action": "submit",
+    "values": {
+      "mode": "user_typed"
+    },
+    "expected": {
+      "mode": "override"
+    }
+  },
+  {
+    "name": "empty default when dataModel is absent or does not have path",
+    "surface": {
+      "version": "1.0",
+      "createSurface": {
+        "components": [
+          { "id": "root", "component": "Column", "children": ["items", "desc", "btn_label", "btn"] },
+          {
+            "id": "items",
+            "component": "ChoicePicker",
+            "options": [
+              { "label": "One", "value": "1" }
+            ],
+            "value": { "@path": "/items" }
+          },
+          {
+            "id": "desc",
+            "component": "TextField",
+            "label": "Description",
+            "value": { "@path": "/desc" }
+          },
+          { "id": "btn_label", "component": "Text", "text": "Submit" },
+          {
+            "id": "btn",
+            "component": "Button",
+            "child": "btn_label",
+            "action": {
+              "event": {
+                "name": "submit"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "action": "submit",
+    "values": {},
+    "expected": {
+      "items": [],
+      "desc": ""
+    }
+  }
+]

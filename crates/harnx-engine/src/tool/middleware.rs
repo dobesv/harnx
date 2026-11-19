@@ -29,7 +29,7 @@ pub enum ToolMiddlewareOrigin {
 #[derive(Debug, Clone)]
 pub struct PreparedToolCall {
     /// Original transcript identity and arguments. `arguments` below contains
-    /// parsed arguments, including any legacy hook mutation.
+    /// parsed arguments.
     pub call: ToolCall,
     pub arguments: Value,
     /// Actual invocation context, including late-installed lease/admission guards.
@@ -89,6 +89,12 @@ pub enum ToolMiddlewareOutcome {
         interaction: harnx_core::interaction::InteractionRequest,
         checkpoint: super::ToolCallCheckpoint,
     },
+    /// A provider suspended asking for user input, with raw pre-identity
+    /// data (MRTR `input_required`). The runtime's durable layer completes
+    /// the identity and checkpoint; anywhere it is not converted (no
+    /// durable round, inner or operator origin) it degrades to an error
+    /// result instead of suspending.
+    ToolInputRequired(harnx_core::tool::ToolInputRequired),
 }
 
 pub type ToolMiddlewareFuture =
@@ -158,7 +164,7 @@ impl NextDispatch {
             result = self.dispatch(arguments) => result,
         };
         match result {
-            Ok(result) => Ok(ToolMiddlewareOutcome::Completed(result)),
+            Ok(outcome) => Ok(outcome),
             Err(ToolError::Fatal(error)) => {
                 // Keep the original typed cause out of the script's error
                 // policy. Even an ignored next error cannot swallow it.
@@ -172,7 +178,7 @@ impl NextDispatch {
     }
 
     // qual:allow(iosp) reason: "Cancellation and the optional borrowed-authorization bridge must precede leaf dispatch in the host operation's task."
-    async fn dispatch(&self, arguments: Value) -> Result<MaterializedToolResult, ToolError> {
+    async fn dispatch(&self, arguments: Value) -> Result<ToolMiddlewareOutcome, ToolError> {
         if self.abort.aborted() {
             return Err(ToolError::Fatal(anyhow!(
                 "interrupted during tool execution"
@@ -186,10 +192,8 @@ impl NextDispatch {
         let mut call = self.call.clone();
         call.arguments = arguments.clone();
         let effective = ApprovedToolCall {
-            tool_use_id: call.id.clone().unwrap_or_default(),
             call,
-            json_data: arguments.clone(),
-            tool_input: arguments,
+            json_data: arguments,
         };
         let output = dispatch_authorized_call(&effective, &self.ctx, &self.abort, None).await;
         materialize_dispatch_result(

@@ -136,12 +136,12 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
     args
 }
 
-/// Collect all env vars to pass through, returning (key, value) pairs for the
-/// ambient environment and the list of key names for `--env` args.
-fn collect_env(
-    cli: &Cli,
-    hook_env: HashMap<String, String>,
-) -> (Vec<(String, String)>, Vec<String>) {
+fn push_or_replace_env(env: &mut Vec<(String, String)>, key: String, value: String) {
+    env.retain(|(k, _)| k != &key);
+    env.push((key, value));
+}
+
+fn collect_baseline_env() -> Vec<(String, String)> {
     const DEFAULT_PASSTHROUGH: &[&str] = &[
         "HOME",
         "USER",
@@ -153,21 +153,16 @@ fn collect_env(
         "LC_CTYPE",
         "PATH",
         "TMPDIR",
-        // Forward Go cache locations so sandboxed `go` honors custom cache dirs
-        // that were also whitelisted by push_env_relative_defaults().
         "GOMODCACHE",
         "GOCACHE",
     ];
 
-    let mut env: Vec<(String, String)> = Vec::new();
-
-    // 1. Baseline passthrough
+    let mut env = Vec::new();
     for name in DEFAULT_PASSTHROUGH {
         if let Ok(value) = std::env::var(name) {
             env.push((name.to_string(), value));
         }
     }
-    // Safe XDG Base Directory Specification vars only (deny-by-default whitelist).
     for name in harnx_sandbox_common::SAFE_XDG_VARS {
         if let Ok(value) = std::env::var(name) {
             if !env.iter().any(|(k, _)| k == name) {
@@ -175,22 +170,36 @@ fn collect_env(
             }
         }
     }
+    env
+}
 
-    // 2. CLI --env (override defaults)
-    for raw in &cli.env_vars {
+fn apply_cli_env(env: &mut Vec<(String, String)>, env_vars: &[String]) {
+    for raw in env_vars {
         if let Some((key, value)) = raw.split_once('=') {
-            env.retain(|(k, _)| k != key);
-            env.push((key.to_string(), value.to_string()));
+            push_or_replace_env(env, key.to_string(), value.to_string());
         } else if let Ok(value) = std::env::var(raw) {
-            env.retain(|(k, _)| k != raw.as_str());
-            env.push((raw.clone(), value));
+            push_or_replace_env(env, raw.clone(), value);
         }
     }
+}
 
-    // 3. Hook env (highest priority — never appears in args)
-    for (key, value) in hook_env {
-        env.retain(|(k, _)| k != &key);
-        env.push((key, value));
+/// Collect all env vars to pass through, returning (key, value) pairs for the
+/// ambient environment and the list of key names for `--env` args.
+fn collect_env(
+    cli: &Cli,
+    proxy_env: HashMap<String, String>,
+    credential_env: HashMap<String, String>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut env = collect_baseline_env();
+
+    // Proxy hook env (caller-wins: merged before CLI --env, so CLI overrides)
+    for (key, value) in proxy_env {
+        push_or_replace_env(&mut env, key, value);
+    }
+    apply_cli_env(&mut env, &cli.env_vars);
+    // Credential hook env (provider-wins: overrides CLI --env)
+    for (key, value) in credential_env {
+        push_or_replace_env(&mut env, key, value);
     }
 
     let keys: Vec<String> = env.iter().map(|(k, _)| k.clone()).collect();
@@ -200,12 +209,13 @@ fn collect_env(
 /// Spawn `harnx-sandbox-exec` and wait for it to exit.
 pub fn setup_and_spawn(
     cli: &Cli,
-    hook_env: HashMap<String, String>,
+    proxy_env: HashMap<String, String>,
+    credential_env: HashMap<String, String>,
     use_defaults: bool,
 ) -> Result<i32> {
     let sandbox_exec = find_sandbox_exec();
 
-    let (env_pairs, env_keys) = collect_env(cli, hook_env);
+    let (env_pairs, env_keys) = collect_env(cli, proxy_env, credential_env);
 
     #[cfg(unix)]
     let exec_args = build_exec_args(cli, &env_keys, use_defaults);
@@ -270,9 +280,9 @@ mod tests {
     }
 
     #[test]
-    fn collect_env_hook_overrides_cli() {
+    fn collect_env_credential_hook_overrides_cli() {
         let cli = Cli {
-            env_vars: vec!["MYVAR=from_cli".to_string()],
+            env_vars: vec!["AWS_REGION=from_cli".to_string()],
             allow_read: vec![],
             allow_write: vec![],
             allow_exec: vec![],
@@ -282,14 +292,43 @@ mod tests {
             no_defaults: false,
             command: vec![],
         };
-        let hook_env = HashMap::from([("MYVAR".to_string(), "from_hook".to_string())]);
-        let (env, keys) = collect_env(&cli, hook_env);
+        let proxy_env = HashMap::new();
+        let credential_env =
+            HashMap::from([("AWS_REGION".to_string(), "from_provider".to_string())]);
+        let (env, keys) = collect_env(&cli, proxy_env, credential_env);
         let val = env
             .iter()
-            .find(|(k, _)| k == "MYVAR")
+            .find(|(k, _)| k == "AWS_REGION")
             .map(|(_, v)| v.as_str());
-        assert_eq!(val, Some("from_hook"));
-        assert!(keys.contains(&"MYVAR".to_string()));
+        assert_eq!(val, Some("from_provider"));
+        assert!(keys.contains(&"AWS_REGION".to_string()));
+    }
+
+    #[test]
+    fn collect_env_caller_wins_over_proxy_hook() {
+        let cli = Cli {
+            env_vars: vec!["HTTP_PROXY=http://caller-proxy:8080".to_string()],
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_exec: vec![],
+            allow_rwx: vec![],
+            no_network: false,
+            working_dir: None,
+            no_defaults: false,
+            command: vec![],
+        };
+        let proxy_env = HashMap::from([(
+            "HTTP_PROXY".to_string(),
+            "http://127.0.0.1:3009".to_string(),
+        )]);
+        let credential_env = HashMap::new();
+        let (env, keys) = collect_env(&cli, proxy_env, credential_env);
+        let val = env
+            .iter()
+            .find(|(k, _)| k == "HTTP_PROXY")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(val, Some("http://caller-proxy:8080"));
+        assert!(keys.contains(&"HTTP_PROXY".to_string()));
     }
 
     #[test]
@@ -306,7 +345,7 @@ mod tests {
             no_defaults: false,
             command: vec![],
         };
-        let (_, keys) = collect_env(&cli, HashMap::new());
+        let (_, keys) = collect_env(&cli, HashMap::new(), HashMap::new());
         assert!(keys.contains(&"HOME".to_string()));
     }
 
@@ -350,7 +389,7 @@ mod tests {
             no_defaults: false,
             command: vec![],
         };
-        let (env, _keys) = collect_env(&cli, HashMap::new());
+        let (env, _keys) = collect_env(&cli, HashMap::new(), HashMap::new());
         let has = |k: &str| env.iter().any(|(name, _)| name == k);
 
         // Base-directory spec var is forwarded.
@@ -521,22 +560,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        let cli = Cli {
-            env_vars: vec![],
-            allow_read: vec![],
-            allow_write: vec![],
-            allow_exec: vec![],
-            allow_rwx: vec![PathBuf::from("$GIT_ROOT")],
-            no_network: false,
-            working_dir: None,
-            no_defaults: false,
-            command: vec![],
-        };
-
-        let args: Vec<String> = build_exec_args(&cli, &[], false)
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let args = git_root_rwx_args();
 
         assert_eq!(
             args,
@@ -550,6 +574,27 @@ mod tests {
                 "--".to_string(),
             ]
         );
+    }
+
+    // qual:test_helper
+    #[cfg(unix)]
+    fn git_root_rwx_args() -> Vec<String> {
+        let cli = Cli {
+            env_vars: vec![],
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_exec: vec![],
+            allow_rwx: vec![PathBuf::from("$GIT_ROOT")],
+            no_network: false,
+            working_dir: None,
+            no_defaults: false,
+            command: vec![],
+        };
+
+        build_exec_args(&cli, &[], false)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -567,22 +612,7 @@ mod tests {
         }
         std::env::set_current_dir(temp.path()).expect("set cwd");
 
-        let cli = Cli {
-            env_vars: vec![],
-            allow_read: vec![],
-            allow_write: vec![],
-            allow_exec: vec![],
-            allow_rwx: vec![PathBuf::from("$GIT_ROOT")],
-            no_network: false,
-            working_dir: None,
-            no_defaults: false,
-            command: vec![],
-        };
-
-        let args: Vec<String> = build_exec_args(&cli, &[], false)
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let args = git_root_rwx_args();
 
         assert_eq!(args, vec!["--".to_string()]);
     }

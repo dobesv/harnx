@@ -2,6 +2,9 @@
 //! binary per file links the whole dependency graph again for each, which
 //! dominated build time; nextest still runs every test in its own process.
 
+#[path = "../../../harnx-toolset-server/tests/support/mcp_stdio.rs"]
+pub(crate) mod mcp_stdio;
+
 mod acli_integration;
 mod exec_hook;
 mod gcp_auth_e2e;
@@ -10,4 +13,4 @@ mod github_app_hook_script;
 mod hook_pipeline_integration;
 mod https_connect;
 mod integration;
-mod nats_hook;
+mod tool_server;

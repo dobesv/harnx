@@ -414,11 +414,15 @@ mod tests {
                     );
                     assert_eq!(
                         json["defaultInputModes"],
-                        serde_json::json!(["text/plain", "application/json"])
+                        serde_json::json!([
+                            "text/plain",
+                            "application/json",
+                            "application/a2ui+json"
+                        ])
                     );
                     assert_eq!(
                         json["defaultOutputModes"],
-                        serde_json::json!(["text/plain"])
+                        serde_json::json!(["text/plain", "application/a2ui+json"])
                     );
                     let decoded: a2a_lf::AgentCard =
                         a2a_pb::protojson_conv::from_value(json.clone()).unwrap();

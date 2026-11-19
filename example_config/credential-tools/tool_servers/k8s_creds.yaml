@@ -1,0 +1,22 @@
+command: harnx-k8s-creds
+description: Long-lived Kubernetes credentials provider tool service
+
+# Deploy alongside bash in the same filesystem/network namespace.
+# Exposes the k8s_creds toolset and k8s_creds_environment tool.
+# At least one --context <name> matching your cluster context is required.
+
+middleware:
+  - name: k8s-creds
+    match: '^bash_(exec|spawn)$'
+    script: middleware/k8s-creds.py
+    tools: [k8s_creds_environment]
+    timeout: 25h
+    on_error: deny
+
+args:
+  - --tool-server
+  - --context
+  - my-cluster
+  # Optional: specify path to kubeconfig (defaults to $KUBECONFIG or ~/.kube/config)
+  # - --kubeconfig
+  # - ~/.kube/config

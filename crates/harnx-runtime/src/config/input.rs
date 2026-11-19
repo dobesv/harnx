@@ -204,7 +204,21 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
     };
     drop(guard);
     request_context::append(input, &mut messages, with_session);
+    strip_user_surfaces(&mut messages);
     Ok(messages)
+}
+
+/// User-audience A2UI surfaces ride tool results for durability and frontends
+/// (plan T5.1); the model must never see them. The session message content
+/// keeps them for re-logging, so the model-input boundary removes them here.
+fn strip_user_surfaces(messages: &mut [Message]) {
+    for message in messages {
+        if let MessageContent::ToolCalls(calls) = &mut message.content {
+            for result in &mut calls.tool_results {
+                result.user_surfaces = Vec::new();
+            }
+        }
+    }
 }
 
 pub fn echo_messages(input: &mut Input, config: &GlobalConfig) -> anyhow::Result<String> {

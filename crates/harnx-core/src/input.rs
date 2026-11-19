@@ -80,6 +80,13 @@ pub struct Input {
     /// beforehand is discarded, and again after a successful model call. It is
     /// never persisted.
     pub transient_note: Option<String>,
+    /// Context added by lifecycle event hooks and the pending context queue.
+    /// Unlike `injected_user_text`, which on worker mid-turn rounds
+    /// carries folded durable rows that only exist in memory — this text has
+    /// no other durable copy, so `begin_turn` appends it to the session log
+    /// even under `skip_user_log_append`, and request building adds it as a
+    /// trailing user message. The agent loop clears it once per round (#2198).
+    pub hook_context: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +126,7 @@ impl Input {
             preferred_assistant_message_id: None,
             timing_context: None,
             transient_note: None,
+            hook_context: None,
         }
     }
 
@@ -225,6 +233,26 @@ impl Input {
 
     pub fn injected_user_text(&self) -> Option<&str> {
         self.injected_user_text.as_deref()
+    }
+
+    /// Queue hook-added context for the next model call. It becomes a trailing
+    /// user message in both the durable log and the request, then the loop
+    /// clears it when the round advances. Empty text is ignored.
+    pub fn push_hook_context(&mut self, context: &str) {
+        if context.trim().is_empty() {
+            return;
+        }
+        match &mut self.hook_context {
+            Some(existing) if !existing.is_empty() => {
+                existing.push_str("\n\n");
+                existing.push_str(context);
+            }
+            _ => self.hook_context = Some(context.to_string()),
+        }
+    }
+
+    pub fn hook_context(&self) -> Option<&str> {
+        self.hook_context.as_deref()
     }
 
     pub fn agent(&self) -> &AgentConfig {

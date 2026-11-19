@@ -5,6 +5,7 @@ fn completed(outcome: ToolMiddlewareOutcome) -> MaterializedToolResult {
     match outcome {
         ToolMiddlewareOutcome::Completed(result) => result,
         ToolMiddlewareOutcome::InputRequired { .. } => panic!("unexpected interaction"),
+        ToolMiddlewareOutcome::ToolInputRequired(_) => panic!("unexpected tool challenge"),
     }
 }
 
@@ -12,41 +13,12 @@ fn completed(outcome: ToolMiddlewareOutcome) -> MaterializedToolResult {
 async fn middleware_rewrites_skips_and_repeats_with_one_outer_publication() {
     for count in 0..=2 {
         let arguments = Arc::new(Mutex::new(Vec::new()));
-        let events = Arc::new(StdMutex::new(Vec::new()));
-        let hooks = events.clone();
-        let mut ctx = test_context(
-            vec![Arc::new(CapturingToolProvider::new(
-                "tool",
-                arguments.clone(),
-                json!({"raw": true}),
-            ))],
-            move |event| {
-                let mut events = hooks.lock().unwrap();
-                match event {
-                    HookEvent::PreToolUse { .. } => {
-                        events.push("pre".to_string());
-                        return HookOutcome {
-                            control: HookResultControl::Ask { reason: None },
-                            result: HookResult {
-                                mutated_tool_input: Some(json!({"from_pre": true})),
-                                ..HookResult::default()
-                            },
-                        };
-                    }
-                    HookEvent::PostToolUse { tool_input, .. } => {
-                        assert!(tool_input.get("attempt").is_some());
-                        events.push("post".to_string());
-                    }
-                    _ => panic!("unexpected hook"),
-                }
-                continue_hook_outcome()
-            },
-        );
-        let approvals = events.clone();
-        ctx.confirm_tool_use_fn = Arc::new(move |_, _, _| {
-            approvals.lock().unwrap().push("approve".into());
-            ToolUseConfirmation::Approve
-        });
+        let events = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let mut ctx = test_context(vec![Arc::new(CapturingToolProvider::new(
+            "tool",
+            arguments.clone(),
+            json!({"raw": true}),
+        ))]);
         let published = events.clone();
         ctx.emit_tool_result_fn = Arc::new(move |_, result| {
             assert_eq!(result, &json!({"effective": count}));
@@ -65,8 +37,7 @@ async fn middleware_rewrites_skips_and_repeats_with_one_outer_publication() {
             let events = chain_events.clone();
             Box::pin(async move {
                 assert_eq!(origin, ToolMiddlewareOrigin::Model);
-                assert_eq!(prepared.arguments, json!({"from_pre": true}));
-                assert_eq!(*events.lock().unwrap(), ["pre", "approve"]);
+                assert_eq!(prepared.arguments, json!({}));
                 events.lock().unwrap().push("enter".into());
                 let mut result = MaterializedToolResult::new(
                     ToolResult::new(prepared.call, json!({"skipped": true})),
@@ -95,8 +66,7 @@ async fn middleware_rewrites_skips_and_repeats_with_one_outer_publication() {
             .collect::<Vec<_>>();
         assert_eq!(*arguments.lock().await, expected_arguments);
         assert_eq!(*starts.lock().unwrap(), expected_arguments);
-        let mut expected = vec!["pre", "approve", "enter"];
-        expected.extend(std::iter::repeat_n("post", count));
+        let mut expected = vec!["enter"];
         expected.extend(["exit", "publish"]);
         assert_eq!(*events.lock().unwrap(), expected);
     }
@@ -105,7 +75,7 @@ async fn middleware_rewrites_skips_and_repeats_with_one_outer_publication() {
 #[tokio::test]
 async fn middleware_receives_inner_and_operator_origins() {
     for origin in [ToolMiddlewareOrigin::Inner, ToolMiddlewareOrigin::Operator] {
-        let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+        let mut ctx = test_context(vec![]);
         ctx.allowed_tool_names.insert("tool".into());
         ctx.middleware_fn = Some(Arc::new(move |prepared, actual, _| {
             Box::pin(async move {
@@ -137,54 +107,12 @@ async fn middleware_receives_inner_and_operator_origins() {
 }
 
 #[tokio::test]
-async fn middleware_failure_hooks_only_count_leaf_dispatches() {
-    for dispatch in [false, true] {
-        let hooks = Arc::new(AtomicUsize::new(0));
-        let captured = hooks.clone();
-        let mut ctx = test_context(
-            vec![Arc::new(MockToolProvider::err(
-                "tool",
-                Duration::ZERO,
-                ToolError::Recoverable(anyhow!("leaf failure")),
-            ))],
-            move |event| {
-                if matches!(event, HookEvent::PostToolUseFailure { .. }) {
-                    captured.fetch_add(1, Ordering::SeqCst);
-                }
-                continue_hook_outcome()
-            },
-        );
-        ctx.middleware_fn = Some(Arc::new(move |prepared, _, next| {
-            Box::pin(async move {
-                if dispatch {
-                    let result = completed(next(prepared.arguments).await?);
-                    assert_eq!(result.status, InnerToolCallStatus::ToolError);
-                    assert_eq!(result.result.output["is_error"], true);
-                }
-                Err(ToolError::Recoverable(anyhow!("chain failure")))
-            })
-        }));
-        let results = eval_tool_calls(&ctx, vec![test_call("tool")], &create_abort_signal())
-            .await
-            .unwrap();
-        assert_eq!(results[0].output["error"], "chain failure");
-        assert_eq!(hooks.load(Ordering::SeqCst), usize::from(dispatch));
-    }
-}
-
-#[tokio::test]
 async fn middleware_cannot_swallow_typed_fatal_dispatch() {
-    let mut ctx = test_context(
-        vec![Arc::new(MockToolProvider::err(
-            "tool",
-            Duration::ZERO,
-            ToolError::Fatal(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
-        ))],
-        |event| {
-            assert!(matches!(event, HookEvent::PreToolUse { .. }));
-            continue_hook_outcome()
-        },
-    );
+    let mut ctx = test_context(vec![Arc::new(MockToolProvider::err(
+        "tool",
+        Duration::ZERO,
+        ToolError::Fatal(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+    ))]);
     ctx.middleware_fn = Some(Arc::new(|prepared, _, next| {
         Box::pin(async move {
             let _ = next(prepared.arguments).await;
@@ -208,14 +136,11 @@ async fn middleware_cannot_swallow_typed_fatal_dispatch() {
 #[tokio::test]
 async fn middleware_cancellation_between_next_calls_prevents_second_dispatch() {
     let arguments = Arc::new(Mutex::new(Vec::new()));
-    let mut ctx = test_context(
-        vec![Arc::new(CapturingToolProvider::new(
-            "tool",
-            arguments.clone(),
-            json!("ok"),
-        ))],
-        |_| continue_hook_outcome(),
-    );
+    let mut ctx = test_context(vec![Arc::new(CapturingToolProvider::new(
+        "tool",
+        arguments.clone(),
+        json!("ok"),
+    ))]);
     let abort = create_abort_signal();
     let cancel = abort.clone();
     ctx.middleware_fn = Some(Arc::new(move |prepared, _, next| {
@@ -255,14 +180,11 @@ async fn middleware_revalidates_ownership_before_every_next() {
         }
     }
     let arguments = Arc::new(Mutex::new(Vec::new()));
-    let mut ctx = test_context(
-        vec![Arc::new(CapturingToolProvider::new(
-            "tool",
-            arguments.clone(),
-            json!("ok"),
-        ))],
-        |_| continue_hook_outcome(),
-    );
+    let mut ctx = test_context(vec![Arc::new(CapturingToolProvider::new(
+        "tool",
+        arguments.clone(),
+        json!("ok"),
+    ))]);
     ctx.middleware_fn = Some(Arc::new(|prepared, _, next| {
         Box::pin(async move {
             next(prepared.arguments.clone()).await?;
@@ -289,7 +211,7 @@ async fn middleware_revalidates_ownership_before_every_next() {
 #[tokio::test]
 async fn middleware_handoff_snapshot_survives_only_non_error_outer_result() {
     for error_key in [None, Some("is_error"), Some("isError")] {
-        let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+        let mut ctx = test_context(vec![]);
         ctx.allowed_tool_names
             .insert("atlas_session_handoff".into());
         ctx.middleware_fn = Some(Arc::new(move |prepared, _, next| {
@@ -321,12 +243,9 @@ async fn middleware_next_retains_private_execution_context() {
         std::path::Path::new("/private"),
         std::path::Path::new("/private"),
     );
-    let mut ctx = test_context(
-        vec![Arc::new(PrivateContextProvider {
-            observation: observation.clone(),
-        })],
-        |_| continue_hook_outcome(),
-    );
+    let mut ctx = test_context(vec![Arc::new(PrivateContextProvider {
+        observation: observation.clone(),
+    })]);
     ctx.middleware_fn = Some(Arc::new(move |prepared, _, next| {
         let observation = observation.clone();
         Box::pin(async move {
@@ -350,14 +269,11 @@ async fn middleware_next_retains_private_execution_context() {
 
 #[tokio::test(start_paused = true)]
 async fn middleware_is_polled_while_next_is_pending() {
-    let mut ctx = test_context(
-        vec![Arc::new(MockToolProvider::ok(
-            "tool",
-            Duration::from_secs(100),
-            json!("too late"),
-        ))],
-        |_| continue_hook_outcome(),
-    );
+    let mut ctx = test_context(vec![Arc::new(MockToolProvider::ok(
+        "tool",
+        Duration::from_secs(100),
+        json!("too late"),
+    ))]);
     ctx.middleware_fn = Some(Arc::new(|prepared, _, next| {
         Box::pin(async move {
             tokio::select! {
@@ -378,9 +294,7 @@ async fn middleware_is_polled_while_next_is_pending() {
 async fn escaped_middleware_continuation_cannot_dispatch() {
     let saved: Arc<StdMutex<Option<Arc<ToolCallNext>>>> = Arc::default();
     let captured = saved.clone();
-    let mut ctx = test_context(vec![Arc::new(MockToolProvider::panic("tool"))], |_| {
-        continue_hook_outcome()
-    });
+    let mut ctx = test_context(vec![Arc::new(MockToolProvider::panic("tool"))]);
     ctx.middleware_fn = Some(Arc::new(move |prepared, _, next| {
         *captured.lock().unwrap() = Some(next);
         Box::pin(async move {
@@ -401,14 +315,11 @@ async fn escaped_middleware_continuation_cannot_dispatch() {
 
 #[tokio::test]
 async fn middleware_next_materializes_images_before_callback_unwinds() {
-    let mut ctx = test_context(
-        vec![Arc::new(CapturingToolProvider::new(
-            "tool",
-            Arc::default(),
-            json!({"content": [{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}]}),
-        ))],
-        |_| continue_hook_outcome(),
-    );
+    let mut ctx = test_context(vec![Arc::new(CapturingToolProvider::new(
+        "tool",
+        Arc::default(),
+        json!({"content": [{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}]}),
+    ))]);
     ctx.middleware_fn = Some(Arc::new(|prepared, _, next| {
         Box::pin(async move {
             let result = completed(next(prepared.arguments).await?);
@@ -426,14 +337,11 @@ async fn middleware_next_materializes_images_before_callback_unwinds() {
 #[tokio::test]
 async fn middleware_next_materializes_null_without_publishing_it() {
     for rewrite in [false, true] {
-        let mut ctx = test_context(
-            vec![Arc::new(MockToolProvider::ok(
-                "tool",
-                Duration::ZERO,
-                Value::Null,
-            ))],
-            |_| continue_hook_outcome(),
-        );
+        let mut ctx = test_context(vec![Arc::new(MockToolProvider::ok(
+            "tool",
+            Duration::ZERO,
+            Value::Null,
+        ))]);
         let published = Arc::new(StdMutex::new(Vec::new()));
         let captured = published.clone();
         ctx.emit_tool_result_fn =
@@ -467,7 +375,7 @@ async fn middleware_handoff_round_waits_for_sibling_chain() {
     let release = Arc::new(tokio::sync::Notify::new());
     let callback_ready = ready.clone();
     let callback_release = release.clone();
-    let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+    let mut ctx = test_context(vec![]);
     ctx.allowed_tool_names
         .insert("atlas_session_handoff".into());
     ctx.middleware_fn = Some(Arc::new(move |prepared, _, next| {
@@ -518,14 +426,11 @@ async fn middleware_handoff_round_waits_for_sibling_chain() {
 #[tokio::test]
 async fn middleware_rechecks_work_admission_with_effective_arguments() {
     let arguments = Arc::new(Mutex::new(Vec::new()));
-    let mut ctx = test_context(
-        vec![Arc::new(CapturingToolProvider::new(
-            "tool",
-            arguments.clone(),
-            json!("ok"),
-        ))],
-        |_| continue_hook_outcome(),
-    );
+    let mut ctx = test_context(vec![Arc::new(CapturingToolProvider::new(
+        "tool",
+        arguments.clone(),
+        json!("ok"),
+    ))]);
     ctx.work_boundary = Some(Arc::new(|boundary, call| {
         Box::pin(async move {
             if matches!(boundary, WorkBoundary::Start) && call.arguments["denied"] == true {
@@ -552,7 +457,7 @@ async fn middleware_rechecks_work_admission_with_effective_arguments() {
 
 #[tokio::test]
 async fn middleware_survives_inner_context_fork() {
-    let mut outer = test_context(vec![], |_| continue_hook_outcome());
+    let mut outer = test_context(vec![]);
     outer.middleware_fn = Some(Arc::new(|prepared, origin, _| {
         Box::pin(async move {
             assert_eq!(origin, ToolMiddlewareOrigin::Inner);
@@ -585,14 +490,11 @@ async fn middleware_survives_inner_context_fork() {
 #[tokio::test]
 async fn middleware_next_preserves_host_operation_task_context() {
     tokio::task_local! { static SCRIPT_DEPTH: usize; }
-    let mut ctx = test_context(
-        vec![Arc::new(MockToolProvider::ok(
-            "tool",
-            Duration::ZERO,
-            json!("ok"),
-        ))],
-        |_| continue_hook_outcome(),
-    );
+    let mut ctx = test_context(vec![Arc::new(MockToolProvider::ok(
+        "tool",
+        Duration::ZERO,
+        json!("ok"),
+    ))]);
     ctx.work_boundary = Some(Arc::new(|boundary, _| {
         Box::pin(async move {
             if matches!(boundary, WorkBoundary::Start) {

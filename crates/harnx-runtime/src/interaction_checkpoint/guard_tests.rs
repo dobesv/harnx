@@ -81,6 +81,7 @@ async fn clear_leaves_checkpoint_only_rounds_inert_and_guards_post_clear_rounds(
 fn clear_abandons_selected_handoff_without_hiding_later_handoffs() {
     let handoff = SessionLogEntry::ToolResults {
         results: vec![harnx_core::session::ToolOutput {
+            user_surfaces: Vec::new(),
             id: Some("handoff".into()),
             name: "target_session_handoff".into(),
             output: serde_json::json!({}),

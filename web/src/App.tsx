@@ -20,6 +20,10 @@ import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import { MessageAttachments } from './MessageAttachments';
 import { sendPrompt, submitHitlDecision, submitInteractionResponse, InteractionResponseError, uploadAttachment, markRead, markUnread } from './api';
+import { A2UIForm } from './a2ui/A2UIForm';
+import { A2uiSurfaceCard } from './a2ui/A2uiSurfaceCard';
+import { useA2uiSurfaces } from './a2ui/A2uiSurfacesContext';
+import { buildData, defaultValue, inputFields } from './a2ui/buildData';
 import { CancellationContext, type CancellationControl } from './CancellationContext';
 import { CompactionContext } from './CompactionContext';
 import { useCompactionMetadata } from './CompactionMetadataContext';
@@ -684,6 +688,27 @@ export const InteractionUI = ({
   const [note, setNote] = useState('');
   const [error, setError] = useState<string | null>(null);
 
+  const isA2ui = interaction.kind === 'a2ui';
+  const isConfirm = interaction.kind === 'confirm';
+  const isSupported = isConfirm || isA2ui;
+
+  const initFormValues = useCallback((): Record<string, unknown> => {
+    if (interaction.kind === 'a2ui' && interaction.payload) {
+      const initial: Record<string, unknown> = {};
+      for (const field of inputFields(interaction.payload)) {
+        initial[field.key] = defaultValue(
+          interaction.payload,
+          field.path,
+          field.kind === 'ChoicePicker'
+        );
+      }
+      return initial;
+    }
+    return {};
+  }, [interaction.kind, interaction.payload]);
+
+  const [formValues, setFormValues] = useState<Record<string, unknown>>(initFormValues);
+
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -700,6 +725,7 @@ export const InteractionUI = ({
     setSubmitting(false);
     setNote('');
     setError(null);
+    setFormValues(initFormValues());
   }
 
   const scopeRef = useRef({
@@ -715,9 +741,7 @@ export const InteractionUI = ({
     requestSeq: interaction.requestSeq,
   };
 
-  const isSupported = interaction.kind === 'confirm';
-
-  const handleResponse = async (action: 'approve' | 'deny') => {
+  const handleResponse = async (action: string) => {
     const submittingAgent = agentName;
     const submittingSession = sessionId;
     const submittingId = interaction.interactionId;
@@ -727,12 +751,16 @@ export const InteractionUI = ({
     setSubmitting(true);
     try {
       const trimmedNote = note.trim();
+      let data: Record<string, unknown> = {};
+      if (action !== 'deny' && isA2ui && interaction.payload) {
+        data = buildData(interaction.payload, action, formValues);
+      }
       const res = await submitInteractionResponse(submittingAgent, submittingSession, {
         interactionId: submittingId,
         requestSeq: submittingSeq,
         response: {
           action,
-          data: {},
+          data,
           note: trimmedNote || undefined,
         },
       });
@@ -798,21 +826,54 @@ export const InteractionUI = ({
 
   return (
     <div className="aui-interrupts-batch" data-testid="pending-interaction-card">
-      <h4 className="aui-interrupts-title">Action Required: {isSupported ? 'Confirm' : 'Interaction'}</h4>
+      <h4 className="aui-interrupts-title">Action Required: {isConfirm ? 'Confirm' : 'Interaction'}</h4>
       <div className="aui-interrupt" data-testid="pending-interaction">
-        <p className="aui-interrupt-message">
-          <strong>{interaction.message}</strong>
-        </p>
+        {isConfirm && (
+          <p className="aui-interrupt-message">
+            <strong>{interaction.message}</strong>
+          </p>
+        )}
 
         {!isSupported && (
-          <div
-            className="aui-interrupt-unsupported"
-            role="alert"
-            style={{ color: '#c62828', marginTop: '8px', marginBottom: '8px', fontWeight: 500 }}
-          >
-            not supported by this client
-          </div>
+          <>
+            <p className="aui-interrupt-message">
+              <strong>{interaction.message}</strong>
+            </p>
+            <div
+              className="aui-interrupt-unsupported"
+              role="alert"
+              style={{ color: '#c62828', marginTop: '8px', marginBottom: '8px', fontWeight: 500 }}
+            >
+              not supported by this client
+            </div>
+          </>
         )}
+
+        {isA2ui &&
+          (interaction.payload ? (
+            <A2UIForm
+              payload={interaction.payload}
+              values={formValues}
+              onValueChange={(key, val) =>
+                setFormValues((prev) => ({ ...prev, [key]: val }))
+              }
+              onAction={(actionName) => handleResponse(actionName)}
+              disabled={submitting}
+            />
+          ) : (
+            <>
+              <p className="aui-interrupt-message">
+                <strong>{interaction.message}</strong>
+              </p>
+              <div
+                className="aui-interrupt-unsupported"
+                role="alert"
+                style={{ color: '#c62828', marginTop: '8px', marginBottom: '8px', fontWeight: 500 }}
+              >
+                Unable to render form
+              </div>
+            </>
+          ))}
 
         <div style={{ marginTop: '10px' }}>
           <label
@@ -843,7 +904,7 @@ export const InteractionUI = ({
         )}
 
         <div className="aui-interrupt-actions" style={{ marginTop: '10px', display: 'flex', gap: '10px' }}>
-          {isSupported && (
+          {isConfirm && (
             <button
               type="button"
               disabled={submitting}
@@ -865,7 +926,7 @@ export const InteractionUI = ({
             type="button"
             disabled={submitting}
             onClick={() => handleResponse('deny')}
-            className="aui-interrupt-submit"
+            className="aui-interrupt-submit a2ui-btn-deny"
             style={{
               backgroundColor: '#c62828',
               color: 'white',
@@ -1046,6 +1107,7 @@ const MyThread = ({
   updatePendingState: (update: (current: PendingPromptsState) => PendingPromptsState) => void;
 }) => {
   const threadMessages = useAuiState(s => s.thread.messages);
+  const { unattachedSurfaces } = useA2uiSurfaces();
   const isEmpty = threadMessages.length === 0;
   const userMessageIds = useMemo(
     () => pendingUserMessageIds(pendingState, threadMessages),
@@ -1065,15 +1127,23 @@ const MyThread = ({
   }, [updatePendingState]);
 
   return (
-    <ThreadPrimitive.Root className={`aui-thread ${isEmpty && reconciled.prompts.length === 0 ? 'aui-thread-empty' : ''}`}>
+    <ThreadPrimitive.Root className={`aui-thread ${isEmpty && reconciled.prompts.length === 0 && unattachedSurfaces.length === 0 ? 'aui-thread-empty' : ''}`}>
       <RunStateMonitor onRunFinish={onRunFinish} />
       <div role="log" aria-label="Queued messages" aria-live="polite" aria-relevant="additions" className="aui-visually-hidden">
         {reconciled.prompts.map((prompt) => <div key={prompt.id}>Message accepted and queued.</div>)}
       </div>
 
-      {(!isEmpty || reconciled.prompts.length > 0) && (
+      {(!isEmpty || reconciled.prompts.length > 0 || unattachedSurfaces.length > 0) && (
         <ThreadPrimitive.Viewport className="aui-thread-viewport">
           <ThreadPrimitive.Messages components={{ Message: MyMessage }} />
+          {unattachedSurfaces.map((surface) => (
+            <A2uiSurfaceCard
+              key={`${surface.surfaceId}:${surface.publishSeq}`}
+              surface={surface}
+              agentName={agentName}
+              sessionId={sessionId}
+            />
+          ))}
           {reconciled.prompts.map((prompt) => (
             <div key={prompt.id} className="aui-message aui-user-message aui-queued-message">
               <div className="aui-message-content">{prompt.text}</div>

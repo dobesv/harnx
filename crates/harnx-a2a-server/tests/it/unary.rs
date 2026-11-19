@@ -6,5 +6,6 @@ pub(crate) mod lifecycle;
 pub(crate) mod validation;
 
 pub(crate) use fixtures::*;
+mod a2ui;
 mod interaction;
 mod shipped_confirmation;

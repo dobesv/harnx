@@ -1,481 +1,283 @@
 # Hooks Guide
 
-Hooks allow you to extend Harnx by running external commands at specific points during agent execution. They can be used for auditing, policy enforcement, environment injection, or even modifying the interaction between the agent and its tools.
+Lifecycle event hooks run short Bash or Python scripts inside the harnx worker
+process when a session starts, a prompt is submitted, or a turn ends. They can
+inject context, reject or rewrite a prompt, and resume a stopped turn — without
+spawning or supervising any external hook process.
 
-For in-process Bash/Python scripts that wrap tool calls, rewrite arguments and
-results, or deny calls in cloud/unmanaged workers, use
-[tool middleware](middleware-guide.md). The legacy `hooks:` configuration described
-here remains separate.
+For scripts that wrap tool calls (the old `PreToolUse`/`PostToolUse` use
+cases: deny, ask, mutate arguments and results), use
+[tool middleware](middleware-guide.md). Existing Claude-protocol hook commands
+can run through the [Claude hooks compatibility tool](middleware-claude-hooks.md).
 
-## Middleware and PostToolUse
+## Events and operations
 
-When middleware calls `next`, legacy `PostToolUse` runs for each successful
-physical downstream dispatch, before that result returns to the script.
-`PostToolUseFailure` handles failed dispatches. Two `next` calls can therefore
-produce two post-tool hook events even though the model receives one final outer
-result. Skipping `next` produces no downstream post-tool event. Outer middleware
-finalization doesn't fire an extra `PostToolUse`; transformations made after
-`next` aren't another dispatch. Call/result UI publication remains once per outer
-call.
+| Event | When it fires | Operations | Effect |
+| :--- | :--- | :--- | :--- |
+| `SessionStart` | Once per session, before the first model call. Resuming a session does not fire it again. | `add_context` | Context reaches the first model call. |
+| `UserPromptSubmit` | When the user submits a prompt, before it is persisted or sent to the model. | `add_context`, `block`, `rewrite_prompt` | Blocking rejects the turn; a rewrite replaces the prompt the model sees. |
+| `Stop` | When the agent finishes its turn normally. | `resume` | The turn continues with the given message, bounded by `max_resume`. |
+| `StopFailure` | When a turn fails. Observe-only. | — | Diagnostics are available through `event_input`. |
 
-## 1. Overview
+Every hook can also call `event_input` (read the event payload) and `fetch`
+(HTTP(S) requests to the entry's allowlisted hosts). Interaction operations
+(`confirm`, `save`, `next`, …) are deliberately not registered: an event hook
+that calls one fails, and the entry's `on_error` policy decides what happens.
 
-Hooks are external programs or scripts that Harnx executes when specific events occur. Depending on the event and the hook configuration, a hook can:
+## Configuration
 
-*   **Observe**: Record events for logging or auditing without affecting execution.
-*   **Block**: Prevent a tool from running or stop an agent turn.
-*   **Ask**: Pause execution and request user confirmation.
-*   **Mutate**: Modify tool arguments before execution or tool responses after execution.
-*   **Resume**: Trigger an additional agent turn after the agent has stopped.
+`hooks:` is a map from event name to a list of script entries. The same
+`hooks:` block can appear at three levels:
 
-## 2. Configuration
+1. **Global** (`config.yaml`): applies to every session and agent.
+2. **Tool server / package** (`tool_servers/*.yaml`, package manifests): hooks
+   declared by a tool server or package.
+3. **Agent** (agent `.md` front-matter): applies to sessions bound to that agent.
 
-Hooks can be configured in three places depending on their intended scope:
+Entries resolve per event in the order global → tool server/package → agent:
 
-1. **Global Hooks** (`config.yaml` under `hooks:`): Apply across all sessions and agents for the lifetime of the Harnx worker daemon.
-2. **Tool-Server Hooks** (`tool_servers/*.yaml` under `hooks:`): Co-launched alongside a specific tool server and attached directly to tool calls handled by that server (e.g., attaching authentication proxies to `bash.yaml`).
-3. **Agent Hooks** (agent `.md` front-matter under `hooks:`): Selected from the session's bound agent and launched for each active turn. A handoff finishes the source turn; the independently activated target session starts its own agent hooks through the normal worker lifecycle.
+* A later entry with the same `name` replaces the earlier one in place.
+* An entry `{name: ..., enabled: false}` removes the earlier entry with that
+  name (it must exist — disabling an unknown hook is a config error).
+* Names must be unique within one configuration file; the same name in a
+  later tool-server file follows the replacement rule above, so packages
+  shipping the same hook resolve to a single chain entry per event.
 
-### Configuration Fields
+`max_resume` (top-level `hooks:` setting, default 3) bounds how many times
+`Stop` hooks may resume a turn. An agent's value overrides the global one.
+
+### Entry fields
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `command` | string | **Required.** The shell command to run as a hook server. |
-| `status_message` | string | **Optional.** A message displayed to the user while the hook is running. |
-| `async` | boolean | **Optional.** If `true`, the hook runs in the background. Async hooks cannot block or mutate. |
-| `max_resume` | integer | **Optional.** (Top-level only) Maximum number of times a `Stop` hook can request a resume. |
-
-### Command-Only Model
-
-Hook configuration uses a **command-only** model: a hook entry specifies only the `command` to run (plus optional `status_message` and `async`). The command is a hook server binary that declares its own event, matcher, and other metadata.
-
-There are two types of hook servers:
-
-1. **Generic runner** (`harnx-claude-compatible-hook-server`): Runs a child command or an embedded jaq expression and exposes it as a NATS hook server. It declares the event/matcher/etc. via CLI flags:
-   ```sh
-   harnx-claude-compatible-hook-server
-     --event <EVENT>              # Hook event (e.g., PreToolUse, PostToolUse)
-     --matcher <REGEX>            # Optional regex matched against bare tool name
-     --persistent                 # Keep one process alive across requests (optional)
-     --priority <N>               # Dispatch priority, lower runs first (default: 0)
-     --timeout <SECS>             # Execution timeout in seconds (optional)
-     --fail-policy <closed|open>  # Failure behavior (default: closed)
-     --jaq <FILTER>               # Embedded jaq expression (one handler option)
-     -- <CHILD_COMMAND>           # The actual hook script/binary to run
-   ```
-   Everything after `--` is an argv, executed directly rather than through a
-   shell. For pipes, redirection or variable expansion, ask for a shell:
-   `-- sh -c 'cmd >> log 2>&1'`.
-   `--jaq` is an alternative to a child command. It compiles the expression at
-   startup and evaluates it against each hook payload without requiring an
-   external `jq`/`jaq` executable. It cannot be combined with `--persistent`.
-
-2. **Native hooks** (e.g., `harnx-proxy-auth`): Specialized binaries that implement the NATS hook protocol directly and self-declare their event/matcher via `Hook::hooks()`. They need no `--event`/`--matcher` flags:
-   ```sh
-   harnx-proxy-auth --hook <FILTER> --env <JSON> ...
-   ```
-
-### Hook Location and Merging
-
-*   **Global Hooks**: Apply to all agents and sessions across the Harnx instance.
-*   **Tool-Server Hooks**: Attached directly to tool-server configuration files and co-launched with the tool server.
-*   **Agent Hooks**: Defined in an agent's YAML front-matter, selected from the session's bound agent, and launched for each active turn.
-*   **Merging**: Agent hooks extend the global list. If an agent hook has the same `event` and `matcher` as a global hook, the agent hook **replaces** the global one.
-*   **max_resume**: If set in an agent's front-matter, it overrides the global `max_resume` value.
-*   **Declaration Order**: Within each scope (global, tool-server, agent), hooks dispatch in config declaration order when priorities are equal.
-
-## 3. Event Reference
-
-Harnx supports the following events. Each event sends a JSON payload to the hook.
-
-| Event | When it fires | Payload Fields | Capabilities |
-| :--- | :--- | :--- | :--- |
-| `SessionStart` | Once, when a session is created. Resuming a session does not fire it again. `source` is `startup`. | `session_id`, `cwd`, `source`, `model` | Observe, Context |
-| `UserPromptSubmit` | When the user sends a prompt. | `session_id`, `cwd`, `prompt` | Observe |
-| `Stop` | When the agent finishes its turn. | `session_id`, `cwd`, `stop_hook_active`, `last_assistant_message` | Resume |
-| `StopFailure` | When an agent turn fails. | `session_id`, `cwd`, `error`, `error_type` | Observe |
-| `PreToolUse` | Before a tool is executed. | `session_id`, `cwd`, `tool_name`, `tool_input`, `tool_use_id` | Block, Ask, Mutate, Context |
-| `PostToolUse` | After a tool successfully runs. | `session_id`, `cwd`, `tool_name`, `tool_input`, `tool_response`, `tool_use_id` | Context |
-| `PostToolUseFailure`| When a tool execution fails. | `session_id`, `cwd`, `tool_name`, `tool_input`, `tool_use_id`, `error` | Observe |
-| `InstructionsLoaded`| When system/agent instructions are loaded. | `session_id`, `cwd`, `file_path`, `memory_type`, `load_reason` | Observe |
-| `CwdChanged` | When working directory changes. | `session_id`, `cwd`, `old_cwd`, `new_cwd` | Observe |
-
-## 4. Hook Types
-
-Hooks run as NATS hook services launched and managed by the worker-side `HookServerSupervisor`.
-
-### One-shot Hooks (Generic Runner)
-
-The default one-shot hook type. Served over NATS using the generic `harnx-claude-compatible-hook-server` binary wrapper. Use `--event` and `--matcher` to specify when the hook fires:
-*   **Input**: The event payload is sent to the command's `stdin` as a single JSON object.
-*   **Output**: Harnx reads `stdout` for a JSON response (see Protocol below).
-*   **Control**:
-    *   Exit code `0`: Continue execution.
-    *   Exit code `2`: Block execution (equivalent to `permissionDecision: "deny"`).
-    *   Other non-zero codes: Logged as errors, but execution usually continues.
-
-### Embedded Jaq Hooks (Generic Runner)
-
-Use `--jaq <FILTER>` for hooks that can be expressed as a JSON transformation:
-
-```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --matcher '^atlas_session_handoff$'
-        --jaq
-        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Confirm agent handoff"}}'
-```
-
-*   **Input**: The same event payload documented above, as the jaq input value.
-*   **Output**: An object in the [response protocol](#5-response-protocol)
-    shape. Return `{}` to continue without changes.
-*   **Startup validation**: Parse and compile errors prevent the hook server
-    from registering.
-*   **Runtime failures**: The configured `--fail-policy` applies (`closed` by
-    default).
-*   **Process model**: Evaluation happens in the hook server, so `--persistent`
-    does not apply and no child process or jq installation is needed.
-
-### Persistent Hooks (Generic Runner with `--persistent`)
-
-Useful for hooks that maintain state or have high startup overhead. The persistent process is started by `HookServerSupervisor` and served over NATS via `harnx-claude-compatible-hook-server --persistent`.
-*   **Protocol**: JSONL (JSON Lines) over `stdin` and `stdout`.
-*   **Correlation**: Each request from Harnx includes a unique `id` field. The hook must include the same `id` in its response line.
-
-### Native Hooks (`harnx-proxy-auth`)
-
-Native hook servers implement the NATS hook protocol directly and self-declare their event/matcher via `Hook::hooks()`. They need no `--event`/`--matcher` flags:
-
-*   `harnx-proxy-auth`: Self-declares `PreToolUse` with matcher `exec|spawn`.
-*   Served over NATS without requiring an external proxy wrapper.
-
-### Async Hooks (`async: true`)
-
-Any hook can be marked as `async`.
-*   Harnx fires the hook and continues immediately without waiting for a response.
-*   Async hooks **cannot** block or mutate tool data. Any such fields in their response are ignored.
-*   They can still request a `resume` or provide `additionalContext`, which will be applied to the *next* agent turn.
-*   Harnx ensures all async hooks have completed their execution before starting a new LLM turn.
-
-## 5. Response Protocol
-
-Hooks communicate their results by printing a JSON object to `stdout`.
-
-```json
-{
-  "additionalContext": "Text to append to the agent's conversation history",
-  "resume": false,
-  "systemMessage": "A hidden message to inject into the system prompt for the next turn",
-  "hookSpecificOutput": {
-    "permissionDecision": "allow",
-    "permissionDecisionReason": "Reason for the decision",
-    "toolInput": { "arg": "mutated value" },
-    "toolResponse": { "result": "mutated response" }
-  }
-}
-```
-
-### Field Details
-
-*   **`additionalContext`**: String. Appended to the conversation context.
-*   **`resume`**: Boolean. If `true`, requests that the agent perform another turn (primary use for `Stop` hooks).
-*   **`systemMessage`**: String. Injected as a system-level message.
-*   **`hookSpecificOutput`**:
-    *   **`permissionDecision`**: One of `"allow"`, `"deny"`, or `"ask"`.
-    *   **`permissionDecisionReason`**: Description of why access was allowed, denied, or why the user is being asked.
-    *   **`toolInput`**: (PreToolUse only) An object that replaces the original arguments sent to the tool.
-    *   **`toolResponse`**: (PostToolUse only) A value (object or string) that replaces the original response from the tool.
-
-## 6. Mutation
-
-Mutation allows hooks to transparently modify the data flowing between the agent and its tools.
-
-### Chaining Semantics
-
-When multiple hooks are configured for the same event (e.g., two `PreToolUse` hooks for `bash_exec`):
-1.  Hooks fire in **document order** (global hooks first, then agent hooks).
-2.  Each hook receives the **current** value in its payload. If a previous hook mutated the value, the subsequent hook sees the mutated version.
-3.  The final value used by Harnx is the one produced by the **last** hook in the chain that provided a mutation.
-
-### Mutation Example: Injecting Environment Variables
-
-A `PreToolUse` hook can inject secrets or configuration into a `bash_exec` call.
-
-**hook-script.sh:**
-```bash
-#!/bin/bash
-# Read payload from stdin
-PAYLOAD=$(cat)
-TOOL_INPUT=$(echo "$PAYLOAD" | jq '.tool_input')
-
-# Inject AWS credentials into the command
-NEW_COMMAND="AWS_ACCESS_KEY_ID=xxx AWS_SECRET_ACCESS_KEY=yyy $(echo "$TOOL_INPUT" | jq -r '.command')"
-NEW_INPUT=$(echo "$TOOL_INPUT" | jq --arg cmd "$NEW_COMMAND" '.command = $cmd')
-
-# Return the mutated input
-echo "{\"hookSpecificOutput\": {\"toolInput\": $NEW_INPUT}}"
-```
-
-### Hook Process Environment: `$HARNX_PACKAGE_DIR`
-
-Every hook command runs through a shell, and Harnx injects one extra environment variable:
-
-| Variable | Value |
-|---|---|
-| `HARNX_PACKAGE_DIR` | The directory of the package that owns the hook or tool server (`<config>/packages/<name>/`). For hooks or tool servers defined outside a package (the global `config.yaml`, or servers under `<config>/tool_servers/`), it falls back to the config directory (`~/.config/harnx` by default). |
-
-This lets a package bundle helper scripts alongside its config and reference
-them without hardcoding an absolute path. For example, a packaged MCP server can
-ship `packages/<name>/hooks/jira-auth-hook.py` and invoke it from a hook:
-
-```yaml
-    command: >-
-      harnx-proxy-auth --hook $HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py
-```
-
-Because the command runs through a shell, `$HARNX_PACKAGE_DIR` (along with `~`
-and other `$VARS`) is expanded before the hook binary sees it. Note this
-expansion applies to the hook `command` only — an MCP server's own `command`
-and `args` are spawned directly and are **not** shell-expanded.
-
-This variable is also ambiently exported by the NATS tool-server supervisor to
-all spawned tool-server processes (and inherited by child process chains), allowing
-bundled hooks to resolve `$HARNX_PACKAGE_DIR/...` paths when hooks are attached to
-tool servers running over NATS (e.g. `harnx-proxy-auth` co-launched with `bash.yaml`).
-
-## 7. Permissions
-
-The `permissionDecision` field controls whether a tool is allowed to run.
-
-*   **`allow`**: Execution continues.
-*   **`deny`**: Execution is blocked. The agent receives a message indicating the tool was blocked.
-*   **`ask`**: Harnx prompts the user to allow or deny the execution. The `permissionDecisionReason` is shown to the user.
-
-**Shorthand**: A hook script can exit with code `2` to immediately signal a `deny` decision without printing a JSON response.
-
-## 8. Resume
-
-The `resume` field is primarily used with the `Stop` event. It allows a hook to decide if the agent should continue thinking or performing tasks.
-
-*   **Loop Protection**: To prevent infinite loops, the `max_resume` setting (default: 3) limits how many consecutive resumes can be triggered.
-*   **Async Drain**: Harnx waits for all pending async hooks to finish before checking if a resume was requested. This ensures that any context gathered by background tasks is available to the agent in the next turn.
-
-## 9. Persistent Hooks
-
-Persistent hooks use a JSONL-based protocol to avoid the overhead of spawning a new process for every event. Use the `--persistent` flag on `harnx-claude-compatible-hook-server` to enable this mode:
-
-### Request Format (Harnx to Hook)
-```json
-{"id": "1", "session_id": "...", "cwd": "...", "hook_event_name": "PreToolUse", ...}
-```
-
-### Response Format (Hook to Harnx)
-```json
-{"id": "1", "additionalContext": "...", "hookSpecificOutput": {...}}
-```
-
-The hook process must read one line from `stdin`, process it, and write exactly one line to `stdout`. The `id` must match the request.
-
-Harnx sets `HARNX_HOOK_PROTOCOL=jsonl` on persistent hook processes. Hooks that
-also support a direct startup/readiness protocol can use this value to keep
-their persistent-hook stdout strictly JSONL.
-
-
-### Startup Message for Proxy-style Persistent Hooks
-
-Some persistent hooks use an extended JSONL handshake before normal request/response traffic begins. After the hook prints `READY`, the caller may send one startup message shaped like:
-
-```json
-{"id": "startup-1", "event": "startup", "vars": {"temp_file_root": "/tmp/harnx-123", "proxy_port": 8443}}
-```
-
-`vars` uses same safe request-vars block later per-request messages can carry. For `harnx-proxy-auth`, this includes values such as:
-
-- `temp_file_root`: per-run writable temp directory the hook can populate before sandboxed command starts
-- `proxy_port`: local proxy port, available because startup message is sent after proxy listener is ready
-
-Hook should respond with normal single-line JSON object using same `id`. It may include an `env` object:
-
-```json
-{"id": "startup-1", "env": {"ACLI_CONFIG_DIR": "/tmp/harnx-123/acli"}}
-```
-
-Only string values from `env` are kept. Caller merges them into sandboxed command environment with this precedence:
-
-1. `tool_input.env`
-2. `--env` jaq scripts
-3. hook startup `env`
-4. proxy defaults such as `HTTPS_PROXY` and CA-bundle variables
-
-This lets startup hook fill gaps without overriding explicit tool-call env or jaq-derived env. Startup hook can also write files directly under `temp_file_root` before command starts.
-
-### Backwards Compatibility
-
-Startup message is optional extension. Older hooks that ignore `event: "startup"`, or reply without an `env` field, still work: caller treats missing/unknown startup env as empty and continues with normal per-request traffic. Keeping lazy per-request initialization paths in hook code remains valid defensive fallback.
-### Surfacing Notices to the UI
-
-A persistent hook can push a message to the active interface (TUI/CLI/serve) at
-any time by writing a **standalone** JSONL line — one that carries **no `id`**,
-so it is not treated as a response:
-
-```json
-{"notice": {"level": "error", "message": "Atlassian auth unavailable — Jira calls will fail"}}
-```
-
-`level` is `error`, `warning`, or `info` (default `warning`). Harnx emits it as
-a user-visible `Notice`. This is the recommended way for a live hook to report
-an internal problem (it keeps running and answering requests). `harnx-proxy-auth`
-forwards `notice` lines emitted by its exec sub-hooks, so a nested hook (e.g.
-`jira-auth-hook.py`) can surface errors up the chain.
-
-If a persistent hook process instead **exits unexpectedly** (bad flag, crash),
-Harnx automatically emits an Error notice containing the tail of its captured
-stderr — so a dead hook is never silent.
-
-## 10. Examples
-
-### 1. AWS Credential Injector (PreToolUse Mutation)
-
-Injects AWS credentials into any `bash_exec` call.
+| `name` | string | Required. Unique within a level. |
+| `bash` | string | Inline Bash script (mutually exclusive with `python`/`script`). |
+| `python` | string | Inline Python script. |
+| `script` | path | Script file (`.sh`/`.bash` → Bash, `.py` → Python), resolved relative to the declaring file's directory. |
+| `timeout` | duration | Wall-clock limit per run (default `30s`). |
+| `on_error` | `allow`/`deny` | Default `allow`. `deny` fails the event when the script run fails; valid only for `SessionStart` and `UserPromptSubmit` — elsewhere it is a config error. |
+| `fetch` | list | Exact HTTP(S) hosts the script may request. Empty (default) denies all. |
+| `enabled` | boolean | `false` marks a disable entry. |
+
+Parsing is strict: unknown fields, unknown event names (e.g. `PreToolUse`), and
+legacy `command:` entries all fail config load with a migration message.
+
+### Example
 
 ```yaml
 # config.yaml
 hooks:
-  entries:
-    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher bash_exec -- inject-aws-creds.sh
+  max_resume: 1
+  SessionStart:
+    - name: session-context
+      bash: add_context "Server notes: see RUNBOOK.md"
+  UserPromptSubmit:
+    - name: no-secrets
+      bash: |
+        payload=$(event_input)
+        case "$payload" in *password*) block "secrets are not allowed in prompts";; esac
+      on_error: deny
+  Stop:
+    - name: keep-going
+      script: hooks/keep-going.sh
+  StopFailure:
+    - name: audit
+      python: |
+        payload = event_input()
+        print(payload.get("error", "unknown"))
 ```
 
-**inject-aws-creds.sh:**
+An agent can override one event and disable another without touching the rest:
+
+```yaml
+# agents/example-agent.md front-matter
+---
+hooks:
+  Stop:
+    - name: keep-going   # replaces the global entry with this name
+      bash: resume "finish the checklist first"
+  SessionStart:
+    - name: session-context
+      enabled: false      # removes the global entry for this agent
+---
+```
+
+## Writing hook scripts
+
+Hooks run in the same in-process BashKit/Monty script runtime as tool
+middleware. Each event's operations are registered as Bash commands and Python
+functions.
+
+**Bash** — operations are commands:
+
 ```bash
-#!/bin/bash
-# Replaces command with one prefixed with AWS env vars
-input=$(jq -r '.tool_input.command')
-new_input=$(jq -n --arg cmd "AWS_REGION=us-east-1 $input" '{"command": $cmd}')
-echo "{\"hookSpecificOutput\": {\"toolInput\": $new_input}}"
+add_context "remember this"
+block "not allowed"
+rewrite_prompt "cleaned-up prompt"
+resume "keep going"
+payload=$(event_input)   # JSON string
+fetch https://example.com/info
 ```
 
-### 2. GitHub Auth Injector (PreToolUse Mutation)
+**Python** — operations are functions:
 
-Intercepts GitHub API calls or git commands to inject a token.
-
-```bash
-#!/bin/bash
-input=$(cat)
-tool_name=$(echo "$input" | jq -r '.tool_name')
-
-if [[ "$tool_name" == "git_clone" ]]; then
-  url=$(echo "$input" | jq -r '.tool_input.url')
-  # Rewrite https://github.com/... to https://<token>@github.com/...
-  new_url=${url/https:\/\/github.com/https://$GH_TOKEN@github.com}
-  echo "{\"hookSpecificOutput\": {\"toolInput\": {\"url\": \"$new_url\"}}}"
-else
-  echo "{}"
-fi
+```python
+payload = event_input()          # dict
+add_context("remember this")
+block("not allowed")
+rewrite_prompt("cleaned-up prompt")
+resume("keep going")
+fetch("https://example.com/info")
 ```
 
-### 3. Tool Deny-list (Block Tools)
+The `event_input` payload contains `event`, `session_id`, `cwd`,
+`resume_count`, and the event-specific fields:
 
-Prevents the use of `bash_exec` for security reasons.
+| Event | Extra fields |
+| :--- | :--- |
+| `SessionStart` | `source`, `model` |
+| `UserPromptSubmit` | `prompt` (the prompt as this hook sees it — rewritten if an earlier hook rewrote it) |
+| `Stop` | `last_assistant_message` |
+| `StopFailure` | `error`, `error_type` |
 
-```yaml
-hooks:
-  entries:
-    - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher bash_exec -- sh -c 'exit 2'
-      status_message: "Blocking bash_exec for safety"
-```
+`resume` may be called with an empty message. Effects from a failed run are
+discarded entirely.
 
-### 4. Manual Tool Confirmation (Ask)
+## Composition
 
-Requires user approval before any tool runs. See the [Tool Confirmation Guide](tool-confirmation-guide.md) for a full walkthrough.
+Hooks run sequentially in declaration order, per event:
 
-```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server --event PreToolUse --jaq
-        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
-```
+* `add_context` texts accumulate in order.
+* A later `rewrite_prompt` replaces an earlier one; following hooks see the
+  rewritten prompt through `event_input`.
+* The first `block` stops the chain, skips later hooks, and discards all
+  accumulated context for the event.
+* The first `resume` wins; remaining `Stop` hooks are skipped.
+* With `on_error: allow` a failed run's effects are dropped and later hooks
+  still run. With `on_error: deny` the event fails with an error naming the
+  hook.
 
-When the agent calls a tool, the attached TUI shows the full arguments in its confirmation modal. Press `Enter` after the two-second keyboard-idle gate to approve, `Ctrl+D` to reject while the agent continues, or `Ctrl+C` to reject and interrupt. You can also type a message that will be queued after the tool result. See the [Tool Confirmation Guide](tool-confirmation-guide.md#4-use-the-tui-confirmation-modal) for rendering, scrolling, and editing controls.
+## Where added context goes
 
-Use `--matcher` to limit confirmation to specific tools:
+Context from `SessionStart`/`UserPromptSubmit` hooks is appended to the
+conversation as its own durable user row and reaches the next model call —
+including mid-turn rounds and NATS HA worker turns, where the prompt itself is
+folded out of the durable log (issue #2198).
 
-```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --matcher '^(bash_exec|bash_spawn)$'
-        --jaq
-        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Shell command requires approval"}}'
-```
+The row carries a reserved `hook-context-v1-<uuid>` message id, so harnx never
+treats it as an executable prompt or pending input. Binaries from before this
+prefix existed classify such rows as ordinary user prompts. In a mixed-version
+cluster sharing session logs, upgrade every session-log reader before enabling
+event hooks that call `add_context` — the same reader-first ordering as the
+[middleware rollout](middleware-guide.md#cluster-rollout-and-rollback).
 
-### 5. Audit Logger (Async PostToolUse)
+`rewrite_prompt` replaces the prompt in the persisted user row on a local
+turn. On a NATS worker turn the append-only durable log keeps the original
+text; the rewrite is applied to the folded rows in memory and re-derived if the
+hook chain runs again (`rewrite_durable_prompt_rows` in
+`crates/harnx-runtime/src/agent_loop.rs`).
 
-Logs all tool results to a file in the background.
+## Legacy process hooks
 
-```yaml
-hooks:
-  entries:
-    - command: harnx-claude-compatible-hook-server --event PostToolUse -- tee -a tool_audit.log
-      async: true
-```
+`hooks:` previously configured external hook-server processes (`command:`
+entries, `entries:` lists, `PreToolUse`/`PostToolUse`/`InstructionsLoaded`/`
+`CwdChanged` events) supervised over NATS. That configuration model is gone:
+a legacy entry now fails config load with a message pointing at its
+replacement. Migration:
 
-## 11. Auth Proxy (`harnx-proxy-auth`)
+* **Tool gating / mutation** (`PreToolUse`, `PostToolUse`): use
+  [tool middleware](middleware-guide.md). Claude-protocol commands run through
+  the [Claude compatibility adapter](middleware-claude-hooks.md).
+* **Lifecycle events** (`SessionStart`, `UserPromptSubmit`, `Stop`,
+  `StopFailure`): use the in-process entries described above.
+* **`harnx-sandbox-run`** uses `--hook environment <COMMAND> [ARGS...] \;`
+  to query native credential/proxy environment tools over MCP stdio. Legacy
+  JSONL adapters were removed; helper services stay alive until the command exits.
 
-The `harnx-proxy-auth` binary is a specialized persistent hook that solves the problem of injecting authentication headers into HTTPS requests made by tools like `curl`, `git`, or custom scripts, without having to manually rewrite every command.
+## Auth proxy (`harnx-proxy-auth`) and middleware migration
+
+The `harnx-proxy-auth` binary is a TLS-intercepting authentication proxy that solves the problem of injecting authentication headers into HTTPS requests made by tools like `curl`, `git`, `gh`, `acli`, or custom scripts, without having to manually rewrite commands or expose long-lived secrets to the agent environment.
+
+### Migration Overview: Tool Server & Middleware Architecture
+
+Previously, `harnx-proxy-auth` ran as a native hook attached directly to `bash.yaml`. In modern Harnx configurations (including the bundled `pantheon` and `coding` packages), **`harnx-proxy-auth` runs as an ordinary long-lived tool service (`--tool-server`) paired with in-process tool middleware**:
+
+1. **Proxy Tool Service (`--tool-server`)**:
+   `harnx-proxy-auth` runs with `--tool-server`, exposing the `proxy_auth` toolset with the no-argument `environment` tool (invoked as `proxy_auth_environment`).
+   When called, `proxy_auth_environment` returns:
+   ```json
+   {
+     "env": {
+       "HTTP_PROXY": "http://127.0.0.1:<port>",
+       "HTTPS_PROXY": "http://127.0.0.1:<port>",
+       "SSL_CERT_FILE": "<ca_cert_path>",
+       "NODE_EXTRA_CA_CERTS": "<ca_cert_path>",
+       "CURL_CA_BUNDLE": "<ca_cert_path>",
+       "REQUESTS_CA_BUNDLE": "<ca_cert_path>",
+       "GIT_SSL_CAINFO": "<ca_cert_path>",
+       "ACLI_CONFIG_DIR": "<temp_file_root>/harnx-fs-acli"
+     },
+     "filesystem": {
+       "ca_cert_path": "<ca_cert_path>",
+       "temp_file_root": "<temp_file_root>"
+     }
+   }
+   ```
+2. **Dedicated Tool Server Config (`tool_servers/proxy_auth.yaml`)**:
+   `packages/{pantheon,coding}/tool_servers/proxy_auth.yaml` owns all proxy flags (GitHub jaq filters, `--fs` provisioning, `--env`, and resident Jira hook).
+3. **Bash Tool Server with In-Process Middleware (`tool_servers/bash.yaml`)**:
+   `packages/{pantheon,coding}/tool_servers/bash.yaml` has **no hooks**. Instead, it defines in-process middleware matching `^bash_(exec|spawn)$` that executes `middleware/proxy-auth.py` with `tools: [proxy_auth_environment]`.
+4. **In-Process Middleware Script (`middleware/proxy-auth.py`)**:
+   The script queries `proxy_auth_environment`, merges the returned proxy environment defaults on top of existing arguments (ensuring caller-provided environment keys always win), and invokes `call_next`.
+5. **Supervisor & Namespace Co-Location**:
+   - The proxy binds to a loopback address (`http://127.0.0.1:<port>`) and generates CA certificates and synthetic config files on the local disk. Therefore, **`harnx-proxy-auth` must share the same network and filesystem namespace as `harnx-bash-tools`**.
+   - **Managed Supervisor**: Harnx supervisor automatically co-locates `harnx-proxy-auth` and `harnx-bash-tools` on the bash host.
+   - **Unmanaged / Distributed Deployment**: Operators deploy `harnx-proxy-auth --tool-server ...` alongside `harnx-bash-tools` on the bash host in the same network/filesystem namespace, connecting both to a common NATS cluster. The worker executing agent turns and in-process middleware can be remote: middleware calls `proxy_auth_environment` over NATS, merges the environment, and forwards the call to `bash_exec`/`bash_spawn`.
+   > **Deployment Warning on Routing Scopes**: Connecting multiple bash hosts or proxy instances to a common NATS URL alone is not sufficient. Because proxies allocate loopback listeners and local filesystem paths (`ca_cert_path`, `temp_file_root`), each bash host and proxy service pair must use distinct routing scopes (`HARNX_SERVER_SCOPE`) and package/config identities to prevent workers from cross-routing requests to a different host.
+6. **Standalone Sandbox Execution (`harnx-sandbox-run`)**:
+   `harnx-sandbox-run` uses `--hook environment <COMMAND> [ARGS...] \;` to query `proxy_auth_environment` over MCP stdio. Legacy JSONL adapters were removed; `harnx-sandbox-run` manages the sidecar process and keeps it alive until the sandboxed command exits.
 
 ### Feature Overview
 
-It acts as a local HTTPS MITM (Man-in-the-Middle) proxy. When configured as a hook for `bash_exec` or `bash_spawn`, it:
-1. Starts a local proxy server.
-2. Generates an ephemeral CA certificate.
-3. Injects proxy configuration environment variables into the tool's environment.
-4. Transparently injects headers (like `Authorization`) into requests that match configured URL patterns.
+The proxy acts as a local HTTPS MITM (Man-in-the-Middle) proxy:
+1. Starts a local proxy server binding to loopback (`127.0.0.1:<port>`).
+2. Generates an ephemeral CA certificate trusted only during the run.
+3. Provisions synthetic tool configuration files in a private temporary directory (`temp_file_root`).
+4. Serves the `proxy_auth_environment` tool so middleware can inject proxy configuration into bash commands.
+5. Transparently injects headers (such as `Authorization`) or returns synthetic responses for requests that match configured URL patterns or resident hooks.
 
 ### Installation
 
-`harnx-proxy-auth` is built alongside the main `harnx` binary. You can install it via `cargo install --path crates/harnx-proxy-auth` from the repository root to ensure it's in your `PATH`.
+`harnx-proxy-auth` is built alongside the main `harnx` binary:
+
+```sh
+cargo install --path crates/harnx-proxy-auth
+```
 
 ### CLI Flags
 
-Primary configuration is done via `--hook`:
-
-`--hook <JQ_FILTER>`
-
-Each hook is jq/jaq filter expression applied to JSON request object with fields:
-
-```json
-{
-  "method": "GET",
-  "host": "github.com",
-  "path": "/repos/foo/bar",
-  "headers": {
-    "authorization": "existing-value",
-    "content-type": "application/json"
-  }
-}
-```
-
-Filter should return the same object, optionally with:
-
-- **Modified `headers`** — patch the request headers (null removes a header, string upserts it).
-- **`block` field** — set `.block = true` or `.block = "reason"` to reject the request with a `403 Forbidden` response instead of forwarding it. Use this to prevent requests to specific hosts or paths.
-
-Multiple `--hook` flags are combined as a pipe: `hook1 | hook2 | ...`.
+| Flag | Description |
+| :--- | :--- |
+| `--tool-server` | Optional legacy compatibility flag; tool server mode is default. Runs as a tool service (`proxy_auth` toolset) over NATS (default), exposing `proxy_auth_environment`. |
+| `--mcp-stdio` | Use MCP stdio transport for the tool service. |
+| `--mcp-http` | Use MCP Streamable HTTP transport for the tool service. |
+| `--host <HOST>` | MCP HTTP bind host (default: `0.0.0.0`; requires `--mcp-http`). |
+| `--port <PORT>` | MCP HTTP port (default: `3009`; requires `--mcp-http`). |
+| `--enable-tool <GLOB>` | Enable only matching tools in tool-server mode. |
+| `--name <NAME>` | Server name assigned by supervisor. |
+| `--hook <HOOK>` | A jaq filter, script path (`/`, `./`, `../`), inline script (`#!...`), or package script (`$HARNX_PACKAGE_DIR/...`) applied to each request. Receives `{host, path, method, headers}`. Can be repeated. |
+| `--hook-timeout-secs <SECS>` | Per-request timeout in seconds for exec `--hook` stages (default: 30). |
+| `--env <JQ_FILTER>` | A jaq filter to generate extra environment variables, with access to sentinels, `$temp_file_root`, and `$proxy_port`. |
+| `--fs <JQ_FILTER>` | A jaq filter generating relative files under a private temp directory (`$temp_file_root`). |
+| `--load-yaml <NAME=PATH>` | Load a YAML file into jaq variable `$NAME` before evaluating hooks. |
+| `--load-json <NAME=PATH>` | Load a JSON file into jaq variable `$NAME` before evaluating hooks. |
+| `--load-raw <NAME=PATH>` | Load a raw text file into jaq variable `$NAME` before evaluating hooks. |
+| `--load-exec <NAME=CMD>` | Execute a command and load stdout into jaq variable `$NAME`. |
+| `--log-file <PATH>` | Write a JSON log line for every proxied request. |
 
 #### Executable (script) hooks and the `vars` block
 
-A `--hook` argument that is a path to an executable (or an inline shebang
-script) runs as a resident process speaking the JSONL protocol: it reads one
-request object per line from `stdin` (each carrying a correlation `id`) and
-writes one response line per `id`. In addition to `method`/`host`/`path`/
-`headers`, each request includes a **`vars`** object with the resolved,
-non-secret context that jq hooks reference as jaq variables:
+A `--hook` argument that is a path to an executable (or an inline shebang script) runs as a resident process speaking the JSONL protocol: it reads one request object per line from `stdin` (each carrying a correlation `id`) and writes one response line per `id`. In addition to `method`/`host`/`path`/`headers`, each request includes a **`vars`** object with the resolved, non-secret context that jq hooks reference as jaq variables:
 
 ```json
 {
@@ -489,13 +291,7 @@ non-secret context that jq hooks reference as jaq variables:
 }
 ```
 
-`temp_file_root` is populated only when `--fs` is passed (proxy-auth's
-per-instance temp dir). Real secrets are **not** placed in `vars` — an
-executable hook already inherits proxy-auth's process environment, so it reads
-real tokens directly from its own `os.environ` (or equivalent). Keeping secrets
-out of the request payload avoids duplicating them into a surface that could be
-logged. Use `vars.temp_file_root` when a hook needs to write files into the same
-directory that a sibling `--env`/`--fs` exposes to the sandbox.
+`temp_file_root` is populated only when `--fs` is passed (proxy-auth's per-instance temp dir). Real secrets are **not** placed in `vars` — an executable hook already inherits proxy-auth's process environment, so it reads real tokens directly from its own `os.environ` (or equivalent). Keeping secrets out of the request payload avoids duplicating them into a surface that could be logged. Use `vars.temp_file_root` when a hook needs to write files into the same directory that a sibling `--env`/`--fs` exposes to the sandbox.
 
 Examples:
 
@@ -518,18 +314,61 @@ harnx-proxy-auth --hook '
   else . end'
 ```
 
-### Hook Configuration
+### Shipped Production Configuration
 
-Add it to your `config.yaml` as a hook for bash tools. `harnx-proxy-auth` is a native hook that self-declares `PreToolUse` with matcher `exec|spawn`:
+In `packages/pantheon` and `packages/coding`:
 
+#### 1. Tool Server: `packages/pantheon/tool_servers/proxy_auth.yaml`
 ```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-proxy-auth
-        --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
-            then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
-            end'
+command: harnx-proxy-auth
+description: Long-lived GitHub/Atlassian auth proxy, used by bash middleware
+args:
+  - --tool-server
+  - --hook
+  - 'if .host == "github.com" and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Basic \(["x-access-token", (env.GITHUB_TOKEN // env.GH_TOKEN)] | join(":") | @base64)" end'
+  - --hook
+  - 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)" end'
+  - --fs
+  - '{"harnx-fs-acli/acli/.keep": ""}'
+  - --env
+  - '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+  - --hook
+  - $HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py
+```
+
+#### 2. Bash Tool Server: `packages/pantheon/tool_servers/bash.yaml`
+```yaml
+command: harnx-bash-tools
+description: Shell execution — lets agents run commands and scripts
+
+middleware:
+  - name: proxy-auth
+    match: '^bash_(exec|spawn)$'
+    script: middleware/proxy-auth.py
+    tools: [proxy_auth_environment]
+    timeout: 25h
+    on_error: deny
+
+args:
+  - --allow-common-default
+```
+
+#### 3. Middleware Script: `packages/pantheon/middleware/proxy-auth.py`
+```python
+# Files are provisioned by the long-lived proxy on the bash host, not in this VFS.
+additions = call_tool("proxy_auth_environment", {})
+if additions.get("is_error") or additions.get("isError"):
+    raise RuntimeError("proxy auth environment lookup failed")
+
+args = tool_input()["arguments"]
+caller_env = args.get("env")
+if not isinstance(caller_env, dict):
+    caller_env = {}
+env = additions["env"]
+# Existing caller keys win, including explicit proxy/CA overrides.
+env.update(caller_env)
+args["env"] = env
+respond(call_next(args))
 ```
 
 ### Sentinel Environment Variable Injection (`--env`)
@@ -546,9 +385,9 @@ When an agent uses a tool like `curl` or `git`, any credentials passed as argume
 2. **Order**: Multiple `--env` flags run in order; later keys overwrite earlier ones.
 3. **Validation**: Any compilation, runtime, or type error in an `--env` script will abort startup.
 4. **Precedence**: Injection follows this order (highest priority wins):
-    - `tool_input.env` (user-provided keys always win)
+    - `tool_input.env` (caller-provided keys always win)
     - **Sentinel environment variables** (from `--env` flags)
-    - Proxy variables (`HTTP_PROXY`, etc.)
+    - Proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, etc.)
 
 #### Available Sentinel Variables
 
@@ -576,17 +415,18 @@ Two helper functions are provided for formatting authentication headers:
 The `--env` script overrides `GITHUB_TOKEN` in the bash tool's environment with a session-unique sentinel value. The tool sends that sentinel in the `Authorization` header. The `--hook` script sees the sentinel value in the outbound request and swaps in the real `GITHUB_TOKEN` (still in the proxy's own environment) before the request leaves the machine.
 
 ```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-proxy-auth
-        --env 'if (env.GITHUB_TOKEN // env.GH_TOKEN) then .GITHUB_TOKEN = "ghs_\($fake_base64_key)" else . end'
-        --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
-            then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
-            else . end'
+# Inside tool_servers/proxy_auth.yaml:
+args:
+  - --tool-server
+  - --env
+  - 'if (env.GITHUB_TOKEN // env.GH_TOKEN) then .GITHUB_TOKEN = "ghs_\($fake_base64_key)" else . end'
+  - --hook
+  - 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
+      then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
+      else . end'
 ```
 
-### Atlassian CLI (`acli`) Example
+### Atlassian CLI (`acli`) Setup
 
 `acli` (the Atlassian CLI for Jira, Confluence, etc.) stores API tokens in the OS keyring, which is inaccessible inside the sandboxed environment. `harnx-proxy-auth` solves this by automatically sourcing the token from your host OS keyring at startup. Once you have logged in with an API token on the host, no further manual environment variables or `.env` entries are required.
 
@@ -603,7 +443,7 @@ echo "<your-real-api-token>" | acli jira auth login \
   --token
 ```
 
-This writes profile metadata (site, email, cloud ID) to `~/.config/acli/jira_config.yaml` and stores the token in the OS keyring. Inside the harnx birdcage, `acli` will attempt requests using the sentinel token from its synthetic config. The proxy intercepts these requests and replaces the sentinel with the real token sourced from your host keyring.
+This writes profile metadata (site, email, cloud ID) to `~/.config/acli/jira_config.yaml` and stores the token in the OS keyring. Inside the sandbox, `acli` will attempt requests using the sentinel token from its synthetic config. The proxy intercepts these requests and replaces the sentinel with the real token sourced from your host keyring.
 
 The same command applies to other `acli` products: replace `jira` with `confluence`, `assets`, etc.
 
@@ -611,118 +451,101 @@ The same command applies to other `acli` products: replace `jira` with `confluen
 
 > **`acli jira auth status` reports "Unauthorized" inside the sandbox — this is expected.** That command performs a **local** check: it decrypts and validates the token stored in the config, and never makes a network request. Inside the sandbox the stored token is the *sentinel* (the real token deliberately never enters the sandbox), so the local validation fails. Actual Jira operations — `acli jira workitem view`, `project list`, etc. — still work, because those make network calls that the proxy authenticates on the wire by swapping the sentinel for the real token. Judge success by whether data commands work, not by `auth status`.
 
-#### Step 2 — Configure the proxy hook
+#### Step 2 — Configure the proxy tool service
 
-Add the following to your `config.yaml`. The bundled `jira-auth-hook.py` does all the work: it reads your host `acli` profile, sources the real token from the OS keyring, writes a synthetic `jira_config.yaml` — holding only a sentinel token, written as a YAML `!!binary` scalar so `acli` accepts it — into the proxy's per-run temp dir, and replaces the sentinel with the real token on outbound `api.atlassian.com` / site requests. The `--fs`/`--env` lines allocate that temp dir and point `ACLI_CONFIG_DIR` at it.
+The bundled `jira-auth-hook.py` does all the work: it reads your host `acli` profile, sources the real token from the OS keyring, writes a synthetic `jira_config.yaml` — holding only a sentinel token, written as a YAML `!!binary` scalar so `acli` accepts it — into the proxy's per-run temp dir, and replaces the sentinel with the real token on outbound `api.atlassian.com` / site requests. The `--fs`/`--env` lines allocate that temp dir and point `ACLI_CONFIG_DIR` at it.
 
-The hook ships with the `harnx` **pantheon** and **coding** packages at `$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py`. For a standalone `harnx-sandbox-run` install, see the download-and-verify step in [sandbox-run.md](./sandbox-run.md).
-
-No manual environment variables are required as long as you have logged in with an **API token** (Step 1) on your host — OAuth (`--web`) is not supported.
+The hook ships with the `harnx` **pantheon** and **coding** packages at `$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py`.
 
 ```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-proxy-auth
-        --fs '{"harnx-fs-acli/acli/.keep": ""}'
-        --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
-        --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
+# tool_servers/proxy_auth.yaml
+command: harnx-proxy-auth
+description: Long-lived Atlassian auth proxy tool service
+args:
+  - --tool-server
+  - --fs
+  - '{"harnx-fs-acli/acli/.keep": ""}'
+  - --env
+  - '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+  - --hook
+  - $HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py
 ```
 
 The hook sources the token from the platform keyring automatically (`secret-tool` on Linux, `security find-generic-password` on macOS); set `HARNX_JIRA_TOKEN_CMD` to use a different secret store.
 
 > **Security note:** The hook injects the token only for the site in your active `acli` profile (plus `api.atlassian.com`), preventing credentials from being accidentally forwarded to other Atlassian tenants.
 
-You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocation attached directly to a tool server (such as `tool_servers/bash.yaml`):
-
-```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-proxy-auth
-        --hook 'if .host == "github.com" and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Basic \(["x-access-token", (env.GITHUB_TOKEN // env.GH_TOKEN)] | join(":") | @base64)" end'
-        --hook 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)" end'
-        --fs '{"harnx-fs-acli/acli/.keep": ""}'
-        --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
-        --hook "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"
-```
-
 ### Injected Environment Variables
 
-When the hook runs, it injects the following variables into the tool's environment:
+When `proxy_auth_environment` is queried, it provides the following environment variables:
 
 | Variable | Purpose |
 | :--- | :--- |
-| `HTTPS_PROXY` | Directs HTTPS traffic to the local proxy. |
+| `HTTP_PROXY` / `HTTPS_PROXY` | Directs HTTP/HTTPS traffic to the local proxy (`http://127.0.0.1:<port>`). |
 | `SSL_CERT_FILE` | Points to the ephemeral CA certificate so tools trust the proxy. |
 | `REQUESTS_CA_BUNDLE` | Used by Python `requests` library. |
 | `CURL_CA_BUNDLE` | Used by `curl`. |
 | `NODE_EXTRA_CA_CERTS` | Used by Node.js. |
 | `GIT_SSL_CAINFO` | Used by `git`. |
+| `ACLI_CONFIG_DIR` | (When configured) Points Atlassian CLI to the synthetic config directory. |
 
 ### Security & Precedence
 
-*   **User Precedence**: If the agent or user already defined any of these environment variables in the tool call, `harnx-proxy-auth` will **not** overwrite them. This allows for manual overrides.
-*   **Ephemeral CA**: The proxy CA certificate is generated on startup and deleted immediately upon the hook's exit. It is only trusted by the processes spawned during a single harnx run.
-*   **Scoped Injection**: Request mutation scope is defined by your jaq filter. Requests that do not match your condition should return `.`, leaving traffic unchanged.
+*   **User Precedence**: Middleware merges caller environment variables on top of proxy additions (`env.update(caller_env)`). If the agent or caller already defined any of these environment variables in the tool call, the caller values win.
+*   **Ephemeral CA**: The proxy CA certificate is generated on startup and deleted upon exit. It is only trusted by processes spawned on the bash host during the session.
+*   **Scoped Injection**: Request mutation scope is defined by your jaq filter or resident hook. Requests that do not match return `.`, leaving traffic unchanged.
 
+### Standalone Sandbox Run Usage
 
-## 12. Hook Architecture & Execution over NATS
+For standalone commands, `harnx-sandbox-run` queries the native `environment {}` tool over MCP stdio and keeps the service alive until the command exits:
 
-Harnx dispatches all hook events natively over NATS microservices using the `harnx-hookset` and `harnx-hookset-server` infrastructure. There is no inline/dual-dispatch runtime path or intermediate wrapper proxy (`harnx-mcp-hooks-proxy`).
+```bash
+harnx-sandbox-run \
+  --hook environment harnx-proxy-auth \
+    --fs '{"harnx-fs-acli/acli/.keep": ""}' \
+    --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}' \
+    --hook "$SHIM_DIR/jira-auth-hook.py" \
+  \; \
+  -- acli jira workitem list
+```
 
-### Hook Server Supervision and Scopes
+## Credential tool services and bash middleware
 
-Hook processes are managed by a worker-side `HookServerSupervisor`. On startup, the supervisor injects NATS transport identity (`HARNX_SERVER_SCOPE`, `HARNX_NATS_URL`, `HARNX_NATS_TOKEN`) and package context (`HARNX_PACKAGE_DIR`), spawns the hook process, awaits JetStream Key-Value registry readiness, and ensures processes terminate cleanly when their scope ends.
+`harnx-aws-creds --tool-server` and `harnx-k8s-creds --tool-server` are ordinary long-lived NATS/MCP tool servers, not PreToolUse hooks. Their environment tools supply capabilities and file paths before `bash_exec` and `bash_spawn`; actual credentials are resolved on demand by existing authenticated loopback HTTP handlers.
 
-Hooks are scoped according to where they are configured:
+| Service | Tool (input `{}` only) | Additions |
+|---------|-----------------------|-----------|
+| AWS | `aws_creds_environment` | `env`: `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_AUTHORIZATION_TOKEN`, `AWS_REGION`; `filesystem: {}` |
+| Kubernetes | `k8s_creds_environment` | `env: {KUBECONFIG}`; `filesystem: {kubeconfig_path}` |
 
-* **Global Hooks** (`config.yaml`): Instance-scoped lifetime, launched by the worker daemon during worker startup.
-* **Tool-Server Hooks** (`tool_servers/*.yaml`): Co-launched alongside the specific tool server by `ToolServerSupervisor` and bound to that tool server's lifecycle.
-* **Agent Hooks** (agent `.md` front-matter): Activation-scoped, launched when an agent binds to a session activation and explicitly shut down after that activation's turn finishes. A handoff activates an independent target session, whose worker reconciles and starts the target agent's hooks normally.
+AWS provisions no files. Kubernetes retains a synthetic `NamedTempFile` in the OS temp directory for the service lifetime and removes it on graceful shutdown. Its curl exec plugin calls the local token endpoint using a capability, not a source token or host plugin command.
 
-### Registry Discovery and Routing
+### Enable the documented configuration
 
-NATS hook servers register their capabilities in a JetStream Key-Value bucket and handle event invocation requests over dedicated NATS subjects.
+These services are opt-in; neither is enabled in shipped packages. Copy the desired provider YAML and middleware script from [`example_config/credential-tools`](../example_config/credential-tools/README.md) into your active package's `tool_servers/` and `middleware/` directories. Keep your existing `bash.yaml`. Configure at least one host `--context` before enabling Kubernetes; AWS works independently.
 
-* **Registry Bucket**: `harnx_hook_registry` (constant `HOOK_REGISTRY_BUCKET`).
-* **Registration**: Hook servers publish a `HookRegistration` payload containing their server ID, registered `HookSpec` list, `schema_version`, and `proto_version`. Registrations feature a 90-second TTL refreshed every 30 seconds. The registration key is retained on shutdown and expires by TTL, which is correct for both singleton and HA deployments where multiple replicas share a registration key.
-* **Subject Scheme**: `{instance}.hook.{server}.{event}`.
-* **Request/Reply**: `NatsHookProvider` queries active registrations, matches events against configured matchers (regex on bare tool names like `bash_exec`), orders matching hooks by ascending priority, then by registered server name (supervisor-assigned nonce), then by discovery-list index, and posts `HookPayload` requests to collect `HookOutcome` replies.
+Each provider YAML declares middleware matching `^bash_(exec|spawn)$`, allowlists its environment helper and sets `on_error: deny`. The Python stage calls the helper, merges provider additions **over matching caller env keys**, then invokes `next`. Unrelated caller env survives. This preserves the old credential hooks' unconditional overwrite behavior; proxy-auth instead gives caller keys precedence. Missing/null `env` means `{}`; invalid env and helper errors deny before next.
 
-### Event Processing and Capabilities
+Runtime integration tests load these exact YAML/scripts in managed and independently deployed configurations. Exec/spawn children check env precedence, read the generated kubeconfig and exercise AWS/Kubernetes provider refresh.
 
-`NatsHookProvider` handles all `HookEvent` variants (`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `InstructionsLoaded`, `CwdChanged`):
+### Deployment and security limits
 
-* **`PreToolUse` Hooks**: Executed sequentially in priority order.
-  * *Input Mutation*: `mutated_tool_input` chains from hook to hook (e.g., sequentially augmenting environment variables).
-  * *Short-Circuiting*: `Block` immediately halts execution. `Ask` is remembered (the first `Ask` wins) while later hooks run; a later `Block` wins, and input mutations continue chaining.
-  * *Context Injection*: `additional_context` and `system_message` strings are aggregated across matching hooks and enqueued into `pending_async_context` for injection into the next agent turn.
-* **`Ask` Outcome**: A `PreToolUse` hook returning `Ask` surfaces as a tool confirmation request (`ToolApprovalRequiredError`). The worker routes the prompt to the attached frontend's session-scoped confirmation subject via NATS. Direct turns and queued continuation turns both use this route. If the frontend detaches or the route shuts down, the request fails closed (deny). Without a live confirmation route, the worker persists a durable HITL approval request and suspends the invocation instead of denying the tool. A2A uses this path; see [tool confirmation](./tool-confirmation-guide.md) for client reply semantics.
-* **`PostToolUse` Hooks**: Executed asynchronously (`tokio::spawn` fire-and-forget). Errors emit an `AgentEvent::Notice(Error)`. Returned `additional_context` or `system_message` values route to `pending_async_context`. Note: `mutated_tool_response` is logged and dropped in the NATS dispatch path.
-* **Non-Tool Blocking Events** (`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`): Executed sequentially; short-circuits on `Block` or `Ask`; appends returned context to `pending_async_context`.
-* **Best-Effort Events** (`InstructionsLoaded`, `CwdChanged`, `PostToolUseFailure`): Dispatched as asynchronous background tasks.
+Both credential services need the same loopback network namespace as bash. Kubernetes also needs its generated kubeconfig readable at the same absolute path and `curl` on the child's `PATH`. The supplied local managed services share a host; remote bash/container deployments must arrange shared namespaces/mounts. The worker executing middleware may be remote. Unmanaged services need matching NATS scope/package/config identities; see [AWS setup](aws-creds.md) and [Kubernetes setup](k8s-creds.md) for exact variables.
 
-### Fail-Closed Behavior & Expectation Tracking
+The tool API returns no raw provider credentials, but authorized AWS clients and Kubernetes curl exec plugins receive actual credentials over HTTP. Host providers control permissions and expiry; static credentials can remain long-lived. Protect endpoint capabilities, synthetic kubeconfig and command output/logs accordingly.
 
-Each hook specification registers a `fail_policy`:
+Both binaries support `--mcp-stdio`, `--mcp-http`, `--host`, `--port`, `--name` and `--enable-tool` in tool-server mode. Default MCP HTTP ports are `3010` (AWS) and `3011` (Kubernetes); these listeners are separate from the loopback credential endpoints.
 
-* `Closed` (default, `"closed"`): Treats execution timeouts, NATS request failures, or unresponsiveness as a blocking error (`Block` outcome).
-* `Open` (`"open"`): Logs errors and permits execution to continue.
+### Standalone sandbox-run usage
 
-To prevent fail-open security gaps if a required closed hook fails to start or crashes mid-session, Harnx uses an expectation manifest bucket (`harnx_hook_expectations`). `HookServerSupervisor` registers required closed hooks in the expectations manifest upon launch. If a required closed hook server process fails to start or exits unexpectedly, `NatsHookProvider` checks expectations against live registry entries and **blocks** tool execution rather than silently bypassing the missing hook.
+Use native MCP stdio environment tools for standalone commands. Credential additions override matching caller keys; proxy additions remain caller-overridable:
 
-### Fail-Closed-on-Failure
+```bash
+harnx-sandbox-run \
+  --hook environment harnx-aws-creds --profile my-profile \; \
+  -- aws s3 ls
 
-When a hook server with `fail_policy: closed` fails to start or crashes:
-
-* **UserPromptSubmit** and **PreToolUse** events are blocked.
-* A synthetic "rejector" server is published with the hook's name suffixed by `-rejector`.
-* The rejector's display label is prefixed with `hook server failed to start:` and includes the `status_message` (or a truncated command if no status_message).
-* This ensures security-critical hooks (like auth injection) never silently bypass.
-
-Hooks with `fail_policy: open` do not block on failure — errors are logged and execution continues.
-
-### Standalone Utility Exception (`harnx-sandbox-run`)
-
-Note that while Harnx agent loops and tool servers dispatch hooks exclusively over NATS, the standalone `harnx-sandbox-run` birdcage CLI utility continues to use `harnx-hooks` inline parsing for standalone subprocess sandboxing outside the worker process daemon.
+harnx-sandbox-run \
+  --hook environment harnx-k8s-creds --context my-cluster \; \
+  -- kubectl get pods
+```

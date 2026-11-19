@@ -10,7 +10,7 @@ use crate::tool_output::{
 use anyhow::{bail, ensure, Context, Result};
 use futures_util::StreamExt;
 use harnx_core::tool::{ToolCall, ToolDeclaration};
-use harnx_engine::tool::{eval_inner_tool_call, ToolEvalContext, ToolUseConfirmation};
+use harnx_engine::tool::{eval_inner_tool_call, ToolEvalContext};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -251,26 +251,6 @@ pub(crate) fn operator_bash_inner_declarations(
     admitted
 }
 
-/// Approve the root `bash` call of an operator script run, mirroring the
-/// wrapper `eval_operator_tool_call` applies to direct calls (#2630). The
-/// Bash path keeps the context shared (the provider upgrades the weak slot
-/// reference to fork inner-call contexts during the run), so the wrapper is
-/// applied before the context is installed into the slot. Inner calls never
-/// see it: the fork resets confirmation, and operator-script consent is what
-/// re-approves them.
-pub(crate) fn approve_root_bash_call(ctx: &mut ToolEvalContext, root_call_id: &str) {
-    let root_name = crate::config::BASH_TOOL_NAME.to_string();
-    let root_id = root_call_id.to_string();
-    let original = ctx.confirm_tool_use_fn.clone();
-    ctx.confirm_tool_use_fn = Arc::new(move |candidate, arguments, reason| {
-        if candidate.name == root_name && candidate.id.as_deref() == Some(root_id.as_str()) {
-            ToolUseConfirmation::Approve
-        } else {
-            original(candidate, arguments, reason)
-        }
-    });
-}
-
 /// Script and execution options shared by reserved and session operator calls.
 pub(crate) struct BashInvocation<'a> {
     pub script: &'a str,
@@ -319,6 +299,7 @@ pub(crate) async fn evaluate_bash(
     Ok(OperatorToolReply {
         output: format_tool_result(&result.output, format)?,
         error,
+        error_kind: None,
     })
 }
 
@@ -329,10 +310,24 @@ pub(crate) enum OperatorToolMessage {
     Finished(OperatorToolReply),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorToolErrorKind {
+    /// The target tool is not available under the session's tool
+    /// permissions. Authorization itself is still enforced by the engine;
+    /// this kind only classifies the failure for callers (surface actions
+    /// map it to `unauthorized_tool` instead of matching error strings).
+    UnauthorizedTool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OperatorToolReply {
     pub output: String,
     pub error: Option<String>,
+    /// Machine-readable classification of `error`, when the worker knows
+    /// one. Absent on every reply an older worker sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<OperatorToolErrorKind>,
 }
 
 pub(crate) fn subject(cluster: &str, route: &SessionActivationRoute) -> Result<String> {
@@ -353,7 +348,7 @@ pub(crate) fn subject(cluster: &str, route: &SessionActivationRoute) -> Result<S
 }
 
 /// Capture the active session before awaiting routing. Never creates a default
-/// agent or virtual caller session. All provider/hook execution stays on workers.
+/// agent or virtual caller session. All provider and middleware execution stays on workers.
 pub async fn run_session_tool_command(
     config: &GlobalConfig,
     abort: &crate::utils::AbortSignal,
@@ -498,37 +493,23 @@ pub(crate) async fn evaluate(
     let declarations = allowed_declarations(&ctx);
     let output = match command {
         OperatorToolCommand::Info { name } => {
-            format_tool_declaration(find_tool(&declarations, name)?, format)?
+            if declarations.iter().any(|tool| tool.name == *name) {
+                format_tool_declaration(find_tool(&declarations, name)?, format)?
+            } else {
+                // Same typed denial as `call` (review C10/C26): callers
+                // must not string-match the transport error to detect an
+                // unauthorized tool.
+                return Ok(unavailable_tool_reply(name));
+            }
         }
         OperatorToolCommand::List { pattern } => {
-            let selector = pattern
-                .as_deref()
-                .map(|pattern| crate::tool_selector::ToolSelector::new(pattern, true));
-            let selected: Vec<_> = declarations
-                .into_iter()
-                .filter(|tool| selector.as_ref().is_none_or(|s| s.is_match(&tool.name)))
-                .collect();
-            format_tool_list(&selected, format)?
+            format_tool_list(&selected_declarations(&declarations, pattern), format)?
         }
         OperatorToolCommand::Call { name, args_json } => {
-            find_tool(&declarations, name)?;
-            let call = ToolCall {
-                name: name.clone(),
-                arguments: parse_arguments(args_json)?,
-                id: None,
-                thought_signature: None,
-                reasoning_provenance: None,
-            };
-            let result = harnx_engine::tool::eval_operator_tool_call(ctx, call, abort).await?;
-            let error = if result.switch_agent.is_some() {
-                Some("Session handoff requires an agent turn; handoff was not applied".into())
-            } else {
-                result_error(&result.output)
-            };
-            return Ok(OperatorToolReply {
-                output: format_tool_result(&result.output, format)?,
-                error,
-            });
+            if !declarations.iter().any(|tool| tool.name == *name) {
+                return Ok(unavailable_tool_reply(name));
+            }
+            return eval_call(ctx, name, args_json, format, abort).await;
         }
         // Operator paths evaluate Bash on the command-scoped context
         // (`evaluate_bash`): the script provider needs the slot-installed
@@ -540,6 +521,63 @@ pub(crate) async fn evaluate(
     Ok(OperatorToolReply {
         output,
         error: None,
+        error_kind: None,
+    })
+}
+
+/// Typed denial for a tool the session's operator surface does not expose
+/// (review C10/C26): callers match `error_kind`, never the message string.
+fn unavailable_tool_reply(name: &str) -> OperatorToolReply {
+    OperatorToolReply {
+        output: String::new(),
+        error: Some(format!(
+            "Tool '{name}' is not available in the active session"
+        )),
+        error_kind: Some(OperatorToolErrorKind::UnauthorizedTool),
+    }
+}
+
+/// The declarations a `list` command reports, filtered by its glob pattern.
+fn selected_declarations(
+    declarations: &[ToolDeclaration],
+    pattern: &Option<String>,
+) -> Vec<ToolDeclaration> {
+    let selector = pattern
+        .as_deref()
+        .map(|pattern| crate::tool_selector::ToolSelector::new(pattern, true));
+    declarations
+        .iter()
+        .filter(|tool| selector.as_ref().is_none_or(|s| s.is_match(&tool.name)))
+        .cloned()
+        .collect()
+}
+
+/// Dispatch a `call` through the operator tool path. The caller has already
+/// confirmed the tool is exposed to this session.
+async fn eval_call(
+    ctx: ToolEvalContext,
+    name: &str,
+    args_json: &str,
+    format: ToolOutputFormat,
+    abort: &crate::utils::AbortSignal,
+) -> Result<OperatorToolReply> {
+    let call = ToolCall {
+        name: name.to_string(),
+        arguments: parse_arguments(args_json)?,
+        id: None,
+        thought_signature: None,
+        reasoning_provenance: None,
+    };
+    let result = harnx_engine::tool::eval_operator_tool_call(ctx, call, abort).await?;
+    let error = if result.switch_agent.is_some() {
+        Some("Session handoff requires an agent turn; handoff was not applied".into())
+    } else {
+        result_error(&result.output)
+    };
+    Ok(OperatorToolReply {
+        output: format_tool_result(&result.output, format)?,
+        error,
+        error_kind: None,
     })
 }
 

@@ -164,6 +164,12 @@ fn outcome_notice(approved: bool, result: Result<ChildDecisionOutcome, String>) 
                 Interaction::Stale | Interaction::AfterComplete | Interaction::WrongSequence,
             ),
         ) => (true, "this request is no longer pending".into()),
+        Ok(Middleware(Interaction::InvalidResponse)) => (
+            false,
+            "response rejected: not a declared action or valid data for this surface; \
+             answer again or open the child session"
+                .into(),
+        ),
         Ok(Middleware(Interaction::LeaseLost)) => (
             false,
             "worker ownership changed; retry the response or open child session".into(),

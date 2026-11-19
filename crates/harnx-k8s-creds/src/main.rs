@@ -6,24 +6,23 @@ use axum::routing::get;
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
-use clap::Parser;
 use kube::config::{ExecConfig, KubeConfigOptions, Kubeconfig};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempPath;
-use urlencoding::encode as pct_encode;
-
-/// Newtype for the path of the synthetic kubeconfig file.
-/// Avoids passing a raw `&str` through every hook-loop function.
-#[derive(Clone, Copy)]
-struct KubeconfigPath<'a>(&'a str);
-use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use urlencoding::encode as pct_encode;
 use uuid::Uuid;
+
+mod cli;
+mod toolset;
+
+use clap::Parser;
+use cli::Args;
 
 struct AppState {
     bearer_token: String,
@@ -58,19 +57,6 @@ struct ExecCredentialStatus {
         skip_serializing_if = "Option::is_none"
     )]
     expiration_timestamp: Option<String>,
-}
-
-#[derive(Debug, Parser)]
-struct Args {
-    #[arg(long, num_args = 1..)]
-    context: Vec<String>,
-    #[arg(long)]
-    kubeconfig: Option<PathBuf>,
-
-    #[command(flatten)]
-    metrics: harnx_metrics::MetricsFlags,
-    #[command(flatten)]
-    healthz: harnx_healthz::HealthzFlags,
 }
 
 async fn build_app_state(args: &Args) -> Result<Arc<AppState>> {
@@ -331,171 +317,41 @@ fn write_synthetic_kubeconfig(state: &AppState, port: u16) -> Result<TempPath> {
     Ok(file.into_temp_path())
 }
 
-async fn run_hook_loop(kubeconfig_path: &FsPath) -> Result<()> {
-    let path_str = kubeconfig_path
-        .to_str()
-        .ok_or_else(|| anyhow!("kubeconfig path is not valid UTF-8"))?;
-    run_hook_loop_io(KubeconfigPath(path_str), stdin(), stdout()).await
-}
-
-fn handle_hook_line(line: &str, kubeconfig_path: KubeconfigPath<'_>) -> Option<Value> {
-    let input: Value = serde_json::from_str(line).ok()?;
-    let id = input.get("id")?.clone();
-    let hook_event_name = input.get("hook_event_name").and_then(Value::as_str);
-
-    // Respond to any PreToolUse event with a tool_input — tool name filtering
-    // is the caller's responsibility (configured via the hook's matcher field).
-    if hook_event_name == Some("PreToolUse") {
-        if let Some(tool_input) = input.get("tool_input") {
-            if let Ok(tool_input) = mutate_tool_input(tool_input, kubeconfig_path) {
-                return Some(json!({
-                    "id": id,
-                    "hookSpecificOutput": {
-                        "toolInput": tool_input
-                    }
-                }));
-            }
-        }
-    }
-
-    Some(json!({ "id": id }))
-}
-
-async fn run_hook_loop_io<R, W>(
-    kubeconfig_path: KubeconfigPath<'_>,
-    input: R,
-    mut output: W,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut lines = BufReader::new(input).lines();
-    while let Some(line) = lines.next_line().await? {
-        if let Some(response) = handle_hook_line(&line, kubeconfig_path) {
-            let mut encoded = serde_json::to_vec(&response)?;
-            encoded.push(b'\n');
-            output.write_all(&encoded).await?;
-            output.flush().await?;
-        }
-    }
-    Ok(())
-}
-
-fn mutate_tool_input(tool_input: &Value, kubeconfig_path: KubeconfigPath<'_>) -> Result<Value> {
-    let mut tool_input = tool_input
-        .as_object()
-        .cloned()
-        .ok_or_else(|| anyhow!("tool_input must be object"))?;
-
-    let env_value = tool_input
-        .entry("env".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let env = env_value
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("tool_input.env must be object"))?;
-
-    env.insert(
-        "KUBECONFIG".to_string(),
-        Value::String(kubeconfig_path.0.to_string()),
-    );
-
-    Ok(Value::Object(tool_input))
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let telemetry = harnx_telemetry::init_telemetry("harnx-k8s-creds")?;
-
-    let result = run().await;
-    telemetry.shutdown().await;
-    result
+fn main() -> Result<()> {
+    const MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("k8s-creds-main".into())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(Box::pin(run()))
+        })?
+        .join()
+        .map_err(|_| anyhow::anyhow!("k8s credentials server thread panicked"))?
 }
 
 async fn run() -> Result<()> {
     let args = Args::parse();
-    harnx_metrics::init(&args.metrics)?;
-    let readiness = harnx_healthz::init(&args.healthz).await?;
     let state = build_app_state(&args).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = start_server(Arc::clone(&state), listener).await?;
-    if let Some(r) = &readiness {
-        r.ready();
-    }
     let temp_path = write_synthetic_kubeconfig(&state, port)?;
+    let kubeconfig_path = std::path::absolute(&*temp_path)?;
+    let toolset = toolset::K8sCredsToolset::new(&kubeconfig_path);
 
-    eprintln!(
-        "harnx-k8s-creds: synthetic kubeconfig: {}",
-        temp_path.to_string_lossy()
-    );
-
-    run_hook_loop(temp_path.as_ref()).await
+    // Keep token HTTP server and synthetic kubeconfig tempfile alive for tool service lifetime.
+    let result = Box::pin(harnx_toolset_server::run_toolset_main(toolset)).await;
+    drop(temp_path);
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
-    use axum::{routing::get, Router};
-    use serde_json::Value;
     use tempfile::NamedTempFile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    async fn run_hook_with_io(input: &str, kubeconfig_path: KubeconfigPath<'_>) -> String {
-        let (mut input_writer, input_reader) = tokio::io::duplex(16384);
-        input_writer.write_all(input.as_bytes()).await.unwrap();
-        drop(input_writer);
-
-        let (output_writer, mut output_reader) = tokio::io::duplex(16384);
-        run_hook_loop_io(kubeconfig_path, input_reader, output_writer)
-            .await
-            .unwrap();
-
-        let mut output = String::new();
-        output_reader.read_to_string(&mut output).await.unwrap();
-        output
-    }
-
-    async fn run_hook_once(event: &Value, kubeconfig_path: KubeconfigPath<'_>) -> String {
-        let line = format!("{event}\n");
-        run_hook_with_io(&line, kubeconfig_path).await
-    }
-
-    async fn run_hook_multi(inputs: &[&str], kubeconfig_path: KubeconfigPath<'_>) -> Vec<Value> {
-        let output = run_hook_with_io(&inputs.join(""), kubeconfig_path).await;
-        output
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
-    /// Assert that `event` produces a single-field `{"id": expected_id}` noop with no hookSpecificOutput.
-    async fn assert_noop(event: &Value, expected_id: u32) {
-        let output = run_hook_once(event, KubeconfigPath("/synthetic/path")).await;
-        let response: Value = serde_json::from_str(output.trim()).unwrap();
-        assert_eq!(response["id"], expected_id.to_string());
-        assert!(response.get("hookSpecificOutput").is_none());
-    }
-
-    /// Assert that `bad_line` is skipped and `good_line` produces exactly one noop with `expected_id`.
-    async fn assert_skipped_continues(bad_line: &str, good_line: &str, expected_id: u32) {
-        let responses =
-            run_hook_multi(&[bad_line, good_line], KubeconfigPath("/synthetic/path")).await;
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0]["id"], expected_id.to_string());
-    }
-
-    async fn hook_injected_env(tool_input: Value) -> Value {
-        let event = json!({
-            "id": "1", "hook_event_name": "PreToolUse",
-            "tool_name": "bash_exec", "tool_input": tool_input
-        });
-        let output = run_hook_once(&event, KubeconfigPath("/synthetic/path")).await;
-        let response: Value = serde_json::from_str(output.trim()).unwrap();
-        assert_eq!(response["id"], "1");
-        response["hookSpecificOutput"]["toolInput"]["env"].clone()
-    }
 
     fn test_state() -> Arc<AppState> {
         let uri = "https://127.0.0.1:6443".parse().unwrap();
@@ -566,75 +422,6 @@ mod tests {
         let json = serde_json::from_str(body).unwrap_or(Value::Null);
 
         (StatusCode::from_u16(status_code).unwrap(), json)
-    }
-
-    #[tokio::test]
-    async fn hook_non_pretooluse_event_emits_noop() {
-        // PostToolUse events are always ignored regardless of tool name.
-        assert_noop(
-            &json!({"id":"1","hook_event_name":"PostToolUse","tool_name":"bash_exec","tool_input":{"command":"ls"}}),
-            1,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn hook_bash_exec_injects_kubeconfig() {
-        let env = hook_injected_env(json!({"command":"ls","env":{"EXISTING":"val"}})).await;
-        assert_eq!(env["EXISTING"], "val");
-        assert_eq!(env["KUBECONFIG"], "/synthetic/path");
-    }
-
-    #[tokio::test]
-    async fn hook_bash_spawn_injects_kubeconfig() {
-        let event = json!({"id":"1","hook_event_name":"PreToolUse","tool_name":"bash_spawn","tool_input":{"command":"sleep 1","env":{}}});
-        let output = run_hook_once(&event, KubeconfigPath("/synthetic/path")).await;
-        let response: Value = serde_json::from_str(output.trim()).unwrap();
-        assert_eq!(
-            response["hookSpecificOutput"]["toolInput"]["env"]["KUBECONFIG"],
-            "/synthetic/path"
-        );
-    }
-
-    #[tokio::test]
-    async fn hook_kubeconfig_overwrites_existing() {
-        let env = hook_injected_env(json!({"command":"ls","env":{"KUBECONFIG":"old"}})).await;
-        assert_eq!(env["KUBECONFIG"], "/synthetic/path");
-    }
-
-    #[tokio::test]
-    async fn hook_missing_env_creates_env_with_kubeconfig() {
-        let env = hook_injected_env(json!({"command":"ls"})).await;
-        assert_eq!(env["KUBECONFIG"], "/synthetic/path");
-    }
-
-    #[tokio::test]
-    async fn hook_malformed_json_skipped_continues_loop() {
-        assert_skipped_continues(
-            "this is not json\n",
-            "{\"id\":\"2\",\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"bash_exec\"}\n",
-            2,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn hook_missing_id_skipped_continues_loop() {
-        assert_skipped_continues(
-            "{\"hook_event_name\":\"SessionStart\"}\n",
-            "{\"id\":\"3\",\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"bash_exec\"}\n",
-            3,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn hook_non_object_tool_input_emits_noop() {
-        assert_noop(
-            &json!({"id":"4","hook_event_name":"PreToolUse","tool_name":"bash_exec","tool_input":"not-an-object"}),
-            4,
-        )
-        .await;
     }
 
     #[test]

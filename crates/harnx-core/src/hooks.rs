@@ -1,560 +1,534 @@
+use crate::middleware::{MiddlewareOrigin, MiddlewareSourceConfig};
+use serde::de::{Deserializer, Error as _};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
-/// Environment variable describing the stdio protocol expected from a hook.
-pub const HARNX_HOOK_PROTOCOL_ENV: &str = "HARNX_HOOK_PROTOCOL";
+// --- Event-hook configuration (serialized shape read from config.yaml) ------
 
-/// Value of [`HARNX_HOOK_PROTOCOL_ENV`] for persistent JSON Lines hooks.
-pub const HARNX_HOOK_PROTOCOL_JSONL: &str = "jsonl";
+/// Guidance shown when a configuration still uses the retired process-hook
+/// `hooks:` shape. Kept in one place so every rejection spells it the same way.
+pub const LEGACY_HOOK_MIGRATION: &str =
+    "legacy process hooks were replaced by in-process scripts: \
+    wrap tool calls with `middleware:` (docs/middleware-guide.md), run existing Claude-protocol \
+    hook commands through the claude_hook_run compatibility tool from middleware \
+    (docs/middleware-claude-hooks.md), or declare lifecycle events as `hooks:` script entries \
+    with `bash:`/`python:`/`script:` (docs/hooks-guide.md)";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HookPayload {
-    pub session_id: String,
-    pub cwd: PathBuf,
-    #[serde(default)]
-    pub resume_count: u32,
+/// Lifecycle events that can carry event-hook entries. Tool-call events
+/// (`PreToolUse`/`PostToolUse`/`PostToolUseFailure`) moved to middleware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum HookEventKind {
+    SessionStart,
+    UserPromptSubmit,
+    Stop,
+    StopFailure,
+}
+
+impl HookEventKind {
+    pub const ALL: [Self; 4] = [
+        Self::SessionStart,
+        Self::UserPromptSubmit,
+        Self::Stop,
+        Self::StopFailure,
+    ];
+
+    pub fn key(&self) -> &'static str {
+        // qual:allow(dry, repeated_matches) reason: "Canonical enum-to-config-key mapping; a lookup table would separate the keys from the event they name."
+        match self {
+            Self::SessionStart => "SessionStart",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::Stop => "Stop",
+            Self::StopFailure => "StopFailure",
+        }
+    }
+
+    /// `on_error: deny` is only meaningful where the event's failure can stop
+    /// work: blocking a prompt (UserPromptSubmit) or failing the session start.
+    pub fn allows_on_error_deny(&self) -> bool {
+        matches!(self, Self::SessionStart | Self::UserPromptSubmit)
+    }
+}
+
+/// Error policy for event hooks. Defaults to `allow`: a failing run's effects
+/// are dropped, a warning is logged and later hooks still run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventHookOnError {
+    #[default]
+    Allow,
+    Deny,
+}
+
+/// A file's ordered event-hook declarations for one event. Origin is attached
+/// by the file/package loader.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct EventHooksList {
+    pub entries: Vec<EventHookEntry>,
+}
+
+/// One event-hook entry: a full script declaration or a disable marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum EventHookEntry {
+    Full(EventHookDefinition),
+    Disable { name: String, enabled: bool },
+}
+
+impl EventHookEntry {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Full(definition) => &definition.name,
+            Self::Disable { name, .. } => name,
+        }
+    }
+}
+
+/// Full replacement, never a partial overlay of an earlier declaration.
+/// Middleware fields minus `match`, `tools` and the interaction operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventHookDefinition {
+    pub name: String,
     #[serde(flatten)]
-    pub hook_event: HookEvent,
+    pub source: MiddlewareSourceConfig,
+    /// Exact HTTP(S) hosts; empty denies all fetch requests.
+    pub fetch: Vec<String>,
+    #[serde(serialize_with = "serialize_event_hook_timeout")]
+    pub timeout: Duration,
+    pub on_error: EventHookOnError,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "hook_event_name", rename_all = "PascalCase")]
-pub enum HookEvent {
-    SessionStart {
-        source: String,
-        model: String,
-    },
-    UserPromptSubmit {
-        prompt: String,
-    },
-    Stop {
-        stop_hook_active: bool,
-        last_assistant_message: Option<String>,
-    },
-    StopFailure {
-        error: String,
-        error_type: String,
-    },
-    InstructionsLoaded {
-        file_path: PathBuf,
-        memory_type: String,
-        load_reason: String,
-    },
-    CwdChanged {
-        old_cwd: PathBuf,
-        new_cwd: PathBuf,
-    },
-    PreToolUse {
-        tool_name: String,
-        tool_input: Value,
-        tool_use_id: String,
-    },
-    PostToolUse {
-        tool_name: String,
-        tool_input: Value,
-        tool_response: Value,
-        tool_use_id: String,
-    },
-    PostToolUseFailure {
-        tool_name: String,
-        tool_input: Value,
-        tool_use_id: String,
-        error: String,
-    },
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEventHookEntry {
+    name: String,
+    bash: Option<String>,
+    python: Option<String>,
+    script: Option<PathBuf>,
+    fetch: Option<Vec<String>>,
+    timeout: Option<String>,
+    on_error: Option<EventHookOnError>,
+    enabled: Option<bool>,
 }
 
-impl HookEvent {
-    pub fn event_name(&self) -> &'static str {
-        match self {
-            Self::SessionStart { .. } => "SessionStart",
-            Self::UserPromptSubmit { .. } => "UserPromptSubmit",
-            Self::Stop { .. } => "Stop",
-            Self::StopFailure { .. } => "StopFailure",
-            Self::InstructionsLoaded { .. } => "InstructionsLoaded",
-            Self::CwdChanged { .. } => "CwdChanged",
-            Self::PreToolUse { .. } => "PreToolUse",
-            Self::PostToolUse { .. } => "PostToolUse",
-            Self::PostToolUseFailure { .. } => "PostToolUseFailure",
-        }
-    }
+const DEFAULT_EVENT_HOOK_TIMEOUT_SECS: u64 = 30;
 
-    pub fn matcher_text(&self) -> Option<&str> {
-        match self {
-            Self::PreToolUse { tool_name, .. }
-            | Self::PostToolUse { tool_name, .. }
-            | Self::PostToolUseFailure { tool_name, .. } => Some(tool_name),
-            _ => None,
-        }
+fn serialize_event_hook_timeout<S: serde::Serializer>(
+    duration: &Duration,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&humantime::format_duration(*duration).to_string())
+}
+
+impl<'de> Deserialize<'de> for EventHooksList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        parse_event_hooks_list(&value)
+            .map_err(|error| D::Error::custom(format!("event hooks: {error}")))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HookResultControl {
-    Continue,
-    Block { reason: String },
-    Ask { reason: Option<String> },
+fn parse_event_hooks_list(value: &serde_json::Value) -> Result<EventHooksList, String> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "expected a list of hook entries".to_string())?;
+    let mut parsed = Vec::with_capacity(entries.len());
+    let mut names = HashSet::new();
+    for entry in entries {
+        let name = entry
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unnamed>");
+        if !names.insert(name.to_string()) {
+            return Err(format!(
+                "hook '{name}': duplicate name in the same configuration level"
+            ));
+        }
+        parsed.push(
+            parse_event_hook_entry(entry).map_err(|error| format!("hook '{name}': {error}"))?,
+        );
+    }
+    Ok(EventHooksList { entries: parsed })
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HookSpecificOutput {
-    #[serde(default)]
-    pub permission_decision: Option<String>,
-    #[serde(default)]
-    pub permission_decision_reason: Option<String>,
-    #[serde(default)]
-    pub tool_input: Option<Value>,
-    #[serde(default)]
-    pub tool_response: Option<Value>,
+fn parse_event_hook_entry(value: &serde_json::Value) -> Result<EventHookEntry, String> {
+    if value.get("command").is_some() {
+        return Err(format!(
+            "legacy `command:` hook entries are no longer supported; {LEGACY_HOOK_MIGRATION}"
+        ));
+    }
+    let raw: RawEventHookEntry =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    crate::middleware::validate_entry_shape(value, &raw.name)?;
+    if crate::middleware::disable_entry(value, raw.enabled)? {
+        return Ok(EventHookEntry::Disable {
+            name: raw.name,
+            enabled: false,
+        });
+    }
+    let source = crate::middleware::parse_entry_source(raw.bash, raw.python, raw.script)?;
+    let timeout =
+        crate::middleware::parse_entry_timeout(raw.timeout, DEFAULT_EVENT_HOOK_TIMEOUT_SECS)?;
+    Ok(EventHookEntry::Full(EventHookDefinition {
+        name: raw.name,
+        source,
+        fetch: crate::middleware::parse_fetch_hosts(raw.fetch.unwrap_or_default())?,
+        timeout,
+        on_error: raw.on_error.unwrap_or_default(),
+    }))
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HookResult {
-    #[serde(default)]
-    pub additional_context: Option<String>,
-    #[serde(default)]
-    pub resume: Option<bool>,
-    #[serde(default)]
-    pub system_message: Option<String>,
-    #[serde(default, rename = "hookSpecificOutput")]
-    pub hook_specific_output: Option<HookSpecificOutput>,
-    #[serde(default)]
-    pub mutated_tool_input: Option<Value>,
-    #[serde(default)]
-    pub mutated_tool_response: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HookOutcome {
-    pub control: HookResultControl,
-    pub result: HookResult,
-}
-
-// --- HookConfig / HooksConfig (serialized shape read from config.yaml) -------
-
-/// Configuration for a single hook entry
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct HookConfig {
-    /// Hook server command to execute
-    pub command: String,
-
-    /// Optional status message to display
-    #[serde(default)]
-    pub status_message: Option<String>,
-
-    #[serde(default, rename = "async")]
-    pub async_hook: Option<bool>,
-
-    /// Directory of the package that owns this hook, set at load time when the
-    /// hook was defined by a packaged MCP server. Injected into the hook
-    /// process environment as `HARNX_PACKAGE_DIR` so bundled hook scripts can
-    /// be referenced relative to their package. Not serialized. `None` for
-    /// hooks not owned by a package (global or unpackaged config); those fall
-    /// back to the config dir at spawn time.
-    #[serde(skip)]
-    pub package_dir: Option<PathBuf>,
-}
-
-/// Configuration for all hooks (global or per-agent)
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+/// Configuration for lifecycle event hooks (global, per-agent or per
+/// tool-server): a map from event name to ordered script entries, plus the
+/// `max_resume` bound for `Stop` resumes.
+///
+/// Strict parsing: unknown keys and the retired legacy shape
+/// (`entries:` with `command:` processes) fail configuration load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct HooksConfig {
-    /// Maximum number of resume iterations
-    #[serde(default)]
+    /// Maximum number of resume iterations a `Stop` hook may trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_resume: Option<u32>,
 
-    /// List of hook entries
-    #[serde(default)]
-    pub entries: Vec<HookConfig>,
+    #[serde(
+        rename = "SessionStart",
+        default,
+        skip_serializing_if = "is_empty_list"
+    )]
+    pub session_start: EventHooksList,
+    #[serde(
+        rename = "UserPromptSubmit",
+        default,
+        skip_serializing_if = "is_empty_list"
+    )]
+    pub user_prompt_submit: EventHooksList,
+    #[serde(rename = "Stop", default, skip_serializing_if = "is_empty_list")]
+    pub stop: EventHooksList,
+    #[serde(rename = "StopFailure", default, skip_serializing_if = "is_empty_list")]
+    pub stop_failure: EventHooksList,
+
+    /// Declaring file and the directory `script:` paths resolve against.
+    /// Attached by the loader, never serialized.
+    #[serde(skip)]
+    pub origin: Option<MiddlewareOrigin>,
+}
+
+fn is_empty_list(list: &EventHooksList) -> bool {
+    list.entries.is_empty()
 }
 
 impl HooksConfig {
-    /// Merge global and agent hooks.
-    ///
-    /// Agent entries follow global entries so declaration order remains the
-    /// dispatch tiebreak within the merged supervisor.
-    pub fn merge(global: &HooksConfig, agent: &HooksConfig) -> HooksConfig {
-        let mut entries = global.entries.clone();
-        entries.extend(agent.entries.iter().cloned());
+    pub fn is_empty(&self) -> bool {
+        self.max_resume.is_none()
+            && is_empty_list(&self.session_start)
+            && is_empty_list(&self.user_prompt_submit)
+            && is_empty_list(&self.stop)
+            && is_empty_list(&self.stop_failure)
+    }
 
-        HooksConfig {
-            max_resume: agent.max_resume.or(global.max_resume),
-            entries,
+    pub fn list(&self, event: HookEventKind) -> &EventHooksList {
+        match event {
+            HookEventKind::SessionStart => &self.session_start,
+            HookEventKind::UserPromptSubmit => &self.user_prompt_submit,
+            HookEventKind::Stop => &self.stop,
+            HookEventKind::StopFailure => &self.stop_failure,
         }
     }
+
+    /// Merge global and agent hooks: the agent's `max_resume` wins; event
+    /// lists are resolved per event by name/override/disable rules at
+    /// resolution time (see `Config::resolved_event_hooks`), so this only
+    /// serves callers reading `max_resume`.
+    pub fn merge(global: &HooksConfig, agent: &HooksConfig) -> HooksConfig {
+        let mut merged = agent.clone();
+        merged.max_resume = agent.max_resume.or(global.max_resume);
+        merged
+    }
+}
+
+impl<'de> Deserialize<'de> for HooksConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        parse_hooks_config(&value).map_err(D::Error::custom)
+    }
+}
+
+fn parse_hooks_config(value: &serde_json::Value) -> Result<HooksConfig, String> {
+    let fields = value
+        .as_object()
+        .ok_or_else(|| "hooks must be a map of event names to hook entries".to_string())?;
+    let mut config = HooksConfig::default();
+    for (key, entry) in fields {
+        match key.as_str() {
+            "max_resume" => {
+                config.max_resume = serde_json::from_value(entry.clone())
+                    .map_err(|e| format!("max_resume: {e}"))?;
+            }
+            "entries" => {
+                return Err(format!(
+                    "legacy `hooks:` `entries:` are no longer supported; {LEGACY_HOOK_MIGRATION}"
+                ));
+            }
+            event => {
+                let kind = HookEventKind::ALL
+                    .iter()
+                    .find(|kind| kind.key() == event)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "unknown hooks key '{event}': expected max_resume or one of {}",
+                            HookEventKind::ALL
+                                .iter()
+                                .map(|kind| kind.key())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?;
+                let list: EventHooksList =
+                    serde_json::from_value(entry.clone()).map_err(|e| e.to_string())?;
+                validate_on_error(&list, kind)?;
+                // qual:allow(dry, repeated_matches) reason: "Distributes one parsed list to the field the event names; a helper would hide the four-event layout the config documents."
+                match kind {
+                    HookEventKind::SessionStart => config.session_start = list,
+                    HookEventKind::UserPromptSubmit => config.user_prompt_submit = list,
+                    HookEventKind::Stop => config.stop = list,
+                    HookEventKind::StopFailure => config.stop_failure = list,
+                }
+            }
+        }
+    }
+    Ok(config)
+}
+
+/// `on_error: deny` is a configuration error on events whose failure cannot
+/// stop work (D7).
+fn validate_on_error(list: &EventHooksList, event: HookEventKind) -> Result<(), String> {
+    if event.allows_on_error_deny() {
+        return Ok(());
+    }
+    for entry in &list.entries {
+        if let EventHookEntry::Full(definition) = entry {
+            if definition.on_error == EventHookOnError::Deny {
+                return Err(format!(
+                    "hook '{}': on_error: deny is only valid for SessionStart and \
+                     UserPromptSubmit hooks",
+                    definition.name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        HookConfig, HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl,
-        HookSpecificOutput, HooksConfig,
+        EventHookEntry, EventHookOnError, EventHooksList, HookEventKind, HooksConfig,
+        LEGACY_HOOK_MIGRATION,
     };
-    use serde_json::{json, Value};
-    use std::path::PathBuf;
 
     #[test]
-    fn test_hooks_config_parse() {
+    fn hooks_config_parses_event_map() {
         let yaml = r#"
 max_resume: 3
-entries:
-  - command: "/path/to/hook-server --event Stop -- /path/to/hook.sh"
-    async: true
+SessionStart:
+  - name: greet
+    bash: |
+      add_context "hello"
+UserPromptSubmit:
+  - name: policy
+    python: |
+      add_context("checked")
+    timeout: 5s
+Stop:
+  - name: keep-going
+    bash: |
+      resume "keep going"
+StopFailure:
+  - name: log-failure
+    bash: |
+      event_input
 "#;
 
         let config: HooksConfig = serde_yaml::from_str(yaml).expect("parse hooks config");
 
         assert_eq!(config.max_resume, Some(3));
-        assert_eq!(config.entries.len(), 1);
-        let entry = &config.entries[0];
         assert_eq!(
-            entry.command,
-            "/path/to/hook-server --event Stop -- /path/to/hook.sh"
-        );
-        assert!(entry.status_message.is_none());
-        assert_eq!(entry.async_hook, Some(true));
-        assert!(entry.package_dir.is_none());
-    }
-
-    #[test]
-    fn test_hooks_config_merge_preserves_declaration_order() {
-        let hook = |command: &str| HookConfig {
-            command: command.to_string(),
-            status_message: None,
-            async_hook: None,
-            package_dir: None,
-        };
-        let global = HooksConfig {
-            max_resume: Some(5),
-            entries: vec![hook("global-first"), hook("global-second")],
-        };
-        let agent = HooksConfig {
-            max_resume: Some(3),
-            entries: vec![hook("agent-first")],
-        };
-
-        let merged = HooksConfig::merge(&global, &agent);
-
-        assert_eq!(merged.max_resume, Some(3));
-        assert_eq!(
-            merged
+            config
+                .session_start
                 .entries
                 .iter()
-                .map(|entry| entry.command.as_str())
+                .map(EventHookEntry::name)
                 .collect::<Vec<_>>(),
-            vec!["global-first", "global-second", "agent-first"]
+            vec!["greet"]
+        );
+        let EventHookEntry::Full(definition) = &config.session_start.entries[0] else {
+            panic!("expected a full entry");
+        };
+        assert!(matches!(
+            definition.source,
+            crate::middleware::MiddlewareSourceConfig::Bash { .. }
+        ));
+        let EventHookEntry::Full(policy) = &config.user_prompt_submit.entries[0] else {
+            panic!("expected a full entry");
+        };
+        assert_eq!(policy.timeout, std::time::Duration::from_secs(5));
+        assert_eq!(policy.on_error, EventHookOnError::Allow);
+    }
+
+    #[test]
+    fn hooks_config_defaults_are_allow_and_thirty_seconds() {
+        let yaml = "Stop:\n  - name: s\n    bash: |\n      resume \"again\"\n";
+        let config: HooksConfig = serde_yaml::from_str(yaml).expect("parse hooks config");
+        let EventHookEntry::Full(definition) = &config.stop.entries[0] else {
+            panic!("expected a full entry");
+        };
+        assert_eq!(definition.timeout, std::time::Duration::from_secs(30));
+        assert_eq!(definition.on_error, EventHookOnError::Allow);
+    }
+
+    #[test]
+    fn hooks_config_merges_max_resume_agent_first() {
+        let global: HooksConfig = serde_yaml::from_str("max_resume: 5\n").unwrap();
+        let agent: HooksConfig = serde_yaml::from_str("max_resume: 3\n").unwrap();
+        assert_eq!(HooksConfig::merge(&global, &agent).max_resume, Some(3));
+        assert_eq!(
+            HooksConfig::merge(&global, &HooksConfig::default()).max_resume,
+            Some(5)
         );
     }
 
     #[test]
-    fn test_hooks_config_default() {
+    fn legacy_entries_key_fails_with_migration_guidance() {
+        let yaml = "entries:\n  - command: hook-server --event Stop\n";
+        let error =
+            serde_yaml::from_str::<HooksConfig>(yaml).expect_err("legacy entries must fail");
+        let message = error.to_string();
+        assert!(message.contains("entries"), "{message}");
+        assert!(message.contains("middleware"), "{message}");
+    }
+
+    #[test]
+    fn legacy_command_entry_fails_with_migration_guidance() {
+        let yaml = r#"
+Stop:
+  - command: /path/to/hook.sh
+"#;
+        let error =
+            serde_yaml::from_str::<HooksConfig>(yaml).expect_err("legacy command entry must fail");
+        let message = error.to_string();
+        assert!(message.contains("command"), "{message}");
+        assert!(message.contains(LEGACY_HOOK_MIGRATION), "{message}");
+    }
+
+    #[test]
+    fn unknown_hooks_key_and_unknown_entry_field_fail() {
+        let error = serde_yaml::from_str::<HooksConfig>("PreToolUse: []")
+            .expect_err("tool events are not event hooks");
+        assert!(error.to_string().contains("PreToolUse"), "{error}");
+
+        let yaml = "Stop:\n  - name: s\n    bash: |\n      resume \"x\"\n    match: \".*\"\n";
+        let error = serde_yaml::from_str::<HooksConfig>(yaml)
+            .expect_err("middleware-only fields must fail");
+        assert!(error.to_string().contains("match"), "{error}");
+    }
+
+    #[test]
+    fn on_error_deny_rejected_for_stop_and_stop_failure() {
+        let yaml = "Stop:\n  - name: s\n    bash: |\n      resume \"x\"\n    on_error: deny\n";
+        let error = serde_yaml::from_str::<HooksConfig>(yaml)
+            .expect_err("deny on Stop must fail config load");
+        assert!(error.to_string().contains("on_error"), "{error}");
+
+        let yaml =
+            "StopFailure:\n  - name: s\n    bash: |\n      event_input\n    on_error: deny\n";
+        assert!(serde_yaml::from_str::<HooksConfig>(yaml).is_err());
+
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            let yaml = format!(
+                "{event}:\n  - name: s\n    bash: |\n      event_input\n    on_error: deny\n"
+            );
+            assert!(
+                serde_yaml::from_str::<HooksConfig>(&yaml).is_ok(),
+                "deny is valid for {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_names_and_disable_entries_validate() {
+        let yaml = r#"
+UserPromptSubmit:
+  - name: a
+    bash: |
+      event_input
+  - name: a
+    bash: |
+      event_input
+"#;
+        let error = serde_yaml::from_str::<HooksConfig>(yaml).expect_err("duplicate names fail");
+        assert!(error.to_string().contains("duplicate"), "{error}");
+
+        let yaml = "Stop:\n  - name: a\n    enabled: false\n    bash: |\n      resume \"x\"\n";
+        assert!(serde_yaml::from_str::<HooksConfig>(yaml).is_err());
+
+        let yaml = "Stop:\n  - name: a\n    enabled: false\n";
+        let config: HooksConfig = serde_yaml::from_str(yaml).expect("bare disable entry parses");
+        assert!(matches!(
+            config.stop.entries[0],
+            EventHookEntry::Disable { .. }
+        ));
+
+        let yaml = "Stop:\n  - name: a\n    enabled: false\n    extra: 1\n";
+        assert!(serde_yaml::from_str::<HooksConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn event_hook_timeout_serializes_as_human_duration() {
+        let mut config = super::HooksConfig::default();
+        config
+            .stop
+            .entries
+            .push(EventHookEntry::Full(super::EventHookDefinition {
+                name: "keep-going".into(),
+                source: crate::middleware::MiddlewareSourceConfig::Bash {
+                    bash: "resume \"continue\"".into(),
+                },
+                fetch: vec![],
+                timeout: std::time::Duration::from_millis(1500),
+                on_error: super::EventHookOnError::Allow,
+            }));
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("timeout: 1s 500ms"), "{yaml}");
+
+        let mut output = Vec::new();
+        let mut serializer = serde_json::Serializer::new(&mut output);
+        super::serialize_event_hook_timeout(
+            &std::time::Duration::from_millis(1500),
+            &mut serializer,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<String>(&output).unwrap(),
+            "1s 500ms"
+        );
+    }
+
+    #[test]
+    fn hooks_config_default_is_empty() {
         let config = HooksConfig::default();
-
         assert!(config.max_resume.is_none());
-        assert!(config.entries.is_empty());
+        assert!(config.is_empty());
+        assert!(config.list(HookEventKind::Stop).entries.is_empty());
     }
 
     #[test]
-    fn test_hook_payload_serialization() {
-        let payload = HookPayload {
-            session_id: "session-123".to_string(),
-            cwd: PathBuf::from("/tmp/project"),
-            resume_count: 2,
-            hook_event: HookEvent::PreToolUse {
-                tool_name: "shell".to_string(),
-                tool_input: json!({"command": "echo hi"}),
-                tool_use_id: "call-1".to_string(),
-            },
-        };
+    fn event_hooks_list_requires_script_entries() {
+        let error = serde_yaml::from_str::<EventHooksList>("- name: s\n")
+            .expect_err("entry without a source fails");
+        assert!(error.to_string().contains("exactly one"), "{error}");
 
-        let value = serde_json::to_value(payload).expect("serialize hook payload");
-        assert_eq!(
-            value["hook_event_name"],
-            Value::String("PreToolUse".to_string())
-        );
-        assert_eq!(value["tool_name"], Value::String("shell".to_string()));
-        assert_eq!(value["tool_input"], json!({"command": "echo hi"}));
-        assert_eq!(
-            value["session_id"],
-            Value::String("session-123".to_string())
-        );
-        assert_eq!(value["cwd"], Value::String("/tmp/project".to_string()));
-        assert_eq!(value["resume_count"], Value::from(2));
-    }
-
-    #[test]
-    fn test_hook_payload_json_round_trip() {
-        let payload = HookPayload {
-            session_id: "session-123".to_string(),
-            cwd: PathBuf::from("/tmp/project"),
-            resume_count: 2,
-            hook_event: HookEvent::PreToolUse {
-                tool_name: "shell".to_string(),
-                tool_input: json!({"command": "echo hi"}),
-                tool_use_id: "call-1".to_string(),
-            },
-        };
-
-        let json = serde_json::to_string(&payload).expect("serialize hook payload");
-        let decoded: HookPayload = serde_json::from_str(&json).expect("deserialize hook payload");
-
-        assert_eq!(decoded.session_id, payload.session_id);
-        assert_eq!(decoded.cwd, payload.cwd);
-        assert_eq!(decoded.resume_count, payload.resume_count);
-        match decoded.hook_event {
-            HookEvent::PreToolUse {
-                tool_name,
-                tool_input,
-                tool_use_id,
-            } => {
-                assert_eq!(tool_name, "shell");
-                assert_eq!(tool_input, json!({"command": "echo hi"}));
-                assert_eq!(tool_use_id, "call-1");
-            }
-            event => panic!("expected PreToolUse, got {event:?}"),
-        }
-    }
-
-    #[test]
-    fn test_hook_outcome_json_round_trip() {
-        let outcome = HookOutcome {
-            control: HookResultControl::Block {
-                reason: "dangerous command".to_string(),
-            },
-            result: HookResult {
-                mutated_tool_input: Some(json!({"command": "echo safe"})),
-                ..HookResult::default()
-            },
-        };
-
-        let json = serde_json::to_string(&outcome).expect("serialize hook outcome");
-        let decoded: HookOutcome = serde_json::from_str(&json).expect("deserialize hook outcome");
-
-        assert_eq!(decoded.control, outcome.control);
-        assert_eq!(
-            decoded.result.mutated_tool_input,
-            Some(json!({"command": "echo safe"}))
-        );
-    }
-
-    #[test]
-    fn test_hook_result_control_json_round_trip() {
-        let controls = [
-            HookResultControl::Continue,
-            HookResultControl::Block {
-                reason: "blocked".to_string(),
-            },
-            HookResultControl::Ask { reason: None },
-        ];
-
-        for control in controls {
-            let json = serde_json::to_string(&control).expect("serialize hook result control");
-            let decoded: HookResultControl =
-                serde_json::from_str(&json).expect("deserialize hook result control");
-            assert_eq!(decoded, control);
-        }
-    }
-
-    #[test]
-    fn test_hook_result_deserialization() {
-        let result: HookResult =
-            serde_json::from_str(r#"{"resume":true,"additionalContext":"keep going"}"#)
-                .expect("deserialize hook result");
-
-        assert_eq!(result.resume, Some(true));
-        assert_eq!(result.additional_context.as_deref(), Some("keep going"));
-    }
-
-    #[test]
-    fn test_hook_result_empty_json() {
-        let result: HookResult = serde_json::from_str("{}").expect("deserialize empty hook result");
-
-        assert!(result.additional_context.is_none());
-        assert!(result.resume.is_none());
-    }
-
-    fn assert_event_names(events: Vec<(HookEvent, &str)>) {
-        for (event, expected_name) in events {
-            assert_eq!(event.event_name(), expected_name);
-            let serialized = serde_json::to_value(&event).expect("serialize hook event");
-            assert_eq!(serialized["hook_event_name"], expected_name);
-            let decoded: HookEvent =
-                serde_json::from_value(serialized).expect("deserialize hook event");
-            assert_eq!(decoded.event_name(), expected_name);
-        }
-    }
-
-    #[test]
-    fn lifecycle_event_names_round_trip() {
-        assert_event_names(vec![
-            (
-                HookEvent::SessionStart {
-                    source: "cli".to_string(),
-                    model: "claude".to_string(),
-                },
-                "SessionStart",
-            ),
-            (
-                HookEvent::UserPromptSubmit {
-                    prompt: "hello".to_string(),
-                },
-                "UserPromptSubmit",
-            ),
-            (
-                HookEvent::Stop {
-                    stop_hook_active: true,
-                    last_assistant_message: Some("done".to_string()),
-                },
-                "Stop",
-            ),
-            (
-                HookEvent::StopFailure {
-                    error: "boom".to_string(),
-                    error_type: "runtime".to_string(),
-                },
-                "StopFailure",
-            ),
-        ]);
-    }
-
-    #[test]
-    fn file_and_tool_event_names_round_trip() {
-        assert_event_names(vec![
-            (
-                HookEvent::InstructionsLoaded {
-                    file_path: PathBuf::from("/tmp/CLAUDE.md"),
-                    memory_type: "Project".to_string(),
-                    load_reason: "session_start".to_string(),
-                },
-                "InstructionsLoaded",
-            ),
-            (
-                HookEvent::CwdChanged {
-                    old_cwd: PathBuf::from("/tmp/old"),
-                    new_cwd: PathBuf::from("/tmp/new"),
-                },
-                "CwdChanged",
-            ),
-            (
-                HookEvent::PreToolUse {
-                    tool_name: "shell".to_string(),
-                    tool_input: json!({}),
-                    tool_use_id: "call-1".to_string(),
-                },
-                "PreToolUse",
-            ),
-            (
-                HookEvent::PostToolUse {
-                    tool_name: "shell".to_string(),
-                    tool_input: json!({}),
-                    tool_response: json!({"ok": true}),
-                    tool_use_id: "call-2".to_string(),
-                },
-                "PostToolUse",
-            ),
-            (
-                HookEvent::PostToolUseFailure {
-                    tool_name: "shell".to_string(),
-                    tool_input: json!({}),
-                    tool_use_id: "call-3".to_string(),
-                    error: "failed".to_string(),
-                },
-                "PostToolUseFailure",
-            ),
-        ]);
-    }
-
-    #[test]
-    fn test_hook_specific_output_deserialization() {
-        let output: HookSpecificOutput = serde_json::from_str(
-            r#"{"permissionDecision":"deny","permissionDecisionReason":"blocked","hookEventName":"PreToolUse"}"#,
-        )
-        .expect("deserialize hook specific output");
-
-        assert_eq!(output.permission_decision.as_deref(), Some("deny"));
-        assert_eq!(
-            output.permission_decision_reason.as_deref(),
-            Some("blocked")
-        );
-        assert!(output.tool_input.is_none());
-        assert!(output.tool_response.is_none());
-    }
-
-    #[test]
-    fn test_hook_specific_output_deserializes_tool_input() {
-        let output: HookSpecificOutput = serde_json::from_str(r#"{"toolInput":{"mutated":true}}"#)
-            .expect("deserialize tool input mutation");
-
-        assert_eq!(output.tool_input, Some(json!({"mutated": true})));
-        assert!(output.tool_response.is_none());
-    }
-
-    #[test]
-    fn test_hook_specific_output_deserializes_tool_response() {
-        let output: HookSpecificOutput = serde_json::from_str(r#"{"toolResponse":{"ok":true}}"#)
-            .expect("deserialize tool response mutation");
-
-        assert!(output.tool_input.is_none());
-        assert_eq!(output.tool_response, Some(json!({"ok": true})));
-    }
-
-    #[test]
-    fn test_hook_specific_output_deserializes_both_mutations() {
-        let output: HookSpecificOutput =
-            serde_json::from_str(r#"{"toolInput":{"mutated":true},"toolResponse":{"ok":true}}"#)
-                .expect("deserialize both hook mutations");
-
-        assert_eq!(output.tool_input, Some(json!({"mutated": true})));
-        assert_eq!(output.tool_response, Some(json!({"ok": true})));
-    }
-
-    #[test]
-    fn test_hook_specific_output_partial() {
-        let output: HookSpecificOutput = serde_json::from_str(r#"{"permissionDecision":"ask"}"#)
-            .expect("deserialize partial hook specific output");
-
-        assert_eq!(output.permission_decision.as_deref(), Some("ask"));
-        assert!(output.permission_decision_reason.is_none());
-        assert!(output.tool_input.is_none());
-        assert!(output.tool_response.is_none());
-    }
-
-    #[test]
-    fn test_hook_result_with_hook_specific_output() {
-        let result: HookResult = serde_json::from_str(
-            r#"{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"dangerous"},"additionalContext":"extra"}"#,
-        )
-        .expect("deserialize hook result with hook specific output");
-
-        assert_eq!(result.additional_context.as_deref(), Some("extra"));
-        assert!(result.hook_specific_output.is_some());
-        let hso = result.hook_specific_output.unwrap();
-        assert_eq!(hso.permission_decision.as_deref(), Some("deny"));
-        assert_eq!(hso.permission_decision_reason.as_deref(), Some("dangerous"));
-    }
-
-    #[test]
-    fn test_hook_result_backward_compat_no_hook_specific_output() {
-        let result: HookResult =
-            serde_json::from_str(r#"{"resume":true,"additionalContext":"keep going"}"#)
-                .expect("deserialize hook result without hook specific output");
-
-        assert_eq!(result.resume, Some(true));
-        assert_eq!(result.additional_context.as_deref(), Some("keep going"));
-        assert!(result.hook_specific_output.is_none());
-        assert!(result.mutated_tool_input.is_none());
-        assert!(result.mutated_tool_response.is_none());
-    }
-
-    #[test]
-    fn test_hook_result_deserializes_mutated_tool_fields() {
-        let result: HookResult = serde_json::from_str(
-            r#"{"mutatedToolInput":{"mutated":true},"mutatedToolResponse":{"ok":true}}"#,
-        )
-        .expect("deserialize mutated tool fields");
-
-        assert_eq!(result.mutated_tool_input, Some(json!({"mutated": true})));
-        assert_eq!(result.mutated_tool_response, Some(json!({"ok": true})));
+        let list: EventHooksList =
+            serde_yaml::from_str("- name: s\n  bash: |\n    event_input\n").unwrap();
+        assert_eq!(list.entries.len(), 1);
     }
 }

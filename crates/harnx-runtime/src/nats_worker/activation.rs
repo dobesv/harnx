@@ -30,7 +30,7 @@ pub struct SessionActivate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
     /// Ephemeral Core NATS subject owned by a frontend attached to this
-    /// session. Workers use it only when a `PreToolUse` hook asks the user.
+    /// session. Workers use it when tool confirmation asks the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_confirmation_subject: Option<String>,
 }

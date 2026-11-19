@@ -28,7 +28,7 @@ Running AI coding agents safely with permissions bypassed (the sandbox provides 
 ```bash
 #!/usr/bin/env bash
 exec harnx-sandbox-run \
-  --hook claude-command-persistent harnx-aws-creds \; \
+  --hook environment harnx-aws-creds \; \
   -- \
   claude --dangerously-skip-permissions "$@"
 ```
@@ -44,7 +44,7 @@ exec harnx-sandbox-run \
 ### With AWS credential hooks
 Uses `harnx-aws-creds` to inject AWS credentials before running `claude`:
 ```bash
-harnx-sandbox-run --hook claude-command-persistent harnx-aws-creds --profile my-profile \; -- claude
+harnx-sandbox-run --hook environment harnx-aws-creds --profile my-profile \; -- claude
 ```
 
 ### Allowing custom paths
@@ -93,15 +93,15 @@ Environment:
 
 ## How Hooks Work
 
-Hooks allow you to run a command before the main sandboxed process starts. These hooks can mutate the environment variables that will be passed to the sandboxed process.
+Hooks allow you to run MCP stdio sidecar processes before the main sandboxed process starts. These sidecar services provide environment variable mutations and remain active for the full lifetime of the sandboxed command.
 
-Syntax: `--hook TYPE CMD ARGS... \;`
+Syntax: `--hook environment CMD [ARGS...] \;`
 
-- **TYPE**: Currently supports `claude-command` (one-shot) or `claude-command-persistent`.
-- **CMD ARGS...**: The command to execute and its arguments.
+- **TYPE**: `environment` (connects via MCP stdio to request the service's `environment` tool).
+- **CMD [ARGS...]**: The command to execute and its arguments. `harnx-sandbox-run` automatically supplies `--mcp-stdio` if omitted.
 - **`\;`**: Terminates the hook definition (can also be a plain `;` if escaped from the shell).
 
-`harnx-sandbox-run` sends a `PreToolUse` event to each hook command before spawning the sandboxed process. Hook commands respond by returning environment-variable mutations, which `harnx-sandbox-run` collects and applies to the environment of the spawned process.
+`harnx-sandbox-run` spawns each hook command as an MCP stdio server, performs the MCP handshake, calls the `environment` tool, and collects the returned environment variables (`env` object). Credential provider additions override CLI values (provider-wins), while proxy additions yield to caller values (caller-wins). The sidecar processes stay running throughout sandboxed execution and are gracefully shut down and reaped after the command exits.
 
 ## Platform Support
 

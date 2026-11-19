@@ -618,6 +618,7 @@ fn test_orphan_partition_logic() {
 #[test]
 fn test_non_idempotent_output_is_synthesized() {
     let lost = ToolOutput {
+        user_surfaces: Vec::new(),
         id: Some("call_1".to_string()),
         name: "write_file".to_string(),
         output: json!({

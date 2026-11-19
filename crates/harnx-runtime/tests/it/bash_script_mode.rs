@@ -431,6 +431,8 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
 
 async fn seed_journaled_bash_reply(client: &async_nats::Client) -> Result<()> {
     let request = harnx_toolset::ToolRequest {
+        input_responses: None,
+        request_state: None,
         run_context: None,
         replay: None,
         call_id: "wire-1".to_string(),
@@ -456,6 +458,7 @@ async fn seed_journaled_bash_reply(client: &async_nats::Client) -> Result<()> {
         .complete(
             &request,
             harnx_toolset::ToolReply {
+                input_required: None,
                 call_id: "wire-1".to_string(),
                 result: Ok(json!({"native": true})),
                 final_progress: None,

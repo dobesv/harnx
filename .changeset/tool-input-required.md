@@ -1,0 +1,4 @@
+---
+harnx: minor
+---
+Native tools can suspend their own call asking the user for input. A `Toolset` declares `harnx:input_required` on its spec (`ToolSpec::with_input_required`) and returns `ToolInvokeError::InputRequired` (confirm or A2UI form, with an opaque bounded `request_state`) from `invoke_with_context`. The challenge travels the tool wire beside the arguments (`ToolReply::input_required`, MRTR SEP-2322 shape; older callers see a visible compatibility error), and the runtime converts it into the same durable interaction middleware interactions use, with an infrastructure-derived `tool:<server>/<tool>` producer and the tool's own request key. Answers and the latest state reach the tool on the rerun through `ToolInvocationContext::input_responses`/`request_state`, beside the arguments, surviving worker moves via the checkpoint store; repeated challenges each get their own prompt and only the latest responses.

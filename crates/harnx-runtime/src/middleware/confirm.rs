@@ -16,12 +16,7 @@ impl Frame {
         host: &ScriptHostContext,
     ) -> Result<Value> {
         let _operation = self.begin()?;
-        let key = {
-            let mut state = self.state.lock();
-            state.interaction_ordinal += 1;
-            id.unwrap_or_else(|| state.interaction_ordinal.to_string())
-        };
-        ensure!(!key.is_empty(), "confirm id must not be empty");
+        let key = self.interaction_key(id, "confirm")?;
         let request = self.confirm_request(key, message);
         if self.origin == ToolMiddlewareOrigin::Inner {
             self.terminal.lock().get_or_insert_with(|| {
@@ -109,7 +104,8 @@ impl Frame {
         request
     }
 
-    fn request_id(&self, request: &InteractionRequest) -> String {
+    /// Interaction identity hash shared by `confirm` and `interact`.
+    pub(super) fn request_id(&self, request: &InteractionRequest) -> String {
         interaction_id(&InteractionIdentity {
             session: &self.session,
             tool_round_seq: self

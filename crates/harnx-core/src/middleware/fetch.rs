@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-pub(super) fn parse_fetch_hosts(hosts: Vec<String>) -> Result<Vec<String>, String> {
+pub(crate) fn parse_fetch_hosts(hosts: Vec<String>) -> Result<Vec<String>, String> {
     hosts.into_iter().map(parse_host).collect()
 }
 

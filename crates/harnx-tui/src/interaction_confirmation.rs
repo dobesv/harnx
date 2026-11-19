@@ -6,6 +6,13 @@ use ratatui_textarea::TextArea;
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
+pub(crate) mod a2ui;
+pub(super) mod a2ui_render;
+pub(crate) mod shared;
+pub(crate) use shared::{
+    attach_event_stream, render_a2ui_form, render_modal_body, render_note_area, ModalBodyParts,
+};
+
 mod child;
 mod child_decision;
 mod decision;
@@ -28,6 +35,7 @@ pub(crate) struct PendingConfirmation {
     pub key: InteractionKey,
     pub kind: String,
     pub message: String,
+    pub payload: serde_json::Value,
     pub pending_count: usize,
 }
 
@@ -48,6 +56,11 @@ pub(super) fn pending_confirmation(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_else(|| head.summary())
             .to_string(),
+        payload: if head.request.kind == "a2ui" {
+            head.request.payload.clone()
+        } else {
+            serde_json::Value::Null
+        },
         pending_count: pending.len().saturating_sub(1),
     }))
 }
@@ -57,6 +70,7 @@ pub(super) struct InteractionModal {
     pub generation: u64,
     pub pending: PendingConfirmation,
     pub child: Option<child::ChildRequest>,
+    pub a2ui: Option<a2ui::A2UIFormState>,
     pub note: TextArea<'static>,
     pub last_key_at: Instant,
     pub scroll: u16,
@@ -92,6 +106,17 @@ pub(super) struct InteractionClient {
     accepted: Vec<InteractionKey>,
     read_error: Option<String>,
     decisions: Vec<JoinHandle<()>>,
+}
+
+impl InteractionClient {
+    pub(super) fn check_target(&self) -> Result<Target, String> {
+        if let Some(error) = &self.read_error {
+            return Err(format!("Cannot refresh request: {error}"));
+        }
+        self.target
+            .clone()
+            .ok_or_else(|| "Session is no longer selected".into())
+    }
 }
 
 impl Drop for InteractionClient {
@@ -231,10 +256,16 @@ impl Tui {
         if self.interactions.accepted.contains(&pending.key) {
             return;
         }
+        let a2ui = if pending.kind == "a2ui" {
+            a2ui::A2UIFormState::new(&pending.payload)
+        } else {
+            None
+        };
         self.app.modal = Some(ModalState::ConfirmInteraction(Box::new(InteractionModal {
             generation: self.interactions.generation,
             pending,
             child: None,
+            a2ui,
             note: TextArea::default(),
             last_key_at: Instant::now(),
             scroll: 0,

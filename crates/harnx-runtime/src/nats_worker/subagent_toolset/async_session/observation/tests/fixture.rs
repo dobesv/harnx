@@ -91,6 +91,8 @@ impl Fixture {
             None => toolset,
         };
         let request = ToolRequest {
+            input_responses: None,
+            request_state: None,
             operation_id: "operation".into(),
             call_id: "original-prompt".into(),
             tool: "session_send".into(),
