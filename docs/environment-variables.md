@@ -74,7 +74,7 @@ Harnx can load environment variables from a `.env` file located in the data dire
 
 Every binary in this repo reads the same five variables, and every one of them
 is inherited by child processes — so setting `HARNX_LOG_LEVEL=debug` once raises
-the level for the front-end, the worker, and every tool and hook server it
+the level for the front-end, the worker, and every tool server it
 starts.
 
 - **HARNX_LOG_LEVEL**: `off`, `error`, `warn`, `info`, `debug`, or `trace`.
@@ -98,7 +98,7 @@ starts.
 `harnx` owns the terminal, so it writes to a file; log lines on the terminal
 would overwrite the TUI and corrupt piped output from a one-shot invocation.
 
-Every other binary — `harnx-serve`, `harnx-worker`, the tool and hook servers,
+Every other binary — `harnx-serve`, `harnx-worker`, the tool servers,
 the MCP bridge — writes to **stderr** and ignores `HARNX_LOG_PATH`. Whoever
 spawned it decides where that goes, and one process per tree owns the file. In
 practice `harnx` points the worker's stdout and stderr at its own log file and
@@ -141,7 +141,7 @@ OpenTelemetry distributed tracing is off unless an OTLP endpoint environment var
 
 Prometheus metrics serving is off unless `--metrics-addr` or `HARNX_METRICS_ADDR` is set. See [Prometheus Metrics](metrics.md) for full documentation.
 
-- **HARNX_METRICS_ADDR**: Environment variable fallback for `--metrics-addr` on shared-entrypoint binaries (`harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-plans-tools`, `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`). Address format is `IP:PORT` or `:PORT` (blank host binds `0.0.0.0`).
+- **HARNX_METRICS_ADDR**: Environment variable fallback for `--metrics-addr` on shared-entrypoint binaries (`harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-claude-hook-tools`, `harnx-plans-tools`, `harnx-mcp-remote`, `harnx-mcp-bridge`). Address format is `IP:PORT` or `:PORT` (blank host binds `0.0.0.0`).
 
 ## Tool filesystem allowlist envs
 
@@ -169,7 +169,7 @@ Variables used by `harnx-mcp-server`:
 
 ## NATS Transport Envs
 
-These are set for you in normal use. Tool and hook servers receive them from
+These are set for you in normal use. Tool servers receive them from
 whichever process launched them.
 
 - `HARNX_NATS_URL` — NATS server or cluster URL. `nats://` and `tls://` use the
@@ -184,7 +184,7 @@ whichever process launched them.
   advertises instead of adding them to the connection's server pool. Defaults to
   on for `ws://`/`wss://` URLs and off otherwise.
 - `HARNX_NATS_REPLICAS` — JetStream replica count for buckets harnx creates.
-- `HARNX_SERVER_SCOPE` — the scope a tool or hook server registers under.
+- `HARNX_SERVER_SCOPE` — the scope a tool server registers under.
 
 **Do not set `HARNX_SERVER_SCOPE` yourself unless you are deploying servers
 independently.** It namespaces every NATS subject and registry key. A worker

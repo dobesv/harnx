@@ -478,8 +478,8 @@ remotes:
 
 ## Interactive tool approval
 
-When a tool requires confirmation (for example, a `PreToolUse` hook returns
-`permissionDecision: ask`), the task pauses at `TASK_STATE_INPUT_REQUIRED`.
+When a tool requires confirmation (for example, middleware calls `confirm`),
+the task pauses at `TASK_STATE_INPUT_REQUIRED`.
 Its agent status message contains a plain-text Markdown challenge with the tool
 name, persisted JSON arguments (truncated above 8 KiB), and approval reason.
 Blocking `SendMessage` returns at this boundary. `SendStreamingMessage` and

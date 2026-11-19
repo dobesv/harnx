@@ -369,16 +369,66 @@ fn middleware_tool_server_patch_keeps_script_origin() {
 }
 
 #[test]
-fn middleware_tool_server_keeps_legacy_hooks_parsing() {
+fn middleware_tool_server_rejects_legacy_hooks_entries() {
     let legacy = "command: unused\nhooks:\n  entries:\n    - command: legacy-hook\n      legacy_extra: accepted\n";
-    let original: ToolServerConfig = serde_yaml::from_str(legacy).unwrap();
-    let combined: ToolServerConfig =
-        serde_yaml::from_str(&format!("{legacy}middleware: [{}]", full("audit", "next"))).unwrap();
-    assert_eq!(original.hooks, combined.hooks);
+    let error = serde_yaml::from_str::<ToolServerConfig>(legacy).unwrap_err();
+    assert!(format!("{error}").contains("legacy"), "{error}");
+    let combined = serde_yaml::from_str::<ToolServerConfig>(&format!(
+        "{legacy}middleware: [{}]",
+        full("audit", "next")
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(combined.contains("legacy"), "{combined}");
 }
 
 #[test]
-fn middleware_names_are_unique_across_tool_server_package_level() {
+fn middleware_same_name_across_tool_servers_replaces_in_place() {
+    let _lock = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", root);
+    let file = write(root, "config.yaml", "{}");
+    write(
+        root,
+        "tool_servers/a.yaml",
+        &format!(
+            "command: unused\nmiddleware: [{}, {}]",
+            full("first", "next"),
+            full("shared", "from-user-server")
+        ),
+    );
+    write(
+        root,
+        "packages/pkg/tool_servers/b.yaml",
+        &format!(
+            "command: unused\nmiddleware: [{}]",
+            full("shared", "from-package-server")
+        ),
+    );
+    let config = Config::load_from_file(&file).unwrap();
+    let chain = config.resolved_middleware().unwrap();
+    // Replacement keeps the earlier position; the chain stays name-unique.
+    assert_eq!(
+        chain
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "shared"]
+    );
+    assert_eq!(
+        chain.entries[1].source,
+        MiddlewareSource::Bash("from-package-server".into())
+    );
+    assert_eq!(
+        chain.entries[1].origin.file,
+        root.join("packages/pkg/tool_servers/b.yaml")
+    );
+}
+
+#[test]
+fn middleware_disable_in_later_tool_server_removes_earlier_server_entry() {
     let _lock = env_lock();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -389,23 +439,43 @@ fn middleware_names_are_unique_across_tool_server_package_level() {
         "tool_servers/a.yaml",
         &format!(
             "command: unused\nmiddleware: [{}]",
-            full("duplicate", "next")
+            full("shared", "from-user-server")
         ),
     );
     write(
         root,
         "packages/pkg/tool_servers/b.yaml",
-        &format!(
-            "command: unused\nmiddleware: [{}]",
-            full("duplicate", "next")
-        ),
+        "command: unused\nmiddleware: [{name: shared, enabled: false}]",
     );
-    let error = Config::load_from_file(&file).unwrap_err().to_string();
-    assert!(
-        error.contains("duplicate name at tool-server/package level"),
-        "{error}"
+    let config = Config::load_from_file(&file).unwrap();
+    assert!(config.resolved_middleware().unwrap().entries.is_empty());
+}
+
+#[test]
+fn middleware_two_packages_shipping_same_server_name_resolve_one_chain_entry() {
+    // Mirrors the shipped pantheon/coding bash.yaml: both packages declare the
+    // same tool server with middleware of the same name.
+    let _lock = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", root);
+    let file = write(root, "config.yaml", "{}");
+    let entry = "{name: proxy-auth, match: '^bash_(exec|spawn)$', bash: next}";
+    for package in ["aaa", "zzz"] {
+        write(
+            root,
+            &format!("packages/{package}/tool_servers/bash.yaml"),
+            &format!("command: unused\nmiddleware: [{entry}]"),
+        );
+    }
+    let config = Config::load_from_file(&file).unwrap();
+    let chain = config.resolved_middleware().unwrap();
+    assert_eq!(chain.entries.len(), 1);
+    assert_eq!(chain.entries[0].name, "proxy-auth");
+    assert_eq!(
+        chain.entries[0].origin.file,
+        root.join("packages/zzz/tool_servers/bash.yaml")
     );
-    assert!(error.contains("duplicate"), "{error}");
 }
 
 #[test]

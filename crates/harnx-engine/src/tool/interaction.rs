@@ -4,8 +4,8 @@ use super::{
     dispatch_authorized_call, ensure_tool_call_ids, materialize_dispatch_result,
     normalize_outer_result, prepare_tool_call, publish_tool_call, run_middleware, work_boundary,
     ApprovedToolCall, EvaluatedInnerCall, InnerToolCallStatus, MaterializedToolResult,
-    ToolAdmission, ToolApprovalRequiredError, ToolEvalContext, ToolEvaluation,
-    ToolMiddlewareOrigin, ToolMiddlewareOutcome, WorkBoundary,
+    ToolAdmission, ToolEvalContext, ToolEvaluation, ToolMiddlewareOrigin, ToolMiddlewareOutcome,
+    WorkBoundary,
 };
 use anyhow::{anyhow, Result};
 use futures_util::future::join_all;
@@ -101,7 +101,6 @@ pub(super) async fn evaluate_round(
         all_null: true,
     };
     let mut approved = Vec::new();
-    let mut deferred = Vec::new();
     for call in &calls {
         if let Some(result) = call.id.as_ref().and_then(|id| completed.remove(id)) {
             round.all_null = false;
@@ -112,17 +111,13 @@ pub(super) async fn evaluate_round(
             continue;
         }
         match prepare_tool_call(evaluation.ctx, call.clone(), evaluation.abort_signal).await? {
-            ToolAdmission::Approved(call) => approved.push(call),
+            ToolAdmission::Approved(call) => approved.push(*call),
             ToolAdmission::Immediate(result, status) => {
                 let result = finalize_immediate(evaluation, *result, status).await?;
                 round.completed.push(EvaluatedInnerCall { result, status });
                 round.all_null = false;
             }
-            ToolAdmission::Deferred(call) => deferred.push(call),
         }
-    }
-    if !deferred.is_empty() {
-        return Err(ToolApprovalRequiredError::new(calls, deferred).into());
     }
     // Finalization lives inside each future, not after join_all. A slow sibling
     // must not delay another call's durable completion or terminal publication.

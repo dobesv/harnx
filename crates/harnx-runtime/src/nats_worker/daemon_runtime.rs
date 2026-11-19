@@ -243,7 +243,6 @@ pub(super) struct WorkerRuntime {
     pub(super) activation_route: SessionActivationRoute,
     pub(super) activation_mode: WorkerActivationMode,
     pub(super) activation_heartbeat_interval: Duration,
-    pub(super) manage_servers: bool,
     pub(super) worker_id: String,
     pub(super) identity: crate::worker_identity::WorkerReadiness,
     pub(super) lease: NatsLeaseConfig,

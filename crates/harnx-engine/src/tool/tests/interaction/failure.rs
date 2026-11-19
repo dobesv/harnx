@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn interaction_manifest_failure_retains_completed_and_pending_calls() {
-    let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+    let mut ctx = test_context(vec![]);
     let events: Events = Default::default();
     callbacks(&mut ctx, &events);
     ctx.middleware_fn = Some(Arc::new(|prepared, _, _| {
@@ -38,7 +38,7 @@ async fn interaction_manifest_failure_retains_completed_and_pending_calls() {
 
 #[tokio::test]
 async fn interaction_fatal_sibling_retains_unexposed_pending_request() {
-    let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+    let mut ctx = test_context(vec![]);
     ctx.middleware_fn = Some(Arc::new(|prepared, _, _| {
         Box::pin(async move {
             if prepared.call.name == "a" {
@@ -68,7 +68,7 @@ async fn interaction_fatal_sibling_retains_unexposed_pending_request() {
 
 #[tokio::test]
 async fn interaction_legacy_opt_in_preserves_typed_suspension() {
-    let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+    let mut ctx = test_context(vec![]);
     ctx.middleware_fn = Some(Arc::new(|_, _, _| Box::pin(async { Ok(input_required()) })));
     ctx.on_interaction = Some(Arc::new(|_| Box::pin(async { Ok(()) })));
     let error = eval_tool_calls(&ctx, vec![call("a")], &create_abort_signal())

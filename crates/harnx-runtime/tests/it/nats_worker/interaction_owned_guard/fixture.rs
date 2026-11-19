@@ -144,7 +144,6 @@ impl Fixture {
         input.skip_user_log_append = true;
         run_agent_loop_with_nats(RunAgentLoopArgs {
             cluster_key: "local",
-            manage_servers: false,
             session_id: self.log.storage_key(),
             config: self.config.clone(),
             instance_id: self.scope.clone(),

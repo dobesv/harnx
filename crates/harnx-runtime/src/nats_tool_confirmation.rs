@@ -1,8 +1,8 @@
-//! Request/reply bridge for interactive tool approval across NATS workers.
+//! Request/reply bridge for interactive tool confirmation across NATS workers.
 //!
 //! An attached frontend owns a session-scoped reply subject. Direct and queued
-//! activations carry that subject to the worker, which sends `PreToolUse` `ask`
-//! decisions there instead of reading from the worker process's non-interactive
+//! activations carry that subject to the worker, which sends tool confirmation
+//! requests there instead of reading from the worker process's non-interactive
 //! stdin.
 //!
 //! The reply subject is lifecycle routing, not an authentication boundary.

@@ -26,7 +26,6 @@ use std::sync::{
 pub(super) struct TurnWorker {
     pub cluster: String,
     pub instance_id: harnx_core::instance::ServerScope,
-    pub manage_servers: bool,
     pub activation_route: super::SessionActivationRoute,
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
     pub session_metadata: crate::nats_session_metadata::SessionMetadataStore,
@@ -43,7 +42,6 @@ impl From<&WorkerRuntime> for TurnWorker {
         Self {
             cluster: worker.cluster.clone(),
             instance_id: worker.instance_id.clone(),
-            manage_servers: worker.manage_servers,
             activation_route: worker.activation_route.clone(),
             call_fn: worker.call_fn.clone(),
             session_metadata: worker.session_metadata.clone(),
@@ -430,7 +428,6 @@ impl SessionTurn {
         let outcome = Box::pin(run_agent_loop_with_nats_outcome(
             RunAgentLoopArgs {
                 cluster_key: &self.worker.cluster,
-                manage_servers: self.worker.manage_servers,
                 session_id: &self.activation.session_id,
                 config: self.per_session.clone(),
                 instance_id: self.worker.instance_id.clone(),

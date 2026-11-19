@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn python_processes_tool_output_from_vfs_without_tool_bridge() {
     let inner = FakeProvider::new();
-    let (bash, _slot, hooks, _ctx) = harness(inner.clone(), vec![]);
+    let (bash, _slot, _ctx) = harness(inner.clone(), vec![]);
     let output = ok(run(
         &bash,
         "fs_read --path a > /tmp/result; python3 - <<'EOF'\nprint(open('/tmp/result').read().strip())\nprint(sum(range(10)))\nEOF",
@@ -32,20 +32,11 @@ async fn python_processes_tool_output_from_vfs_without_tool_bridge() {
     );
     assert!(partial["trace"].as_array().unwrap().is_empty());
     assert_eq!(inner.calls.lock().unwrap().len(), 1);
-    assert_eq!(
-        hooks
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|hook| matches!(hook, HookEvent::PreToolUse { .. }))
-            .count(),
-        1
-    );
 }
 
 #[tokio::test]
 async fn python_timeout_keeps_partial_output_and_limit_metadata() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), vec![]);
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), vec![]);
     let result = tokio::time::timeout(
         Duration::from_secs(3),
         bash.call_tool(
@@ -68,7 +59,7 @@ async fn python_timeout_keeps_partial_output_and_limit_metadata() {
 
 #[tokio::test]
 async fn python_memory_limit_is_recoverable_with_clear_partial_stderr() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), vec![]);
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), vec![]);
     let error = recoverable(
         run(
             &bash,
@@ -108,7 +99,7 @@ impl harnx_script::fs_attachments::AttachmentFetcher for LoopEntry {
 #[tokio::test]
 async fn python_parent_abort_stops_busy_loop_within_one_second() {
     let entered = Arc::new(LoopEntry(tokio::sync::Semaphore::new(0)));
-    let (bash, _slot, _hooks, _ctx) =
+    let (bash, _slot, _ctx) =
         harness_with_attachments(FakeProvider::new(), vec![], Some(entered.clone()));
     let abort = create_abort_signal();
     let task_abort = abort.clone();

@@ -625,7 +625,7 @@ pub(super) enum ModalState {
         seq: usize,
         user_text: Option<String>,
     },
-    /// Confirmation for a tool call gated by a `PreToolUse` "ask" hook.
+    /// Confirmation for a tool call gated by tool confirmation or legacy approvals.
     /// The reply channel lives in `App::pending_confirm_reply`.
     ConfirmToolUse(Box<ConfirmToolUseState>),
     /// Durable middleware request; never answered through the legacy bool route.
@@ -1199,7 +1199,7 @@ impl App {
 }
 
 pub(crate) enum ToolConfirmationEvent {
-    /// A worker-side `PreToolUse` hook asked for confirmation via NATS. The
+    /// A worker requested tool confirmation via NATS. The
     /// async task waits on `reply`; the main loop shows a modal and sends the decision back.
     Show {
         confirmation_id: u64,

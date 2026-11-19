@@ -1,0 +1,9 @@
+name: credential-tools
+version: v0.1.0
+description: >
+  Opt-in credential provider tool servers and bash middleware for AWS and
+  Kubernetes. Keeps long-lived credentials out of sandboxes by running
+  dedicated credential services on the bash host.
+harnx_min_version: "0.34.0"
+homepage: https://github.com/dobesv/harnx
+license: MIT OR Apache-2.0

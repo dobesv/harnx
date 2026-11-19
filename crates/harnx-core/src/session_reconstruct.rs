@@ -438,11 +438,13 @@ impl ReplayAccumulator {
                 if crate::timing_identity::is_timing_notice(&content.to_text()) {
                     return;
                 }
-                // Runtime notes (sub-agent starts, cancels) are context too.
-                // Replay synthesized them from control events; a compaction
-                // re-log persists them as user rows, and they must not be
+                // Runtime notes (sub-agent starts, cancels) and
+                // hook-added context rows are context too. Replay
+                // synthesized the notes from control events and event hooks
+                // appended the context mid-turn; a compaction re-log
+                // persists both as user rows, and they must not be
                 // executed or queued as pending input.
-                if crate::runtime_note::is_runtime_note_id(id.as_deref()) {
+                if crate::runtime_note::is_runtime_context_id(id.as_deref()) {
                     return;
                 }
                 self.on_user_message_with_seq(log_seq, entry)

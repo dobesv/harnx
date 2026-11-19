@@ -1,13 +1,6 @@
-#[path = "follow_boundary_support.rs"]
-mod follow_boundary_support;
-use follow_boundary_support::*;
-
 use super::*;
-use futures_util::StreamExt;
 use harnx_core::event::{AgentEvent, AgentEventSink, ContentBlock, ModelEvent};
-use harnx_runtime::{
-    FollowBoundary, FollowBoundaryOptions, HitlDecisionOutcome, PendingHitlApproval,
-};
+use harnx_runtime::{FollowBoundary, FollowBoundaryOptions};
 use std::time::Duration;
 
 #[derive(Default)]
@@ -26,8 +19,6 @@ impl AgentEventSink for TextSink {
 
 struct BoundaryFixture {
     harness: ConfirmationHarness,
-    final_started: Arc<tokio::sync::Notify>,
-    finish: Arc<tokio::sync::Notify>,
 }
 
 async fn setup_boundary_environment(
@@ -80,30 +71,19 @@ impl BoundaryFixture {
         let server = common::spawn_nats_server()
             .await?
             .context("nats-server required")?;
-        ensure_hook_server_binary().await?;
         let (environment, config, client, jetstream) =
             setup_boundary_environment(server.url()).await?;
-        let final_started = Arc::new(tokio::sync::Notify::new());
-        let finish = Arc::new(tokio::sync::Notify::new());
-        let call_fn = build_boundary_call_fn(
-            final_started.clone(),
-            finish.clone(),
-            client.clone(),
-            jetstream.clone(),
-        );
+        let call_fn = build_boundary_call_fn(client.clone(), jetstream.clone());
         let daemon = start_ready_daemon(config, call_fn, &client).await?;
         let source = create_boundary_session(client.clone(), jetstream.clone()).await?;
         Ok(Self {
             harness: ConfirmationHarness {
                 source,
-                client,
                 jetstream,
                 daemon,
                 _server: server,
                 _environment: environment,
             },
-            final_started,
-            finish,
         })
     }
 
@@ -153,28 +133,23 @@ impl BoundaryFixture {
 }
 
 fn build_boundary_call_fn(
-    final_started: Arc<tokio::sync::Notify>,
-    finish: Arc<tokio::sync::Notify>,
     client: async_nats::Client,
     jetstream: async_nats::jetstream::Context,
 ) -> harnx_runtime::agent_loop::AgentCallFn {
     let rounds = Arc::new(AtomicUsize::new(0));
     Arc::new(move |_input, _config, _abort| {
         let round = rounds.fetch_add(1, Ordering::SeqCst);
-        let final_started = final_started.clone();
-        let finish = finish.clone();
         let client = client.clone();
         let js = jetstream.clone();
         Box::pin(async move {
             if round > 0 {
-                final_started.notify_one();
-                finish.notified().await;
+                // Keep the worker mid-turn so the terminal boundary comes from
+                // the durable error/cancel the test seeds, never from a quick
+                // clean finish.
+                std::future::pending::<()>().await;
+                unreachable!("pending model call returned");
             }
-            let text = if round == 0 {
-                "before approval"
-            } else {
-                "after approvals"
-            };
+            let text = "before approval";
             harnx_runtime::nats_event_sink::NatsEventSink::new(client.clone(), js, source_key())
                 .await
                 .publish_event(AgentEvent::Model(ModelEvent::MessageChunk {
@@ -182,49 +157,20 @@ fn build_boundary_call_fn(
                 }))
                 .await;
             client.flush().await?;
-            let calls = if round == 0 {
-                ["first-approval", "second-approval"]
-                    .into_iter()
-                    .map(|id| {
-                        ToolCall::new(
-                            "time_get_current_time".into(),
-                            json!({"timezone": "UTC"}),
-                            Some(id.into()),
-                            None,
-                        )
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
+            let calls = ["first-approval", "second-approval"]
+                .into_iter()
+                .map(|id| {
+                    ToolCall::new(
+                        "time_get_current_time".into(),
+                        json!({"timezone": "UTC"}),
+                        Some(id.into()),
+                        None,
+                    )
+                })
+                .collect();
             Ok((text.into(), None, calls, CompletionTokenUsage::default()))
         })
     })
-}
-
-async fn serial_approvals(reject_first: bool) -> Result<()> {
-    let fixture = BoundaryFixture::start().await?;
-    let ticket = fixture.ticket().await?;
-    let sink = Arc::new(TextSink::default());
-    let ctx = SerialApprovalContext {
-        fixture: &fixture,
-        ticket: &ticket,
-        sink: &sink,
-    };
-    let first = assert_first_approval_gate(&ctx, reject_first).await?;
-    let second = assert_second_approval_gate(&ctx, &first).await?;
-    assert_terminal_follow_segment(&ctx, &second, reject_first).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hitl_follow_boundary_two_serial_approvals_stream_text_and_resume_original_prompt(
-) -> Result<()> {
-    serial_approvals(false).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hitl_follow_boundary_rejected_first_call_still_returns_second_approval() -> Result<()> {
-    serial_approvals(true).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

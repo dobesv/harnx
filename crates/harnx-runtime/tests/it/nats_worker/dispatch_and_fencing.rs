@@ -418,7 +418,6 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
     let result = run_agent_loop_with_nats_inner(
         RunAgentLoopArgs {
             cluster_key: "local",
-            manage_servers: false,
             session_id: &storage_key(session_id),
             config,
             instance_id: harnx_core::instance::ServerScope::new(),

@@ -135,7 +135,10 @@ pub(super) fn config(entries: Vec<Value>) -> GlobalConfig {
 
 impl Fixture {
     pub async fn new(entries: Vec<Value>) -> Self {
-        let config = config(entries);
+        Self::with_config(config(entries)).await
+    }
+
+    pub async fn with_config(config: GlobalConfig) -> Self {
         let slot = Arc::new(BashEvalContextSlot::default());
         let scope = ServerScope::new();
         let mut params = BuildToolEvalContextParams::new(&config, &scope);

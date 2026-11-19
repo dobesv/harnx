@@ -204,11 +204,9 @@ pub fn write_with_wait_tool(
     Ok(paths)
 }
 
-/// Like `write_with_wait_tool`, but also overwrites `config.yaml` with a
-/// `hooks:` block that registers a PreToolUse hook pointing at a
-/// `block.sh` script (runs `sleep 30`) in the same temp dir. The hook's
-/// timeout is set to 300s so the harness's per-hook timeout does not kill
-/// the hook before our Ctrl-C budget expires.
+/// Add middleware that calls a blocking Claude hook through the compatibility
+/// tool server. Its timeout exceeds the Ctrl-C budget so only cancellation can
+/// stop the sleeping script.
 pub fn write_with_blocking_hook(
     dir: &Path,
     mock_base_url: &str,
@@ -229,12 +227,29 @@ pub fn write_with_blocking_hook(
         perm.set_mode(0o755);
         std::fs::set_permissions(&block_sh, perm)?;
     }
+    let tool_servers_dir = paths.harnx_config_dir.join("tool_servers");
+    let bridge_bin =
+        time_tools_bin.with_file_name(format!("harnx-mcp-bridge{}", std::env::consts::EXE_SUFFIX));
+    let claude_hook_bin = time_tools_bin.with_file_name(format!(
+        "harnx-claude-hook-tools{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::write(
+        tool_servers_dir.join("claude_hook.yaml"),
+        format!(
+            "command: {}\nargs:\n  - --name\n  - claude_hook\n  - --\n  - {}\n  - --mcp-stdio\n",
+            bridge_bin.display(),
+            claude_hook_bin.display()
+        ),
+    )
+    .context("failed to write tool_servers/claude_hook.yaml")?;
+
     std::fs::write(
         paths.harnx_config_dir.join("config.yaml"),
         format!(
             "save: false\nclient: mock-llm\nmodel: mock-llm:test\ntool_use: true\nuse_tools: '*'\n\
-             hooks:\n  entries:\n    - command: harnx-claude-compatible-hook-server --event PreToolUse --timeout 300 -- {}\n",
-            shell_words::quote(&block_sh.display().to_string())
+             middleware:\n  - name: block\n    match: '^time_wait$'\n    tools: [claude_hook_run]\n    timeout: 300s\n    bash: |\n      claude_hook_run --json '{{\"command\":[{}],\"event\":\"PreToolUse\",\"payload\":{{\"session_id\":\"test\",\"tool_name\":\"time_wait\"}}}}'\n      next\n",
+            serde_json::to_string(&block_sh.display().to_string())?
         ),
     )
     .context("failed to write config.yaml with hook")?;

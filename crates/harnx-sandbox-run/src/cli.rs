@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// Parsed hook definition from `--hook TYPE CMD [ARGS...] ;` syntax.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookDef {
-    /// Hook type: "claude-command" or "claude-command-persistent".
+    /// Hook type: "environment" (MCP stdio environment tool helper).
     pub hook_type: String,
     /// Command to execute (first token after type).
     pub command: String,

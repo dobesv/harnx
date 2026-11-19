@@ -21,7 +21,7 @@ pub(super) fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
-fn fenced_blocks(text: &str) -> Vec<(String, String)> {
+pub(super) fn fenced_blocks(text: &str) -> Vec<(String, String)> {
     normalize_line_endings(text)
         .split("```")
         .enumerate()

@@ -91,7 +91,7 @@ pub struct WorkerDaemonConfig {
     pub activation_mode: WorkerActivationMode,
     pub worker_id: String,
     pub lease: NatsLeaseConfig,
-    /// Whether this worker launches its own tool and hook servers as child
+    /// Whether this worker launches its own tool servers as child
     /// processes instead of discovering independently deployed ones.
     pub manage_servers: bool,
     activation_ack_wait: Duration,

@@ -85,7 +85,6 @@ pub(super) async fn run_repair(
         CI_SAFE_TIMEOUT,
         run_agent_loop_with_nats(RunAgentLoopArgs {
             cluster_key: "local",
-            manage_servers: false,
             session_id: key,
             config,
             instance_id: harnx_core::instance::ServerScope::new(),

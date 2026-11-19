@@ -34,10 +34,14 @@ conversation_starters:           # Suggested starting prompts
 documents:                       # RAG document paths (relative to config dir)
   - docs/guide.md
 
-# hooks:                         # Per-agent hooks (merged with global)
+# hooks:                         # Per-agent lifecycle event hooks (merged with global)
 #   max_resume: 3
-#   entries:
-#   - command: harnx-claude-compatible-hook-server --event Stop -- /path/to/agent-hook.sh
+#   Stop:
+#     - name: keep-going
+#       bash: resume "finish the checklist first"
+#   SessionStart:
+#     - name: session-context
+#       enabled: false          # disable the global entry for this agent
 ---
 
 You are a helpful AI assistant. Your task is to help the user with their questions and tasks.

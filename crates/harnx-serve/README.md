@@ -604,14 +604,16 @@ Intentionally dropped today:
 - `Notice::Info` / `Notice::Warning` — not currently emitted in server flows worth surfacing; omitted to avoid custom-event spam.
 ## Operational Notes
 
-### Tool Approval Interrupts
+### Tool Confirmation and Interaction Interrupts
 
-When a `PreToolUse` hook returns `{"permissionDecision": "ask"}`, the lease-holding
-worker persists `HitlApprovalRequested`. The server derives `Interrupted` state
-from this durable log, including after reconnects and server restarts. Decisions
-are routed to the worker, which writes `HitlApprovalDecision` using lease fencing,
-stream-tail compare-and-set, and ownership revalidation. Only a winning durable
-decision can resume the tool round; the server does not retain a continuation.
+When tool middleware requests confirmation (`confirm`), or when replaying legacy
+tool approval requests, the lease-holding worker persists durable interaction
+requests (`InteractionRequested` or legacy `HitlApprovalRequested`). The server
+derives `Interrupted` state from this durable log, including after reconnects and
+server restarts. Decisions are routed to the worker, which writes `InteractionResponse`
+(or legacy `HitlApprovalDecision`) using lease fencing, stream-tail compare-and-set,
+and ownership revalidation. Only a winning durable decision can resume the tool
+round; the server does not retain a continuation.
 
 #### Wire format
 

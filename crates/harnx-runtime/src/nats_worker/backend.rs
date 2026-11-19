@@ -357,20 +357,6 @@ impl FencedSessionLogSink {
             .await
     }
 
-    /// Blocking form used by the synchronous agent-loop approval callback.
-    pub fn append_hitl_event_cas_blocking(
-        &self,
-        entry: &harnx_core::session::SessionLogEntry,
-        expected_last_sequence: u64,
-    ) -> Result<Option<u64>> {
-        let sink = self.clone();
-        let entry = entry.clone();
-        block_on_io(async move {
-            sink.append_hitl_event_cas(&entry, expected_last_sequence)
-                .await
-        })
-    }
-
     fn fenced_entry(
         &self,
         entry: &harnx_core::session::SessionLogEntry,

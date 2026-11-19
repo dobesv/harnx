@@ -339,6 +339,9 @@ async fn assert_recovered_intent_decision(
             SessionLogEntry::HitlApprovalDecision { approved, note, .. } => {
                 Some((*approved, note.clone()))
             }
+            SessionLogEntry::InteractionResponse { response, .. } => {
+                Some((response.action == "approve", response.note.clone()))
+            }
             _ => None,
         })
         .collect();
@@ -385,22 +388,56 @@ async fn append_and_verify_running_decision(
     before: &ContextSnapshot,
     request: &ApprovalRef,
 ) -> Result<()> {
-    NatsSessionLog::new(t.h.jetstream.clone(), session.storage_key())
-        .append_event_async(&SessionLogEntry::HitlApprovalDecision {
-            tool_call_id: request.tool_call_id.clone(),
-            approved: true,
-            note: Some("saved audit".into()),
-            fence_token: 1,
-        })
+    let entries = NatsSessionLog::new(t.h.jetstream.clone(), session.storage_key())
+        .load_events_latest_required_async()
         .await?;
+    let interaction = entries.iter().find_map(|(seq, e)| match e {
+        SessionLogEntry::InteractionRequested {
+            interaction_id,
+            tool_round_seq,
+            tool_call_id,
+            ..
+        } if *seq == request.request_seq
+            && *tool_round_seq == request.tool_round_seq
+            && *tool_call_id == request.tool_call_id =>
+        {
+            Some(interaction_id.clone())
+        }
+        _ => None,
+    });
+    if let Some(interaction_id) = interaction {
+        NatsSessionLog::new(t.h.jetstream.clone(), session.storage_key())
+            .append_event_async(&SessionLogEntry::InteractionResponse {
+                request_seq: request.request_seq,
+                interaction_id,
+                tool_call_id: request.tool_call_id.clone(),
+                response: harnx_core::interaction::InteractionResponse {
+                    action: "approve".into(),
+                    data: Default::default(),
+                    note: Some("saved audit".into()),
+                },
+                fence_token: 1,
+            })
+            .await?;
+    } else {
+        NatsSessionLog::new(t.h.jetstream.clone(), session.storage_key())
+            .append_event_async(&SessionLogEntry::HitlApprovalDecision {
+                tool_call_id: request.tool_call_id.clone(),
+                approved: true,
+                note: Some("saved audit".into()),
+                fence_token: 1,
+            })
+            .await?;
+    }
     let progress = session
         .fixed_prompt_progress(&ticket(before, session.storage_key())?)
         .await?;
     assert!(matches!(
         progress,
-        PromptProgress::Running {
-            last_decision: Some(_)
-        }
+        PromptProgress::Parked
+            | PromptProgress::Running {
+                last_decision: Some(_)
+            }
     ));
     Ok(())
 }
@@ -452,13 +489,54 @@ async fn recovery_hitl_committed_decision_without_activation_resumes_original_ti
 async fn apply_external_decision_and_wait(
     session: &NatsSession,
     before: &ContextSnapshot,
-    tool_call_id: &str,
+    request: &ApprovalRef,
 ) -> Result<()> {
-    assert!(
-        session
-            .decide_hitl_approval(tool_call_id, false, Some("external rejection".into()))
-            .await?
-    );
+    let metadata = session.metadata_store();
+    let entries = NatsSessionLog::new_with_replicas(
+        metadata.jetstream().clone(),
+        session.storage_key(),
+        metadata.replicas(),
+    )
+    .load_events_latest_required_async()
+    .await?;
+    let interaction = entries.iter().find_map(|(seq, entry)| match entry {
+        SessionLogEntry::InteractionRequested {
+            tool_round_seq,
+            tool_call_id,
+            interaction_id,
+            ..
+        } if *seq == request.request_seq
+            && *tool_round_seq == request.tool_round_seq
+            && *tool_call_id == request.tool_call_id =>
+        {
+            Some((*seq, interaction_id.clone()))
+        }
+        _ => None,
+    });
+    if let Some((request_seq, interaction_id)) = interaction {
+        let outcome = session
+            .decide_interaction(
+                &interaction_id,
+                request_seq,
+                &harnx_core::interaction::InteractionResponse {
+                    action: "deny".into(),
+                    data: Default::default(),
+                    note: Some("external rejection".into()),
+                },
+            )
+            .await?;
+        assert!(outcome.is_applied());
+    } else {
+        assert!(
+            session
+                .decide_hitl_approval(
+                    &request.tool_call_id,
+                    false,
+                    Some("external rejection".into())
+                )
+                .await?
+        );
+    }
     tokio::time::timeout(DEADLINE, async {
         while session
             .fixed_prompt_completion(&ticket(before, session.storage_key())?)
@@ -490,7 +568,7 @@ async fn recovery_hitl_external_runtime_decision_is_picked_up_without_http() -> 
     let active = before.document.state.active.as_ref().unwrap();
     let request = &active.hitl_checkpoint.as_ref().unwrap().request;
     let inspected = wait_inspected_pause(&t).await?;
-    apply_external_decision_and_wait(&session, &before, &request.tool_call_id).await?;
+    apply_external_decision_and_wait(&session, &before, request).await?;
     drop(inspected);
     let id = &before
         .document
@@ -521,6 +599,20 @@ async fn wait_for_next_progress_request(
                 session.fixed_prompt_progress(&ticket(before, session.storage_key())?).await?,
                 PromptProgress::InputRequired(p) if p.request_seq > q1_seq
             ) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            let metadata = session.metadata_store();
+            let entries = NatsSessionLog::new_with_replicas(
+                metadata.jetstream().clone(),
+                session.storage_key(),
+                metadata.replicas(),
+            )
+            .load_events_latest_required_async()
+            .await?;
+            if harnx_runtime::interactions::derive_pending_interactions(&entries)?
+                .into_iter()
+                .any(|p| p.request_seq > q1_seq)
+            {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

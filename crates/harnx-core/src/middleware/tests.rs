@@ -132,16 +132,24 @@ fn middleware_roundtrips_agent_frontmatter_without_dropping_it() {
 }
 
 #[test]
-fn middleware_leaves_legacy_hooks_permissive_and_unchanged() {
-    let legacy = "hooks:\n  max_resume: 3\n  entries:\n    - command: legacy-hook --event PreToolUse\n      status_message: Checking\n      async: true\n      old_extra_key: accepted\n";
-    let global: ConfigData = serde_yaml::from_str(legacy).unwrap();
+fn middleware_coexists_with_event_hooks_and_legacy_hooks_fail() {
+    let hooks = "hooks:\n  max_resume: 3\n  Stop:\n    - name: keep-going\n      bash: resume \"continue\"\n";
+    let global: ConfigData = serde_yaml::from_str(hooks).unwrap();
     let combined: ConfigData = serde_yaml::from_str(&format!(
-        "{legacy}middleware: [{{name: audit, match: '.*', bash: next}}]\n"
+        "{hooks}middleware: [{{name: audit, match: '.*', bash: next}}]\n"
     ))
     .unwrap();
     assert_eq!(global.hooks, combined.hooks);
-    let agent = AgentConfig::from_markdown("test", &format!("---\n{legacy}---\nPrompt")).unwrap();
+    let agent = AgentConfig::from_markdown("test", &format!("---\n{hooks}---\nPrompt")).unwrap();
     assert_eq!(agent.hooks(), global.hooks.as_ref());
+
+    // The retired process-hook shape fails configuration load with guidance.
+    let legacy = "hooks:\n  entries:\n    - command: legacy-hook --event PreToolUse\n";
+    let error = serde_yaml::from_str::<ConfigData>(legacy).unwrap_err();
+    assert!(
+        error.to_string().contains("legacy `hooks:` `entries:`"),
+        "{error}"
+    );
 }
 
 fn resolved() -> ResolvedMiddleware {

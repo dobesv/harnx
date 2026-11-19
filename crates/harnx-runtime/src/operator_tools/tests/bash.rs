@@ -2,7 +2,7 @@ use super::*;
 
 /// One installed command-scoped context, mirroring the production flow:
 /// BashProvider first in dispatch order, inner declarations from one
-/// admitted set, late allowed-name overwrite, then root-call approval.
+/// admitted set, late allowed-name overwrite.
 struct BashHarness {
     owner: Arc<ToolEvalContext>,
     root_call_id: String,
@@ -24,7 +24,6 @@ impl BashHarness {
                 base_providers: vec![inner.clone()],
                 slot: Some(slot.clone()),
                 payload_limit: None,
-                operator_inner_consent: true,
             },
         ));
         let mut allowed: HashSet<String> = inner_declarations
@@ -33,7 +32,7 @@ impl BashHarness {
             .collect();
         allowed.insert(crate::config::BASH_TOOL_NAME.to_string());
         let scope = ServerScope::new();
-        let mut ctx = ToolEvalContext {
+        let ctx = ToolEvalContext {
             on_tool_call_completed: None,
             on_interaction: None,
             middleware_fn: None,
@@ -50,21 +49,9 @@ impl BashHarness {
             emit_tool_blocked_fn: Arc::new(|_, _| {}),
             emit_tool_update_fn: Arc::new(|_, _| {}),
             confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Defer),
-            dispatch_hook_fn: Arc::new(|_| {
-                Box::pin(async {
-                    // Ask on every call, so admission depends on the context's
-                    // confirmation callback: only the operator's root call may
-                    // approve itself.
-                    HookOutcome {
-                        control: HookResultControl::Ask { reason: None },
-                        result: HookResult::default(),
-                    }
-                })
-            }),
             prepare_handoff_fn: None,
         };
         let root_call_id = uuid::Uuid::new_v4().to_string();
-        approve_root_bash_call(&mut ctx, &root_call_id);
         let owner = slot.install(ctx);
         Self {
             owner,
@@ -217,33 +204,4 @@ async fn operator_bash_abort_before_run_reports_cancellation() {
     .await
     .unwrap_err();
     assert_eq!(error.to_string(), "Operator tool command cancelled");
-}
-
-/// Root Bash approval is keyed to both the tool name and the generated call
-/// ID: the operator's own script runs, but no other bash call inherits it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn operator_bash_root_approval_is_keyed_to_the_call_id() {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let harness = BashHarness::new(seen, &[]);
-    // The approved root call runs the script.
-    let reply = harness
-        .run("echo approved", None, ToolOutputFormat::Json)
-        .await
-        .unwrap();
-    assert!(reply.error.is_none(), "{reply:?}");
-    // A bash call with any other ID stays deferred, even with the same name.
-    let other = ToolCall {
-        name: crate::config::BASH_TOOL_NAME.to_string(),
-        arguments: json!({"script": "echo nope"}),
-        id: Some(uuid::Uuid::new_v4().to_string()),
-        thought_signature: None,
-        reasoning_provenance: None,
-    };
-    let error = eval_inner_tool_call(&harness.owner, other, &create_abort_signal())
-        .await
-        .unwrap_err();
-    assert!(
-        error.downcast_ref::<ToolApprovalRequiredError>().is_some(),
-        "unapproved bash call must defer: {error:#}"
-    );
 }

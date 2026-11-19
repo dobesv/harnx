@@ -1361,38 +1361,6 @@ impl NatsSession {
         self.run_turn_content(content, event_sink, pending_cancel, None, options)
             .await
     }
-    /// Run a text turn while routing `PreToolUse` approval requests from the
-    /// worker to an interactive frontend.
-    pub async fn run_turn_with_tool_confirmation(
-        &self,
-        user_message: &str,
-        event_sink: Arc<dyn AgentEventSink>,
-        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
-        handler: Arc<crate::nats_tool_confirmation::ToolConfirmationHandler>,
-    ) -> Result<NatsTurnResult> {
-        let route = self.tool_confirmation_route(handler).await?;
-        self.run_turn_with_tool_confirmation_route(user_message, event_sink, pending_cancel, &route)
-            .await
-    }
-
-    /// Run a text turn through an existing frontend-scoped confirmation route.
-    pub async fn run_turn_with_tool_confirmation_route(
-        &self,
-        user_message: &str,
-        event_sink: Arc<dyn AgentEventSink>,
-        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
-        route: &crate::nats_tool_confirmation::ToolConfirmationRoute,
-    ) -> Result<NatsTurnResult> {
-        self.run_turn_content(
-            MessageContent::Text(user_message.to_string()),
-            event_sink,
-            pending_cancel,
-            Some(route.subject()),
-            RunTurnOptions::default(),
-        )
-        .await
-    }
-
     /// Run a turn from an already-composed input. Inline and local attachment
     /// references are uploaded to JetStream before the user message is logged.
     pub async fn run_turn_input(

@@ -83,8 +83,13 @@ test = ["harnx-runtime", "harnx"]
 on-affected = ["harnx-proxy-auth", "harnx-mcp-bridge", "harnx-bash-tools"]
 test = ["harnx"]
 
+# Interrupt tests run Claude hooks through the compatibility tool server.
 [[test-edge]]
-on-affected = ["harnx-fs-tools", "harnx-claude-compatible-hook-server"]
+on-affected = ["harnx-claude-hook-tools"]
+test = ["harnx"]
+
+[[test-edge]]
+on-affected = ["harnx-fs-tools"]
 test = ["harnx-runtime"]
 
 # Runtime attachment/result round tests launch the MCP bridge by path.
@@ -97,7 +102,7 @@ test = ["harnx-runtime"]
 on-affected = ["harnx-attachment-tools"]
 test = ["harnx-runtime"]
 
-# Runtime CLI tool tests launch harnx and managed tool/hook sidecars by path.
+# Runtime CLI tool tests launch harnx and managed tool sidecars by path.
 [[test-edge]]
 on-affected = ["harnx"]
 test = ["harnx-runtime"]
@@ -148,10 +153,6 @@ test = ["harnx-mcp-bridge", "harnx-runtime"]
 globs = ["crates/harnx-runtime/tests/it/common/**"]
 test = ["harnx-serve"]
 
-# A2A runner HITL tests launch the real PreToolUse hook server by path.
-[[test-edge]]
-on-affected = ["harnx-claude-compatible-hook-server"]
-test = ["harnx-a2a-server"]
 
 # Same-round A2A approval tests execute the managed native time tool.
 [[test-edge]]
@@ -173,3 +174,30 @@ test = ["harnx-a2a-server"]
 [[test-path]]
 globs = ["crates/harnx-core/tests/fixtures/**"]
 test = ["harnx", "harnx-acp-server", "harnx-serve", "harnx-tui"]
+
+# Claude compatibility middleware executes this guide and the shared hook fixture.
+[[test-path]]
+globs = ["docs/middleware-claude-hooks.md", "crates/harnx-claude-hook-tools/tests/fixtures/**"]
+test = ["harnx-runtime"]
+
+# Proxy middleware integration starts both native services by path and loads
+# shipped YAML, scripts, and the resident Jira stage from each package.
+[[test-edge]]
+on-affected = ["harnx-proxy-auth", "harnx-bash-tools"]
+test = ["harnx-runtime"]
+# Existing packages/** test-path covers YAML, middleware and Jira file reads.
+
+# Credential middleware tests deploy the real AWS/Kubernetes services beside bash.
+[[test-edge]]
+on-affected = ["harnx-aws-creds", "harnx-k8s-creds", "harnx-bash-tools"]
+test = ["harnx-runtime"]
+
+# These opt-in examples are loaded verbatim by credential middleware tests.
+[[test-path]]
+globs = ["example_config/credential-tools/**"]
+test = ["harnx-runtime"]
+
+# Native environment-service tests share the real MCP stdio lifecycle fixture.
+[[test-path]]
+globs = ["crates/harnx-toolset-server/tests/support/mcp_stdio.rs"]
+test = ["harnx-proxy-auth", "harnx-aws-creds", "harnx-k8s-creds"]

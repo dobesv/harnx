@@ -106,7 +106,7 @@ exec harnx-sandbox-run \
   --allow-rwx '$GIT_COMMON_DIR' \
   --env 'AWS_PROFILE=' \
   --env NODE_OPTIONS \
-  --hook claude-command-persistent harnx-aws-creds --profile my-profile \; \
+  --hook environment harnx-aws-creds --profile my-profile \; \
   -- "$tool" "$@"
 ```
 
@@ -171,9 +171,9 @@ exec harnx-sandbox-run \
   --allow-write ~/.claude.json \
   --env "EDITOR=true" \
   --env "PUPPETEER_NO_SANDBOX=1" \
-  --hook claude-command-persistent harnx-aws-creds --profile my-profile \; \
+  --hook environment harnx-aws-creds --profile my-profile \; \
   \
-  --hook claude-command-persistent harnx-proxy-auth \
+  --hook environment harnx-proxy-auth \
     --env 'if env.GITHUB_TOKEN
         then .GITHUB_TOKEN = "ghp_\($fake_base64_key)"
         end' \
@@ -346,13 +346,15 @@ Any other `$HOME` subdirectory (e.g. `~/.gemini`, `~/.config`, `~/.ssh`) is **bl
 
 ## Hooks
 
-Hooks allow you to run a command before the main process starts to inject credentials or mutate the environment.
+Hooks allow you to run sidecar processes before the main process starts to inject credentials or mutate the environment using MCP stdio.
 
-**Syntax:** `--hook TYPE CMD ARGS... \;`
+**Syntax:** `--hook environment CMD [ARGS...] \;`
 
-- **TYPE**: Currently supports `claude-command` (one-shot) or `claude-command-persistent`.
-- **CMD ARGS...**: The command to execute and its arguments.
+- **TYPE**: `environment` (connects via MCP stdio to call the service's `environment` tool).
+- **CMD [ARGS...]**: The command to execute and its arguments. `harnx-sandbox-run` automatically supplies `--mcp-stdio` if omitted.
 - **`\;`**: Terminates the hook definition (the backslash is required in most shells to prevent the `;` from being interpreted as a command separator).
+
+`harnx-sandbox-run` keeps sidecar processes (such as `harnx-aws-creds`, `harnx-k8s-creds`, and `harnx-proxy-auth`) running for the entire duration of the sandboxed payload. Environment mutations from credential providers override caller settings (provider-wins), while proxy additions yield to caller settings (caller-wins). When the sandboxed command exits, MCP sessions close. Sandbox-run waits up to 500 ms per service, then kills and reaps any remaining child.
 
 ### Example: AWS Credentials with `harnx-aws-creds`
 
@@ -360,21 +362,45 @@ Hooks allow you to run a command before the main process starts to inject creden
 
 **How it works:**
 
-1. On startup, it resolves credentials from the host using the standard AWS credential chain (env vars → `~/.aws/credentials` → IAM instance role → SSO → etc.)
+1. On startup, it configures the host AWS SDK credential chain (environment, shared profiles, instance roles and other supported sources). The HTTP handler resolves credentials on demand.
 2. It starts a local HTTP server on `127.0.0.1:<random-port>` implementing the [AWS container credentials protocol](https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html)
 3. For every `bash_exec`/`bash_spawn` tool call it injects three env vars into the sandboxed process:
    - `AWS_CONTAINER_CREDENTIALS_FULL_URI` — points to the local server
    - `AWS_CONTAINER_AUTHORIZATION_TOKEN` — a per-session bearer token
    - `AWS_REGION` — resolved from config
 
-The AWS SDK inside the sandbox calls back to the local server to fetch credentials on demand. The sandbox process never sees `~/.aws` or raw `AWS_ACCESS_KEY_ID` values. See [harnx-aws-creds documentation](aws-creds.md) for full details.
+The AWS SDK inside the sandbox calls the local server to fetch actual AWS keys on demand; those keys aren't injected as environment variables. Host `~/.aws` stays unmounted. Protect the endpoint capability and credential output. See [harnx-aws-creds documentation](aws-creds.md) for full details.
 
 ```bash
 # Use the default credential chain (env vars, ~/.aws default profile, IAM role, etc.)
-harnx-sandbox-run --hook claude-command-persistent harnx-aws-creds \; -- claude
+harnx-sandbox-run --hook environment harnx-aws-creds \; -- claude
 
 # Use a specific named profile from ~/.aws/config
-harnx-sandbox-run --hook claude-command-persistent harnx-aws-creds --profile my-profile \; -- claude
+harnx-sandbox-run --hook environment harnx-aws-creds --profile my-profile \; -- claude
+```
+
+### Example: Kubernetes Credentials with `harnx-k8s-creds`
+
+`harnx-sandbox-run` queries `harnx-k8s-creds` directly as an MCP stdio environment tool via `--hook environment harnx-k8s-creds [ARGS...] \;`. Legacy JSONL adapters were removed; `harnx-sandbox-run` keeps the helper service alive until the sandboxed command exits. Host `~/.kube` stays unmounted; authorized clients receive actual provider tokens, which can be long-lived for static providers.
+
+**How it works:**
+
+1. On startup, it loads the selected host kubeconfig contexts, then starts an authenticated HTTP token endpoint on `127.0.0.1:<random-port>`.
+2. It writes a synthetic kubeconfig in the OS temp directory, retains it for the service lifetime and injects its path as `KUBECONFIG`. The file contains cluster metadata and a local-service capability, not source tokens or host plugin commands.
+3. When `kubectl` runs inside the sandbox, its curl exec plugin requests `/token/<context>`. The service resolves host tokens on demand and refreshes cached tokens within 60 seconds of reported expiry. Tokens without an expiry stay cached.
+
+See [harnx-k8s-creds documentation](k8s-creds.md) for full details.
+
+```bash
+# Single cluster context
+harnx-sandbox-run \
+  --hook environment harnx-k8s-creds --context my-cluster \; \
+  -- kubectl get pods
+
+# Multiple cluster contexts
+harnx-sandbox-run \
+  --hook environment harnx-k8s-creds --context cluster-a --context cluster-b \; \
+  -- kubectl get pods
 ```
 
 ### Example: GitHub credentials with `harnx-proxy-auth`
@@ -392,7 +418,7 @@ Available jaq helpers: `bearer(token)` → `"Bearer <token>"`, `basic(user; pass
 
 ```bash
 harnx-sandbox-run \
-  --hook claude-command-persistent harnx-proxy-auth \
+  --hook environment harnx-proxy-auth \
     --env 'if env.GITHUB_TOKEN
         then .GITHUB_TOKEN = "ghp_\($fake_base64_key)"
         end' \
@@ -446,7 +472,7 @@ chmod +x "$SHIM_DIR/jira-auth-hook.py"
 
 ```bash
 harnx-sandbox-run \
-  --hook claude-command-persistent harnx-proxy-auth \
+  --hook environment harnx-proxy-auth \
     --fs '{"harnx-fs-acli/acli/.keep": ""}' \
     --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}' \
     --hook "$SHIM_DIR/jira-auth-hook.py" \
@@ -462,7 +488,7 @@ All `--env` and `--hook` flags for a single `harnx-proxy-auth` instance accumula
 
 ```bash
 harnx-sandbox-run \
-  --hook claude-command-persistent harnx-proxy-auth \
+  --hook environment harnx-proxy-auth \
     --env 'if env.GITHUB_TOKEN
         then .GITHUB_TOKEN = "ghp_\($fake_base64_key)"
         end' \

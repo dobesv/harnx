@@ -456,7 +456,7 @@ harnx call tool bash_exec '["echo", "two words"]'
 
 #### Error Handling and Output Contracts
 
-- **Exit codes**: Returns **0** on successful execution; returns **1** on any failure (argument validation error, missing tool, tool execution error, hook rejection, timeout, or reservation failure).
+- **Exit codes**: Returns **0** on successful execution; returns **1** on any failure (argument validation error, missing tool, tool execution error, middleware rejection, timeout, or reservation failure).
 - **`--json` parseability**: In `--json` mode, stdout remains valid, parseable JSON on all exit paths:
   - If the tool provider returned an error or partial result, that exact JSON payload is written to stdout.
   - If failure occurred before a tool result was produced (for example, bad arguments, invalid configuration, or discovery errors), stdout contains `{"isError": true, "error": "<message>"}`.
@@ -467,9 +467,9 @@ harnx call tool bash_exec '["echo", "two words"]'
 
 Tool execution through `harnx call tool` runs with scoped operator consent:
 
-- **Root operator invocation auto-approval**: When an operator runs `harnx call tool`, any `PreToolUse` hook that requests approval (`"permissionDecision": "ask"`) is automatically approved for that specific tool call ID. Because the human operator directly initiated the call, no second interactive approval prompt is presented.
-- **Hook `deny` enforced**: A `PreToolUse` hook that returns `"deny"` (or exits with code 2) is strictly enforced. The tool is blocked immediately, returning a blocked tool result (`"blocked_by_hook": true`) and exiting with code 1.
-- **Hook mutations and schema validation**: Any argument mutations returned by hooks (`mutatedToolInput`) are applied before execution, and tool input schemas are validated normally.
+- **Root operator invocation auto-approval**: When an operator runs `harnx call tool`, any confirmation requested by tool middleware (`confirm`) is automatically approved for that specific tool call ID. Because the human operator directly initiated the call, no second interactive approval prompt is presented.
+- **Middleware `deny` enforced**: A middleware script that invokes `deny <reason>` (or exits nonzero with `on_error: deny`) is strictly enforced. The tool is blocked immediately, returning a blocked tool result and exiting with code 1.
+- **Middleware argument mutations and schema validation**: Any argument mutations performed before calling `next` in middleware are applied before execution, and tool input schemas are validated normally.
 - **Nested approval isolation**: Root consent applies only to the root tool call ID. If the invoked tool spawns nested sub-agents or secondary tool calls, those nested calls do not inherit root approval. In the non-interactive CLI environment, nested approval requests safely defer or decline rather than executing unconfirmed.
 
 ### `harnx call bash '<script>' [--tools <selectors>] [--json]`
@@ -528,9 +528,9 @@ Tool inference uses bounded static AST analysis via BashKit. It parses script st
 
 Scripts run under root operator consent:
 
-- **Operator inner call auto-approval**: When an operator runs `harnx call bash`, any `PreToolUse` hook that returns `"permissionDecision": "ask"` for an inner tool call is automatically approved. Unlike normal agent turns, the operator script does not prompt interactively for inner calls.
+- **Operator inner call auto-approval**: When an operator runs `harnx call bash`, any confirmation requested by tool middleware (`confirm`) for an inner tool call is automatically approved. Unlike normal agent turns, the operator script does not prompt interactively for inner calls.
 - **Contrast with agent scripts**: Normal agent Bash scripts fail closed with exit code 3 (`needs approval: <tool>; call it directly instead of from bash`) when an inner tool requires confirmation.
-- **Hook `deny` enforced**: A `PreToolUse` hook that returns `"deny"` (or exits with code 2) blocks the inner tool call. The inner command exits with status 4 and writes the rejection reason to stderr (with empty stdout); it does not return a JSON object to the script. By default, BashKit enables `set -e`, so an unhandled denial makes the outer CLI exit 1. Scripts can use `set +e` to handle the inner status; if a later command succeeds and the script finishes with status 0, the CLI exits 0.
+- **Middleware `deny` enforced**: A middleware that denies an inner tool call blocks it. The inner command exits with status 4 and writes the rejection reason to stderr (with empty stdout); it does not return a JSON object to the script. By default, BashKit enables `set -e`, so an unhandled denial makes the outer CLI exit 1. Scripts can use `set +e` to handle the inner status; if a later command succeeds and the script finishes with status 0, the CLI exits 0.
 - **Control tools excluded**: Control tools (`bash`, `switch_agent`, `ask_user`, and `*_session_handoff`) are excluded from the inner catalog and cannot be invoked from inside the script.
 - **Child agent isolation**: If an inner tool invokes a child agent or triggers delegated sub-agent turns, those child sessions retain their own normal confirmation policies and do not inherit operator auto-approval.
 

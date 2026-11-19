@@ -704,10 +704,7 @@ impl ToolProvider for NatsToolProvider {
 /// to) turns any of those into "zero tools registered", silently, which is
 /// the exact failure class the zero-registration warning exists to catch.
 /// Check the stream directly first and match the specific JetStream
-/// STREAM_NOT_FOUND error code instead, the same way
-/// `nats_hook_provider::optional_bucket_snapshot` already does for hooks —
-/// that check is the narrower, correct one; this makes the tool side match
-/// it rather than the other way around.
+/// STREAM_NOT_FOUND error code instead. Other failures must remain visible.
 async fn open_registry_store(
     jetstream: &async_nats::jetstream::Context,
 ) -> anyhow::Result<Option<async_nats::jetstream::kv::Store>> {

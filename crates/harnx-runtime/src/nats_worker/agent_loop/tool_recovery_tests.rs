@@ -71,14 +71,6 @@ fn mixed_context(scope: harnx_core::instance::ServerScope) -> crate::tool::ToolE
         emit_tool_blocked_fn: Arc::new(|_, _| {}),
         emit_tool_update_fn: Arc::new(|_, _| {}),
         confirm_tool_use_fn: Arc::new(|_, _, _| crate::tool::ToolUseConfirmation::Approve),
-        dispatch_hook_fn: Arc::new(|_| {
-            Box::pin(async {
-                harnx_core::hooks::HookOutcome {
-                    control: harnx_core::hooks::HookResultControl::Continue,
-                    result: Default::default(),
-                }
-            })
-        }),
         prepare_handoff_fn: None,
     }
 }

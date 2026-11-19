@@ -10,7 +10,7 @@ use crate::tool_output::{
 use anyhow::{bail, ensure, Context, Result};
 use futures_util::StreamExt;
 use harnx_core::tool::{ToolCall, ToolDeclaration};
-use harnx_engine::tool::{eval_inner_tool_call, ToolEvalContext, ToolUseConfirmation};
+use harnx_engine::tool::{eval_inner_tool_call, ToolEvalContext};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -251,26 +251,6 @@ pub(crate) fn operator_bash_inner_declarations(
     admitted
 }
 
-/// Approve the root `bash` call of an operator script run, mirroring the
-/// wrapper `eval_operator_tool_call` applies to direct calls (#2630). The
-/// Bash path keeps the context shared (the provider upgrades the weak slot
-/// reference to fork inner-call contexts during the run), so the wrapper is
-/// applied before the context is installed into the slot. Inner calls never
-/// see it: the fork resets confirmation, and operator-script consent is what
-/// re-approves them.
-pub(crate) fn approve_root_bash_call(ctx: &mut ToolEvalContext, root_call_id: &str) {
-    let root_name = crate::config::BASH_TOOL_NAME.to_string();
-    let root_id = root_call_id.to_string();
-    let original = ctx.confirm_tool_use_fn.clone();
-    ctx.confirm_tool_use_fn = Arc::new(move |candidate, arguments, reason| {
-        if candidate.name == root_name && candidate.id.as_deref() == Some(root_id.as_str()) {
-            ToolUseConfirmation::Approve
-        } else {
-            original(candidate, arguments, reason)
-        }
-    });
-}
-
 /// Script and execution options shared by reserved and session operator calls.
 pub(crate) struct BashInvocation<'a> {
     pub script: &'a str,
@@ -353,7 +333,7 @@ pub(crate) fn subject(cluster: &str, route: &SessionActivationRoute) -> Result<S
 }
 
 /// Capture the active session before awaiting routing. Never creates a default
-/// agent or virtual caller session. All provider/hook execution stays on workers.
+/// agent or virtual caller session. All provider and middleware execution stays on workers.
 pub async fn run_session_tool_command(
     config: &GlobalConfig,
     abort: &crate::utils::AbortSignal,

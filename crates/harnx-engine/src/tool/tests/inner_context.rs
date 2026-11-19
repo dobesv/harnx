@@ -15,13 +15,10 @@ fn silent_options(
 }
 
 fn context_with_metadata() -> ToolEvalContext {
-    let mut outer = test_context(
-        vec![
-            Arc::new(MockToolProvider::panic("base_tool")),
-            Arc::new(MockToolProvider::panic("bash")),
-        ],
-        |_| continue_hook_outcome(),
-    );
+    let mut outer = test_context(vec![
+        Arc::new(MockToolProvider::panic("base_tool")),
+        Arc::new(MockToolProvider::panic("bash")),
+    ]);
     outer.tool_round = Some(1);
     outer.render = Some(ToolEvalRenderContext {
         decl_map: Arc::new(HashMap::new()),
@@ -46,8 +43,9 @@ fn assert_inner_dependencies(inner: &ToolEvalContext, outer: &ToolEvalContext) {
     assert!(Arc::ptr_eq(&inner.providers[0], &outer.providers[0]));
     for (name, shared) in [
         (
-            "hooks",
-            Arc::ptr_eq(&inner.dispatch_hook_fn, &outer.dispatch_hook_fn),
+            "middleware",
+            inner.middleware_fn.as_ref().map(Arc::as_ptr)
+                == outer.middleware_fn.as_ref().map(Arc::as_ptr),
         ),
         (
             "work boundary",
@@ -150,66 +148,6 @@ fn fork_preserves_outer_context_and_shares_admission_dependencies() {
     }
 }
 
-#[tokio::test]
-async fn fork_defers_approval_without_dispatch_or_changing_outer_consent() {
-    let calls = Arc::new(Mutex::new(0));
-    let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let captured_hooks = Arc::clone(&hooks);
-    let mut outer = test_context(
-        vec![Arc::new(MockToolProvider::ok_with_call_count(
-            "tool_a",
-            Duration::ZERO,
-            json!({"ok": true}),
-            Arc::clone(&calls),
-        ))],
-        move |event| {
-            captured_hooks.lock().unwrap().push(event.event_name());
-            if matches!(event, HookEvent::PreToolUse { .. }) {
-                HookOutcome {
-                    control: HookResultControl::Ask {
-                        reason: Some("approval needed".into()),
-                    },
-                    result: HookResult::default(),
-                }
-            } else {
-                continue_hook_outcome()
-            }
-        },
-    );
-    let confirmations = Arc::new(AtomicUsize::new(0));
-    let captured = Arc::clone(&confirmations);
-    outer.confirm_tool_use_fn = Arc::new(move |_, _, _| {
-        captured.fetch_add(1, Ordering::SeqCst);
-        ToolUseConfirmation::Approve
-    });
-    let inner = outer.fork_for_inner_calls(silent_options(outer.providers.clone(), Some(12)));
-    let abort = create_abort_signal();
-    let error = eval_inner_tool_call(&inner, test_call("tool_a"), &abort)
-        .await
-        .unwrap_err();
-    let approval = error.downcast_ref::<ToolApprovalRequiredError>().unwrap();
-    assert_eq!(approval.deferred_calls().len(), 1);
-    assert_eq!(
-        approval.deferred_calls()[0].reason.as_deref(),
-        Some("approval needed")
-    );
-    assert_eq!(*calls.lock().await, 0);
-    assert_eq!(confirmations.load(Ordering::SeqCst), 0);
-    assert_eq!(*hooks.lock().unwrap(), ["PreToolUse"]);
-
-    let result = eval_inner_tool_call(&outer, test_call("tool_a"), &abort)
-        .await
-        .unwrap()
-        .result;
-    assert_eq!(result.output, json!({"ok": true}));
-    assert_eq!(*calls.lock().await, 1);
-    assert_eq!(confirmations.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        *hooks.lock().unwrap(),
-        ["PreToolUse", "PreToolUse", "PostToolUse"]
-    );
-}
-
 type Trace = Arc<std::sync::Mutex<Vec<(&'static str, String, Value)>>>;
 
 fn collector(trace: &Trace, kind: &'static str) -> Arc<ToolCallEmitFn> {
@@ -227,22 +165,29 @@ fn collector(trace: &Trace, kind: &'static str) -> Arc<ToolCallEmitFn> {
 async fn fork_routes_lifecycle_and_progress_to_collectors_with_parent_round() {
     let provider = Arc::new(UpdatingToolProvider::default());
     let origins = Arc::clone(&provider.origins);
-    let outer = test_context_with_emitters(
+    let mut outer = test_context_with_emitters(
         vec![provider, Arc::new(MockToolProvider::panic("blocked_tool"))],
-        |event| match event {
-            HookEvent::PreToolUse { tool_name, .. } if tool_name == "blocked_tool" => HookOutcome {
-                control: HookResultControl::Block {
-                    reason: "blocked".into(),
-                },
-                result: HookResult::default(),
-            },
-            _ => continue_hook_outcome(),
-        },
         |_, _| panic!("inner Started reached outer UI"),
         |_, _| panic!("inner Completed reached outer UI"),
         |_, _| panic!("inner Blocked reached outer UI"),
         |_, _| panic!("inner progress reached outer UI"),
     );
+    outer.middleware_fn = Some(Arc::new(|prep, _origin, next| {
+        Box::pin(async move {
+            if prep.call.name == "blocked_tool" {
+                return Ok(ToolMiddlewareOutcome::Completed(
+                    MaterializedToolResult::new(
+                        ToolResult::new(
+                            prep.call.clone(),
+                            json!({"error": "blocked", "blocked_by_hook": true}),
+                        ),
+                        InnerToolCallStatus::Blocked,
+                    ),
+                ));
+            }
+            next(prep.arguments).await
+        })
+    }));
     let trace = Trace::default();
     let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured_updates = Arc::clone(&updates);
@@ -280,8 +225,9 @@ async fn fork_routes_lifecycle_and_progress_to_collectors_with_parent_round() {
         [
             ("started", success_id.clone(), json!({})),
             ("completed", success_id.clone(), json!({"ok": true})),
+            ("started", blocked_id.clone(), json!({})),
             (
-                "blocked",
+                "completed",
                 blocked_id,
                 json!({"error": "blocked", "blocked_by_hook": true})
             ),
@@ -298,22 +244,19 @@ async fn fork_routes_lifecycle_and_progress_to_collectors_with_parent_round() {
 #[tokio::test]
 async fn excluded_provider_is_unreachable_in_fork_but_still_available_to_outer() {
     let calls = Arc::new(Mutex::new(0));
-    let outer = test_context(
-        vec![
-            Arc::new(MockToolProvider::ok(
-                "base_tool",
-                Duration::ZERO,
-                json!({"base": true}),
-            )),
-            Arc::new(MockToolProvider::ok_with_call_count(
-                "bash",
-                Duration::ZERO,
-                json!({"outer": true}),
-                Arc::clone(&calls),
-            )),
-        ],
-        |_| continue_hook_outcome(),
-    );
+    let outer = test_context(vec![
+        Arc::new(MockToolProvider::ok(
+            "base_tool",
+            Duration::ZERO,
+            json!({"base": true}),
+        )),
+        Arc::new(MockToolProvider::ok_with_call_count(
+            "bash",
+            Duration::ZERO,
+            json!({"outer": true}),
+            Arc::clone(&calls),
+        )),
+    ]);
     let base_providers = vec![Arc::clone(&outer.providers[0])];
     let inner = outer.fork_for_inner_calls(silent_options(base_providers, Some(12)));
     let abort = create_abort_signal();
@@ -341,9 +284,7 @@ async fn excluded_provider_is_unreachable_in_fork_but_still_available_to_outer()
 
 #[tokio::test]
 async fn fork_keeps_work_boundary_checks_and_parent_cancellation() {
-    let mut outer = test_context(vec![Arc::new(MockToolProvider::panic("tool_a"))], |_| {
-        continue_hook_outcome()
-    });
+    let mut outer = test_context(vec![Arc::new(MockToolProvider::panic("tool_a"))]);
     let boundaries = Arc::new(AtomicUsize::new(0));
     let captured = Arc::clone(&boundaries);
     outer.work_boundary = Some(Arc::new(move |boundary, _| {

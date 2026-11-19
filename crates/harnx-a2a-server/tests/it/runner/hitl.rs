@@ -63,9 +63,7 @@ async fn apply_denial_and_advance(
     let active = context.document.state.active.as_ref().unwrap();
     let request = &active.hitl_checkpoint.as_ref().unwrap().request;
     assert_eq!(
-        session
-            .decide_hitl_approval_for(request, false, Some("not this handoff".into()))
-            .await?,
+        decide_hitl(h, session, request, false, Some("not this handoff".into())).await?,
         HitlDecisionOutcome::Applied
     );
     wait_terminal_progress(session, ticket).await?;
@@ -196,12 +194,11 @@ async fn apply_first_and_wait_second(
         .request
         .clone();
     assert_eq!(
-        session
-            .decide_hitl_approval_for(&first, false, None)
-            .await?,
+        decide_hitl(h, session, &first, false, None).await?,
         HitlDecisionOutcome::Applied
     );
-    let second = wait_second_approval(session, ticket, first.request_seq, &h.logs.text()).await?;
+    let second =
+        wait_second_approval(h, session, ticket, first.request_seq, &h.logs.text()).await?;
     following(h, session, context).await?;
     Ok(second)
 }
@@ -290,9 +287,7 @@ async fn advance_to_newer_checkpoint(
         .as_ref()
         .unwrap()
         .request;
-    session
-        .decide_hitl_approval_for(request, false, None)
-        .await?;
+    decide_hitl(&http.h, session, request, false, None).await?;
     following(&http.h, session, context).await?;
     let mut resumed = http
         .h

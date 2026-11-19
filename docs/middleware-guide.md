@@ -6,8 +6,9 @@ helper tools. It runs in the worker, including cloud/unmanaged workers without
 `manage_servers`; it doesn't launch a hook-server process. Helper tool servers
 still need to be available to that worker.
 
-Legacy `hooks:` continues to work separately. See the [Hooks Guide](hooks-guide.md)
-for lifecycle events and existing NATS hook servers.
+Lifecycle `hooks:` are in-process event scripts now; see the [Hooks Guide](hooks-guide.md).
+To call an existing Claude hook command from middleware, use the
+[Claude compatibility tool](middleware-claude-hooks.md).
 
 ## Configure middleware
 
@@ -54,10 +55,12 @@ tool, B-after, A-after. Each entry sees the arguments passed to it by its parent
 Tool-server entries join the resolved chain; their `match` controls which calls
 they wrap, so use a narrow matcher if they should affect only that server's tools.
 
-A full entry with the same name at a later level replaces the earlier entry
-without moving its position. A later `{name: label-bash, enabled: false}` removes
-it. Disabling an unknown earlier name is an error, as are duplicate names at the
-same level (including across tool-server files).
+A full entry with the same name at a later level — or in a later tool-server
+file — replaces the earlier entry without moving its position. A later
+`{name: label-bash, enabled: false}` removes it. Disabling an unknown earlier
+name is an error, as are duplicate names within one file. The same name across
+tool-server files follows the replacement rule, so packages shipping the same
+middleware (for example `proxy-auth` on `bash`) resolve to a single chain entry.
 
 ## Script operations
 
@@ -431,7 +434,7 @@ approve a request.
 
 Only the answered call reruns, from the outermost middleware with its last
 committed checkpoint and accepted responses. Completed siblings don't run their
-middleware, approval, provider or PostToolUse again. Pending unanswered calls stay
+middleware, confirmation, or provider again. Pending unanswered calls stay
 waiting. The worker merges all results in original call order into one
 `ToolResults` entry before calling the model. Handoff activation is round-level:
 Atlas can't start while a sibling still awaits a response.
@@ -492,25 +495,29 @@ a NATS cluster, follow a reader-first rollout:
    expecting them to answer confirmation requests.
 2. **Hold back middleware writers until readers are upgraded.** Any non-empty
    `middleware:` list starts writing durable entries. The updated `pantheon`
-   package ships a middleware chain for Daedalus (`packages/pantheon/agents/daedalus.md`).
+   and `coding` packages ship middleware chains for proxy auth (`packages/{pantheon,coding}/tool_servers/bash.yaml`)
+   and Daedalus handoffs (`packages/pantheon/agents/daedalus.md`).
    To prevent workers from writing new entries during the rollout window:
-   - Keep the previous `pantheon` package pinned on workers, or
-   - Remove the `middleware:` block from `packages/pantheon/agents/daedalus.md`
-     (and any other declaring file) before deploying package files to workers.
-   - Do not try to disable Daedalus's middleware with a global `middleware:` entry
+   - Keep previous package versions pinned on workers, or
+   - Remove the `middleware:` blocks from `packages/{pantheon,coding}/tool_servers/bash.yaml`
+     and `packages/pantheon/agents/daedalus.md` (and any other declaring file) before deploying package files to workers.
+   - Do not try to disable middleware with global `middleware:` entries
      such as `{name: confirm-atlas-handoff, enabled: false}` in `config.yaml`.
      The configuration loader evaluates global entries first, before agent definitions
      exist, and errors with "cannot disable an unknown earlier entry". Later definitions
      in agent front matter would re-add the entry anyway. Remove the entry directly
      at its declaring source instead.
-3. **Understand confirmation fallback without middleware.**
-   - If the previous `pantheon` package remains pinned, Daedalus continues using
-     its legacy PreToolUse `ask` hook on `atlas_session_handoff` via
-     `harnx-claude-compatible-hook-server`, requiring confirmation through legacy
-     HITL approvals.
+3. **Understand confirmation and proxy-auth fallback without middleware.**
+   - Pinned packages containing legacy command hooks fail config loading in
+     this release. A rollback needs an older binary with its matching package.
+     Saved legacy approvals remain readable and answerable in this release. Never
+     delete session logs or checkpoint stores to unblock or roll back a session.
    - If the updated `pantheon` package is deployed with the `middleware:` block
      removed from `daedalus.md`, `atlas_session_handoff` has neither hooks nor
      middleware. Handoffs to Atlas execute directly without prompting for confirmation.
+   - If `middleware:` is removed from `tool_servers/bash.yaml`, commands run
+     without proxy-auth environment injection unless environment variables are
+     configured manually.
 4. **Drain in-flight turns before upgrading workers running middleware.** Workers
    from older releases leave no round-start or attempt-start records in the checkpoint
    store. Without those records, crash recovery must classify calls using the current
@@ -538,8 +545,9 @@ through failover. It contains snapshots and execution observations that must not
 be published as transcript or model input.
 
 Middleware emits tracing events for start, finish and failure with its name.
-Legacy `PostToolUse` hooks run per actual downstream dispatch, not once per outer
-middleware result. See [hook dispatch behavior](hooks-guide.md#middleware-and-posttooluse).
+Legacy process `PostToolUse` hooks no longer run from middleware: since lifecycle
+`hooks:` became in-process event scripts (T3.4), no legacy tool hook servers can
+be configured, so each `next` dispatch fires middleware only.
 
 ## Example tests and timing
 

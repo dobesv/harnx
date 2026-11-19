@@ -9,14 +9,13 @@ description = "Run commands inside the birdcage sandbox with hook support"
 
 [dependencies]
 harnx-sandbox-common = { path = "../harnx-sandbox-common" }
-harnx-hooks = { path = "../harnx-hooks" }
 harnx-core = { path = "../harnx-core" }
 clap = { workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "process", "io-util"] }
 log = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
+rmcp = { workspace = true }
 
 
 [dev-dependencies]

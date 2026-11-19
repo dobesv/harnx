@@ -331,7 +331,7 @@ through the progress classification above.
 
 Tests under `tests/it/` use real admission, JetStream and a worker, not only seeded
 context documents. `support.rs::Script::SameRoundTools` emits two native time-tool
-calls in one model completion and uses a real `PreToolUse` hook to defer them.
+calls in one model completion and uses middleware confirmation to defer them.
 
 - `unary/hitl.rs` covers approval, model-visible full rejection reasons, context-only
   replies, unrecognized messages, parked cancellation and same-round approval identity.

@@ -472,22 +472,32 @@ fn write_proxy_auth_fixture_files(
     repo_root: &Path,
 ) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
-    // Single-quote the binary path so spaces in the path don't split the token.
-    let bin_path = binaries.proxy_auth.to_string_lossy().replace('\'', "'\\''");
     write_yaml(
         &paths.config_path,
         &json!({
             "save": false,
-            "hooks": { "entries": [{
-                "command": format!("'{bin_path}' --hook ."),
-            }]},
+            "middleware": [{
+                "name": "proxy-auth",
+                "match": "^bash_(exec|spawn)$",
+                "python": "additions = call_tool(\"proxy_auth_environment\", {})\nif additions.get(\"is_error\") or additions.get(\"isError\"):\n    raise RuntimeError(\"proxy auth environment lookup failed\")\nargs = tool_input()[\"arguments\"]\ncaller_env = args.get(\"env\")\nif not isinstance(caller_env, dict):\n    caller_env = {}\nenv = additions[\"env\"]\nenv.update(caller_env)\nargs[\"env\"] = env\nrespond(call_next(args))",
+                "tools": ["proxy_auth_environment"],
+                "timeout": "25h",
+                "on_error": "deny"
+            }],
         }),
     )?;
     write_mock_llm_client(&paths.harnx_config_dir, paths.port)?;
 
     let tool_servers_dir = paths.harnx_config_dir.join("tool_servers");
     std::fs::create_dir_all(&tool_servers_dir)?;
-    // This test checks hook-provided process environment, not birdcage. Some CI
+    write_yaml(
+        &tool_servers_dir.join("proxy_auth.yaml"),
+        &json!({
+            "command": binaries.proxy_auth,
+            "args": ["--tool-server"],
+        }),
+    )?;
+    // This test checks middleware-provided process environment, not birdcage. Some CI
     // hosts block user namespaces, which makes sandbox-exec exit 127 before bash runs.
     write_yaml(
         &tool_servers_dir.join("bash.yaml"),

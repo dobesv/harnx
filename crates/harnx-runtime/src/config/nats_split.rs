@@ -362,7 +362,7 @@ impl Config {
 }
 
 /// Convert a config-file cluster entry into the connect-options builder
-/// shared with the standalone tool/hook servers.
+/// shared with the standalone tool servers.
 impl From<&NatsServerConfig> for NatsEndpoint {
     fn from(server: &NatsServerConfig) -> Self {
         Self {
@@ -705,9 +705,9 @@ mod tests {
         assert_error_mentions(&error.to_string(), &["HARNX_NATS_REPLICAS"]);
     }
 
-    /// A worker on a TLS cluster must be able to discover tool/hook servers
+    /// A worker on a TLS cluster must be able to discover tool servers
     /// over TLS too: `resolve_local_nats_server_config` backs
-    /// `NatsToolProvider`/`NatsHookProvider` discovery (both call
+    /// `NatsToolProvider` discovery (calls
     /// `config.nats_client(LOCAL_CLUSTER_KEY)`), so it must read the same
     /// `HARNX_NATS_TLS*` variables `NatsEndpoint::from_env` does, or that
     /// discovery silently stays plaintext regardless of cluster config.

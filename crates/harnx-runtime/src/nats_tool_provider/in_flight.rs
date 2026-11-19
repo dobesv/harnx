@@ -161,6 +161,7 @@ impl NatsInFlightCalls {
         Self { state }
     }
 
+    #[cfg(test)]
     pub(crate) async fn register(
         &self,
         registration: InFlightRegistration,

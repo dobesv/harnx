@@ -48,8 +48,9 @@ documents:
 
 hooks:
   max_resume: 3
-  entries:
-    - command: harnx-claude-compatible-hook-server --event Stop -- /path/to/hook.sh
+  Stop:
+    - name: keep-going
+      bash: resume "finish the checklist first"
 ---
 
 You are a helpful coding assistant working on the {{project_dir}} project.
@@ -77,7 +78,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | `documents` | `list` | `[]` | Document paths for RAG integration. See [Documents](#documents-rag). |
 | `instructions` | `string` | none | If set, overrides the Markdown body as the system prompt. |
 | `middleware` | `list` | `[]` | In-process tool-call scripts, including durable confirmations. See [Tool middleware and confirmation](#tool-middleware-and-confirmation). |
-| `hooks` | `object` | none | Legacy per-agent hook configuration. See [Hooks](#hooks). |
+| `hooks` | `object` | none | Per-agent lifecycle event hooks. See [Hooks](#hooks). |
 
 ## Variables
 
@@ -376,7 +377,7 @@ bash_tools:
     - Untracked native preallocations in `str` and `bytes` `join`/`split` allocate directly on the host heap and abort on allocation failure.
     No newer compatible BashKit release is known to resolve these issues. Python cannot be disabled separately in this version. Use script mode with Python only where a crashed worker is acceptable. For untrusted prompts, leave `bash_tools` unset so the script-mode `bash` tool is not exposed.
 - **Attachments**: `/attachments` is a read-only mount of session media. Read a file at `/attachments/<full-media-cid>` (for example `/attachments/cid:media:<agent>/<session>/<sha256>`); bytes are fetched on first read and cached for the rest of the run. Files over 10 MB fail rather than truncate, listings are empty, and writes fail with a read-only error. `test -f` and other metadata probes answer from object metadata alone — they never download or consume the cache. If the cache is full, subsequent reads fail fast before downloading any content. Images, audio and embedded resources returned by inner tools are stored as attachments before the script sees them, so commands print `[attachment: <cid> (<mime>, <size>)] path=/attachments/<cid>` in place of the inline image, audio or resource blocks. Data URIs embedded inside ordinary text are left as they are. If an upload fails after retries, the inner call fails as a tool error with the inline media discarded; scripts running `set +e` continue.
-- **Attachment access**: Reading from `/attachments` doesn't go through the `attachment_read` tool, so it isn't limited by `use_tools`/`bash_tools` and doesn't fire `PreToolUse` hooks. A script can read any media CID it names that the worker's broker credentials can read, which is the same rule `attachment_read` applies. If an agent must not read attachments, don't give it script mode.
+- **Attachment access**: Reading from `/attachments` doesn't go through the `attachment_read` tool, so it isn't limited by `use_tools`/`bash_tools` and doesn't run tool middleware. A script can read any media CID it names that the worker's broker credentials can read, which is the same rule `attachment_read` applies. If an agent must not read attachments, don't give it script mode.
 - **Error handling**: `set -e` is enabled by default: the script stops when a command fails, following POSIX `set -e` rules — failures of non-final pipeline members, commands guarded with `&&`/`||` or `if`, and background jobs don't stop the run. Scripts can use `set +e` to handle non-zero exit codes.
 - **Command mappings**: Each inner tool becomes a command with the same name. Tool parameters map to kebab-case long options (e.g. `--file-path`, `--max-output-bytes`). Scalar values accept `--flag value` or `--flag=value`; booleans accept `--flag` / `--no-flag`; repeated arrays accept multiple flags. Complex or nested objects take JSON literals or `--json '<json>'` (or `--json -` for stdin).
 - **Discovery**: Scripts can run `tools [pattern]` to list available commands and their synopses, `help <tool>` for full parameter documentation, or `<tool> --help`.
@@ -386,10 +387,10 @@ bash_tools:
   - `1`: Tool error (message on stderr; partial results on stdout if available).
   - `2`: Usage error (flag or schema mismatch on stderr; command is not dispatched).
   - `3`: Approval required (`needs approval: <tool>; call it directly instead of from bash`). Tools requiring human approval fail fast rather than hanging the script.
-  - `4`: Blocked by policy or hook.
+  - `4`: Blocked by policy, middleware, or hook.
   - `5`: Rejected.
   - `127`: Unknown command (with did-you-mean suggestions).
-- **Hooks and concurrency**: Inner tool calls invoke standard tool hooks (`PreToolUse`, `PostToolUse`). Parallel jobs (`&` and pipelines) are supported up to a concurrency cap of 8 simultaneous inner calls per script.
+- **Middleware and concurrency**: Inner tool calls pass through configured tool middleware. Parallel jobs (`&` and pipelines) are supported up to a concurrency cap of 8 simultaneous inner calls per script.
 - **Trace and persistence**: The `bash` result includes a compact inner-call trace whose argument summaries show only keys and value shapes (type and length), so the generated trace, live progress, and `failed_call` summaries don't repeat values a script piped in from content the model hasn't seen. Usage errors and tool error messages on stderr can still quote the values they reject. Inner calls get no session-log rows of their own; the transcript records only the outer `bash` call. The NATS invocation journal still records each inner call's full request for retry and recovery.
 - **Worker interruption**: If a worker restarts while a script runs, the invocation is reported as interrupted and never automatically re-run, avoiding duplicate side effects.
 
@@ -526,36 +527,34 @@ explains those compatibility boundaries and recovery rules; the
 
 ## Hooks
 
-Hooks let you run external commands at specific points during agent execution. They're configured under the `hooks` front-matter field. For a complete reference, see [Hooks Guide](hooks-guide.md).
+Lifecycle event hooks (`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`) run short Bash or Python scripts inside the worker process. They're configured under the `hooks` front-matter field. For a complete reference, see [Hooks Guide](hooks-guide.md).
 
 ### Configuration
 
 ```yaml
 hooks:
   max_resume: 3
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --matcher shell
-        --timeout 15
-        -- /path/to/approve-tool.sh
-    - command: harnx-claude-compatible-hook-server --event Stop -- /path/to/on-stop.sh
-      status_message: "Running stop hook..."
-      async: true
+  Stop:
+    - name: keep-going
+      bash: resume "finish the checklist first"
+  UserPromptSubmit:
+    - name: approve
+      script: hooks/approve.py
+      on_error: deny
 ```
 
 ### Hook Fields
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `command` | `string` | yes | — | Shell command to run as a hook server. For hooks that need event/matcher, use `harnx-claude-compatible-hook-server --event <E> --matcher <M>` with either `--jaq <FILTER>` or `-- <child-command>`. |
-| `status_message` | `string` | no | none | Message to display while the hook runs |
-| `async` | `boolean` | no | none | Whether to run the hook asynchronously |
-
-The `command` field specifies a hook server binary. Options:
-- **Generic runner**: `harnx-claude-compatible-hook-server --event <EVENT> [--matcher <REGEX>] [--timeout <SECS>] [--priority <N>] [--fail-policy <closed|open>] (--jaq <FILTER> | [--persistent] -- <child-command>)`. `--jaq` uses Harnx's embedded jaq engine; `--persistent` keeps a child command alive across requests.
-- **Native hooks** (e.g., `harnx-proxy-auth`): Self-declare their event/matcher and need no runner flags.
+| `name` | `string` | yes | — | Entry name; a later entry with the same name replaces an earlier one |
+| `bash` | `string` | one of `bash`/`python`/`script` | — | Inline Bash script |
+| `python` | `string` | one of `bash`/`python`/`script` | — | Inline Python script |
+| `script` | `path` | one of `bash`/`python`/`script` | — | Script file, resolved relative to the agent file |
+| `timeout` | `duration` | no | `30s` | Wall-clock limit per run |
+| `on_error` | `allow`/`deny` | no | `allow` | `deny` fails the event on a script error; not valid for `Stop`/`StopFailure` |
+| `fetch` | `list` | no | none | Exact HTTP(S) hosts the script may request |
+| `enabled` | `boolean` | no | `true` | `false` marks a disable entry that removes an earlier same-name hook |
 
 ### Top-level Hook Settings
 
@@ -565,10 +564,10 @@ The `command` field specifies a hook server binary. Options:
 
 ### Merge Behavior
 
-Agent hooks extend global hooks (defined in the main config). The merge rules are:
+Agent hooks resolve on top of global and tool-server/package hooks, per event:
 
-- Agent entries are combined with global entries
-- If an agent entry has the same `event` and `matcher` as a global entry, the agent entry replaces it
+- An agent entry with the same `name` as an earlier entry replaces it in place
+- An entry with `enabled: false` removes the earlier entry with that name
 - `max_resume`: agent value overrides global if set; otherwise the global value is used
 
 ## Using Agents

@@ -274,7 +274,7 @@ spec:
 A Kubernetes worker pod requires three distinct configuration settings:
 
 1. **`--cluster prod`**: Specifies the session connection cluster profile (`nats_servers/prod.yaml`) used for leases, session logs, and worker coordination.
-2. **`HARNX_NATS_URL` and `HARNX_NATS_TOKEN`**: **Mandatory in the pod environment.** Tool and hook discovery is a separate connection that does not read `nats_servers/<cluster>.yaml`. It resolves connection settings strictly from the worker's own process environment. If these variables are omitted, session execution connects, but tool and hook discovery fails.
+2. **`HARNX_NATS_URL` and `HARNX_NATS_TOKEN`**: **Mandatory in the pod environment.** Tool discovery is a separate connection that does not read `nats_servers/<cluster>.yaml`. It resolves connection settings strictly from the worker's own process environment. If these variables are omitted, session execution connects, but tool discovery fails.
 3. **`HARNX_SERVER_SCOPE=shared`**: Workers and independently deployed tool servers must share the same scope identifier to discover one another.
 
 In Kubernetes, leave `--manage-servers` off (the default). Workers do not spawn local subprocesses for tools; tool servers run in their own containers.

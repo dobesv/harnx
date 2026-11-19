@@ -29,7 +29,7 @@ pub enum ToolMiddlewareOrigin {
 #[derive(Debug, Clone)]
 pub struct PreparedToolCall {
     /// Original transcript identity and arguments. `arguments` below contains
-    /// parsed arguments, including any legacy hook mutation.
+    /// parsed arguments.
     pub call: ToolCall,
     pub arguments: Value,
     /// Actual invocation context, including late-installed lease/admission guards.
@@ -186,10 +186,8 @@ impl NextDispatch {
         let mut call = self.call.clone();
         call.arguments = arguments.clone();
         let effective = ApprovedToolCall {
-            tool_use_id: call.id.clone().unwrap_or_default(),
             call,
-            json_data: arguments.clone(),
-            tool_input: arguments,
+            json_data: arguments,
         };
         let output = dispatch_authorized_call(&effective, &self.ctx, &self.abort, None).await;
         materialize_dispatch_result(

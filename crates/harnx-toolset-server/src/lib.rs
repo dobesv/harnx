@@ -241,6 +241,7 @@ pub async fn serve_with_client_and_identity(
 /// Serve a toolset using an existing NATS connection, exiting cleanly (and
 /// running exit cleanup while the connection is still usable) when the
 /// lifecycle's shutdown token is cancelled, in addition to the usual failure exits.
+// qual:api
 pub async fn serve_with_shutdown(
     toolset: Arc<dyn Toolset>,
     instance_id: ServerScope,

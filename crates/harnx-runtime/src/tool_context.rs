@@ -1,7 +1,6 @@
 use crate::agent_loop::AgentLoopContext;
 use crate::config::HARNX_NATS_URL_ENV;
 use crate::config::{Config, GlobalConfig, Input};
-use crate::nats_hook_provider::NatsHookProvider;
 use crate::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use crate::tool::{CompletionText, PrepareHandoffFn};
 use crate::utils::AbortSignal;
@@ -23,7 +22,7 @@ pub struct ToolRoundParams<'a> {
     pub abort_signal: &'a AbortSignal,
     pub working_dir: Option<&'a Path>,
     pub prepare_handoff_fn: Option<Arc<PrepareHandoffFn>>,
-    pub nats_hook_provider: Option<Arc<NatsHookProvider>>,
+
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
     pub tool_loop_guard: Option<crate::tool_loop_guard::ToolLoopGuardHandle>,
 }
@@ -36,7 +35,7 @@ pub struct BuildToolEvalContextParams<'a> {
     pub current_agent_package: Option<String>,
     pub working_dir: Option<&'a Path>,
     pub prepare_handoff_fn: Option<Arc<PrepareHandoffFn>>,
-    pub nats_hook_provider: Option<Arc<NatsHookProvider>>,
+
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
     /// Round context handoff for the script-mode `bash` provider (C6). The
     /// caller fills the slot with the built context wrapped in an `Arc` right
@@ -58,7 +57,7 @@ impl<'a> BuildToolEvalContextParams<'a> {
             current_agent_package: None,
             working_dir: None,
             prepare_handoff_fn: None,
-            nats_hook_provider: None,
+
             pending_async_context: None,
             bash_context_slot: None,
             command_bash: None,
@@ -96,7 +95,7 @@ impl AgentLoopContext {
             abort_signal: &self.abort_signal,
             working_dir: self.working_dir.as_deref(),
             prepare_handoff_fn: self.prepare_handoff_fn.clone(),
-            nats_hook_provider: self.nats_hook_provider.clone(),
+
             pending_async_context: self.pending_async_context.clone(),
             tool_loop_guard: Some(self.tool_loop_guard.clone()),
         }
@@ -106,7 +105,6 @@ impl AgentLoopContext {
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_CACHE_MAX_ENTRIES: usize = 256;
 
-type HookDiscoveryCache = std::sync::Mutex<HashMap<ServerScope, CachedDiscovery<NatsHookProvider>>>;
 /// `NatsToolProvider` captures the invoking session, so registration
 /// snapshots may only be shared within that exact context.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -117,7 +115,6 @@ struct ToolDiscoveryKey {
 }
 type ToolDiscoveryCache =
     std::sync::Mutex<HashMap<ToolDiscoveryKey, CachedDiscovery<NatsToolProvider>>>;
-static NATS_HOOK_DISCOVERY_CACHE: OnceLock<HookDiscoveryCache> = OnceLock::new();
 static NATS_TOOL_DISCOVERY_CACHE: OnceLock<ToolDiscoveryCache> = OnceLock::new();
 
 fn tool_discovery_key(
@@ -202,37 +199,6 @@ async fn discover_cached<'a, K: Eq + std::hash::Hash, T>(
     fresh_discovery().await
 }
 
-/// Discover NATS hooks at most once per instance during each refresh interval.
-pub async fn discover_nats_hook_provider_cached(
-    config: &Config,
-    instance_id: &ServerScope,
-) -> Option<Arc<NatsHookProvider>> {
-    let cache = NATS_HOOK_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    discover_cached(cache, instance_id, || {
-        Box::pin(discover_nats_hook_provider_fresh(config, instance_id))
-    })
-    .await
-}
-
-/// Refresh hook discovery immediately and replace the cached snapshot.
-///
-/// Worker activations call this after reconciling an agent's hook servers;
-/// using the prior activation's cached provider here would leave a newly
-/// selected agent's hooks invisible for the cache TTL.
-pub(crate) async fn discover_nats_hook_provider_fresh(
-    config: &Config,
-    instance_id: &ServerScope,
-) -> Option<Arc<NatsHookProvider>> {
-    let cache = NATS_HOOK_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    // Don't hold the process-wide lock while connecting to NATS or scanning KV.
-    let provider = NatsHookProvider::discover(config, instance_id.clone())
-        .await
-        .ok()
-        .map(Arc::new);
-    cache_discovery(cache, instance_id.clone(), provider.clone(), Instant::now());
-    provider
-}
-
 pub async fn discover_nats_tool_provider_cached(
     config: &Config,
     instance_id: &ServerScope,
@@ -288,7 +254,7 @@ pub(crate) async fn discover_nats_tool_provider_fresh(
     provider
 }
 
-/// Whether this process was handed a broker to discover tool and hook servers on.
+/// Whether this process was handed a broker to discover tool servers on.
 ///
 /// Gate on the broker address, not on `HARNX_SERVER_SCOPE`. The worker creates
 /// its instance id in-process and only ever exports it to the children it

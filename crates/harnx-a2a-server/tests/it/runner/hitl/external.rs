@@ -19,8 +19,24 @@ pub(super) async fn wait_progress_boundary(
                 PromptProgress::InputRequired(p) if !terminal && p.request_seq > request_seq => {
                     return Ok(())
                 }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                _ => {}
             }
+            let metadata = session.metadata_store();
+            let entries = NatsSessionLog::new_with_replicas(
+                metadata.jetstream().clone(),
+                session.storage_key(),
+                metadata.replicas(),
+            )
+            .load_events_latest_required_async()
+            .await?;
+            if !terminal
+                && harnx_runtime::interactions::derive_pending_interactions(&entries)?
+                    .into_iter()
+                    .any(|p| p.request_seq > request_seq)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await?
@@ -48,7 +64,11 @@ async fn assert_external_reply_result(
     assert_eq!(
         entries
             .iter()
-            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .filter(|(_, e)| matches!(
+                e,
+                SessionLogEntry::HitlApprovalDecision { .. }
+                    | SessionLogEntry::InteractionResponse { .. }
+            ))
             .count(),
         1
     );
@@ -129,10 +149,14 @@ pub(super) async fn reply_after_external_decision(script: Script, terminal: bool
     );
     tokio::pin!(send);
     wait_for_intent_committed(&setup.http, &mut send, &mut committed, &setup.session).await?;
-    setup
-        .session
-        .decide_hitl_approval_for(&setup.request, false, Some("external decision".into()))
-        .await?;
+    decide_hitl(
+        &setup.http.h,
+        &setup.session,
+        &setup.request,
+        false,
+        Some("external decision".into()),
+    )
+    .await?;
     wait_progress_boundary(
         &setup.session,
         &setup.fixed,

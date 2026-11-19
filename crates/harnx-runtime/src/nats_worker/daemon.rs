@@ -105,7 +105,7 @@ fn validate_worker_daemon(daemon: &WorkerDaemonConfig) -> Result<()> {
         );
         anyhow::ensure!(
             daemon.manage_servers,
-            "targeted local workers require managed tool and hook servers"
+            "targeted local workers require managed tool servers"
         );
     }
     Ok(())
@@ -494,7 +494,6 @@ fn build_worker_runtime(build: WorkerRuntimeBuild) -> Arc<WorkerRuntime> {
         activation_route: setup.daemon.activation_route(),
         activation_mode: setup.daemon.activation_mode,
         activation_heartbeat_interval: setup.daemon.activation_ack_wait() / 3,
-        manage_servers: setup.daemon.manage_servers,
         worker_id: setup.daemon.worker_id.clone(),
         identity: startup.identity,
         lease: setup.daemon.lease,

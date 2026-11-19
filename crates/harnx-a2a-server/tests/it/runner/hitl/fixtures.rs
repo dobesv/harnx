@@ -64,15 +64,11 @@ pub(super) async fn challenge(
                 .iter()
                 .all(|part| matches!(part.content, PartContent::Text(_))));
             let challenge = text(&message.parts);
-            for expected in [
-                "target_session_handoff",
-                "denied-target",
-                "Reply `y`",
-                "audit log",
-                "reject",
-            ] {
-                assert!(challenge.contains(expected), "{challenge}");
-            }
+            assert!(challenge.contains("Approve handoff?"), "{challenge}");
+            assert!(
+                challenge.contains("Reply `yes`") || challenge.contains("Reply `y`"),
+                "{challenge}"
+            );
             break;
         }
     }
@@ -199,6 +195,7 @@ pub(super) async fn wait_terminal_progress(
 }
 
 pub(super) async fn wait_second_approval(
+    h: &Harness,
     session: &NatsSession,
     ticket: &FixedAdmissionTicket,
     first_seq: u64,
@@ -214,6 +211,24 @@ pub(super) async fn wait_second_approval(
                     anyhow::bail!("expected second approval, got terminal {result:?}; {log_text}")
                 }
                 _ => {}
+            }
+            let entries = NatsSessionLog::new(h.jetstream.clone(), session.storage_key())
+                .load_events_latest_required_async()
+                .await?;
+            if let Some(pending) =
+                harnx_runtime::interactions::derive_pending_interactions(&entries)?
+                    .into_iter()
+                    .find(|p| p.request_seq > first_seq)
+            {
+                return Ok::<_, anyhow::Error>(PendingHitlApproval {
+                    request_seq: pending.request_seq,
+                    tool_round_seq: pending.tool_round_seq,
+                    tool_call_id: pending.tool_call_id,
+                    tool_name: pending.request.producer,
+                    arguments: pending.request.payload,
+                    summary: pending.request.summary,
+                    interaction_id: Some(pending.interaction_id),
+                });
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -274,4 +289,63 @@ pub(super) async fn seed_saved_intent(
     let owned = claim_with_lease(h, session, &lease, "seed-claim").await?;
     let updated = write_saved_intent(h, session, &owned, (request, message)).await?;
     release_with_lease(h, session, (&updated.version()?, "seed-release"), lease).await
+}
+
+pub(super) async fn decide_hitl(
+    h: &Harness,
+    session: &NatsSession,
+    target: &ApprovalRef,
+    approved: bool,
+    note: Option<String>,
+) -> Result<HitlDecisionOutcome> {
+    let entries = NatsSessionLog::new(h.jetstream.clone(), session.storage_key())
+        .load_events_latest_required_async()
+        .await?;
+    let interaction = entries.iter().find_map(|(seq, entry)| match entry {
+        SessionLogEntry::InteractionRequested {
+            tool_round_seq,
+            tool_call_id,
+            interaction_id,
+            ..
+        } if *seq == target.request_seq
+            && *tool_round_seq == target.tool_round_seq
+            && *tool_call_id == target.tool_call_id =>
+        {
+            Some((*seq, interaction_id.clone()))
+        }
+        _ => None,
+    });
+    if let Some((request_seq, interaction_id)) = interaction {
+        let response = harnx_core::interaction::InteractionResponse {
+            action: if approved { "approve" } else { "deny" }.into(),
+            data: Default::default(),
+            note: note.clone(),
+        };
+        let outcome = session
+            .decide_interaction(&interaction_id, request_seq, &response)
+            .await?;
+        Ok(match outcome {
+            harnx_runtime::interactions::InteractionDecisionOutcome::Applied => {
+                HitlDecisionOutcome::Applied
+            }
+            harnx_runtime::interactions::InteractionDecisionOutcome::AlreadyApplied => {
+                HitlDecisionOutcome::AlreadyApplied { approved, note }
+            }
+            harnx_runtime::interactions::InteractionDecisionOutcome::Conflicting => {
+                HitlDecisionOutcome::Conflicting
+            }
+            harnx_runtime::interactions::InteractionDecisionOutcome::WrongSequence
+            | harnx_runtime::interactions::InteractionDecisionOutcome::Stale
+            | harnx_runtime::interactions::InteractionDecisionOutcome::AfterComplete => {
+                HitlDecisionOutcome::Stale
+            }
+            harnx_runtime::interactions::InteractionDecisionOutcome::LeaseLost => {
+                anyhow::bail!("interaction decision lease lost")
+            }
+        })
+    } else {
+        session
+            .decide_hitl_approval_for(target, approved, note)
+            .await
+    }
 }

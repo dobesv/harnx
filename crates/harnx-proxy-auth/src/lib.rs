@@ -1,14 +1,15 @@
 pub mod ca;
 pub mod cli;
+mod environment;
 pub mod exec_hook;
 pub mod exec_load;
 pub mod filter;
 pub mod fs_gen;
-pub mod hook;
 pub mod load;
 pub mod notice;
 pub mod proxy;
 pub mod sentinel;
+pub mod toolset;
 pub mod transform;
 
 /// Decode a standard base64 string to bytes.

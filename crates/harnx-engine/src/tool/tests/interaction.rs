@@ -72,7 +72,7 @@ async fn interaction_suspension_keeps_completed_sibling_and_orders_callbacks() {
     let events: Events = Default::default();
     let release = Arc::new(Notify::new());
     let entered = Arc::new(Notify::new());
-    let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+    let mut ctx = test_context(vec![]);
     callbacks(&mut ctx, &events);
     let (wait, started) = (release.clone(), entered.clone());
     ctx.middleware_fn = Some(Arc::new(move |prepared, _, _| {
@@ -124,7 +124,7 @@ async fn interaction_suspension_keeps_completed_sibling_and_orders_callbacks() {
 async fn interaction_completion_fires_before_slow_sibling_finishes() {
     let finished = Arc::new(Notify::new());
     let wait = finished.clone();
-    let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+    let mut ctx = test_context(vec![]);
     ctx.middleware_fn = Some(Arc::new(move |prepared, _, _| {
         let wait = wait.clone();
         Box::pin(async move {
@@ -162,12 +162,7 @@ async fn interaction_completion_fires_before_slow_sibling_finishes() {
 
 #[tokio::test]
 async fn interaction_supplied_completed_call_skips_every_execution_stage() {
-    let mut ctx = test_context(vec![Arc::new(MockToolProvider::panic("b"))], |event| {
-        if let HookEvent::PreToolUse { tool_name, .. } = event {
-            assert_ne!(tool_name, "b");
-        }
-        continue_hook_outcome()
-    });
+    let mut ctx = test_context(vec![Arc::new(MockToolProvider::panic("b"))]);
     ctx.on_tool_call_completed = Some(Arc::new(|result| {
         assert_ne!(result.call.name, "b");
         Box::pin(async { Ok(result) })
@@ -207,17 +202,14 @@ type Fatal = std::io::Error;
 async fn interaction_fatal_sibling_retains_completion_and_original_error() {
     // Both plain provider and middleware dispatch must preserve B's result.
     for middleware in [false, true] {
-        let mut ctx = test_context(
-            vec![
-                Arc::new(MockToolProvider::err(
-                    "a",
-                    Duration::ZERO,
-                    ToolError::Fatal(Fatal::other("fatal a").into()),
-                )),
-                Arc::new(MockToolProvider::ok("b", Duration::ZERO, json!("done"))),
-            ],
-            |_| continue_hook_outcome(),
-        );
+        let mut ctx = test_context(vec![
+            Arc::new(MockToolProvider::err(
+                "a",
+                Duration::ZERO,
+                ToolError::Fatal(Fatal::other("fatal a").into()),
+            )),
+            Arc::new(MockToolProvider::ok("b", Duration::ZERO, json!("done"))),
+        ]);
         if middleware {
             ctx.middleware_fn = Some(Arc::new(|prepared, _, next| {
                 Box::pin(async move { next(prepared.arguments).await })
@@ -243,7 +235,7 @@ async fn interaction_fatal_sibling_retains_completion_and_original_error() {
 
 #[tokio::test]
 async fn interaction_without_callback_is_recoverable_error_result() {
-    let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+    let mut ctx = test_context(vec![]);
     ctx.middleware_fn = Some(Arc::new(|_, _, _| Box::pin(async { Ok(input_required()) })));
     let results = eval_tool_calls(&ctx, vec![call("a")], &create_abort_signal())
         .await
@@ -257,7 +249,7 @@ async fn interaction_without_callback_is_recoverable_error_result() {
 
 #[tokio::test]
 async fn interaction_completion_failure_prevents_publication_but_settles_siblings() {
-    let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+    let mut ctx = test_context(vec![]);
     ctx.middleware_fn = Some(Arc::new(|prepared, _, _| {
         Box::pin(async move {
             Ok(ToolMiddlewareOutcome::Completed(
@@ -296,9 +288,7 @@ async fn interaction_completion_failure_prevents_publication_but_settles_sibling
 
 #[tokio::test]
 async fn interaction_rejects_mismatched_completed_results_before_dispatch() {
-    let ctx = test_context(vec![Arc::new(MockToolProvider::panic("a"))], |_| {
-        panic!("must validate first")
-    });
+    let ctx = test_context(vec![Arc::new(MockToolProvider::panic("a"))]);
     let error = eval_tool_round(
         &ctx,
         vec![call("a")],

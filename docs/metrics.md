@@ -14,8 +14,8 @@ Prometheus metrics operate independently from OpenTelemetry distributed tracing 
 
 You can enable metrics using either the CLI flag or an environment variable fallback:
 
-- `--metrics-addr <ADDR>`: CLI flag available on most binaries. **Caveat:** `harnx-claude-compatible-hook-server` rejects `--metrics-addr` as an unknown argument due to its strict clap parser. Use `HARNX_METRICS_ADDR` instead. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--metrics-addr :8456`) binds `0.0.0.0`, allowing scrapers from other containers or Kubernetes pods to reach the endpoint. Passing `127.0.0.1:9109` restricts the listener to loopback.
-- `HARNX_METRICS_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-plans-tools` (non-HTTP mode), `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, and `harnx-mcp-bridge`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
+- `--metrics-addr <ADDR>`: CLI flag available on most binaries. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--metrics-addr :8456`) binds `0.0.0.0`, allowing scrapers from other containers or Kubernetes pods to reach the endpoint. Passing `127.0.0.1:9109` restricts the listener to loopback.
+- `HARNX_METRICS_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-claude-hook-tools`, `harnx-plans-tools` (non-HTTP mode), `harnx-mcp-remote`, and `harnx-mcp-bridge`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
 
 `harnx-a2a-server`, like `harnx-serve` and `harnx-worker`, uses the shared `MetricsFlags` CLI option without an environment variable fallback. Pass `--metrics-addr :8456` explicitly. A2A HTTP request counts and durations use bounded outer route templates such as `/agents/{name}` and `/agents/{name}/{*path}`, never export names or task IDs. Its application (`3020`), readiness (`8081` in examples) and metrics (`8456` in examples) listeners use separate ports; see [A2A operations](a2a-operations.md#listeners-and-readiness).
 
@@ -24,7 +24,7 @@ You can enable metrics using either the CLI flag or an environment variable fall
 Metrics support is implemented across 18 long-running binaries:
 
 - **Core runtime & proxies**: `harnx-serve`, `harnx-worker`, `harnx-a2a-server`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`
-- **Tool & hook servers**: `harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-plans-tools`, `harnx-time-tools`, `harnx-claude-compatible-hook-server`
+- **Tool servers**: `harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-plans-tools`, `harnx-time-tools`, `harnx-claude-hook-tools`
 - **MCP bridges & servers**: `harnx-mcp-bridge`, `harnx-mcp-remote`
 
 **Out of scope (unchanged)**:

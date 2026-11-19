@@ -79,6 +79,12 @@ fn load_with_qualified_name_from_contents(
         &mut config.middleware,
         middleware::file_origin(path, package_dir.as_deref())?,
     )?;
+    if let Some(hooks) = config.hooks_mut() {
+        event_hooks::bind_event_hooks(
+            hooks,
+            middleware::file_origin(path, package_dir.as_deref())?,
+        )?;
+    }
     Ok(Agent::new(config))
 }
 

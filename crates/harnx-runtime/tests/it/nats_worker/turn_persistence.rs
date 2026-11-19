@@ -51,7 +51,6 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
     let input = harnx_runtime::config::input::from_str(&global_config, prompt, None);
     run_agent_loop_with_nats(RunAgentLoopArgs {
         cluster_key,
-        manage_servers: false,
         session_id: &storage_key(session_id),
         config: global_config,
         instance_id: harnx_core::instance::ServerScope::new(),

@@ -316,13 +316,6 @@ async fn reserved_bash_context(
     let admitted = reserved_bash_admitted_declarations(&config, &provider, view, selection);
     let admitted_names: HashSet<String> = admitted.iter().map(|tool| tool.name.clone()).collect();
     provider.ensure_unambiguous(&admitted_names)?;
-    let client = config.nats_client(config.default_cluster_key()).await?;
-    let hooks = tokio::time::timeout(
-        Duration::from_secs(60),
-        crate::nats_hook_provider::NatsHookProvider::discover_with_client(client, scope.clone()),
-    )
-    .await
-    .context("Operator hook discovery timed out")??;
     let config = Arc::new(crate::config::ConfigLock::new(config));
     let slot = crate::bash_provider::BashEvalContextSlot::new();
     let selectors = view.use_tools.join(",");
@@ -331,11 +324,8 @@ async fn reserved_bash_context(
         .with_current_agent_package(view.package.clone())
         .with_command_bash(crate::bash_provider::CommandBashInputs {
             inner_declarations: admitted,
-            // The operator already consented to this script's inner calls.
-            operator_inner_consent: true,
         });
     params.bash_context_slot = Some(slot.clone());
-    params.nats_hook_provider = Some(Arc::new(hooks));
     let mut ctx =
         crate::tool::build_tool_eval_context_with_provider(params, Arc::new(provider)).await;
     // Late overwrite, after the existing seams: the allowed names are the
@@ -345,7 +335,6 @@ async fn reserved_bash_context(
     ctx.allowed_tool_names
         .insert(crate::config::BASH_TOOL_NAME.to_string());
     let root_call_id = uuid::Uuid::new_v4().to_string();
-    super::approve_root_bash_call(&mut ctx, &root_call_id);
     let owner = slot.install(ctx);
     Ok(ReservedBashContext {
         owner,
@@ -390,19 +379,11 @@ async fn reserved_eval_context(
         Arc::new(parking_lot::RwLock::new(provider.declarations().to_vec()));
     let selected = selected_provider_names(&config, &provider, view);
     provider.ensure_unambiguous(&selected)?;
-    let client = config.nats_client(config.default_cluster_key()).await?;
-    let hooks = tokio::time::timeout(
-        Duration::from_secs(60),
-        crate::nats_hook_provider::NatsHookProvider::discover_with_client(client, scope.clone()),
-    )
-    .await
-    .context("Operator hook discovery timed out")??;
     let config = Arc::new(crate::config::ConfigLock::new(config));
     let selectors = view.use_tools.join(",");
-    let mut params = BuildToolEvalContextParams::new(&config, scope)
+    let params = BuildToolEvalContextParams::new(&config, scope)
         .with_agent_use_tools(Some(&selectors))
         .with_current_agent_package(view.package.clone());
-    params.nats_hook_provider = Some(Arc::new(hooks));
     let mut ctx =
         crate::tool::build_tool_eval_context_with_provider(params, Arc::new(provider)).await;
     ctx.allowed_tool_names = selected;
