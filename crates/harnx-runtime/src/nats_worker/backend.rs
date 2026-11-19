@@ -389,6 +389,18 @@ impl FencedSessionLogSink {
 }
 
 impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
+    fn interaction_session(
+        &self,
+    ) -> Option<crate::interaction_checkpoint::live::InteractionSession> {
+        Some(
+            crate::interaction_checkpoint::live::InteractionSession::new(
+                self.backend.clone(),
+                self.lease.clone(),
+                self.backend.replicas,
+            ),
+        )
+    }
+
     fn append(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
         let fenced = self.fenced_entry(entry);
         self.backend
@@ -1068,6 +1080,7 @@ mod tests {
 
     fn results(ids: &[&str], stamp: i64) -> SessionLogEntry {
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: ids
                 .iter()
                 .map(|id| ToolOutput {

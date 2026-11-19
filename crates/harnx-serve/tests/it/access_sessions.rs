@@ -17,6 +17,8 @@ use serde_json::{json, Value};
 
 use crate::{access_agents::Fixture as HttpFixture, common};
 
+mod exact_hitl;
+
 const RULES: &str = "rules:\n  - agents: [allowed, blocked]\n    scopes: [prompt]\n    users: [alice, bob]\n  - agents: [allowed, blocked]\n    scopes: [admin]\n    users: [admin]\n";
 
 struct Fixture {
@@ -158,6 +160,8 @@ impl SessionClient<'_> {
             "session/get",
             "session/prompt",
             "session/hitl_decision",
+            "session/hitl_decision_exact",
+            "session/interaction_response",
             "session/cancel",
             "session/compact",
             "session/mark_read",

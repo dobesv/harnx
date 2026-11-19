@@ -181,6 +181,7 @@ async fn generated_attachment_idiom_roundtrips_png_through_native_toolset() {
         let result = BashKitBackend
             .run(harnx_script::ScriptRequest {
                 script: &script,
+                python_functions: None,
                 limits: ScriptLimits::default(),
                 commands,
                 fs_mounts: vec![],

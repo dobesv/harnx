@@ -4,6 +4,7 @@
 
 use crate::config_data::{LoopDetectionOverride, RunLimitsOverride};
 use crate::hooks::HooksConfig;
+use crate::middleware::MiddlewareConfig;
 use crate::model::Model;
 use crate::retry_config::RetryConfig;
 use crate::system_vars::render_template;
@@ -146,6 +147,8 @@ pub struct AgentConfig {
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hooks: Option<HooksConfig>,
+    #[serde(default, skip_serializing_if = "MiddlewareConfig::is_empty")]
+    pub middleware: MiddlewareConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +212,7 @@ impl AgentConfig {
             documents: frontmatter.documents,
             instructions: frontmatter.instructions,
             hooks: frontmatter.hooks,
+            middleware: frontmatter.middleware,
             compaction_agent: frontmatter.compaction_agent,
             compaction_keep_recent_turns: frontmatter.compaction_keep_recent_turns,
             compaction_keep_recent_tokens: frontmatter.compaction_keep_recent_tokens,
@@ -611,6 +615,8 @@ struct AgentFrontMatter {
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hooks: Option<HooksConfig>,
+    #[serde(default, skip_serializing_if = "MiddlewareConfig::is_empty")]
+    middleware: MiddlewareConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -647,6 +653,7 @@ impl AgentFrontMatter {
             documents: config.documents.clone(),
             instructions: config.instructions.clone(),
             hooks: config.hooks.clone(),
+            middleware: config.middleware.clone(),
             compaction_agent: config.compaction_agent.clone(),
             compaction_keep_recent_turns: config.compaction_keep_recent_turns,
             compaction_keep_recent_tokens: config.compaction_keep_recent_tokens,
@@ -681,6 +688,7 @@ impl AgentFrontMatter {
             && self.documents.is_empty()
             && self.instructions.is_none()
             && self.hooks.is_none()
+            && self.middleware.is_empty()
     }
 
     fn compaction_is_empty(&self) -> bool {

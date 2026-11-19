@@ -111,6 +111,7 @@ pub(super) async fn verify_reused_id_next_round(
     fixture
         .backend
         .append_event(&SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![],
             timestamp: None,
         })
@@ -153,6 +154,7 @@ pub(super) async fn verify_terminal_precedence_at_append(
     fixture
         .backend
         .append_event(&SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![],
             timestamp: None,
         })

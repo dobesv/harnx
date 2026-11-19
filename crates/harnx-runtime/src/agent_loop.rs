@@ -140,8 +140,18 @@ impl AgentLoopContext {
     }
 }
 
+// qual:allow(coupling, deh) reason: "The anyhow boundary carries typed engine suspension; keep it separate from legacy approval callbacks and ordinary failures."
 async fn defer_tool_approval(ctx: &AgentLoopContext, error: anyhow::Error) -> Result<LoopResult> {
     ctx.check_generation("completion-error")?;
+    if let Some(suspended) = error.downcast_ref::<harnx_engine::tool::ToolInputRequiredError>() {
+        let tool_call_id = suspended
+            .0
+            .pending
+            .first()
+            .and_then(|p| p.call.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("durable suspension has no pending call"))?;
+        return Ok(LoopResult::AwaitingHitlApproval { tool_call_id });
+    }
     let Some(callback) = &ctx.on_hitl_approval_required else {
         return Err(error);
     };
@@ -210,9 +220,9 @@ pub async fn continue_agent_loop_from_tool_round(
         .write()
         .set_tui_confirm_tool_use(Some(confirm_override));
 
-    // Execute full pending tool round using normal helper. Deferred calls resolve via
-    // preseeded confirm function; already-approved calls execute normally.
-    let tool_round = crate::tool::execute_tool_round_with_persistence(
+    // Resume through the same boxed dispatch frame as new rounds. Deferred calls
+    // use preseeded decisions; already-approved calls execute normally.
+    let tool_round = Box::pin(crate::tool::execute_tool_round_with_persistence(
         ctx.tool_round_params(
             config,
             &input,
@@ -223,7 +233,7 @@ pub async fn continue_agent_loop_from_tool_round(
         ),
         round.calls,
         crate::tool::ToolRoundPersistence::ExistingCalls { seq: round.seq },
-    )
+    ))
     .await;
     config
         .write()
@@ -235,7 +245,7 @@ pub async fn continue_agent_loop_from_tool_round(
 
     // Merge tool results into input for the next round
     if !tool_results.is_empty() {
-        let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
+        let switch_agent = crate::handoff_result::select(&tool_results);
         let mut merged_input =
             input.merge_tool_results(round.output, round.thought, tool_results.clone());
 
@@ -798,10 +808,7 @@ async fn advance_tool_round(
     round: ToolRoundOutput,
 ) -> Result<ToolRoundAdvance> {
     ctx.check_generation("tool-round-reducer")?;
-    let switch_agent = round
-        .tool_results
-        .iter()
-        .find_map(|result| result.switch_agent.clone());
+    let switch_agent = crate::handoff_result::select(&round.tool_results);
     let mut merged_input =
         input.merge_tool_results(round.output, round.thought, round.tool_results.clone());
     if let Some(callback) = &ctx.on_tool_round {
@@ -1107,6 +1114,7 @@ async fn run_agent_loop_inner(ctx: &AgentLoopContext, initial_input: Input) -> R
 #[cfg(test)]
 mod tests {
     mod compaction_tests;
+    mod future_size_tests;
     mod input_persistence_tests;
     mod overflow_tests;
     mod preflight_failure_tests;

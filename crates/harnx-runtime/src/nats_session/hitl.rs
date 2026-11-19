@@ -17,6 +17,8 @@ pub struct PendingHitlApproval {
     pub tool_name: String,
     pub arguments: serde_json::Value,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<String>,
 }
 
 impl PendingHitlApproval {
@@ -31,15 +33,7 @@ impl PendingHitlApproval {
     }
 }
 
-/// Durable identity of one approval request. A provider's tool call ID alone
-/// isn't unique across rounds or invocations.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalRef {
-    pub invocation_id: String,
-    pub tool_round_seq: u64,
-    pub request_seq: u64,
-    pub tool_call_id: String,
-}
+pub use harnx_core::pending_interaction::ApprovalRef;
 
 /// Last decision observed for an invocation, including its exact request identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +70,9 @@ pub enum PromptProgress {
         last_decision: Option<HitlDecisionReceipt>,
     },
     InputRequired(PendingHitlApproval),
+    /// A newer worker owns recovery. No legacy approval exists to answer, and
+    /// owner-loss recovery must not cancel or settle this invocation.
+    Parked,
     Terminal(NatsTurnResult),
 }
 
@@ -112,8 +109,13 @@ impl NatsSession {
         if let Some(terminal) = super::invocation_terminal_seq(entries, scope.prompt_sequence) {
             return Ok(terminal_progress(scope, entries, terminal));
         }
+        let effective = apply_log_mutations_nats(entries)?;
+        let start = effective.partition_point(|(seq, _)| *seq <= scope.prompt_sequence);
         if let Some(pending) = pending_approval_for_invocation(entries, scope.prompt_sequence)? {
             return Ok(PromptProgress::InputRequired(pending));
+        }
+        if crate::interaction_checkpoint::guard::log_is_parked(&effective[start..]) {
+            return Ok(PromptProgress::Parked);
         }
         let last_decision =
             last_decision_receipt(scope.invocation_id, scope.prompt_sequence, entries)?;

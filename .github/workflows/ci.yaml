@@ -19,8 +19,8 @@ jobs:
   # must always post a conclusion. A workflow-level `paths:` filter would skip
   # the workflow and hang the merge queue; instead the steps below are gated on
   # this job, and a change with no Rust impact reports success in seconds. The
-  # exclusions are paths no build step or test reads: `packages/` and
-  # `example_config/` are embedded or read by Rust tests, so they stay in.
+  # exclusions are paths no build step or test reads: packages, example_config,
+  # and middleware examples in docs/demos are read by Rust tests, so they stay in.
   # The first path rule in .config/affected.toml mirrors this list.
   changes:
     name: Detect Rust changes
@@ -41,11 +41,9 @@ jobs:
             rust:
               - '**'
               - '!web/**'
-              - '!docs/**'
               - '!.changeset/**'
               - '!scripts/check_changesets.py'
               - '!scripts/test_check_changesets.py'
-              - '!demos/**'
               - '!docker/**'
               - '!*.md'
               - '!**/README.md'

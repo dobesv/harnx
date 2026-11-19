@@ -97,7 +97,7 @@ fn builtin_list_matches_backend_with_network_commands_filtered() {
     ] {
         assert!(names.iter().any(|item| item == name), "missing {name}");
     }
-    for name in ["curl", "wget"] {
+    for name in ["curl", "wget", "http"] {
         assert!(!names.iter().any(|item| item == name));
     }
 }

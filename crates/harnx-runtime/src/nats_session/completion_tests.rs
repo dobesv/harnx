@@ -202,6 +202,7 @@ fn durable_child_completion_repairs_a_lost_event_once_without_ending_parent_turn
     let sink = Arc::new(Sink::default());
     let event_sink: Arc<dyn AgentEventSink> = sink.clone();
     let progress = SubAgentProgress {
+        pending_interaction: None,
         invocation_id: "invocation".into(),
         agent: "athena".into(),
         session_id: "child".into(),
@@ -215,6 +216,7 @@ fn durable_child_completion_repairs_a_lost_event_once_without_ending_parent_turn
     let entries = vec![(
         3,
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![ToolOutput {
                 id: Some("call".into()),
                 name: "session_prompt".into(),
@@ -251,6 +253,7 @@ fn terminal_tool_result_recovery_preserves_title_and_tool_call_id() {
         let sink = Arc::new(Sink::default());
         let event_sink: Arc<dyn AgentEventSink> = sink.clone();
         let progress = SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "invocation-with-title".into(),
             agent: "athena".into(),
             session_id: "child".into(),
@@ -264,6 +267,7 @@ fn terminal_tool_result_recovery_preserves_title_and_tool_call_id() {
         let entries = vec![(
             5,
             SessionLogEntry::ToolResults {
+                handoff_selection: None,
                 results: vec![ToolOutput {
                     id: result_id.map(String::from),
                     name: "session_prompt".into(),

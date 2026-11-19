@@ -261,6 +261,7 @@ pub(super) async fn block(f: &Fixture) -> Result<()> {
 pub(super) async fn settled_round(f: &Fixture, call_id: &str) -> Result<()> {
     f.append(tool_calls(call_id, "ping")).await?;
     f.append(SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results: vec![],
         timestamp: None,
     })

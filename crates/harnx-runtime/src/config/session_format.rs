@@ -427,6 +427,7 @@ mod tests {
                 fence_token: Some(7),
             },
             SessionLogEntry::ToolResults {
+                handoff_selection: None,
                 results: vec![ToolOutput {
                     id: Some("call-id".into()),
                     name: "read".into(),

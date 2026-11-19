@@ -1769,8 +1769,8 @@ pub(crate) fn control_snapshot_events(
 
     // Derive pending HITL approvals by pairing each decision with the latest
     // preceding unmatched request occurrence for that provider tool-call ID.
-    let pending_approvals = derive_pending_hitl_approvals(entries);
-    events.extend(pending_approvals);
+    events.extend(derive_pending_hitl_approvals(entries));
+    events.extend(crate::ag_ui_interactions::pending_event(entries));
 
     events
 }

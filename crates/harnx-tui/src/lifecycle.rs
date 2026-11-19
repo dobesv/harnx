@@ -307,9 +307,6 @@ impl Tui {
         if !cfg!(test) {
             // Keep NATS connection/store setup out of the already-large init frame.
             app.current_session_unread = Box::pin(Self::fetch_initial_session_unread(config)).await;
-        }
-
-        if !cfg!(test) {
             app.modal = Self::resolve_initial_modal(config).await;
         }
 
@@ -330,6 +327,7 @@ impl Tui {
             exit_after_cancel: false,
             exit_interrupt_error: None,
             tool_confirmation_route: Arc::new(parking_lot::Mutex::new(None)),
+            interactions: Default::default(),
             #[cfg(test)]
             confirmation_enqueue_override: None,
             #[cfg(test)]

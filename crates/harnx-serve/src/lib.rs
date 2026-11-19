@@ -5,6 +5,7 @@
 pub mod ag_ui;
 mod ag_ui_attach;
 mod ag_ui_events;
+mod ag_ui_interactions;
 mod ag_ui_lifecycle;
 mod ag_ui_remote_follow;
 pub mod ag_ui_rpc;

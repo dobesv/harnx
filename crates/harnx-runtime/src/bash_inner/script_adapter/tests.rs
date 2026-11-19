@@ -115,6 +115,9 @@ fn context(
     hooks: Arc<Mutex<Vec<HookEvent>>>,
 ) -> ToolEvalContext {
     ToolEvalContext {
+        on_tool_call_completed: None,
+        on_interaction: None,
+        middleware_fn: None,
         work_boundary: None,
         instance_id: ServerScope::new(),
         tool_round: Some(1),
@@ -183,6 +186,7 @@ async fn script(script: &str, executor: Arc<ScriptInnerExecutor>) -> ScriptRun {
     BashKitBackend
         .run(harnx_script::ScriptRequest {
             script,
+            python_functions: None,
             limits: ScriptLimits {
                 timeout_secs: 5,
                 ..Default::default()

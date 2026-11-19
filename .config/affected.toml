@@ -21,11 +21,9 @@
 [[determinator.path-rule]]
 globs = [
     "web/**",
-    "docs/**",
     ".changeset/**",
     "scripts/check_changesets.py",
     "scripts/test_check_changesets.py",
-    "demos/**",
     "docker/**",
     "*.md",
     "**/CHANGELOG.md",
@@ -68,7 +66,7 @@ post-rule = "fallthrough"
 
 # Read only by tests; see the test-path entries below.
 [[determinator.path-rule]]
-globs = ["packages/**", "example_config/**"]
+globs = ["packages/**", "example_config/**", "docs/**", "demos/**"]
 mark-changed = []
 
 # local_orchestrator.rs spawns the worker for every frontend.
@@ -119,6 +117,16 @@ test = ["harnx-runtime", "harnx-mcp-bridge"]
 [[test-path]]
 globs = ["packages/**"]
 test = ["harnx-runtime", "harnx-bash-tools"]
+
+# Frontend confirmation harnesses load Daedalus and its file-backed variables.
+[[test-path]]
+globs = ["packages/pantheon/agents/daedalus.md", "packages/pantheon/agents/shared/**"]
+test = ["harnx-tui", "harnx-a2a-server"]
+
+# Middleware tests execute guide examples and load shipped confirmation agents.
+[[test-path]]
+globs = ["docs/middleware-guide.md", "docs/tool-confirmation-guide.md", "docs/agent-guide.md", "demos/config/agents/tool-confirm-agent.md", "example_config/config.yaml"]
+test = ["harnx-runtime"]
 
 # The example auth hooks are executed by harnx-proxy-auth's tests.
 [[test-path]]

@@ -57,6 +57,11 @@ pub(super) async fn persist_reply_intent(
     authority: &mut OwnedTask,
 ) -> Result<()> {
     let receipt = build_reply_receipt(target)?;
+    anyhow::ensure!(
+        !receipt.approved
+            || crate::hitl::interaction::can_approve(target.session, target.request).await?,
+        "interaction kind not supported by this client"
+    );
     for _ in 0..8 {
         if try_persist_intent_attempt(runner, target, authority, &receipt).await? {
             return Ok(());

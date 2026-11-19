@@ -34,6 +34,9 @@ impl BashHarness {
         allowed.insert(crate::config::BASH_TOOL_NAME.to_string());
         let scope = ServerScope::new();
         let mut ctx = ToolEvalContext {
+            on_tool_call_completed: None,
+            on_interaction: None,
+            middleware_fn: None,
             work_boundary: None,
             instance_id: scope,
             tool_round: Some(1),

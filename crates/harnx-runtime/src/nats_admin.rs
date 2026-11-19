@@ -11,6 +11,9 @@ use async_nats::jetstream::{
     ErrorCode,
 };
 use std::error::Error as _;
+#[cfg(test)]
+mod deletion_tests;
+
 pub(crate) mod a2a;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +115,8 @@ impl A2aDeletion {
     }
 }
 
-/// A session's lease, journal rows, metadata keys, attachments and plans.
+/// A session's lease, journal rows, metadata keys, attachments, plans and
+/// private interaction checkpoint records.
 async fn delete_session_leftovers(
     jetstream: &async_nats::jetstream::Context,
     lease_bucket: Option<async_nats::jetstream::kv::Store>,
@@ -121,6 +125,9 @@ async fn delete_session_leftovers(
     let lease_deleted = delete_session_lease(lease_bucket, session_id).await?;
     purge_session_journal(jetstream, session_id).await?;
     let metadata_keys_deleted = purge_session_metadata(jetstream, session_id).await?;
+    // The checkpoint bucket has no TTL: deleting the session is the only thing
+    // that retires unfinished rounds' private records.
+    purge_session_checkpoints(jetstream, session_id).await?;
     // delete_owner removes media and plans, legacy attachments included.
     let attachments_deleted = harnx_blob_store::delete_owner(jetstream, session_id).await?;
     Ok(SessionDeleteResult {
@@ -129,6 +136,24 @@ async fn delete_session_leftovers(
         metadata_keys_deleted,
         attachments_deleted,
     })
+}
+
+/// Purge the session's private interaction checkpoint records: the round-start
+/// ownership proofs, attempt/dispatch records, private result snapshots and
+/// their retained-byte reservations. The bucket is opened without creating
+/// it, because an absent bucket has nothing to purge. Any failure propagates
+/// so a partially completed deletion stays discoverable and can be retried;
+/// re-running the purge, like every other step of the cascade, is safe.
+async fn purge_session_checkpoints(
+    jetstream: &async_nats::jetstream::Context,
+    session_id: &str,
+) -> Result<()> {
+    let Some(store) =
+        crate::interaction_checkpoint::store::CheckpointStore::open_existing(jetstream).await?
+    else {
+        return Ok(());
+    };
+    store.purge_session(session_id).await
 }
 
 async fn purge_session_journal(

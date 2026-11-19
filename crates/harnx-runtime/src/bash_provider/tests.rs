@@ -248,6 +248,9 @@ fn harness_with_hooks(
     providers.extend(extra);
     providers.push(inner);
     let ctx = Arc::new(ToolEvalContext {
+        on_tool_call_completed: None,
+        on_interaction: None,
+        middleware_fn: None,
         work_boundary: None,
         instance_id: ServerScope::new(),
         tool_round: Some(1),
@@ -817,6 +820,9 @@ async fn command_scoped_catalog_stays_active_and_fails_closed_without_tools() {
     let hooks: Arc<Mutex<Vec<HookEvent>>> = Arc::default();
     let hook_collector = hooks.clone();
     let ctx = slot.install(ToolEvalContext {
+        on_tool_call_completed: None,
+        on_interaction: None,
+        middleware_fn: None,
         work_boundary: None,
         instance_id: ServerScope::new(),
         tool_round: None,

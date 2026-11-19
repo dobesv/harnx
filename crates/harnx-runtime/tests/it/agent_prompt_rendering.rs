@@ -782,7 +782,7 @@ fn coordinator_prompts_skip_argus_before_and_alongside_aristarchus() {
 }
 
 #[test]
-fn daedalus_research_and_review_tools_keep_the_execution_approval_hook() {
+fn daedalus_research_and_review_tools_keep_the_execution_approval_middleware() {
     harnx_core::require_nextest();
     let Some(workspace_root) = workspace_root() else {
         return;
@@ -807,28 +807,33 @@ fn daedalus_research_and_review_tools_keep_the_execution_approval_hook() {
             "missing {required}"
         );
     }
-    let hooks = agent.hooks().expect("execution approval hook");
-    let hook = hooks
+    assert!(
+        agent.hooks().is_none_or(|hooks| {
+            hooks
+                .entries
+                .iter()
+                .all(|hook| !hook.command.contains("^atlas_session_handoff$"))
+        }),
+        "Atlas handoff approval must not use a legacy hook"
+    );
+    let config = Config {
+        agent: Some(agent),
+        ..Config::default()
+    };
+    let middleware = config.resolved_middleware().expect("resolved middleware");
+    let approval = middleware
         .entries
         .iter()
-        .find(|hook| hook.command.contains("^atlas_session_handoff$"))
-        .expect("Atlas handoff hook");
-    assert_ne!(hook.async_hook, Some(true));
-    let args = shell_words::split(&hook.command).expect("valid hook command quoting");
-    assert_eq!(args.len(), 7);
-    assert_eq!(
-        args[..6],
-        [
-            "harnx-claude-compatible-hook-server",
-            "--event",
-            "PreToolUse",
-            "--matcher",
-            "^atlas_session_handoff$",
-            "--jaq",
-        ]
-    );
-    let output: serde_json::Value = serde_json::from_str(&args[6]).expect("literal hook output");
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "ask");
+        .find(|entry| entry.name == "confirm-atlas-handoff")
+        .expect("Atlas handoff approval middleware");
+    assert!(approval.matcher.is_match("atlas_session_handoff").unwrap());
+    assert!(!approval.matcher.is_match("unrelated_tool").unwrap());
+    let harnx_core::middleware::MiddlewareSource::Bash(bash) = &approval.source else {
+        panic!("Atlas handoff approval must use Bash middleware")
+    };
+    let confirm = bash.find("confirm --id handoff").expect("confirm step");
+    let dispatch = bash.find("next --id dispatch").expect("dispatch step");
+    assert!(confirm < dispatch, "approval must precede dispatch");
 }
 
 /// Target agents that should declare `sandbox_connect` in their front-matter `use_tools`.

@@ -421,6 +421,11 @@ impl WorkerRuntime {
     async fn freeze_run_policy(&self, startup: &SessionRuntimeStartup) -> Result<()> {
         self.freeze_activation_limits(&startup.activation, &startup.per_session)
             .await?;
+        // Store failures must not arm owner-loss/deadline cancellation for work
+        // we can't classify. Redelivery retries the checkpoint reads.
+        if super::agent_loop::parks_recovery(&startup.backend, &startup.per_session).await? {
+            return Ok(());
+        }
         super::agent_loop::recover_completed_before_deadline(
             &startup.backend,
             &startup.lease,

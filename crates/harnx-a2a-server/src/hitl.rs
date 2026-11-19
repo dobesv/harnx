@@ -1,4 +1,5 @@
 //! Plain-text HITL approval challenges and replies.
+pub(crate) mod interaction;
 
 use a2a_lf::{Part, PartContent};
 use harnx_runtime::PendingHitlApproval;
@@ -84,6 +85,7 @@ mod tests {
             tool_name: "shell".into(),
             arguments,
             summary: "Run command".into(),
+            interaction_id: None,
         }
     }
 

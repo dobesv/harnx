@@ -108,21 +108,27 @@ async fn python_sum_alias_and_builder_only_opt_in() {
     assert!(result.stderr.text_lossy().contains("disabled by default"));
 }
 
-#[tokio::test]
-async fn python_heredoc_reads_tmp_and_lazy_full_cid_attachment() {
+async fn run_with_attachment(script: &str) -> (ScriptRun, Arc<FixtureFetcher>) {
     let fetcher = Arc::new(FixtureFetcher(Semaphore::new(0)));
-    let script = format!(
-        "echo temporary > /tmp/input.txt\npython3 - <<'EOF'\nfrom pathlib import Path\nprint(open('/tmp/input.txt').read(), end='')\nprint(Path('/attachments/{CID}').read_text(), end='')\nPath('/tmp/from-python').write_text('written')\nEOF\ncat /tmp/from-python"
-    );
     let result = BashKitBackend
         .run(crate::ScriptRequest {
-            script: &script,
+            script,
+            python_functions: None,
             limits: ScriptLimits::default(),
             commands: vec![],
             fs_mounts: vec![AttachmentFs::new(fetcher.clone()).mount()],
             cancel: CancellationToken::new(),
         })
         .await;
+    (result, fetcher)
+}
+
+#[tokio::test]
+async fn python_heredoc_reads_tmp_and_lazy_full_cid_attachment() {
+    let script = format!(
+        "echo temporary > /tmp/input.txt\npython3 - <<'EOF'\nfrom pathlib import Path\nprint(open('/tmp/input.txt').read(), end='')\nprint(Path('/attachments/{CID}').read_text(), end='')\nPath('/tmp/from-python').write_text('written')\nEOF\ncat /tmp/from-python"
+    );
+    let (result, fetcher) = run_with_attachment(&script).await;
     assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
     assert_eq!(result.stdout, "temporary\nattachment\nwritten");
     assert_eq!(fetcher.0.available_permits(), 1);
@@ -130,19 +136,10 @@ async fn python_heredoc_reads_tmp_and_lazy_full_cid_attachment() {
 
 #[tokio::test]
 async fn python_attachment_open_is_binary_safe_and_writes_are_denied() {
-    let fetcher = Arc::new(FixtureFetcher(Semaphore::new(0)));
     let script = format!(
         "python3 -c \"print(open('/attachments/{CID}', 'rb').read())\"; python3 -c \"open('/attachments/{CID}', 'w')\""
     );
-    let result = BashKitBackend
-        .run(crate::ScriptRequest {
-            script: &script,
-            limits: ScriptLimits::default(),
-            commands: vec![],
-            fs_mounts: vec![AttachmentFs::new(fetcher.clone()).mount()],
-            cancel: CancellationToken::new(),
-        })
-        .await;
+    let (result, fetcher) = run_with_attachment(&script).await;
     assert_status(&result, ScriptStatus::Error);
     assert_output_and_stderr_contains(&result, "b'attachment\\n'\n", &["read-only"]);
     assert_eq!(fetcher.0.available_permits(), 1);
@@ -172,6 +169,7 @@ async fn python_cannot_call_registered_tools_or_host_services() {
         let result = BashKitBackend
             .run(crate::ScriptRequest {
                 script: &format!("python3 - <<'EOF'\n{code}\nEOF"),
+                python_functions: None,
                 limits: ScriptLimits::default(),
                 commands: vec![command.clone()],
                 fs_mounts: vec![],
@@ -224,6 +222,7 @@ async fn python_memory_limit_reports_clear_stderr_and_preserves_prior_output() {
     let result = BashKitBackend
         .run(crate::ScriptRequest {
             script: "echo before; python3 -c 'x = [0] * 1000000'; echo after",
+            python_functions: None,
             limits: ScriptLimits {
                 max_python_memory_bytes: 32 * 1024,
                 ..Default::default()
@@ -245,6 +244,7 @@ async fn python_time_limit_stops_busy_loop_with_limit_hit() {
         Duration::from_secs(3),
         BashKitBackend.run(crate::ScriptRequest {
             script: "echo before; sleep 0.2; python3 -c 'while True: pass'; echo after",
+            python_functions: None,
             limits: ScriptLimits {
                 timeout_secs: 1,
                 ..Default::default()
@@ -284,6 +284,7 @@ async fn busy_python() -> (
         BashKitBackend
             .run(crate::ScriptRequest {
                 script: &script,
+                python_functions: None,
                 limits: ScriptLimits {
                     timeout_secs: 10,
                     ..Default::default()
@@ -353,6 +354,7 @@ async fn python_print_buffer_is_bounded_and_memory_error_can_be_handled() {
         Duration::from_secs(2),
         BashKitBackend.run(crate::ScriptRequest {
             script: "set +e; python3 -c \"while True: print('x' * 1000)\"; echo handled",
+            python_functions: None,
             limits: ScriptLimits {
                 max_python_memory_bytes: 32 * 1024,
                 ..Default::default()
@@ -380,13 +382,7 @@ fn python_queued_worker_cancel_and_deadline_do_not_wait_for_blocking_pool() {
         .max_blocking_threads(1)
         .build()
         .unwrap();
-    let (release, wait) = std::sync::mpsc::channel::<()>();
-    let (started, ready) = std::sync::mpsc::channel();
-    let blocker = runtime.spawn_blocking(move || {
-        started.send(()).unwrap();
-        let _ = wait.recv();
-    });
-    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (release, blocker) = block_worker_pool(&runtime);
     runtime.block_on(async {
         for timed_out in [false, true] {
             let token = CancellationToken::new();
@@ -395,6 +391,7 @@ fn python_queued_worker_cancel_and_deadline_do_not_wait_for_blocking_pool() {
                 BashKitBackend
                     .run(crate::ScriptRequest {
                         script: "python3 -c 'while True: pass'",
+                        python_functions: None,
                         limits: ScriptLimits {
                             timeout_secs: 1,
                             max_stderr_bytes: 0,

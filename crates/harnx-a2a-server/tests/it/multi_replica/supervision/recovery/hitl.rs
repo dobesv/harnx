@@ -4,6 +4,8 @@ use harnx_a2a_server::store::context::{ContextSnapshot, HitlPhase};
 use harnx_runtime::ApprovalRef;
 use harnx_runtime::{nats_session::fixed_admission::FixedAdmissionTicket, PromptProgress};
 
+mod interaction;
+mod interaction_owned;
 mod regressions;
 mod support;
 

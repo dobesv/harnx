@@ -24,6 +24,7 @@ fn output(id: &str, bytes: usize) -> ToolOutput {
 
 fn entry(results: Vec<ToolOutput>) -> SessionLogEntry {
     SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results,
         timestamp: None,
     }

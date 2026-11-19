@@ -745,6 +745,7 @@ mod transcript_tests {
             (
                 3,
                 SessionLogEntry::ToolResults {
+                    handoff_selection: None,
                     results: vec![harnx_core::session::ToolOutput {
                         id: Some("call-1".to_string()),
                         name: "bash_exec".to_string(),

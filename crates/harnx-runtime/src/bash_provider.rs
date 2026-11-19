@@ -242,6 +242,7 @@ impl BashProvider {
         let token = CancellationToken::new();
         let run_fut = self.backend.run(harnx_script::ScriptRequest {
             script: &script,
+            python_functions: None,
             limits,
             commands,
             fs_mounts: vec![attachments::mount(self.attachment_fetcher.clone())],
@@ -305,6 +306,7 @@ impl BashOutcome {
                 harnx_script::ScriptStatus::Error => "error",
                 harnx_script::ScriptStatus::TimedOut => "timed_out",
                 harnx_script::ScriptStatus::Cancelled => "cancelled",
+                harnx_script::ScriptStatus::Stopped => "stopped",
             }
         };
         Self {
@@ -388,6 +390,8 @@ impl BashOutcome {
                     .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
             ),
             "cancelled" => "bash script was cancelled".to_string(),
+            "stopped" => "bash script stopped unexpectedly; this tool does not support host stops"
+                .to_string(),
             _ => format!("bash script failed with exit code {}", self.exit_code),
         }
     }

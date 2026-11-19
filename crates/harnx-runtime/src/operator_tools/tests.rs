@@ -91,6 +91,9 @@ fn context(
         (name.into(), declaration)
     }).collect();
     ToolEvalContext {
+        on_tool_call_completed: None,
+        on_interaction: None,
+        middleware_fn: None,
         work_boundary: None,
         instance_id: scope,
         tool_round: None,

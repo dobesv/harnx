@@ -63,6 +63,7 @@ mod follow;
 pub use follow::{FollowBoundary, FollowBoundaryOptions};
 mod hitl;
 mod hitl_decision;
+mod interaction_decision;
 pub use hitl::{
     ApprovalRef, HitlDecisionOutcome, HitlDecisionReceipt, PendingHitlApproval, PromptProgress,
 };
@@ -292,6 +293,9 @@ pub struct RunTurnOptions {
     /// Grace period after a previously observed worker lease disappears before
     /// the client reports an orphaned turn. `None` uses the interactive default.
     pub orphan_timeout: Option<std::time::Duration>,
+    /// Frontend handles durable middleware permissions while following the same turn.
+    /// Ignore their legacy HITL projection as a completion boundary.
+    pub wait_for_interactions: bool,
 }
 
 /// Configuration for a NATS session.
@@ -747,6 +751,18 @@ impl NatsSession {
             .await
     }
 
+    /// Start a route that can defer middleware callbacks to durable interaction acceptance.
+    /// `None` from the handler defers; legacy approve/deny replies remain boolean on the wire.
+    pub async fn tool_confirmation_route_with_defer(
+        &self,
+        handler: Arc<crate::nats_tool_confirmation::DeferredToolConfirmationHandler>,
+    ) -> Result<crate::nats_tool_confirmation::ToolConfirmationRoute> {
+        crate::nats_tool_confirmation::ToolConfirmationRoute::start_with_defer(
+            self.client.clone(),
+            handler,
+        )
+        .await
+    }
     pub(crate) fn jetstream(&self) -> &jetstream::Context {
         &self.jetstream
     }
@@ -1644,6 +1660,15 @@ impl NatsSession {
         effective: Option<&[(u64, SessionLogEntry)]>,
         user_msg_seq: u64,
     ) -> bool {
+        Self::is_follow_completion_visible(entries, effective, user_msg_seq, false)
+    }
+
+    fn is_follow_completion_visible(
+        entries: &[(u64, SessionLogEntry)],
+        effective: Option<&[(u64, SessionLogEntry)]>,
+        user_msg_seq: u64,
+        wait_for_interactions: bool,
+    ) -> bool {
         let status = effective.map_or_else(
             || requested_seq_status(entries, user_msg_seq).ok(),
             |effective| {
@@ -1656,9 +1681,14 @@ impl NatsSession {
         );
         let awaiting_hitl =
             crate::nats_worker::derive_pending_hitl_approvals(entries).is_ok_and(|pending| {
-                pending
-                    .iter()
-                    .any(|approval| approval.tool_round_seq > user_msg_seq)
+                pending.iter().any(|approval| {
+                    approval.tool_round_seq > user_msg_seq
+                        && (!wait_for_interactions
+                            || !crate::interaction_checkpoint::guard::interaction_record_for_round(
+                                effective.unwrap_or(entries),
+                                approval.tool_round_seq,
+                            ))
+                })
             });
         status == Some(RequestedSeqStatus::Covered) || awaiting_hitl
     }
@@ -1849,7 +1879,11 @@ fn render_log_entry_to_sink(
         SessionLogEntry::SubAgentStarted { .. }
         | SessionLogEntry::HandoffCommitted { .. }
         | SessionLogEntry::HitlApprovalRequested { .. }
-        | SessionLogEntry::HitlApprovalDecision { .. } => false,
+        | SessionLogEntry::HitlApprovalDecision { .. }
+        | SessionLogEntry::ToolCallCompleted { .. }
+        | SessionLogEntry::InteractionRequested { .. }
+        | SessionLogEntry::SuspensionReady { .. }
+        | SessionLogEntry::InteractionResponse { .. } => false,
         SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Compress { .. }
         | SessionLogEntry::TurnEnd { .. }
@@ -2827,6 +2861,7 @@ mod tests {
         });
 
         let entry = SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![ToolOutput {
                 id: Some("test".to_string()),
                 name: "echo".to_string(),

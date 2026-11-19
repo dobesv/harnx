@@ -137,6 +137,7 @@ fn tool_calls(name: &str, call_id: &str, text: &str) -> SessionLogEntry {
 
 fn successful_tool_result(name: &str, call_id: &str) -> SessionLogEntry {
     SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results: vec![harnx_core::session::ToolOutput {
             id: Some(call_id.to_string()),
             name: name.to_string(),

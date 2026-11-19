@@ -140,7 +140,7 @@ impl NatsSession {
                         pending: Some(pending),
                     })
                 }
-                PromptProgress::Running { .. } => None,
+                PromptProgress::Running { .. } | PromptProgress::Parked => None,
             },
         )
     }

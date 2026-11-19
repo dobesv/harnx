@@ -20,11 +20,37 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
   - Supported content blocks: text, embedded text resources, resource links.
   - Unsupported content blocks: images, audio, embedded binary blobs (rejected with explicit errors; never silently dropped).
 - `session/cancel` — Stops the local prompt follower and durably cancels the NATS turn and any pending permission request.
-- `session/request_permission` — Bridges worker tool confirmation callbacks to client allow/reject single-turn choices.
+- `session/request_permission` — Presents worker tool confirmations and ready middleware `confirm` interactions as client allow/reject single-turn choices.
 - Committed handoffs report target agent, session ID, cluster, and instructions to switch agent servers.
 - All logging goes to stderr; stdout carries only protocol frames.
 
 See the [ACP v1 Support Matrix](#acp-v1-support-matrix) for capability details, content handling, and deferred feature rationales.
+
+## Middleware permissions
+
+An attached session observes durable middleware interactions, including after
+`session/load` or `session/resume`. A permission request appears only after the
+worker commits `SuspensionReady`. The client sees the public confirmation message,
+not checkpoint references or private middleware inputs.
+
+Permissions are shown one at a time in suspension-manifest order. Middleware and
+legacy tool permissions share a per-session queue. `confirm` offers Allow and
+Reject; other interaction kinds explain that this client doesn't support them and
+offer Reject only. Closing a permission dialog denies it. Cancelling the turn
+abandons the dialog, and a late Allow can't approve the cancelled turn.
+
+Each middleware reply is bound to its exact interaction ID and request sequence
+(also exposed in request `_meta` as `harnx:interaction_id` and
+`harnx:request_seq`). Acceptance failures, including stale or conflicting replies,
+appear in `session/update` warning text. A rejected response isn't retargeted to
+the next interaction. If the head is still pending, failed acceptance can be retried
+without skipping it. A transport disconnect leaves middleware permission pending
+for a replacement client; it isn't a durable denial. Repeated load/resume calls
+share the existing permission queue.
+
+ACP v1 `SelectedPermissionOutcome` contains only `optionId`. It has no free-form
+note field, so middleware responses from ACP store no note. Existing legacy HITL
+allow/reject behavior is unchanged.
 
 ## ACP v1 Support Matrix
 
@@ -56,7 +82,7 @@ The tables and descriptions below document ACP v1 method and capability support 
 - **`session/close`**: Cancels active turns across both local prompt follower and remote NATS worker, then drops in-memory session state. Durable transcripts, metadata, attachments, and session listing visibility are preserved. Closing an unknown or already-closed session succeeds idempotently.
 - **`session/prompt`**: Validates content blocks and streams assistant text chunks, thought chunks, tool call lifecycle updates (`ToolCallUpdate`), notices, and model errors. Handles turn completion, stop reasons, and error mapping.
 - **`session/cancel`**: Stops the local prompt follower and sends a durable cancel signal to the NATS worker turn. Also denies and clears any pending tool permission request.
-- **`session/request_permission`**: When a backend tool requires human-in-the-loop approval, the server calls the client's `session/request_permission` method with `allow` (`AllowOnce`) and `reject` (`RejectOnce`) choices. If the client approves, the tool proceeds; if the client rejects, disconnects, or times out, the tool call is denied.
+- **`session/request_permission`**: Legacy tool approvals and durable middleware confirmations use `allow` (`AllowOnce`) and `reject` (`RejectOnce`) choices. Unsupported interaction kinds offer Reject only. Rejection, client cancellation, and transport errors never approve a call. Human responses have no timeout. Middleware acceptance errors are reported through session updates; see [Middleware permissions](#middleware-permissions).
 
 #### Supported Prompt Content Blocks
 

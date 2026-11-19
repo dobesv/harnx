@@ -347,7 +347,17 @@ async fn finish_completed_turn(
     let budget_exceeded = spec
         .as_ref()
         .is_some_and(|spec| spec.kind == TerminationKind::BudgetExceeded);
-    let status = completed_progress_status(&params.result, cancelled, budget_exceeded);
+    let pending = if !cancelled && spec.is_none() && params.result.error.is_none() {
+        pending_summary(params.toolset, &params.result).await?
+    } else {
+        None
+    };
+    let status = if pending.is_some() {
+        SubAgentProgressStatus::Running
+    } else {
+        completed_progress_status(&params.result, cancelled, budget_exceeded)
+    };
+    params.reporter.set_pending_interaction(pending);
     let progress = finish_progress(&params.reporter, status).await?;
     if cancelled
         && spec
@@ -379,6 +389,38 @@ async fn finish_completed_turn(
         progress,
         termination,
     })
+}
+
+async fn pending_summary(
+    toolset: &SubagentToolset,
+    result: &NatsTurnResult,
+) -> Result<Option<harnx_core::pending_interaction::PendingInteractionSummary>, ToolInvokeError> {
+    let storage =
+        harnx_core::session_identity::session_key(Some(&toolset.agent), &result.session_id);
+    let read = async {
+        let log = crate::nats_session_log::NatsSessionLog::new(toolset.jetstream.clone(), &storage);
+        let entries = log.load_events_after_async(result.user_msg_seq).await?;
+        let admission = toolset
+            .session_metadata
+            .prompt_admission(&storage, &result.user_msg_id)
+            .await?;
+        let Some(admission) = admission else {
+            return Ok(None);
+        };
+        crate::interactions::derive_pending_interaction_summary(
+            &entries,
+            &toolset.agent,
+            toolset.route.cluster(),
+            &result.session_id,
+            admission.invocation_id.as_str(),
+        )
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), read)
+        .await
+        .map_err(|_| ToolInvokeError::Recoverable("read blocked child summary timed out".into()))?
+        .map_err(|error: anyhow::Error| {
+            ToolInvokeError::Recoverable(format!("read blocked child summary: {error:#}"))
+        })
 }
 
 /// The termination a completed child turn reports, if its error is a
@@ -486,6 +528,20 @@ pub(super) fn result_value(
     toolset: &SubagentToolset,
     completed: &CompletedSubagentTurn,
 ) -> Result<serde_json::Value, ToolInvokeError> {
+    if let Some(pending) = &completed.progress.pending_interaction {
+        let progress = SubAgentProgress {
+            tool_call_id: None,
+            ..completed.progress.clone()
+        };
+        return Ok(serde_json::json!({
+            "session_id": completed.session_id,
+            "prompt_id": completed.result.as_ref().expect("blocked turn result").user_msg_id,
+            "status": "blocked", "terminal": false,
+            "pending_interaction": pending,
+            "sub_agent": child_source(toolset, &completed.session_id),
+            "sub_agent_progress": progress,
+        }));
+    }
     let response = match &completed.termination {
         Some(termination) => termination.response.as_str(),
         None => super::require_response(
@@ -537,6 +593,7 @@ mod tests {
             blocks: vec![ContentBlock::Text("public partial answer".into())],
         }));
         let progress = SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "invocation".into(),
             agent: "helper".into(),
             session_id: "child".into(),

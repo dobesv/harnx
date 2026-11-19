@@ -1,0 +1,101 @@
+//! Host-only resume input. Durable response acceptance belongs to the caller.
+use anyhow::{ensure, Result};
+use harnx_core::interaction::{InteractionRequest, InteractionResponse, InteractionStep};
+use harnx_engine::tool::{PreparedToolCall, ToolCallCheckpoint};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{collections::HashMap, future::Future};
+
+/// An exact request and its runtime-accepted response, never model-authored input.
+#[derive(Clone, Debug)]
+pub struct AcceptedInteraction {
+    pub request: InteractionRequest,
+    pub response: InteractionResponse,
+}
+
+/// Restore one call from its last interaction boundary. This doesn't replay tools.
+#[derive(Clone, Debug)]
+pub struct MiddlewareResume {
+    pub checkpoint: ToolCallCheckpoint,
+    pub responses: Vec<AcceptedInteraction>,
+}
+
+tokio::task_local! {
+    static RESUME: MiddlewareResume;
+}
+
+/// Supply trusted resume data while evaluating its owning call. Sibling calls with
+/// other IDs ignore it. Invalid checkpoints for the owning call fail closed.
+/// The caller must accept and persist responses before entering this scope.
+pub async fn with_resume<F: Future>(resume: MiddlewareResume, future: F) -> F::Output {
+    RESUME.scope(resume, future).await
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FrameIdentity {
+    pub middleware: String,
+    pub step_path: Vec<InteractionStep>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FrameCheckpoint {
+    pub middleware: String,
+    pub step_path: Vec<InteractionStep>,
+    pub stash: HashMap<String, Value>,
+    pub retained: HashMap<String, Vec<String>>,
+}
+
+impl FrameCheckpoint {
+    pub fn matches(&self, identity: &FrameIdentity) -> bool {
+        self.middleware == identity.middleware && self.step_path == identity.step_path
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CheckpointState {
+    pub version: u32,
+    pub session: String,
+    pub tool_round_seq: u64,
+    pub tool_call_id: String,
+    pub chain_version: String,
+    pub frames: Vec<FrameCheckpoint>,
+}
+
+impl CheckpointState {
+    pub fn new(session: String, prepared: &PreparedToolCall, chain_version: String) -> Self {
+        Self {
+            version: 1,
+            session,
+            tool_round_seq: prepared.context.evaluation.tool_round.unwrap_or_default(),
+            tool_call_id: prepared.call.id.clone().unwrap_or_default(),
+            chain_version,
+            frames: vec![],
+        }
+    }
+
+    pub fn restore(&self) -> Result<(ToolCallCheckpoint, Vec<AcceptedInteraction>)> {
+        let resume = RESUME.try_with(Clone::clone).ok();
+        let Some(resume) = resume else {
+            return Ok((ToolCallCheckpoint::default(), vec![]));
+        };
+        // Scope is per original call, not per tool name or model arguments.
+        if resume.checkpoint.state["tool_call_id"] != self.tool_call_id {
+            return Ok((ToolCallCheckpoint::default(), vec![]));
+        }
+        let state: Self = serde_json::from_value(resume.checkpoint.state.clone())?;
+        ensure!(
+            state.version == 1,
+            "unsupported middleware checkpoint version"
+        );
+        ensure!(
+            state.session == self.session
+                && state.tool_round_seq == self.tool_round_seq
+                && state.chain_version == self.chain_version,
+            "middleware checkpoint identity mismatch"
+        );
+        Ok((resume.checkpoint, resume.responses))
+    }
+}

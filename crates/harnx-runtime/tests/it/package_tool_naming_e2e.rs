@@ -94,6 +94,7 @@ fn fs_server_binary() -> Result<PathBuf> {
 
 fn fs_server_config(binary: &Path, readable_dir: &Path) -> ToolServerConfig {
     ToolServerConfig {
+        middleware: Default::default(),
         name: "fs".to_string(),
         command: binary.to_string_lossy().into_owned(),
         args: vec![

@@ -673,6 +673,88 @@ so a reconnecting client sees the correct interrupt snapshot without a subscribe
   Live notifications are advisory; clients reload the authoritative transcript
   after each notification and on reconnect.
 
+### Middleware confirm interactions
+
+Middleware confirmations use a separate exact-generation API. The legacy
+`session/hitl_decision` method and `hitl_pending_approval` event are unchanged.
+
+The server emits an AG-UI `CUSTOM` event named `pending_interaction` only after
+its round's durable `SuspensionReady` manifest exists:
+
+```json
+{"type":"CUSTOM","name":"pending_interaction","value":{"interaction_id":"...","request_seq":42,"tool_call_id":"...","kind":"confirm","message":"Run this tool?","pending_count":1}}
+```
+
+`request_seq` is the sequence of `InteractionRequested`, not `SuspensionReady`.
+Only the first unresolved interaction in manifest order is exposed;
+`pending_count` counts further queued interactions. An accepted response exposes
+the next request. A null `value` clears the card when nothing remains. Reconnects
+rebuild this state from the log. A modal boundary ends the current AG-UI attachment
+with `RUN_FINISHED` without completing the suspended invocation. Session state is
+`awaiting_approval`, with metadata `{type: "interaction", pending: <event value>}`;
+this is not a legacy `tool_call` interrupt and must not use legacy resume routing.
+
+Submit a response to the owning session's JSON-RPC endpoint:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"session/interaction_response","params":{"interaction_id":"...","request_seq":42,"response":{"action":"approve","data":{},"note":"Checked the command"}}}
+```
+
+Phase 2 accepts `approve` or `deny`, empty `data`, and an optional string `note`.
+The exact interaction ID and positive request sequence are required. Unknown
+fields and malformed responses return `-32602`. Normal session authorization
+runs before this method; clients never supply a worker fence.
+
+Acceptance uses the worker's durable first-wins CAS before waking the suspended
+call. A new answer returns `{applied: true, outcome: "applied"}`; an identical
+retry returns `{applied: true, outcome: "already_applied"}` without another append.
+Conflicting, mismatched or stale responses return JSON-RPC error `-32004`, message
+`interaction response rejected`, and data `{outcome: "conflicting" | "wrong_sequence"
+| "stale" | "after_complete" | "lease_lost"}`. Transport failures use `-32003`.
+Clients must show rejected answers as errors, not treat them as successful denials.
+When readable, a conflict includes the recorded answer in `error.data.response`
+(`{action, data, note?}`). A note change can conflict even when the action matches,
+so clients must not infer that the recorded action is the opposite of their answer.
+
+Web shows the message with Approve/Deny and an optional note. Unsupported kinds
+show `not supported by this client` and Deny only. Interactions queue behind any
+legacy approval card so only one request is shown at a time.
+
+### Answer a direct child from the parent page
+
+`sub_agent_progress` custom events carry optional `pending_interaction` summaries
+in live updates and durable catch-up. A nonterminal row with a summary is awaiting
+approval. The summary names the owning child agent, routing cluster and session,
+inner tool, bounded message and exact request identity. The child owns the request;
+the parent session doesn't suspend or proxy answers.
+
+For legacy approvals, post the displayed reference to the **child's** session URL:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"session/hitl_decision_exact","params":{"request":{"invocation_id":"...","tool_round_seq":10,"request_seq":11,"tool_call_id":"..."},"approved":true,"note":"Reviewed the request"}}
+```
+
+Normal agent/session access checks run against that child before any decision.
+The result has `applied` and a required `outcome`:
+
+- `applied`: `applied: true`; clear the row's pending state.
+- `already_applied`: `applied: true`, plus recorded `approved` and `note`. The same
+  boolean answer is a successful retry; a different answer is shown as answered
+  differently elsewhere.
+- `conflicting`: `applied: false`, plus recorded `approved`; show that answer.
+- `stale`: `applied: false`; this request is no longer pending. A newer request
+  that reuses the same tool-call ID is untouched.
+
+A missing or unrecognized outcome is an error, including `{applied: true}` alone.
+If the method is unknown, open the child session to answer there. Never fall back
+to `session/hitl_decision`, which intentionally selects the current generation
+for existing session-page callers. That legacy method and its `{applied}` result
+are unchanged.
+
+For middleware `confirm` summaries, use `session/interaction_response` on the
+child URL with the displayed `interaction_id` and `request_seq`. Other kinds have
+an open-session link but no parent-row answer buttons.
+
 ## Request Identity
 
 `harnx-serve` can associate incoming requests with an opaque user identity string, storing it in canonical session metadata (`user_id`).

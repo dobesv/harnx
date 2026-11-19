@@ -21,9 +21,7 @@ async fn redeliver_saved_decision_if_pending(
             active.snapshot.task.history.as_deref(),
             receipt,
         )?;
-        session
-            .decide_hitl_approval_for(&receipt.request, receipt.approved, note)
-            .await?;
+        crate::hitl::interaction::decide(session, &receipt.request, receipt.approved, note).await?;
         Ok(true)
     } else {
         anyhow::ensure!(
@@ -41,7 +39,14 @@ async fn reconcile_pending_request_checkpoint(
     request: &ApprovalRef,
 ) -> Result<bool> {
     anyhow::ensure!(
-        checkpoint.request == *request || checkpoint.request.request_seq < request.request_seq,
+        checkpoint.request == *request
+            || checkpoint.request.request_seq < request.request_seq
+            || crate::hitl::interaction::is_manifest_successor(
+                session,
+                &checkpoint.request,
+                request
+            )
+            .await?,
         "HITL runtime request regressed or changed identity"
     );
     if checkpoint.request == *request {
@@ -113,6 +118,7 @@ pub(super) async fn classify_recovered_progress(
         PromptProgress::InputRequired(pending) => {
             evaluate_input_required_progress(runner, session, authority, &pending).await
         }
+        PromptProgress::Parked => recover_interaction_progress(runner, session, authority).await,
         PromptProgress::Running {
             last_decision: Some(decision),
         } => {
@@ -122,6 +128,11 @@ pub(super) async fn classify_recovered_progress(
         PromptProgress::Running {
             last_decision: None,
         } => {
+            if recover_interaction_progress(runner, session, authority).await?
+                == Some(RecoveryAction::Follow)
+            {
+                return Ok(Some(RecoveryAction::Follow));
+            }
             ensure_no_hitl_checkpoint(
                 authority,
                 "HITL checkpoint has no runtime request or decision",
@@ -129,4 +140,28 @@ pub(super) async fn classify_recovered_progress(
             Ok(Some(RecoveryAction::Settle))
         }
     }
+}
+
+async fn recover_interaction_progress(
+    runner: &Runner,
+    session: &NatsSession,
+    authority: &mut OwnedTask,
+) -> Result<Option<RecoveryAction>> {
+    let checkpoint = authority
+        .context
+        .document
+        .state
+        .active
+        .as_ref()
+        .and_then(|a| a.hitl_checkpoint.as_ref());
+    if let Some(checkpoint) = checkpoint {
+        if let Some(decision) =
+            crate::hitl::interaction::accepted_decision(session, &checkpoint.request).await?
+        {
+            hitl_state::follow_recovered_hitl(runner, session, authority, &decision).await?;
+            return Ok(Some(RecoveryAction::Follow));
+        }
+    }
+    // Round-start-only and handoff-owned work still need a newer worker.
+    Ok(Some(RecoveryAction::Parked))
 }

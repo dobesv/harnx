@@ -63,14 +63,15 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 - attachments_attachment_create
-hooks:
-  entries:
-  - command: >-
-      harnx-claude-compatible-hook-server
-      --event PreToolUse
-      --matcher '^atlas_session_handoff$'
-      --jaq
-      '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Hand off this plan to Atlas for execution?"}}'
+middleware:
+- name: confirm-atlas-handoff
+  match: '^atlas_session_handoff$'
+  bash: |
+    if confirm --id handoff 'Hand off this plan to Atlas for execution?'; then
+      next --id dispatch
+    else
+      deny 'Atlas handoff denied by the user.'
+    fi
 description: "Strategic planner \u2014 researches with Metis and Pytheas before adaptive\
   \ clarification, produces detailed plans reviewed by Momus,\
   \ then hands off to Atlas for execution. Named after Daedalus (DED-uh-lus), the\

@@ -92,6 +92,7 @@ fn subagent_progress(
     elapsed_ms: u64,
 ) -> SubAgentProgress {
     SubAgentProgress {
+        pending_interaction: None,
         invocation_id: invocation_id.into(),
         agent: key.agent.clone(),
         session_id: key.session_id.clone(),

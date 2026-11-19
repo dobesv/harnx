@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::future::join_all;
 use harnx_core::partial_result::error_with_partial_result;
 use std::io::{Error as IoError, ErrorKind};
 

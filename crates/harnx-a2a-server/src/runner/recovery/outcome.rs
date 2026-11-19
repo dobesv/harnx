@@ -73,13 +73,16 @@ async fn handle_admitted_closure(
     canceled: bool,
 ) -> Result<RecoveryOutcome> {
     if !canceled {
-        match cx.session.fixed_prompt_progress(cx.ticket).await? {
+        match crate::hitl::interaction::fixed_progress(cx.session, cx.ticket).await? {
             harnx_runtime::PromptProgress::Terminal(result) => {
                 return Ok(completed_outcome(result, false, cx.output_limit));
             }
             harnx_runtime::PromptProgress::Running {
                 last_decision: None,
             } => {}
+            harnx_runtime::PromptProgress::Parked => {
+                anyhow::bail!("parked work requires progress recovery");
+            }
             _ => anyhow::bail!("HITL continuation requires progress recovery"),
         }
     }

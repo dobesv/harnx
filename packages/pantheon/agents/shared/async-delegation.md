@@ -43,6 +43,17 @@ its deadline.
   with `read.entry_index` + `read.byte_offset`.
 - If a `{agent}_session_cancel` tool is available to you, stop the child with it on its
   `session_id`. Soft wait expiry alone never stops the child.
+- A child waiting for user input returns `status: "blocked", terminal: false`, including
+  from synchronous `session_prompt`. Keep its `session_id` + `prompt_id` and use
+  `session_wait` after the user answers. Don't resend the task or treat this as a failure.
+- Blocked results include `pending_interaction`: the owning child agent/session, exact
+  request identity, inner tool name, message (at most 512 UTF-8 bytes, shorter under tight
+  output budgets), and count of further requests. The same summary appears in live
+  progress and, when space allows, the result's `sub_agent_progress`. Only direct
+  children are advertised.
+- The child owns the request. Users answer through the child's endpoint; the parent
+  doesn't relay answers or suspend its own turn. Repeated waits while blocked return
+  promptly, so continue other work or report the needed input rather than spinning.
 
 Only trust terminal statuses (`completed`, `failed`, `cancelled`, `timed_out`) with
 `terminal: true`. `pending` and `blocked` (awaiting approval) are nonterminal; a soft wait

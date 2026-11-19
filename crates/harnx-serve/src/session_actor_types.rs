@@ -168,6 +168,20 @@ pub enum SessionCommand {
         note: Option<String>,
         reply: oneshot::Sender<Result<bool, String>>,
     },
+    HitlApprovalDecisionExact {
+        request: harnx_runtime::ApprovalRef,
+        approved: bool,
+        note: Option<String>,
+        reply: oneshot::Sender<Result<harnx_runtime::HitlDecisionOutcome, String>>,
+    },
+    InteractionResponse {
+        interaction_id: String,
+        request_seq: u64,
+        response: harnx_core::interaction::InteractionResponse,
+        reply: oneshot::Sender<
+            Result<harnx_runtime::interactions::InteractionDecisionOutcome, String>,
+        >,
+    },
     Get {
         reply: oneshot::Sender<SessionInfo>,
     },

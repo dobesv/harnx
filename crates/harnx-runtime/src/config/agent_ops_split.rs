@@ -77,16 +77,17 @@ impl Config {
     pub fn use_prompt(&mut self, prompt: &str) -> Result<()> {
         let mut agent = Agent::new(AgentConfig::from_prompt(prompt));
         agent.set_model(self.current_model().clone());
-        if agent.temperature().is_none() {
-            agent.set_temperature(self.temperature);
-        }
-        if agent.top_p().is_none() {
-            agent.set_top_p(self.top_p);
-        }
-        if agent.use_tools().is_none() {
-            agent.set_use_tools(self.use_tools.clone());
-        }
+        self.inherit_agent_defaults(&mut agent);
         self.use_agent_obj(agent)
+    }
+
+    fn inherit_agent_defaults(&self, agent: &mut Agent) {
+        let temperature = agent.temperature().or(self.temperature);
+        let top_p = agent.top_p().or(self.top_p);
+        let use_tools = agent.use_tools().or_else(|| self.use_tools.clone());
+        agent.set_temperature(temperature);
+        agent.set_top_p(top_p);
+        agent.set_use_tools(use_tools);
     }
 
     pub fn retrieve_agent(&self, name: &str) -> Result<Agent> {
@@ -96,6 +97,7 @@ impl Config {
         } else {
             self::agent::builtin(name)?
         };
+        self.resolved_middleware_for_agent(Some(&agent))?;
         let current_model = self.current_model().clone();
         match agent.model_id() {
             Some(model_id) => {
@@ -109,15 +111,7 @@ impl Config {
             }
             None => {
                 agent.set_model(current_model);
-                if agent.temperature().is_none() {
-                    agent.set_temperature(self.temperature);
-                }
-                if agent.top_p().is_none() {
-                    agent.set_top_p(self.top_p);
-                }
-                if agent.use_tools().is_none() {
-                    agent.set_use_tools(self.use_tools.clone());
-                }
+                self.inherit_agent_defaults(&mut agent);
             }
         }
         Ok(agent)
@@ -176,11 +170,16 @@ impl Config {
     }
 
     pub fn use_agent_obj(&mut self, agent: Agent) -> Result<()> {
+        self.resolved_middleware_for_agent(Some(&agent))?;
+        self.exit_active_agent()?;
+        self.set_active_agent(agent);
+        Ok(())
+    }
+
+    fn exit_active_agent(&mut self) -> Result<()> {
         if self.agent.is_some() {
             self.exit_agent()?;
         }
-
-        self.set_active_agent(agent);
         Ok(())
     }
 

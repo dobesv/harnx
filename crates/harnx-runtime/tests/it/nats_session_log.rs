@@ -374,6 +374,7 @@ fn mixed_entries() -> Vec<SessionLogEntry> {
             fence_token: Some(41),
         },
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![ToolOutput {
                 id: Some("call-1".to_string()),
                 name: "Bash".to_string(),

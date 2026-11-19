@@ -485,6 +485,15 @@ name, persisted JSON arguments (truncated above 8 KiB), and approval reason.
 Blocking `SendMessage` returns at this boundary. `SendStreamingMessage` and
 `SubscribeToTask` close after the interrupted status; the task is **not terminal**.
 
+Middleware `confirm` interactions use the same boundary and yes/no reply grammar.
+Their challenge shows the middleware's message, without legacy tool arguments.
+A request becomes visible only after its durable `SuspensionReady` manifest.
+Only the first pending interaction is shown; the others follow in manifest order,
+even when concurrent calls persisted their requests in a different order.
+Unknown interaction kinds show "not supported by this client" and accept only a
+rejection. An approval or unrecognized reply repeats the challenge without saving
+an intent or answering anything.
+
 Send another `SendMessage` or `SendStreamingMessage` to answer. Preserve the
 returned `contextId`. Include the same `taskId`, or send only `contextId` to answer
 that context's active challenge (as Jira/Rovo does). A `taskId`-only reply also

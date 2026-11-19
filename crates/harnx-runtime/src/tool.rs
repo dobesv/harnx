@@ -9,7 +9,9 @@ use anyhow::Result;
 use harnx_hooks::HookEvent;
 
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use harnx_core::tool::ToolProvider;
@@ -93,7 +95,14 @@ pub async fn execute_tool_round(
     params: ToolRoundParams<'_>,
     tool_calls: Vec<ToolCall>,
 ) -> Result<Vec<ToolResult>> {
-    execute_tool_round_with_persistence(params, tool_calls, ToolRoundPersistence::AppendCalls).await
+    // Keep checkpoint/resume state out of the model loop's future. Inlining
+    // this frame overflows bounded worker stacks during nested tool dispatch.
+    Box::pin(execute_tool_round_with_persistence(
+        params,
+        tool_calls,
+        ToolRoundPersistence::AppendCalls,
+    ))
+    .await
 }
 
 pub async fn execute_tool_round_with_persistence(
@@ -120,6 +129,9 @@ pub async fn execute_tool_round_with_persistence(
         tool_loop_guard,
     } = params;
     let dry_run = config.read().dry_run;
+    let durable =
+        crate::interaction_checkpoint::live::DurableRound::open(config, tool_round, &tool_calls)
+            .await?;
 
     let agent_use_tools = input.agent().use_tools().map(|v| v.join(","));
     // Derive the active agent's package (e.g. `pantheon` for `pantheon/daedalus`)
@@ -144,42 +156,42 @@ pub async fn execute_tool_round_with_persistence(
             command_bash: None,
         },
         tool_round,
+        durable.as_ref(),
     )
     .await;
     let guard = crate::tool_loop_guard::begin_round(tool_loop_guard.as_deref(), config, input);
     let (to_eval, refused) = screen_tool_round(guard, config, &tool_calls, &eval_ctx).await?;
-    let results = match eval_tool_calls(&eval_ctx, to_eval, abort_signal).await {
-        Ok(results) => results,
-        Err(error) => {
-            // Fallback results cover every call, refused ones included, so the
-            // log keeps one result per call.
-            return fail_tool_round(
-                ToolFailure {
-                    config,
-                    calls: tool_calls,
-                    eval: &eval_ctx,
-                    abort: abort_signal,
-                },
-                error,
-            )
-            .await;
-        }
-    };
+    let results = evaluate_round(
+        ToolFailure {
+            config,
+            calls: &tool_calls,
+            eval: &eval_ctx,
+            abort: abort_signal,
+        },
+        to_eval,
+        &refused,
+        durable.as_ref(),
+    )
+    .await?;
     anyhow::ensure!(!abort_signal.aborted(), "interrupted during tool execution");
     let results = crate::tool_loop_guard::finish_round(guard, results, refused, &tool_calls);
     let mut results = populate_result_markdown(results, &eval_ctx);
-    persist_tool_results(config, &mut results, dry_run).await?;
+    persist_tool_results(config, &mut results, dry_run, durable.as_ref()).await?;
     Ok(results)
 }
 
 async fn build_round_eval_context(
     mut params: BuildToolEvalContextParams<'_>,
     tool_round: Option<u64>,
+    durable: Option<&crate::interaction_checkpoint::live::DurableRound>,
 ) -> Arc<ToolEvalContext> {
     let slot = crate::bash_provider::BashEvalContextSlot::new();
     params.bash_context_slot = Some(slot.clone());
     let mut ctx = build_tool_eval_context(params).await;
     ctx.tool_round = tool_round;
+    if let Some(round) = durable {
+        round.install(&mut ctx);
+    }
     slot.install(ctx)
 }
 
@@ -187,6 +199,7 @@ async fn persist_tool_results(
     config: &GlobalConfig,
     results: &mut [ToolResult],
     dry_run: bool,
+    durable: Option<&crate::interaction_checkpoint::live::DurableRound>,
 ) -> Result<()> {
     if dry_run {
         return Ok(());
@@ -196,15 +209,52 @@ async fn persist_tool_results(
             .write()
             .prepare_session_tool_results_in_place(results)?
     };
+    let session_id = durable
+        .map(|d| d.session.backend.session_id().to_string())
+        .or_else(|| config.read().session.as_ref().map(|s| s.id.clone()))
+        .unwrap_or_default();
+    crate::fault_injection::hit(
+        &session_id,
+        crate::fault_injection::RecoveryFaultPoint::FinalToolResultsBefore,
+    )
+    .await;
     persistence.persist().await;
+    crate::fault_injection::hit(
+        &session_id,
+        crate::fault_injection::RecoveryFaultPoint::FinalToolResultsAfter,
+    )
+    .await;
+    if let Some(round) = durable {
+        round.cleanup().await?;
+    }
     Ok(())
 }
 
 struct ToolFailure<'a> {
     config: &'a GlobalConfig,
-    calls: Vec<ToolCall>,
+    calls: &'a [ToolCall],
     eval: &'a ToolEvalContext,
     abort: &'a harnx_core::abort::AbortSignal,
+}
+
+async fn evaluate_round(
+    failure: ToolFailure<'_>,
+    calls: Vec<ToolCall>,
+    refused: &[ToolResult],
+    durable: Option<&crate::interaction_checkpoint::live::DurableRound>,
+) -> Result<Vec<ToolResult>> {
+    let evaluation = match durable {
+        Some(round) => {
+            round.complete_refused(refused, failure.eval).await?;
+            round.evaluate(failure.eval, calls, failure.abort).await
+        }
+        None => eval_tool_calls(failure.eval, calls, failure.abort).await,
+    };
+    match evaluation {
+        Ok(results) => Ok(results),
+        // Include refused calls too when materializing an actual round failure.
+        Err(error) => fail_tool_round(failure, error).await,
+    }
 }
 
 async fn fail_tool_round(
@@ -219,7 +269,8 @@ async fn fail_tool_round(
         "interrupted during tool execution"
     );
     if !failure.config.read().dry_run {
-        persist_failed_tool_results(failure.config, failure.calls, failure.eval, &error).await?;
+        persist_failed_tool_results(failure.config, failure.calls.to_vec(), failure.eval, &error)
+            .await?;
     }
     Err(error)
 }
@@ -228,7 +279,9 @@ fn terminal_tool_interruption(
     abort: &harnx_core::abort::AbortSignal,
     error: &anyhow::Error,
 ) -> bool {
-    abort.aborted() || ToolApprovalInterrupt::from_error(error).is_some()
+    abort.aborted()
+        || ToolApprovalInterrupt::from_error(error).is_some()
+        || error.is::<harnx_engine::tool::ToolInputRequiredError>()
 }
 
 async fn persist_failed_tool_results(
@@ -462,71 +515,72 @@ pub async fn build_tool_eval_context_with_provider(
 }
 
 async fn build_tool_eval_context_inner(
-    params: BuildToolEvalContextParams<'_>,
-    provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
+    mut params: BuildToolEvalContextParams<'_>,
+    provider: Option<Arc<NatsToolProvider>>,
 ) -> ToolEvalContext {
-    let BuildToolEvalContextParams {
-        config,
-        instance_id,
-        agent_use_tools,
-        current_agent_package,
-        working_dir,
-        nats_hook_provider,
-        prepare_handoff_fn,
-        pending_async_context,
-        bash_context_slot,
-        command_bash,
-    } = params;
-    let ToolRoundSnapshot {
-        declarations: tool_declarations,
-        handoff_targets,
-        session_name,
-        confirmation: confirm_tool_use_fn,
-        config: config_snapshot,
-    } = snapshot_tool_round(config, agent_use_tools, current_agent_package.as_deref());
-
-    let (nats_provider, nats_hook_provider) = resolve_nats_providers(
-        &config_snapshot,
-        instance_id,
-        current_agent_package.as_deref(),
-        (provider, nats_hook_provider),
+    let snapshot = snapshot_tool_round(
+        params.config,
+        params.agent_use_tools,
+        params.current_agent_package.as_deref(),
+    );
+    let (provider, hooks) = resolve_nats_providers(
+        &snapshot.config,
+        params.instance_id,
+        params.current_agent_package.as_deref(),
+        (provider, params.nats_hook_provider.take()),
     )
     .await;
+    assemble_tool_eval_context(params, snapshot, provider, hooks)
+}
+
+fn assemble_tool_eval_context(
+    params: BuildToolEvalContextParams<'_>,
+    snapshot: ToolRoundSnapshot,
+    provider: Option<Arc<NatsToolProvider>>,
+    hooks: Option<Arc<NatsHookProvider>>,
+) -> ToolEvalContext {
     let decl_map = Arc::new(build_context_decl_map(
-        tool_declarations,
-        nats_provider.as_deref(),
-        agent_use_tools,
-        command_bash.as_ref(),
+        snapshot.declarations,
+        provider.as_deref(),
+        params.agent_use_tools,
+        params.command_bash.as_ref(),
     ));
-    let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
-    let providers = build_tool_providers(config, nats_provider, bash_context_slot, command_bash);
-    let dispatch_hook_fn = build_dispatch_hook_fn(
-        (config, session_name.as_deref()),
-        working_dir,
-        nats_hook_provider,
-        pending_async_context,
-    );
     let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn, emit_tool_update_fn) =
         build_emit_fns(&decl_map);
-    ToolEvalContext {
+    let mut ctx = ToolEvalContext {
+        on_tool_call_completed: None,
+        on_interaction: None,
+        middleware_fn: None,
         work_boundary: None,
-        instance_id: instance_id.clone(),
+        instance_id: params.instance_id.clone(),
         tool_round: None,
         render: Some(ToolEvalRenderContext {
             decl_map: Arc::clone(&decl_map),
         }),
-        providers,
-        allowed_tool_names,
-        current_agent_package,
-        handoff_targets,
+        allowed_tool_names: decl_map.keys().cloned().collect(),
+        providers: build_tool_providers(
+            params.config,
+            provider,
+            params.bash_context_slot,
+            params.command_bash,
+        ),
+        current_agent_package: params.current_agent_package,
+        handoff_targets: snapshot.handoff_targets,
         emit_tool_call_fn,
         emit_tool_result_fn,
         emit_tool_blocked_fn,
         emit_tool_update_fn,
-        confirm_tool_use_fn,
-        dispatch_hook_fn,
-        prepare_handoff_fn,
-    }
+        confirm_tool_use_fn: snapshot.confirmation,
+        dispatch_hook_fn: build_dispatch_hook_fn(
+            (params.config, snapshot.session_name.as_deref()),
+            params.working_dir,
+            hooks,
+            params.pending_async_context,
+        ),
+        prepare_handoff_fn: params.prepare_handoff_fn,
+    };
+    crate::middleware::install(&mut ctx, &snapshot.config);
+    ctx
 }
 
 struct ToolRoundSnapshot {
@@ -652,7 +706,7 @@ fn build_tool_providers(
     providers
 }
 
-fn populate_result_markdown(
+pub(crate) fn populate_result_markdown(
     results: Vec<ToolResult>,
     eval_ctx: &ToolEvalContext,
 ) -> Vec<ToolResult> {
@@ -1474,6 +1528,9 @@ mod tests {
             make_decl_with_templates("bash_exec", None, Some("OK: {{ result.content[0].text }}")),
         );
         let eval_ctx = ToolEvalContext {
+            on_tool_call_completed: None,
+            on_interaction: None,
+            middleware_fn: None,
             work_boundary: None,
             instance_id: harnx_core::instance::ServerScope::new(),
             tool_round: None,

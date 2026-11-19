@@ -13,6 +13,8 @@ use harnx_toolset_server::invocation_journal::InvocationJournal;
 
 #[path = "tool_round/compaction.rs"]
 mod compaction;
+#[path = "tool_round/no_middleware.rs"]
+mod no_middleware;
 
 /// A session whose log lives on the broker, and a time tool server registered
 /// under the scope its tool rounds discover.

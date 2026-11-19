@@ -160,6 +160,9 @@ fn has_terminal_entry_after(
 }
 
 fn matches_requested_approval(approval: &PendingHitlApproval, params: &HitlDecisionParams) -> bool {
+    if approval.interaction_id.is_some() {
+        return false;
+    }
     if approval.tool_call_id != params.tool_call_id {
         return false;
     }

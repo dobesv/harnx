@@ -12,6 +12,19 @@ pub(crate) async fn spawn_worker(
     config: GlobalConfig,
     call_fn: AgentCallFn,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    spawn_worker_with_config(
+        config,
+        call_fn,
+        WorkerDaemonConfig::managing(CLUSTER, "acp-integration-worker"),
+    )
+    .await
+}
+
+pub(crate) async fn spawn_worker_with_config(
+    config: GlobalConfig,
+    call_fn: AgentCallFn,
+    daemon_config: WorkerDaemonConfig,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let client = {
         let config = config.read().clone();
         config.nats_client(CLUSTER).await?
@@ -21,7 +34,7 @@ pub(crate) async fn spawn_worker(
 
     let mut daemon = tokio::spawn(run_worker_daemon(
         config,
-        WorkerDaemonConfig::managing(CLUSTER, "acp-integration-worker"),
+        daemon_config,
         Some(call_fn),
         None,
     ));

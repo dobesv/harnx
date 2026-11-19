@@ -154,6 +154,9 @@ fn harness_with_post_hook(
     .with_attachment_fetcher(fetcher)
     .with_media_store(store);
     let ctx = Arc::new(ToolEvalContext {
+        on_tool_call_completed: None,
+        on_interaction: None,
+        middleware_fn: None,
         work_boundary: None,
         instance_id: ServerScope::new(),
         tool_round: Some(1),

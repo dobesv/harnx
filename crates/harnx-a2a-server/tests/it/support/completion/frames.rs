@@ -32,18 +32,21 @@ impl FramePlan {
 fn needs_hold(script: Script, counted_tool: bool) -> bool {
     match script {
         Script::Text => true,
+        Script::ConfirmHeld => counted_tool,
         Script::CountedTool => !counted_tool,
         _ => false,
     }
 }
 
 fn needs_counted_tool(script: Script, body: &Value) -> bool {
-    script == Script::CountedTool
-        && body["messages"]
-            .as_array()
-            .and_then(|m| m.last())
-            .map(|m| m["role"].as_str())
-            != Some(Some("tool"))
+    matches!(
+        script,
+        Script::CountedTool | Script::ConfirmTool | Script::ConfirmHeld | Script::ConfirmSerial
+    ) && body["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .map(|m| m["role"].as_str())
+        != Some(Some("tool"))
 }
 
 fn needs_handoff(llm: &Llm, first: bool) -> bool {
@@ -64,8 +67,15 @@ fn select_frames(llm: &Llm, first: bool, many: bool, counted_tool: bool) -> Vec<
     if counted_tool {
         return counted_tool_frames();
     }
-    if llm.script == Script::SameRoundTools && first {
+    if matches!(
+        llm.script,
+        Script::SameRoundTools | Script::ConfirmSameRound
+    ) && first
+    {
         return same_round_frames();
+    }
+    if llm.script == Script::ShippedDaedalus && first {
+        return shipped_handoff_frames();
     }
     if needs_handoff(llm, first) {
         return handoff_frames(first);
@@ -170,6 +180,20 @@ fn text_frames() -> Vec<String> {
         ),
         chunk(json!({"content":"world"}), Value::Null),
         chunk(json!({}), json!("stop")),
+        "[DONE]".into(),
+    ]
+}
+
+fn shipped_handoff_frames() -> Vec<String> {
+    vec![
+        chunk(
+            json!({"tool_calls":[{"index":0,"id":"shipped-handoff","type":"function",
+                "function":{"name":"atlas_session_handoff", "arguments":json!({
+                    "prompt":"execute plan", "session_id":"shipped-atlas"
+                }).to_string()}}]}),
+            Value::Null,
+        ),
+        chunk(json!({}), json!("tool_calls")),
         "[DONE]".into(),
     ]
 }

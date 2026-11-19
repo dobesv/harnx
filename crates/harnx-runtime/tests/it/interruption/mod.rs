@@ -84,6 +84,7 @@ fn tool_calls(ids: &[&str]) -> Entry {
 
 fn tool_results(id: &str, output: serde_json::Value) -> Entry {
     Entry::ToolResults {
+        handoff_selection: None,
         results: vec![ToolOutput {
             id: Some(id.into()),
             name: "slow_tool".into(),

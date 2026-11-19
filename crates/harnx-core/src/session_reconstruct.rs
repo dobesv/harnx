@@ -793,6 +793,7 @@ fn cancel_after_orphan_tool_call(trailing_user: bool) -> Vec<(u64, SessionLogEnt
 #[cfg(test)]
 fn tool_result_ok() -> SessionLogEntry {
     SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results: vec![ToolOutput {
             id: Some("c1".to_string()),
             name: "bash".to_string(),
@@ -1661,6 +1662,7 @@ mod timing_non_executable_tests {
             (
                 3,
                 SessionLogEntry::ToolResults {
+                    handoff_selection: None,
                     results: vec![],
                     timestamp: None,
                 },

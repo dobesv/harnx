@@ -202,6 +202,7 @@ fn e2e_worker_config(time_binary: PathBuf, plans_binary: PathBuf) -> GlobalConfi
                 description: None,
                 package: None,
                 hooks: None,
+                middleware: Default::default(),
             },
             ToolServerConfig {
                 name: "plans".to_string(),
@@ -212,6 +213,7 @@ fn e2e_worker_config(time_binary: PathBuf, plans_binary: PathBuf) -> GlobalConfi
                 description: None,
                 package: None,
                 hooks: None,
+                middleware: Default::default(),
             },
         ],
         ..Config::default()
@@ -279,6 +281,7 @@ fn single_time_server_config(time_binary: PathBuf) -> GlobalConfig {
             description: None,
             package: None,
             hooks: None,
+            middleware: Default::default(),
         }],
         ..Config::default()
     }))
@@ -560,6 +563,7 @@ async fn stopping_a_server_actually_removes_its_registration() -> anyhow::Result
     let reconciler = ServerReconciler::new(launcher, Duration::ZERO);
 
     let time_server = ToolServerConfig {
+        middleware: Default::default(),
         name: "time".to_string(),
         command: time_binary.to_string_lossy().into_owned(),
         args: Vec::new(),

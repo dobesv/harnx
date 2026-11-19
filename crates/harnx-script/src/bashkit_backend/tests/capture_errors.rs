@@ -6,6 +6,7 @@ async fn fatal_command_error_survives_full_stderr_capture() {
         let result = BashKitBackend
             .run(crate::ScriptRequest {
                 script: "printf '123456789' >&2\nprobe\necho after",
+                python_functions: None,
                 limits: ScriptLimits {
                     max_stderr_bytes: cap,
                     ..Default::default()

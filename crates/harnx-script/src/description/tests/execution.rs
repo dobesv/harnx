@@ -32,6 +32,7 @@ async fn run(script: &str, tools: Vec<ToolSpec>, executor: Arc<Executor>) -> Scr
     BashKitBackend
         .run(crate::ScriptRequest {
             script,
+            python_functions: None,
             limits: ScriptLimits::default(),
             commands: tool_commands(tools, executor).unwrap(),
             fs_mounts: vec![],

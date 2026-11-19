@@ -36,6 +36,7 @@ async fn timeout_preserves_worker_panic_diagnostic() {
         Duration::from_secs(3),
         BashKitBackend.run(crate::ScriptRequest {
             script: "panic_during_cleanup",
+            python_functions: None,
             limits: ScriptLimits {
                 timeout_secs: 1,
                 ..Default::default()
@@ -62,6 +63,7 @@ async fn timeout_preserves_worker_panic_diagnostic() {
 async fn completed_run_is_not_reclassified_when_parent_resumes_after_deadline() {
     let mut run = Box::pin(BashKitBackend.run(crate::ScriptRequest {
         script: "echo completed",
+        python_functions: None,
         limits: ScriptLimits {
             timeout_secs: 1,
             ..Default::default()
@@ -78,7 +80,7 @@ async fn completed_run_is_not_reclassified_when_parent_resumes_after_deadline() 
     // Don't poll the parent while the interpreter completes. Returning its
     // admission permit proves it has left the blocking closure, without sleeps.
     tokio::time::timeout(Duration::from_millis(900), async {
-        while crate::bashkit_backend::worker::ADMISSION.available_permits()
+        while crate::bashkit_backend::worker::ADMISSION[0].available_permits()
             != crate::bashkit_backend::worker::MAX_SCRIPT_WORKERS
         {
             tokio::task::yield_now().await;
@@ -98,7 +100,7 @@ async fn completed_run_is_not_reclassified_when_parent_resumes_after_deadline() 
 #[tokio::test]
 async fn admission_wait_observes_cancel_and_deadline_without_starting_script() {
     use crate::bashkit_backend::worker::{ADMISSION, MAX_SCRIPT_WORKERS};
-    let _all = ADMISSION
+    let _all = ADMISSION[0]
         .clone()
         .acquire_many_owned(MAX_SCRIPT_WORKERS as u32)
         .await
@@ -107,6 +109,7 @@ async fn admission_wait_observes_cancel_and_deadline_without_starting_script() {
         let token = CancellationToken::new();
         let mut run = Box::pin(BashKitBackend.run(crate::ScriptRequest {
             script: "echo must-not-start",
+            python_functions: None,
             limits: ScriptLimits {
                 timeout_secs: 1,
                 ..Default::default()
@@ -136,7 +139,7 @@ async fn admission_wait_observes_cancel_and_deadline_without_starting_script() {
         } else {
             assert_eq!(result.status, ScriptStatus::Cancelled);
         }
-        assert_eq!(ADMISSION.available_permits(), 0);
+        assert_eq!(ADMISSION[0].available_permits(), 0);
     }
 }
 
@@ -148,18 +151,13 @@ fn cancelled_queued_closures_retain_admission_until_blocking_pool_drains() {
         .max_blocking_threads(1)
         .build()
         .unwrap();
-    let (release, wait) = std::sync::mpsc::channel::<()>();
-    let (started, ready) = std::sync::mpsc::channel();
-    let blocker = runtime.spawn_blocking(move || {
-        started.send(()).unwrap();
-        let _ = wait.recv();
-    });
-    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (release, blocker) = block_worker_pool(&runtime);
     runtime.block_on(async {
         for remaining in (0..MAX_SCRIPT_WORKERS).rev() {
             let token = CancellationToken::new();
             let mut run = Box::pin(BashKitBackend.run(crate::ScriptRequest {
                 script: "echo must-not-start",
+                python_functions: None,
                 limits: ScriptLimits::default(),
                 commands: vec![],
                 fs_mounts: vec![],
@@ -172,14 +170,14 @@ fn cancelled_queued_closures_retain_admission_until_blocking_pool_drains() {
             );
             token.cancel();
             assert_eq!(run.await.status, ScriptStatus::Cancelled);
-            assert_eq!(ADMISSION.available_permits(), remaining);
+            assert_eq!(ADMISSION[0].available_permits(), remaining);
         }
     });
     drop(release);
     runtime.block_on(blocker).unwrap();
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while ADMISSION.available_permits() != MAX_SCRIPT_WORKERS {
+            while ADMISSION[0].available_permits() != MAX_SCRIPT_WORKERS {
                 tokio::task::yield_now().await;
             }
         })

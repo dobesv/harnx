@@ -78,10 +78,16 @@ impl HarnxHandler {
             request: checkpoint.request.clone(),
             boundary: active.snapshot.stream_seq,
         };
-        if matches!(
-            parse_reply(&request.message.parts),
-            ReplyParse::Unrecognized
-        ) {
+        let parsed = parse_reply(&request.message.parts);
+        let unsupported = if matches!(parsed, ReplyParse::Approve(_)) {
+            let session = self.session(owner, Some(local_id)).await?;
+            !crate::hitl::interaction::can_approve(&session, &bound.request)
+                .await
+                .map_err(map_error)?
+        } else {
+            false
+        };
+        if matches!(parsed, ReplyParse::Unrecognized) || unsupported {
             let candidate = ReplyCandidate {
                 storage: &storage,
                 active,

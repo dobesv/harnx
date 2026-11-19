@@ -56,15 +56,13 @@ impl Tui {
 
     pub(super) async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
         match event {
+            TuiEvent::Interaction(event) => self.handle_interaction_event(event),
             event @ (TuiEvent::OperatorToolFinished { .. }
             | TuiEvent::PromptTaskFinished { .. }) => {
                 self.handle_task_completion(event).await;
             }
-            TuiEvent::LocalAgent(event) => {
-                // Explicit local commands are not worker advisories. A NATS
-                // follower can only enter through the generation-bound sink.
-                self.render_agent_event(event).await;
-            }
+            // Explicit local commands are not worker advisories.
+            TuiEvent::LocalAgent(event) => self.render_agent_event(event).await,
             TuiEvent::Agent { task, stamp, event } => {
                 self.handle_prompt_agent_event(task, stamp, event).await;
             }

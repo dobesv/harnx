@@ -62,8 +62,8 @@ They must retain the exact original `ApprovalRef`; don't use a new prompt or cal
 
 For a caller already holding `OwnedTask` in a runner module:
 
-1. Deliver the saved decision with `session.decide_hitl_approval_for(&request,
-   approved, note)`. Query `fixed_prompt_progress(ticket)` after the outcome;
+1. Deliver the saved decision with `hitl::interaction::decide(session, &request,
+   approved, note)`. Query `hitl::interaction::fixed_progress(session, ticket)` after the outcome;
    stale/conflicting decisions must not target a newer request.
 2. Drain the old outbox, persist reply dedupe if applicable, then use
    `advance_hitl_to_following(storage, version, params)`. Refresh the
@@ -292,12 +292,22 @@ receipt note is truncated to 4096 bytes. Immediate delivery and recovery use
 `reply_note::saved_reply_note` to recover the full plain-text note, checking its
 fingerprint and approve/reject alignment against the receipt. Missing or mismatched
 history leaves the exact intent unresolved for retry, without delivering a decision.
-Delivery writes reply dedupe before runtime effects and calls
-`decide_hitl_approval_for` with the saved reference. The reply stays in task history;
+Delivery writes reply dedupe before runtime effects. `hitl::interaction::decide`
+resolves the saved exact request sequence, round and tool-call identity. Middleware
+requests call `decide_interaction` with that request's immutable `interaction_id`
+and sequence; legacy requests still call `decide_hitl_approval_for`. No checkpoint
+or receipt schema changes are needed. The reply stays in task history;
 it isn't a new session prompt. Approval notes remain audit-only; rejection
 notes become the blocked-tool reason under the runtime's existing semantics.
 
-After every decision outcome, query `fixed_prompt_progress` on the original ticket.
+After every decision outcome, query `hitl::interaction::fixed_progress` on the
+original ticket. It preserves runtime terminal proof and legacy progress. The
+runtime's mixed-version guard intentionally reports middleware-owned rounds as
+`Parked`, even when ready interactions exist. This A2A adapter derives the first
+ready interaction within the admitted prompt and checks completion again before
+projecting `InputRequired`. Missing manifests and round-start-only work stay parked.
+Accepted middleware responses aren't legacy `last_decision` receipts, so recovery
+resolves the exact checkpoint's durable `InteractionResponse` before following.
 The invocation may already be terminal or awaiting Q2. Applied decisions stage and
 publish Working/Following, then pass the same `OwnedTask` into
 `resume_owned_hitl`. Stale/conflicting outcomes with advanced runtime progress

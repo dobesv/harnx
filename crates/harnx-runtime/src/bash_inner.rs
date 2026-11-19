@@ -935,6 +935,9 @@ mod tests {
         let captured = Arc::clone(&events);
         let control = Arc::new(control);
         let ctx = ToolEvalContext {
+            on_tool_call_completed: None,
+            on_interaction: None,
+            middleware_fn: None,
             work_boundary: None,
             instance_id: ServerScope::new(),
             tool_round: Some(1),

@@ -169,6 +169,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 jaq-all = { version = "0.3", features = ["formats"] }
 indexmap = { version = "2.2.6", features = ["serde"] }
 hmac = "0.13.0"
+humantime = "2.3.0"
 aws-config = { version = "1", features = ["sso"] }
 aws-credential-types = "1"
 aws-smithy-eventstream = "0.61.0"

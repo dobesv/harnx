@@ -366,6 +366,9 @@ impl Tui {
     }
 
     async fn handle_exclusive_view_key(&mut self, key: KeyEvent) -> Option<Result<()>> {
+        if self.handle_child_answer_key(key) {
+            return Some(Ok(()));
+        }
         if self.app.modal.is_none() && self.app.archive_browser.is_some() {
             if self.app.detail_view_open {
                 return Some(self.handle_detail_view_key(key).await);

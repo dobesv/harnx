@@ -236,11 +236,7 @@ impl<'a> ReplayState<'a> {
             SessionLogEntry::DataUrls { urls } => self.session.data_urls.extend(urls),
             SessionLogEntry::Compress { prompt } => self.compress(prompt)?,
             SessionLogEntry::Clear => self.clear(),
-            SessionLogEntry::Unknown => anyhow::ensure!(
-                allow_embedded_metadata,
-                "unsupported or legacy entry found in canonical NATS transcript '{}'",
-                self.name
-            ),
+            SessionLogEntry::Unknown => self.unknown_entry(allow_embedded_metadata)?,
             // Errors annotate the transcript; control state is hydrated separately.
             // None of these entries may break pending tool-call/result adjacency.
             // Runtime-note entries were handled before this dispatch.
@@ -251,12 +247,25 @@ impl<'a> ReplayState<'a> {
             | SessionLogEntry::HandoffCommitted { .. }
             | SessionLogEntry::HitlApprovalRequested { .. }
             | SessionLogEntry::HitlApprovalDecision { .. }
+            | SessionLogEntry::ToolCallCompleted { .. }
+            | SessionLogEntry::InteractionRequested { .. }
+            | SessionLogEntry::SuspensionReady { .. }
+            | SessionLogEntry::InteractionResponse { .. }
             | SessionLogEntry::CompactRequest { .. }
             | SessionLogEntry::CompactResult { .. }
             | SessionLogEntry::AdmissionClosed { .. }
             | SessionLogEntry::EditEntries { .. }
             | SessionLogEntry::Rewind { .. } => {}
         }
+        Ok(())
+    }
+
+    fn unknown_entry(&self, allow_embedded_metadata: bool) -> Result<()> {
+        let name = self.name;
+        anyhow::ensure!(
+            allow_embedded_metadata,
+            "unsupported or legacy entry found in canonical NATS transcript '{name}'"
+        );
         Ok(())
     }
 

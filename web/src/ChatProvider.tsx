@@ -13,7 +13,7 @@ import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
 import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
-import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type MessageAttachmentMeta, type CompactionOutcome } from './harnxCustomEvents';
+import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type MessageAttachmentMeta, type CompactionOutcome, type PendingInteraction } from './harnxCustomEvents';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
 import { SessionNavigationContext } from './SessionNavigationContext';
@@ -106,6 +106,7 @@ export interface HarnxHttpAgentOptions {
   onHandoff?: (agent: string, sessionId: string) => void;
   onSubAgentEvent: (event: unknown) => void;
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  onPendingInteraction?: (interaction: PendingInteraction | null) => void;
   onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
   onCompactingStarted?: (compactionId?: string) => void;
   onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
@@ -143,6 +144,7 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onHandoff?: (agent: string, sessionId: string) => void;
   private readonly onSubAgentEvent: (event: unknown) => void;
   private readonly onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  private readonly onPendingInteractionCb?: (interaction: PendingInteraction | null) => void;
   private readonly onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
   private readonly onCompactingStarted?: (compactionId?: string) => void;
   private readonly onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
@@ -163,6 +165,7 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onHandoff = options.onHandoff;
     this.onSubAgentEvent = options.onSubAgentEvent;
     this.onHitlPendingApproval = options.onHitlPendingApproval;
+    this.onPendingInteractionCb = options.onPendingInteraction;
     this.onMessageAttachments = options.onMessageAttachments;
     this.onCompactingStarted = options.onCompactingStarted;
     this.onCompactingCompleted = options.onCompactingCompleted;
@@ -190,6 +193,7 @@ export class HarnxHttpAgent extends HttpAgent {
         }
       },
       onHitlPendingApproval: this.onHitlPendingApproval,
+      onPendingInteraction: this.onPendingInteractionCb,
       onMessageAttachments: this.onMessageAttachments,
       onCompactingStarted: this.onCompactingStarted,
       onCompactingCompleted: this.onCompactingCompleted,
@@ -321,6 +325,23 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   );
   // Hydrated HITL pending approvals from durable log (hitl_pending_approval CUSTOM events)
   const [hydratedApprovals, setHydratedApprovals] = useState<HydratedPendingApproval[]>([]);
+  const [pendingInteraction, setPendingInteraction] = useState<PendingInteraction | null>(null);
+
+  const clearPendingInteraction = useCallback(() => {
+    setPendingInteraction(null);
+  }, []);
+
+  const clearPendingInteractionIfMatch = useCallback(
+    (interactionId: string, requestSeq: number) => {
+      setPendingInteraction((prev) => {
+        if (prev && prev.interactionId === interactionId && prev.requestSeq === requestSeq) {
+          return null;
+        }
+        return prev;
+      });
+    },
+    [],
+  );
   
   const addHydratedApproval = useCallback((approval: HydratedPendingApproval) => {
     setHydratedApprovals((prev) => {
@@ -385,60 +406,90 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     async remove() {}
   }), [agentName, sessionId]);
 
-  const agent = useMemo(() => new HarnxHttpAgent({
-    url: `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}`,
-    onStatus: (text) => setStatusText(text),
-    onRunFailed: (message) => setErrorText(message),
-    onUsage: (newUsage) => setUsage(newUsage),
-    onToolSummary: (id, summary) => {
-      if (id && summary) {
-        setToolSummaries((prev) => {
-          const next = new Map(prev);
-          next.set(id, summary);
-          return next;
+  const currentSessionRef = useRef({ agentName, sessionId });
+  currentSessionRef.current = { agentName, sessionId };
+  const currentAgentRef = useRef<HarnxHttpAgent | null>(null);
+
+  const agent = useMemo(() => {
+    const boundAgentName = agentName;
+    const boundSessionId = sessionId;
+    const agentInstance: HarnxHttpAgent = new HarnxHttpAgent({
+      url: `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}`,
+      onStatus: (text) => setStatusText(text),
+      onRunFailed: (message) => setErrorText(message),
+      onUsage: (newUsage) => setUsage(newUsage),
+      onToolSummary: (id, summary) => {
+        if (id && summary) {
+          setToolSummaries((prev) => {
+            const next = new Map(prev);
+            next.set(id, summary);
+            return next;
+          });
+        }
+      },
+      onHandoff,
+      isForeground: true,
+      onHitlPendingApproval: (toolCallId, summary) => {
+        cancellationRef.current?.reset?.();
+        addHydratedApproval({ toolCallId, summary });
+      },
+      onPendingInteraction: (interaction) => {
+        if (
+          currentAgentRef.current !== agentInstance ||
+          currentSessionRef.current.agentName !== boundAgentName ||
+          currentSessionRef.current.sessionId !== boundSessionId
+        ) {
+          return;
+        }
+        cancellationRef.current?.reset?.();
+        setPendingInteraction(interaction);
+      },
+      onRunTerminal: () => {
+        cancellationRef.current?.reset?.();
+        setCompactionPhase(compactionAfterRunTerminal);
+      },
+      onMessageAttachments: (messageId, attachments) => {
+        dispatchAttachments({
+          type: 'SET_ATTACHMENTS',
+          agent: agentName,
+          session: sessionId,
+          messageId,
+          attachments,
         });
+      },
+      onSubAgentEvent: (event: any) => dispatchSubAgentEvent(event),
+      onCompactingStarted: (compactionId) => {
+        setCompactionPhase({ phase: 'compacting', compactionId });
+      },
+      onCompactingCompleted: (outcome, _compactionId) => {
+        setCompactionPhase({ phase: 'idle' });
+        if (outcome.status === 'unchanged') {
+          setStatusMessage(formatUnchangedReason(outcome.detail));
+        }
+      },
+      onCompactingFailed: (error, _compactionId) => {
+        setCompactionPhase({ phase: 'failed' });
+        setErrorText(error);
+      },
+      onSessionCompaction: (metadata) => {
+        setCompactionMetadata(metadata);
+      },
+      onToolUpdate: (patch: ToolCallUpdatePatch) => {
+        dispatchToolUpdate({ type: 'TOOL_UPDATE', patch });
+      },
+    });
+    currentAgentRef.current = agentInstance;
+    return agentInstance;
+  }, [agentName, sessionId, onHandoff, addHydratedApproval]);
+
+  useEffect(() => {
+    currentAgentRef.current = agent;
+    return () => {
+      if (currentAgentRef.current === agent) {
+        currentAgentRef.current = null;
       }
-    },
-    onHandoff,
-    isForeground: true,
-    onHitlPendingApproval: (toolCallId, summary) => {
-      cancellationRef.current.reset?.();
-      addHydratedApproval({ toolCallId, summary });
-    },
-    onRunTerminal: () => {
-      cancellationRef.current.reset?.();
-      setCompactionPhase(compactionAfterRunTerminal);
-    },
-    onMessageAttachments: (messageId, attachments) => {
-      dispatchAttachments({
-        type: 'SET_ATTACHMENTS',
-        agent: agentName,
-        session: sessionId,
-        messageId,
-        attachments,
-      });
-    },
-    onSubAgentEvent: (event: any) => dispatchSubAgentEvent(event),
-    onCompactingStarted: (compactionId) => {
-      setCompactionPhase({ phase: 'compacting', compactionId });
-    },
-    onCompactingCompleted: (outcome, _compactionId) => {
-      setCompactionPhase({ phase: 'idle' });
-      if (outcome.status === 'unchanged') {
-        setStatusMessage(formatUnchangedReason(outcome.detail));
-      }
-    },
-    onCompactingFailed: (error, _compactionId) => {
-      setCompactionPhase({ phase: 'failed' });
-      setErrorText(error);
-    },
-    onSessionCompaction: (metadata) => {
-      setCompactionMetadata(metadata);
-    },
-    onToolUpdate: (patch: ToolCallUpdatePatch) => {
-      dispatchToolUpdate({ type: 'TOOL_UPDATE', patch });
-    },
-  }), [agentName, sessionId, onHandoff, addHydratedApproval]);
+    };
+  }, [agent]);
 
   const runtime = useAgUiRuntime({
     agent,
@@ -457,7 +508,8 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     dispatchAttachments({ type: 'RESET', agent: agentName, session: sessionId });
     dispatchToolUpdate({ type: 'RESET' });
     clearHydratedApprovals();
-  }, [agentName, sessionId, clearHydratedApprovals]);
+    clearPendingInteraction();
+  }, [agentName, sessionId, clearHydratedApprovals, clearPendingInteraction]);
 
   const subAgentContext = useMemo(() => ({
     notes: subAgentState.notes,
@@ -491,7 +543,8 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       <PendingContext.Provider value={{ 
         statusText, setStatusText, errorText, setErrorText,
         statusMessage, setStatusMessage,
-        hydratedApprovals, addHydratedApproval, clearHydratedApprovals, removeHydratedApproval
+        hydratedApprovals, addHydratedApproval, clearHydratedApprovals, removeHydratedApproval,
+        pendingInteraction, setPendingInteraction, clearPendingInteraction, clearPendingInteractionIfMatch
       }}>
         <UsageContext.Provider value={{ usage, toolSummaries, toolUpdates: toolUpdatesState }}>
           <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>

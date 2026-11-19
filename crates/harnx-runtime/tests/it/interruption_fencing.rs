@@ -150,6 +150,7 @@ async fn cancel_vs_transcript_same_lease_new_generation_succeeds() -> Result<()>
             [
                 assistant("stale assistant"),
                 SessionLogEntry::ToolResults {
+                    handoff_selection: None,
                     results: vec![],
                     timestamp: None,
                 },

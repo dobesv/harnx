@@ -4,10 +4,12 @@ class MockEventSource {
 }
 (globalThis as any).EventSource = MockEventSource;
 
+import { useContext, StrictMode } from 'react';
 import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import {
   BatchInterruptUI,
+  InteractionUI,
   CancelButton,
   MyAttachment,
   MyComposer,
@@ -17,7 +19,8 @@ import {
   StatusIndicator,
 } from '../App';
 import { MarkdownLink } from '../markdownLink';
-import { sendPrompt, uploadAttachment, submitHitlDecision, markRead } from '../api';
+import { sendPrompt, uploadAttachment, submitHitlDecision, submitInteractionResponse, InteractionResponseError, markRead } from '../api';
+import type { PendingInteraction } from '../harnxCustomEvents';
 import { PendingContext } from '../PendingContext';
 import { UsageContext } from '../UsageContext';
 import { MessageAttachmentsContext } from '../MessageAttachmentsContext';
@@ -39,6 +42,9 @@ const defaultPendingContext = {
   hydratedApprovals: [],
   addHydratedApproval: vi.fn(),
   clearHydratedApprovals: vi.fn(), removeHydratedApproval: vi.fn(),
+  pendingInteraction: null,
+  setPendingInteraction: vi.fn(),
+  clearPendingInteraction: vi.fn(),
 };
 
 vi.mock('@assistant-ui/react-ag-ui', async (importOriginal) => {
@@ -53,6 +59,7 @@ vi.mock('../api', async (importOriginal) => {
     sendPrompt: vi.fn(),
     uploadAttachment: vi.fn(),
     submitHitlDecision: vi.fn(),
+    submitInteractionResponse: vi.fn(),
     markRead: vi.fn().mockResolvedValue({ status: 'ok' }),
     markUnread: vi.fn().mockResolvedValue({ status: 'ok' }),
   };
@@ -348,6 +355,790 @@ describe('BatchInterruptUI', () => {
       expect(screen.getByText('Tool 2 interrupt')).toBeInTheDocument();
     });
     expect(screen.queryByText(/more tool call/)).not.toBeInTheDocument();
+  });
+});
+
+describe('InteractionUI & BatchInterruptUI (interactions)', () => {
+  beforeEach(() => {
+    vi.mocked(submitInteractionResponse).mockReset();
+    vi.mocked(submitHitlDecision).mockReset();
+    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([]);
+  });
+
+  const sampleInteraction: PendingInteraction = {
+    interactionId: 'int-123',
+    requestSeq: 5,
+    toolCallId: 'tool-xyz',
+    kind: 'confirm',
+    message: 'Allow executing rm -rf?',
+    pendingCount: 0,
+  };
+
+  it('renders approve/deny buttons, message, and optional note for confirm kind', () => {
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, pendingInteraction: sampleInteraction }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    expect(screen.getByTestId('pending-interaction-card')).toBeInTheDocument();
+    expect(screen.getByText('Allow executing rm -rf?')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Deny' })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Reason for approval or denial...')).toBeInTheDocument();
+    expect(screen.queryByText(/not supported by this client/i)).not.toBeInTheDocument();
+  });
+
+  it('submits approve action without note when note is empty', async () => {
+    vi.mocked(submitInteractionResponse).mockResolvedValueOnce({ applied: true, outcome: 'applied' });
+    const setPendingInteraction = vi.fn();
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, pendingInteraction: sampleInteraction, setPendingInteraction }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => {
+      expect(submitInteractionResponse).toHaveBeenCalledWith('test-agent', 'test-session', {
+        interactionId: 'int-123',
+        requestSeq: 5,
+        response: {
+          action: 'approve',
+          data: {},
+          note: undefined,
+        },
+      });
+    });
+
+    const updater = setPendingInteraction.mock.calls[0][0];
+    expect(typeof updater).toBe('function');
+    expect(updater(sampleInteraction)).toBeNull();
+    expect(updater({ ...sampleInteraction, interactionId: 'different' })).toEqual({
+      ...sampleInteraction,
+      interactionId: 'different',
+    });
+  });
+
+  it('submits deny action with optional note when entered', async () => {
+    vi.mocked(submitInteractionResponse).mockResolvedValueOnce({ applied: true, outcome: 'applied' });
+    const setPendingInteraction = vi.fn();
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, pendingInteraction: sampleInteraction, setPendingInteraction }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    const noteInput = screen.getByPlaceholderText('Reason for approval or denial...');
+    fireEvent.change(noteInput, { target: { value: '  dangerous command  ' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Deny' }));
+
+    await waitFor(() => {
+      expect(submitInteractionResponse).toHaveBeenCalledWith('test-agent', 'test-session', {
+        interactionId: 'int-123',
+        requestSeq: 5,
+        response: {
+          action: 'deny',
+          data: {},
+          note: 'dangerous command',
+        },
+      });
+    });
+
+    const updater = setPendingInteraction.mock.calls[0][0];
+    expect(typeof updater).toBe('function');
+    expect(updater(sampleInteraction)).toBeNull();
+  });
+
+  it('sets statusText when already_applied outcome is returned', async () => {
+    vi.mocked(submitInteractionResponse).mockResolvedValueOnce({ applied: true, outcome: 'already_applied' });
+    const setStatusText = vi.fn();
+    const setPendingInteraction = vi.fn();
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, pendingInteraction: sampleInteraction, setStatusText, setPendingInteraction }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => {
+      expect(setStatusText).toHaveBeenCalledWith('This interaction was already resolved elsewhere.');
+    });
+    const updater = setPendingInteraction.mock.calls[0][0];
+    expect(typeof updater).toBe('function');
+    expect(updater(sampleInteraction)).toBeNull();
+  });
+
+  it('shows visible error on stale rejected result (error -32004)', async () => {
+    const error = new InteractionResponseError('interaction response rejected', -32004, 'stale', { outcome: 'stale' });
+    vi.mocked(submitInteractionResponse).mockRejectedValueOnce(error);
+    const setErrorText = vi.fn();
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, pendingInteraction: sampleInteraction, setErrorText }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/stale/i)).toBeInTheDocument();
+    });
+    expect(setErrorText).toHaveBeenCalledWith(expect.stringMatching(/stale/i));
+  });
+
+  it('renders unsupported kind with "not supported by this client" and deny only', async () => {
+    vi.mocked(submitInteractionResponse).mockResolvedValueOnce({ applied: true, outcome: 'applied' });
+    const unsupportedInteraction: PendingInteraction = {
+      ...sampleInteraction,
+      kind: 'wizard_form',
+      message: 'Fill out this custom wizard',
+    };
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, pendingInteraction: unsupportedInteraction }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    expect(screen.getByText('not supported by this client')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Deny' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Deny' }));
+
+    await waitFor(() => {
+      expect(submitInteractionResponse).toHaveBeenCalledWith('test-agent', 'test-session', {
+        interactionId: 'int-123',
+        requestSeq: 5,
+        response: {
+          action: 'deny',
+          data: {},
+          note: undefined,
+        },
+      });
+    });
+  });
+
+  it('displays pending count when pendingCount > 0', () => {
+    const multiInteraction: PendingInteraction = {
+      ...sampleInteraction,
+      pendingCount: 3,
+    };
+
+    render(
+      <PendingContext.Provider value={{ ...defaultPendingContext, pendingInteraction: multiInteraction }}>
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    expect(screen.getByText('3 more interactions awaiting response')).toBeInTheDocument();
+  });
+
+  it('queues interaction behind legacy approval UI so only one card is shown', async () => {
+    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([]);
+    vi.mocked(submitHitlDecision).mockResolvedValueOnce({ applied: true });
+    vi.mocked(submitInteractionResponse).mockResolvedValueOnce({ applied: true, outcome: 'applied' });
+
+    const hydratedApprovals = [{ toolCallId: 'legacy-tool', summary: 'Approve legacy tool' }];
+    const removeHydratedApproval = vi.fn();
+    const setPendingInteraction = vi.fn();
+
+    const { rerender } = render(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          hydratedApprovals,
+          removeHydratedApproval,
+          pendingInteraction: sampleInteraction,
+          setPendingInteraction,
+        }}
+      >
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    // Only legacy approval card is rendered
+    expect(screen.getByText(/Approve legacy tool/)).toBeInTheDocument();
+    expect(screen.queryByTestId('pending-interaction-card')).not.toBeInTheDocument();
+    expect(screen.queryByText('Allow executing rm -rf?')).not.toBeInTheDocument();
+
+    // Decide the legacy approval
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => {
+      expect(submitHitlDecision).toHaveBeenCalledWith('test-agent', 'test-session', {
+        toolCallId: 'legacy-tool',
+        approved: true,
+        note: undefined,
+      });
+    });
+
+    // When legacy approvals are cleared, interaction card appears
+    rerender(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          hydratedApprovals: [],
+          pendingInteraction: sampleInteraction,
+          setPendingInteraction,
+        }}
+      >
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    expect(screen.getByTestId('pending-interaction-card')).toBeInTheDocument();
+    expect(screen.getByText('Allow executing rm -rf?')).toBeInTheDocument();
+  });
+
+  it('does not clear next interaction when event advances before RPC promise resolves', async () => {
+    let resolveRpc: (val: any) => void = () => {};
+    const rpcPromise = new Promise((resolve) => {
+      resolveRpc = resolve;
+    });
+    vi.mocked(submitInteractionResponse).mockReturnValueOnce(rpcPromise as any);
+
+    let currentPending: PendingInteraction | null = sampleInteraction;
+    const setPendingInteraction = vi.fn((update: any) => {
+      if (typeof update === 'function') {
+        currentPending = update(currentPending);
+      } else {
+        currentPending = update;
+      }
+    });
+
+    const { rerender } = render(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: currentPending,
+          setPendingInteraction,
+          clearPendingInteractionIfMatch: (id, seq) => {
+            if (currentPending?.interactionId === id && currentPending?.requestSeq === seq) {
+              currentPending = null;
+              setPendingInteraction(null);
+            }
+          },
+        }}
+      >
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    // Click Approve on int-123
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(submitInteractionResponse).toHaveBeenCalledTimes(1);
+
+    // Server broadcasts next interaction before int-123 RPC resolves
+    const nextInteraction: PendingInteraction = {
+      interactionId: 'int-next-456',
+      requestSeq: 6,
+      toolCallId: 'tool-next',
+      kind: 'confirm',
+      message: 'Next interaction message',
+      pendingCount: 0,
+    };
+    currentPending = nextInteraction;
+
+    rerender(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: currentPending,
+          setPendingInteraction,
+          clearPendingInteractionIfMatch: (id, seq) => {
+            if (currentPending?.interactionId === id && currentPending?.requestSeq === seq) {
+              currentPending = null;
+              setPendingInteraction(null);
+            }
+          },
+        }}
+      >
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    expect(screen.getByText('Next interaction message')).toBeInTheDocument();
+
+    // Now resolve the earlier RPC for int-123
+    resolveRpc({ applied: true, outcome: 'applied' });
+    await rpcPromise;
+
+    // Next interaction must NOT be clobbered
+    expect(currentPending).toEqual(nextInteraction);
+    expect(screen.getByText('Next interaction message')).toBeInTheDocument();
+  });
+
+  it('handles identity change while submitting: resets submitting/note and does not leak errors from superseded call', async () => {
+    let rejectRpc: (err: any) => void = () => {};
+    const rpcPromise = new Promise((_, reject) => {
+      rejectRpc = reject;
+    });
+    vi.mocked(submitInteractionResponse).mockReturnValueOnce(rpcPromise as any);
+
+    let currentPending: PendingInteraction | null = sampleInteraction;
+
+    const { rerender } = render(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: currentPending,
+        }}
+      >
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    // Enter note and click Approve on int-123
+    fireEvent.change(screen.getByPlaceholderText('Reason for approval or denial...'), {
+      target: { value: 'note for first interaction' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    // Buttons should now be disabled
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
+
+    // While submitting, interaction identity changes to next item
+    const nextInteraction: PendingInteraction = {
+      interactionId: 'int-789',
+      requestSeq: 8,
+      toolCallId: 'tool-789',
+      kind: 'confirm',
+      message: 'Interaction 789 message',
+      pendingCount: 0,
+    };
+    currentPending = nextInteraction;
+
+    rerender(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: currentPending,
+        }}
+      >
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    // Submitting state should be reset for new interaction
+    expect(screen.getByText('Interaction 789 message')).toBeInTheDocument();
+    const newApproveBtn = screen.getByRole('button', { name: 'Approve' });
+    expect(newApproveBtn).not.toBeDisabled();
+    // Note input should be cleared
+    const noteInput = screen.getByPlaceholderText('Reason for approval or denial...') as HTMLInputElement;
+    expect(noteInput.value).toBe('');
+
+    // Now reject the superseded RPC call with stale error
+    const staleError = new InteractionResponseError('interaction response rejected', -32004, 'stale', { outcome: 'stale' });
+    rejectRpc(staleError);
+
+    try {
+      await rpcPromise;
+    } catch {}
+
+    // Error for superseded interaction must NOT appear on the new interaction
+    expect(screen.queryByText(/stale/i)).not.toBeInTheDocument();
+    expect(screen.getByText('Interaction 789 message')).toBeInTheDocument();
+  });
+
+  it('surfaces visible error and retains interaction card on malformed result', async () => {
+    vi.mocked(submitInteractionResponse).mockRejectedValueOnce(
+      new Error('RPC call returned malformed interaction response result')
+    );
+    const setErrorText = vi.fn();
+    const setPendingInteraction = vi.fn();
+
+    render(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: sampleInteraction,
+          setErrorText,
+          setPendingInteraction,
+        }}
+      >
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => {
+      expect(setErrorText).toHaveBeenCalledWith('RPC call returned malformed interaction response result');
+    });
+
+    expect(screen.getByRole('alert')).toHaveTextContent('RPC call returned malformed interaction response result');
+    expect(screen.getByTestId('pending-interaction-card')).toBeInTheDocument();
+    expect(setPendingInteraction).not.toHaveBeenCalled();
+  });
+
+  it('ignores late rejection after session switch and does not surface error on new session', async () => {
+    let rejectRpc: (err: any) => void = () => {};
+    const rpcPromise = new Promise((_, reject) => {
+      rejectRpc = reject;
+    });
+    vi.mocked(submitInteractionResponse).mockReturnValueOnce(rpcPromise as any);
+
+    const setErrorText = vi.fn();
+
+    const { rerender } = render(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: sampleInteraction,
+          setErrorText,
+        }}
+      >
+        <InteractionUI
+          agentName="agent-1"
+          sessionId="session-1"
+          interaction={sampleInteraction}
+        />
+      </PendingContext.Provider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(submitInteractionResponse).toHaveBeenCalledTimes(1);
+
+    // Switch session to session-2 before RPC finishes
+    rerender(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: sampleInteraction,
+          setErrorText,
+        }}
+      >
+        <InteractionUI
+          agentName="agent-1"
+          sessionId="session-2"
+          interaction={sampleInteraction}
+        />
+      </PendingContext.Provider>
+    );
+
+    // Earlier request for session-1 rejects
+    setErrorText.mockClear();
+    rejectRpc(new Error('session-1 late failure'));
+    try {
+      await rpcPromise;
+    } catch {}
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(setErrorText).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('ignores late success after session switch and does not clear new session interaction', async () => {
+    let resolveRpc: (val: any) => void = () => {};
+    const rpcPromise = new Promise((resolve) => {
+      resolveRpc = resolve;
+    });
+    vi.mocked(submitInteractionResponse).mockReturnValueOnce(rpcPromise as any);
+
+    const setStatusText = vi.fn();
+    const onResolved = vi.fn();
+
+    const { rerender } = render(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: sampleInteraction,
+          setStatusText,
+        }}
+      >
+        <InteractionUI
+          agentName="agent-1"
+          sessionId="session-1"
+          interaction={sampleInteraction}
+          onResolved={onResolved}
+        />
+      </PendingContext.Provider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    // Switch session to session-2 before RPC finishes
+    rerender(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: sampleInteraction,
+          setStatusText,
+        }}
+      >
+        <InteractionUI
+          agentName="agent-1"
+          sessionId="session-2"
+          interaction={sampleInteraction}
+          onResolved={onResolved}
+        />
+      </PendingContext.Provider>
+    );
+
+    resolveRpc({ applied: true, outcome: 'already_applied' });
+    await rpcPromise;
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(setStatusText).not.toHaveBeenCalled();
+    expect(onResolved).not.toHaveBeenCalled();
+  });
+
+  it('ignores onPendingInteraction callback from obsolete agent after session switch', async () => {
+    const capturedAgents: any[] = [];
+    const origUseAgUiRuntime = agUi.useAgUiRuntime;
+    const spy = vi.spyOn(agUi, 'useAgUiRuntime').mockImplementation((params: any) => {
+      capturedAgents.push(params.agent);
+      return origUseAgUiRuntime(params);
+    });
+
+    function InteractionViewer() {
+      const { pendingInteraction } = useContext(PendingContext);
+      return (
+        <div data-testid="viewer-interaction">
+          {pendingInteraction ? pendingInteraction.message : 'none'}
+        </div>
+      );
+    }
+
+    try {
+      const { rerender } = render(
+        <ChatProvider agentName="agent-a" sessionId="session-1" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+          <InteractionViewer />
+        </ChatProvider>
+      );
+
+      expect(capturedAgents.length).toBeGreaterThan(0);
+      const agent1 = capturedAgents[capturedAgents.length - 1];
+
+      rerender(
+        <ChatProvider agentName="agent-a" sessionId="session-2" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+          <InteractionViewer />
+        </ChatProvider>
+      );
+
+      const agent2 = capturedAgents[capturedAgents.length - 1];
+      expect(agent1).not.toBe(agent2);
+
+      // Dispatch event on old agent (agent1)
+      act(() => {
+        (agent1 as any).handleAgentEvent({
+          type: 'CUSTOM',
+          name: 'pending_interaction',
+          value: {
+            interaction_id: 'int-old',
+            request_seq: 1,
+            tool_call_id: 'tc-old',
+            kind: 'confirm',
+            message: 'Old interaction message',
+            pending_count: 0,
+          },
+        });
+      });
+
+      expect(screen.getByTestId('viewer-interaction')).toHaveTextContent('none');
+
+      // Dispatch event on current agent (agent2)
+      act(() => {
+        (agent2 as any).handleAgentEvent({
+          type: 'CUSTOM',
+          name: 'pending_interaction',
+          value: {
+            interaction_id: 'int-new',
+            request_seq: 1,
+            tool_call_id: 'tc-new',
+            kind: 'confirm',
+            message: 'New interaction message',
+            pending_count: 0,
+          },
+        });
+      });
+
+      expect(screen.getByTestId('viewer-interaction')).toHaveTextContent('New interaction message');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('resets submitting state and note when scope changes (session changes) with identical interaction ID and seq', async () => {
+    let resolveRpc: (val: any) => void = () => {};
+    const rpcPromise = new Promise((resolve) => {
+      resolveRpc = resolve;
+    });
+    vi.mocked(submitInteractionResponse).mockReturnValueOnce(rpcPromise as any);
+
+    const { rerender } = render(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: sampleInteraction,
+        }}
+      >
+        <InteractionUI
+          agentName="agent-a"
+          sessionId="session-1"
+          interaction={sampleInteraction}
+        />
+      </PendingContext.Provider>
+    );
+
+    const noteInput = screen.getByPlaceholderText('Reason for approval or denial...');
+    fireEvent.change(noteInput, { target: { value: 'note for session 1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
+
+    // Re-render same InteractionUI with new sessionId "session-2", but SAME interactionId and requestSeq
+    rerender(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          pendingInteraction: sampleInteraction,
+        }}
+      >
+        <InteractionUI
+          agentName="agent-a"
+          sessionId="session-2"
+          interaction={sampleInteraction}
+        />
+      </PendingContext.Provider>
+    );
+
+    // Submitting state must be reset, Approve button enabled, note input cleared
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeEnabled();
+    const newNoteInput = screen.getByPlaceholderText('Reason for approval or denial...') as HTMLInputElement;
+    expect(newNoteInput.value).toBe('');
+
+    // Now earlier request finishes; must not impact session-2
+    resolveRpc({ applied: true, outcome: 'applied' });
+    await rpcPromise;
+
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeEnabled();
+  });
+
+  it('delivers pending_interaction event correctly when ChatProvider is wrapped in StrictMode', async () => {
+    let capturedAgent: any;
+    const origUseAgUiRuntime = agUi.useAgUiRuntime;
+    const spy = vi.spyOn(agUi, 'useAgUiRuntime').mockImplementation((params: any) => {
+      capturedAgent = params.agent;
+      return origUseAgUiRuntime(params);
+    });
+
+    function InteractionViewer() {
+      const { pendingInteraction } = useContext(PendingContext);
+      return (
+        <div data-testid="strict-viewer-interaction">
+          {pendingInteraction ? pendingInteraction.message : 'none'}
+        </div>
+      );
+    }
+
+    try {
+      render(
+        <StrictMode>
+          <ChatProvider agentName="agent-strict" sessionId="session-strict" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+            <InteractionViewer />
+          </ChatProvider>
+        </StrictMode>
+      );
+
+      expect(capturedAgent).toBeDefined();
+
+      // Dispatch pending_interaction event on the agent
+      act(() => {
+        (capturedAgent as any).handleAgentEvent({
+          type: 'CUSTOM',
+          name: 'pending_interaction',
+          value: {
+            interaction_id: 'int-strict',
+            request_seq: 1,
+            tool_call_id: 'tc-strict',
+            kind: 'confirm',
+            message: 'Strict mode interaction',
+            pending_count: 0,
+          },
+        });
+      });
+
+      // After StrictMode setup->cleanup->setup, the event must NOT be ignored
+      expect(screen.getByTestId('strict-viewer-interaction')).toHaveTextContent('Strict mode interaction');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+    it('clears pending interaction on session switch in ChatProvider', async () => {
+    function InteractionViewer() {
+      const { pendingInteraction, setPendingInteraction } = useContext(PendingContext);
+      return (
+        <div>
+          <button
+            type="button"
+            onClick={() => setPendingInteraction?.(sampleInteraction)}
+          >
+            Set Pending
+          </button>
+          <div data-testid="viewer-interaction">
+            {pendingInteraction ? pendingInteraction.message : 'none'}
+          </div>
+        </div>
+      );
+    }
+
+    const { rerender } = render(
+      <ChatProvider agentName="agent-a" sessionId="session-1" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+        <InteractionViewer />
+      </ChatProvider>
+    );
+
+    expect(screen.getByTestId('viewer-interaction')).toHaveTextContent('none');
+
+    // Set pending interaction
+    fireEvent.click(screen.getByRole('button', { name: 'Set Pending' }));
+    expect(screen.getByTestId('viewer-interaction')).toHaveTextContent('Allow executing rm -rf?');
+
+    // Switch session
+    rerender(
+      <ChatProvider agentName="agent-a" sessionId="session-2" isFreshSession={false} onOpenSubAgent={vi.fn()}>
+        <InteractionViewer />
+      </ChatProvider>
+    );
+
+    // Should be cleared to none on session switch
+    expect(screen.getByTestId('viewer-interaction')).toHaveTextContent('none');
+  });
+
+  it('does not let legacy RUN_FINISHED interrupt send old hitl RPC for interactions', () => {
+    vi.mocked(agUi.useAgUiInterrupts).mockReturnValue([
+      { id: 'int-legacy-outcome', toolCallId: sampleInteraction.toolCallId, reason: 'tool_call', message: 'Legacy outcome' } as any,
+    ]);
+
+    render(
+      <PendingContext.Provider
+        value={{
+          ...defaultPendingContext,
+          hydratedApprovals: [],
+          pendingInteraction: sampleInteraction,
+        }}
+      >
+        <BatchInterruptUI agentName="test-agent" sessionId="test-session" />
+      </PendingContext.Provider>
+    );
+
+    // Should render the interaction card, NOT the legacy approval card
+    expect(screen.getByTestId('pending-interaction-card')).toBeInTheDocument();
+    expect(screen.queryByTestId('hydrated-pending-approval')).not.toBeInTheDocument();
+    expect(screen.queryByText('Legacy outcome')).not.toBeInTheDocument();
   });
 });
 

@@ -345,6 +345,7 @@ fn relog_entries(msg: &Message) -> Vec<SessionLogEntry> {
                     fence_token: None,
                 },
                 SessionLogEntry::ToolResults {
+                    handoff_selection: None,
                     results,
                     timestamp: msg.log_timestamp,
                 },
@@ -1473,6 +1474,7 @@ content: work complete
         entries.push((
             2,
             SessionLogEntry::ToolResults {
+                handoff_selection: None,
                 results: vec![harnx_core::session::ToolOutput {
                     id: Some("call-1".to_string()),
                     name: "plato_session_prompt".to_string(),
@@ -1572,6 +1574,7 @@ invocation_id: invocation-direct
             (
                 3,
                 SessionLogEntry::ToolResults {
+                    handoff_selection: None,
                     results: interrupted_tool_outputs(&calls, Some("x")),
                     timestamp: None,
                 },

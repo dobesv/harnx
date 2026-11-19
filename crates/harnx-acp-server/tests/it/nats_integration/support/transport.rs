@@ -29,14 +29,24 @@ pub(crate) enum PermissionReply {
     Allow,
     Reject,
     Pending,
+    Manual,
+    Cancelled,
 }
 
 pub(crate) struct TestClient {
     pub(crate) connection: acp::ConnectionTo<acp::Agent>,
     pub(crate) notifications: mpsc::UnboundedReceiver<SessionNotification>,
     pub(crate) permissions: mpsc::UnboundedReceiver<RequestPermissionRequest>,
+    pub(crate) permission_responses: mpsc::UnboundedSender<RequestPermissionOutcome>,
     _tasks: BackgroundTasks,
 }
+impl TestClient {
+    pub(crate) fn disconnect(&self) {
+        // Keep the agent transport alive to observe EOF and fail outstanding requests.
+        self._tasks.0[1].abort();
+    }
+}
+
 fn spawn_test_agent_transport(
     agent: Arc<harnx_acp_server::HarnxAgent>,
     stream: tokio::io::DuplexStream,
@@ -73,6 +83,7 @@ fn spawn_test_agent_transport(
 fn spawn_test_client_transport(
     stream: tokio::io::DuplexStream,
     permission_reply: PermissionReply,
+    responses: mpsc::UnboundedReceiver<RequestPermissionOutcome>,
 ) -> (
     tokio::task::JoinHandle<()>,
     oneshot::Receiver<acp::ConnectionTo<acp::Agent>>,
@@ -83,6 +94,7 @@ fn spawn_test_client_transport(
     let transport = acp::ByteStreams::new(write.compat_write(), read.compat());
     let (notification_tx, notification_rx) = mpsc::unbounded_channel();
     let (permission_tx, permission_rx) = mpsc::unbounded_channel();
+    let responses = Arc::new(tokio::sync::Mutex::new(responses));
     let (connection_tx, connection_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = acp::Client
@@ -99,7 +111,16 @@ fn spawn_test_client_transport(
                 acp::Agent,
                 async move |request: RequestPermissionRequest, responder, _connection| {
                     let _ = permission_tx.send(request.clone());
-                    let outcome = permission_outcome(&request, permission_reply).await;
+                    let outcome = if matches!(permission_reply, PermissionReply::Manual) {
+                        responses
+                            .lock()
+                            .await
+                            .recv()
+                            .await
+                            .expect("manual permission response")
+                    } else {
+                        permission_outcome(&request, permission_reply).await
+                    };
                     responder.respond(RequestPermissionResponse::new(outcome))
                 },
                 acp::on_receive_request!(),
@@ -122,8 +143,9 @@ pub(crate) async fn attach_test_client(
     let (agent_stream, client_stream) = tokio::io::duplex(64 * 1024);
     let (agent_task, agent_connection_rx) =
         spawn_test_agent_transport(Arc::clone(&agent), agent_stream);
+    let (permission_responses, response_rx) = mpsc::unbounded_channel();
     let (client_task, client_connection_rx, notifications, permissions) =
-        spawn_test_client_transport(client_stream, permission_reply);
+        spawn_test_client_transport(client_stream, permission_reply, response_rx);
 
     let agent_connection = tokio::time::timeout(TEST_TIMEOUT, agent_connection_rx)
         .await
@@ -138,6 +160,7 @@ pub(crate) async fn attach_test_client(
         connection: client_connection,
         notifications,
         permissions,
+        permission_responses,
         _tasks: BackgroundTasks(vec![agent_task, client_task]),
     })
 }
@@ -150,6 +173,8 @@ async fn permission_outcome(
         PermissionReply::Allow => ALLOW_OPTION_ID,
         PermissionReply::Reject => REJECT_OPTION_ID,
         PermissionReply::Pending => return std::future::pending().await,
+        PermissionReply::Cancelled => return RequestPermissionOutcome::Cancelled,
+        PermissionReply::Manual => unreachable!("manual reply handled by transport"),
     };
     let option = request
         .options

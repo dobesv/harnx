@@ -157,7 +157,10 @@ impl NatsToolProvider {
         enable_progress: bool,
         run_context: Option<&crate::nats_session_metadata::RunLimitsRecord>,
     ) -> Result<PendingToolRequest, ToolError> {
-        let call_id = Uuid::new_v4().to_string();
+        let call_id = origin
+            .tool_call_id
+            .and_then(current_physical_invocation_for)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let mut capabilities = BTreeSet::from([EXECUTION_CONTEXT_NAMESPACE.to_string()]);
         if enable_progress {
             capabilities.insert(CAPABILITY_TOOL_PROGRESS.to_string());

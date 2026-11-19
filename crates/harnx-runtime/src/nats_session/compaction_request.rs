@@ -215,6 +215,10 @@ pub(super) fn decide_compact_submit(entries: &[(u64, SessionLogEntry)]) -> Optio
         | SessionLogEntry::HandoffCommitted { .. }
         | SessionLogEntry::HitlApprovalRequested { .. }
         | SessionLogEntry::HitlApprovalDecision { .. }
+        | SessionLogEntry::ToolCallCompleted { .. }
+        | SessionLogEntry::InteractionRequested { .. }
+        | SessionLogEntry::SuspensionReady { .. }
+        | SessionLogEntry::InteractionResponse { .. }
         | SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Clear
         | SessionLogEntry::EditEntries { .. }

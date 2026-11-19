@@ -444,16 +444,20 @@ impl SubagentToolset {
         // bounds the page to that prompt's turn. Load never resumes,
         // activates, repairs or waits on the session.
         let mut status = None;
+        let mut pending = None;
         if let Some(prompt_id) = args.prompt_id.as_deref() {
             if prompt_id.trim().is_empty() {
                 return Err(ToolInvokeError::Recoverable(
                     "prompt_id must not be empty".into(),
                 ));
             }
-            let scope = self.prompt_load_scope(&storage, prompt_id).await?;
+            let scope = self
+                .prompt_load_scope(&storage, &session_id, prompt_id)
+                .await?;
             session_read::scope_read_to_prompt(&mut read, scope.start, scope.end)
                 .map_err(ToolInvokeError::Recoverable)?;
             status = Some(scope.status);
+            pending = scope.pending_interaction;
         }
         let log = crate::nats_session_log::NatsSessionLog::new(self.jetstream.clone(), &storage);
         // The page is merged into the wrapper below, so the wrapper's own
@@ -475,16 +479,25 @@ impl SubagentToolset {
         let page = session_read::read_session_log_window(&log, &read, reserve)
             .await
             .map_err(ToolInvokeError::Recoverable)?;
-        let result = merge_page_into_wrapper(wrapper, page)?;
+        let mut result = merge_page_into_wrapper(wrapper, page)?;
+        if let Some(pending) = pending {
+            async_session::observation::attach_pending_progress(
+                &mut result,
+                pending,
+                None,
+                read.max_output_bytes,
+            );
+        }
         Ok(result)
     }
 
     async fn prompt_load_scope(
         &self,
         storage: &str,
+        session_id: &str,
         prompt_id: &str,
     ) -> Result<async_session::observation::PromptScope, ToolInvokeError> {
-        async_session::observation::resolve_prompt_scope(self, storage, prompt_id)
+        async_session::observation::resolve_prompt_scope(self, storage, session_id, prompt_id)
             .await
             .map_err(|error| {
                 ToolInvokeError::Recoverable(match error {
