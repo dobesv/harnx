@@ -69,7 +69,7 @@ jobs:
         if: needs.changes.outputs.web == 'true'
         uses: actions/setup-node@v7
         with:
-          node-version: '24.22.2'
+          node-version: '24.22.3'
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
