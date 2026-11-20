@@ -175,7 +175,8 @@ impl Config {
         // variable defaults introduced by a patch.
         let mut agent = baseline.clone();
         agent.set_user_principals(Some(user.clone()));
-        if !agent.patches().is_empty() {
+        let has_patches = !agent.patches().is_empty();
+        if has_patches {
             prepare_patch_model_ids(&mut agent);
             agent.apply_user_patches(user)?;
             self.resolve_patched_agent_model(&mut agent, baseline)
@@ -184,20 +185,28 @@ impl Config {
                 })?;
         }
         resolve_patched_agent_variables(&mut agent, baseline, variables).with_context(|| {
-            format!(
-                "agent '{}': resolve variables after `patches`",
-                agent.name()
-            )
+            if has_patches {
+                format!(
+                    "agent '{}': resolve variables after `patches`",
+                    agent.name()
+                )
+            } else {
+                format!("agent '{}': resolve variables", agent.name())
+            }
         })?;
         // Re-validate middleware against the patched agent, mirroring
         // `use_agent_obj`: a patch that adds an invalid middleware entry must
         // fail the activation, not the first tool call.
         self.resolved_middleware_for_agent(Some(&agent))
             .with_context(|| {
-                format!(
-                    "agent '{}': validate middleware after `patches`",
-                    agent.name()
-                )
+                if has_patches {
+                    format!(
+                        "agent '{}': validate middleware after `patches`",
+                        agent.name()
+                    )
+                } else {
+                    format!("agent '{}': validate middleware", agent.name())
+                }
             })?;
         self.agent = Some(agent);
         Ok(())

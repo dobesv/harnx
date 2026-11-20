@@ -398,6 +398,41 @@ fn patched_model_and_middleware_errors_leave_the_active_agent_unchanged() {
 }
 
 #[test]
+fn middleware_validation_without_patches_uses_unpatched_context() {
+    require_nextest();
+    let fixture = AgentFixture::open(
+        "---\nmodel: openai:test-model\nmiddleware:\n  - name: audit\n    match: '^bash_exec$'\n    bash: event_input\n---\nTailored agent.\n",
+    );
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", fixture._temp.path());
+    let mut config = fixture.config.clone();
+    config.use_agent_by_name("tailored").unwrap();
+    let agent = config.agent.as_mut().unwrap();
+    agent.set_user_principals(Some(developer_principals()));
+    assert!(agent.patches().is_empty());
+    match &mut agent.middleware.entries[0] {
+        harnx_core::middleware::MiddlewareEntry::Full(definition) => {
+            definition.matcher = "[".into();
+        }
+        harnx_core::middleware::MiddlewareEntry::Disable { .. } => {
+            panic!("fixture should contain a full middleware entry");
+        }
+    }
+
+    let error = config
+        .apply_session_agent_patches(
+            &outsider_principals(),
+            &harnx_core::agent_config::AgentVariables::default(),
+        )
+        .unwrap_err();
+    let message = error_chain(error);
+
+    assert!(message.contains("tailored"), "{message}");
+    assert!(message.contains("validate middleware"), "{message}");
+    assert!(message.contains("invalid match regex"), "{message}");
+    assert!(!message.contains("patches"), "{message}");
+}
+
+#[test]
 fn a_broken_patch_fails_the_install_naming_the_agent() {
     require_nextest();
     // Compiles at load, fails at activation: the filter indexes a field on
@@ -723,10 +758,10 @@ patches:
 #[test]
 fn install_missing_effective_variable_fails_with_its_name() {
     require_nextest();
-    for (default, patches) in [
-        (None, vec![]),
-        (None, vec!["."]),
-        (Some("blue"), vec!["del(.variables[0].default)"]),
+    for (default, patches, expect_patch_context) in [
+        (None, vec![], false),
+        (None, vec!["."], true),
+        (Some("blue"), vec!["del(.variables[0].default)"], true),
     ] {
         let frontmatter = serde_json::json!({
             "model": "openai:test-model",
@@ -743,7 +778,13 @@ fn install_missing_effective_variable_fails_with_its_name() {
         let error = install_session_metadata_agent(&fixture.global(), &metadata).unwrap_err();
 
         let message = error_chain(error);
+        assert!(message.contains("resolve variables"), "{message}");
         assert!(message.contains("color"), "{message}");
         assert!(message.contains("tailored"), "{message}");
+        assert_eq!(
+            message.contains("patches"),
+            expect_patch_context,
+            "{message}"
+        );
     }
 }
