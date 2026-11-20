@@ -465,6 +465,7 @@ fn test_symlinked_grant_stays_reachable() {
 
 /// Verify MCP stdio environment hook execution, environment precedence
 /// (credential provider-wins vs proxy caller-wins), and service lifetime.
+#[cfg(unix)]
 fn write_mock_cred_service(path: &Path) {
     make_unix_script(
         path,
@@ -495,6 +496,7 @@ for line in sys.stdin:
     );
 }
 
+#[cfg(unix)]
 fn write_mock_proxy_service(path: &Path) {
     make_unix_script(
         path,
@@ -525,6 +527,7 @@ for line in sys.stdin:
     );
 }
 
+#[cfg(unix)]
 fn assert_pid_terminated(pid: i32) {
     let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
     if let Ok(exit_status) = status {
