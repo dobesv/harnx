@@ -5,7 +5,10 @@
 //! interrupted parent cannot resume a descendant under a later independent run.
 //! The worker interrupts the original child invocation
 //! and records the parent that closed it. Repeating that one step per level is
-//! what carries a root interruption to the leaf.
+//! what carries a root interruption to the leaf. The walk stops at a detached
+//! (`session_send`) admission: a stopped ancestor above it doesn't reach the
+//! levels below, but a directly cancelled detached parent still stops its
+//! synchronous children.
 use super::*;
 use anyhow::Context;
 use harnx_runtime::nats_session_metadata::{
@@ -71,7 +74,10 @@ fn tool_calls(id: &str) -> Entry {
 
 /// Seed root → middle → leaf as a delegation chain leaves them: each level
 /// mid tool round, each child's metadata naming the call it was created for.
-async fn seed_chain(js: &async_nats::jetstream::Context) -> Result<[Level; 3]> {
+async fn seed_chain(
+    js: &async_nats::jetstream::Context,
+    detached_middle: bool,
+) -> Result<[Level; 3]> {
     let metadata = SessionMetadataStore::ensure(js, 1).await?;
     let key = |id: &str| harnx_core::session_identity::session_key(None, id);
     let levels = [
@@ -112,6 +118,7 @@ async fn seed_chain(js: &async_nats::jetstream::Context) -> Result<[Level; 3]> {
                 admitted_at: now,
             },
             Some(parent) => harnx_runtime::nats_session_metadata::AdmissionAuthority::Inherited {
+                detached: detached_middle && index == 1,
                 parent: parent.clone(),
                 edge: harnx_runtime::nats_session_metadata::InvocationEdgeKind::Delegation,
                 admitted_at: now,
@@ -254,7 +261,7 @@ async fn exercise_hierarchy(cancel_root: bool) -> Result<()> {
         .context("nats-server required")?;
     let client = async_nats::connect(server.url()).await?;
     let js = async_nats::jetstream::new(client.clone());
-    let [root, middle, leaf] = seed_chain(&js).await?;
+    let [root, middle, leaf] = seed_chain(&js, false).await?;
 
     // The middle level's worker died mid-turn without releasing its lease, so
     // nothing is left in the middle of the chain to forward anything: the
@@ -356,4 +363,60 @@ async fn cancelled_ownerless_child_prompt_is_not_replayed_when_reopened() -> Res
     daemon.abort();
     let _ = daemon.await;
     Ok(())
+}
+
+async fn exercise_detached_boundary(cancel_middle: bool) -> Result<()> {
+    let server = require_nats_server()
+        .await?
+        .context("nats-server required")?;
+    let client = async_nats::connect(server.url()).await?;
+    let js = async_nats::jetstream::new(client.clone());
+    let [root, middle, leaf] = seed_chain(&js, true).await?;
+    let target = if cancel_middle { &middle } else { &root };
+    interrupt(&js, &client, &target.key).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let daemon = spawn_worker_daemon_with_call_fn(
+        local_nats_runtime_config(server.url()),
+        "detached-boundary-worker",
+        counting_stub_call_fn(calls.clone()),
+    )
+    .await?;
+
+    if cancel_middle {
+        assert_eq!(
+            refused_under(&js, &leaf).await?,
+            format!("parent:{}", middle.key)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!has_cancel(&js, &root.key).await?);
+    } else {
+        // Activate the synchronous grandchild without ever activating its
+        // detached parent. Only the immutable boundary can stop the root walk.
+        publish_session_activate(&js, "local", &SessionActivate::new(&leaf.key), 1).await?;
+        poll_until(async || {
+            Ok(log(&js, &leaf.key)
+                .load_events_latest_async()
+                .await?
+                .iter()
+                .any(|(_, entry)| matches!(entry, Entry::TurnEnd { .. })))
+        })
+        .await?;
+        assert!(calls.load(Ordering::SeqCst) > 0);
+        assert!(!has_cancel(&js, &leaf.key).await?);
+        assert!(!has_cancel(&js, &middle.key).await?);
+    }
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synchronous_grandchild_survives_root_cancellation_across_detached_admission() -> Result<()>
+{
+    exercise_detached_boundary(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synchronous_grandchild_stops_when_its_detached_parent_is_cancelled() -> Result<()> {
+    exercise_detached_boundary(true).await
 }

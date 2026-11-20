@@ -764,7 +764,7 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
   any available worker. A frontend-owned local worker targets nested
   activations back to its own worker ID. Distributed `harnx_leases` still
   ensure exactly one active holder per session in either topology.
-- **Lease-backed liveness**: Sub-agent tool calls run synchronously from the
+- **Lease-backed liveness**: `session_new` and `session_prompt` run synchronously from the
   parent agent's perspective without an implicit idle or elapsed-time deadline.
   The child worker renews its session lease independently of model and tool
   activity; if that worker disappears without writing a durable result, the
@@ -851,6 +851,14 @@ send with an explicit soft wait and leave the hard execution policy inherited:
 {"message": "research the topic and report findings", "wait": {}}
 ```
 
+- Newly admitted `session_send` work is detached from the parent invocation. Parent cancellation or failure,
+  including cancellation during send's inline wait or server restart recovery, doesn't stop
+  the child or prevent worker resumes. Cancelling a `session_send` or `session_wait` tool call
+  stops observation only. Explicit `session_cancel` and inherited hard deadlines still stop
+  the child. Synchronous `session_new` and `session_prompt` children still stop when their parent is cancelled.
+  Messages joined to an existing invocation keep that invocation's admission policy.
+  In a mixed-version deployment, an older worker that resumes a detached child after its parent
+  stopped still cancels it, so the guarantee holds once every worker runs the new version.
 - The wait is an observation budget only, never execution time. `seconds` is 1 to 240 and defaults to 240, or pass `forever: true`; it never cancels the child or extends its deadline.
 - Any caller with access to an agent's `session_wait` or `session_load` can observe a known session and prompt in that agent's namespace, even when another caller sent the prompt. Dispatch replay still requires the original caller's identity.
 - A wait that returns `stopped_by: "new_message"` ended because a new message arrived for the caller; read it before waiting again. `stopped_by: "caller_deadline"` means the caller's own run deadline is near; report what you have instead of waiting again.

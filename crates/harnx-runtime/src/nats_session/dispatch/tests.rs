@@ -625,6 +625,7 @@ async fn leftover_busy_reserve_intent_loses_to_a_successful_join() -> Result<()>
     // intent before the head check refuses the active turn.
     let entries = session.load_durable_entries().await?;
     let authority = crate::nats_session_metadata::AdmissionAuthority::Inherited {
+        detached: false,
         parent: parent.clone(),
         edge: InvocationEdgeKind::Delegation,
         admitted_at: parent.admitted_at,
@@ -766,6 +767,7 @@ async fn fixed_admission_head(session: &NatsSession, f: &Fixture) -> Result<()> 
         0,
     )?;
     let authority = AdmissionAuthority::Inherited {
+        detached: false,
         parent: f.parent.clone(),
         edge: InvocationEdgeKind::Delegation,
         admitted_at: f.parent.admitted_at,

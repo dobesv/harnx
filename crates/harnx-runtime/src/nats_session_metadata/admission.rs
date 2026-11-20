@@ -23,6 +23,7 @@ pub enum AdmissionAuthority {
     Inherited {
         parent: RunLimitsRecord,
         edge: super::InvocationEdgeKind,
+        detached: bool,
         admitted_at: DateTime<Utc>,
     },
 }
@@ -47,6 +48,10 @@ pub struct InvocationAdmission {
     pub parent: Option<RunLimitsRecord>,
     pub parent_storage_key: Option<String>,
     pub edge: Option<super::InvocationEdgeKind>,
+    /// Parent interruption does not propagate across this admission's edge.
+    /// Run identity and inherited limits still apply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
     pub timeout_secs: Option<u64>,
     pub token_budget: Option<u64>,
     pub prompt_content: Option<harnx_core::message::MessageContent>,
@@ -69,6 +74,7 @@ impl InvocationAdmission {
                 parent,
                 edge,
                 admitted_at,
+                ..
             } => (
                 parent.run_id.clone(),
                 *admitted_at,
@@ -88,6 +94,10 @@ impl InvocationAdmission {
             parent,
             parent_storage_key: None,
             edge,
+            detached: matches!(
+                authority,
+                AdmissionAuthority::Inherited { detached: true, .. }
+            ),
             timeout_secs,
             token_budget,
             prompt_content: None,
@@ -535,6 +545,33 @@ mod tests {
                 fence_token: None,
             },
         )
+    }
+
+    #[test]
+    fn legacy_admission_defaults_to_attached_and_detached_round_trips() {
+        let original = InvocationAdmission::new(
+            &AdmissionAuthority::External {
+                admitted_at: Utc::now(),
+            },
+            "legacy-admission".into(),
+            None,
+            None,
+        );
+        let mut json = serde_json::to_value(&original).unwrap();
+        assert!(json.get("detached").is_none());
+        let legacy: InvocationAdmission = serde_json::from_value(json.clone()).unwrap();
+        assert!(!legacy.detached);
+        assert_eq!(legacy, original);
+
+        json["detached"] = serde_json::json!(true);
+        let detached: InvocationAdmission = serde_json::from_value(json).unwrap();
+        assert!(detached.detached);
+        let encoded = serde_json::to_value(&detached).unwrap();
+        assert_eq!(encoded["detached"], true);
+        assert_eq!(
+            serde_json::from_value::<InvocationAdmission>(encoded).unwrap(),
+            detached
+        );
     }
 
     #[test]

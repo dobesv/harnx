@@ -805,6 +805,7 @@ impl NatsSession {
     ) -> Self {
         self.admission_authority = Some(
             crate::nats_session_metadata::AdmissionAuthority::Inherited {
+                detached: false,
                 parent,
                 edge,
                 admitted_at,
@@ -812,6 +813,17 @@ impl NatsSession {
         );
         self.invocation_id = Some(invocation_id);
         self.admission_timeout = timeout_secs;
+        self
+    }
+
+    /// Detach inherited work from parent interruption without changing its limits.
+    pub(crate) fn with_detached_admission(mut self) -> Self {
+        if let Some(crate::nats_session_metadata::AdmissionAuthority::Inherited {
+            detached, ..
+        }) = self.admission_authority.as_mut()
+        {
+            *detached = true;
+        }
         self
     }
 

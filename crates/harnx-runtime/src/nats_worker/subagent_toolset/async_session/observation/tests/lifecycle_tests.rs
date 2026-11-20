@@ -163,6 +163,7 @@ async fn prompt_identity_is_not_execution_identity_and_filters_never_classify_li
     let f = Fixture::new().await?;
     let parent = serde_json::from_value(f.request.run_context.as_ref().unwrap().snapshot.clone())?;
     let authority = AdmissionAuthority::Inherited {
+        detached: false,
         parent,
         edge: InvocationEdgeKind::Delegation,
         admitted_at: chrono::Utc::now(),

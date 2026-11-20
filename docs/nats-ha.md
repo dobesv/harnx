@@ -1087,16 +1087,23 @@ wind-up has cancelled them. Two guards make the order irrelevant.
 
 **Ancestor check.** A sub-agent session records `parent: { session_id,
 tool_call_id }` in its metadata at creation. Before rolling an
-`InFlightResumable` turn forward, the worker reads the parent's log
-(`nats_worker/ancestor_check.rs`): if the parent's `ToolCalls` for that call id
-is followed by a `Cancel`, or the call already has a result, nothing is waiting
-for the child's answer, so it does not resume — it interrupts itself with the
-parent's cancellation id and winds up instead. The walk follows parent links
-upward, at most 32 levels, and fails closed: a parent log it cannot read is
-never taken for "the parent is still waiting". As implemented, that failure
-ends the child's turn with an `Error` entry rather than being retried — the
-activation is Term'd, not retried, so a transient read failure costs the child
-its turn.
+`InFlightResumable` turn forward — and before each later turn of the same
+session — the worker runs `refuse_resume_under_interrupted_parent`
+(`nats_worker/daemon_turn_input.rs`; `nats_worker/ancestor_check.rs` is a
+cfg(test) re-implementation of the same verdict): if a parent delegation
+invocation ended in `Cancel` or `Error`, nothing is waiting for the child's
+answer, so it does not resume — it interrupts itself with a `parent-stop:`
+cancellation and winds up instead. The walk follows admission links upward,
+at most 32 levels, and stops at a detached admission (issue #2779):
+`session_send` work keeps running after its parent stops, while the
+synchronous children of a detached parent still stop when that parent itself
+is cancelled. The guarantee needs every worker on the new version; an older
+worker resuming such a child still cancels it. A parent whose admission
+metadata lives at another broker is skipped — the snapshot copied at dispatch
+still bounds the child, and the original RPC cancellation crosses brokers. A
+parent log that fails to load ends the child's turn with an `Error` entry
+rather than being retried — the activation is Term'd, not retried, so a
+transient read failure costs the child its turn.
 
 **Idempotent wind-up cancels.** When the root is activated, its wind-up resends
 a cancel for every call with no journal reply, catching any child that slipped
