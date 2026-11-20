@@ -444,9 +444,9 @@ dependencies = [
 
 [[package]]
 name = "async-nats"
-version = "0.51.0"
+version = "0.53.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4f92759f418774b78c36ef07885849150ce950c67d9bcdeff8a9c253f57d9a1"
+checksum = "486635b3139935dcea5b88d219c5998aefa3c5b99e9a204312b93ac3aa10b30f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -8337,7 +8337,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -8358,7 +8358,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.15.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -10714,11 +10714,9 @@ dependencies = [
  "http",
  "httparse",
  "rand 0.10.3",
- "rustls-pki-types",
  "sha1_smol",
  "simdutf8",
  "tokio",
- "tokio-rustls",
  "tokio-util",
 ]
 
