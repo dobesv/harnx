@@ -29,18 +29,24 @@ fn outcome_message(outcome: SurfaceActionOutcome, id: &str) -> (bool, String) {
             "Rejected: a different action for '{id}' was already accepted \
              (conflicting). Nothing was recorded."
         ),
-        // `rejection_message` handled every other rejection, so only
-        // `unknown_surface` reaches this arm.
-        _ => format!(
+        SurfaceActionOutcome::UnknownSurface => format!(
             "Rejected: no published surface matches '{id}' at that sequence \
              (unknown_surface). Nothing was recorded."
         ),
+        // `submit_surface_action` consumes Pending acknowledgements internally;
+        // keep this mapping defensive if the public outcome contract changes.
+        SurfaceActionOutcome::Pending => {
+            "Pending: the worker is still processing this action. Check the session \
+             for its outcome before submitting again."
+                .to_string()
+        }
+        _ => "Rejected: this surface action outcome is not supported by the CLI.".to_string(),
     };
     (accepted, message)
 }
 
-/// The static rejection texts, keyed by outcome; `None` for the accepted and
-/// id-bearing outcomes, which `outcome_message` formats itself.
+/// The static rejection texts, keyed by outcome; `None` for outcomes formatted
+/// directly by `outcome_message`.
 fn rejection_message(outcome: &SurfaceActionOutcome) -> Option<&'static str> {
     match outcome {
         SurfaceActionOutcome::UndeclaredAction => Some(
@@ -68,13 +74,15 @@ fn rejection_message(outcome: &SurfaceActionOutcome) -> Option<&'static str> {
              Nothing was recorded; a retry re-runs the tool.",
         ),
         SurfaceActionOutcome::LeaseLost => Some(
-            "Rejected: the worker lost its session lease before recording \
-             (lease_lost); retry.",
+            "Rejected: the worker lost its session lease (lease_lost). The action \
+             outcome is uncertain: a direct tool may have run, and the action may \
+             or may not be recorded. Check the session before retrying.",
         ),
         SurfaceActionOutcome::AppendFailed => Some(
-            "Rejected: the record could not be appended after repeated \
-             conflicts (append_failed). Nothing is durable; resubmit when \
-             the session settles.",
+            "Rejected: the action record could not be confirmed after conflicts \
+             or a handler panic (append_failed). The action outcome is uncertain: \
+             a direct tool may have run, and the action may or may not be recorded. \
+             Check the session before retrying.",
         ),
         SurfaceActionOutcome::Pending => None,
         SurfaceActionOutcome::Applied
@@ -181,10 +189,28 @@ mod tests {
             SurfaceActionOutcome::ToolFailed,
             SurfaceActionOutcome::LeaseLost,
             SurfaceActionOutcome::AppendFailed,
+            SurfaceActionOutcome::Pending,
         ] {
             let (ok, message) = outcome_message(outcome, "deploy-1");
             assert!(!ok, "message: {message}");
         }
+
+        for outcome in [
+            SurfaceActionOutcome::LeaseLost,
+            SurfaceActionOutcome::AppendFailed,
+        ] {
+            let (_, message) = outcome_message(outcome, "deploy-1");
+            assert!(message.contains("direct tool may have run"), "{message}");
+            assert!(
+                message.contains("Check the session before retrying"),
+                "{message}"
+            );
+        }
+
+        let (ok, message) = outcome_message(SurfaceActionOutcome::Pending, "deploy-1");
+        assert!(!ok);
+        assert!(message.contains("still processing"), "{message}");
+        assert!(message.contains("before submitting again"), "{message}");
     }
 
     #[test]

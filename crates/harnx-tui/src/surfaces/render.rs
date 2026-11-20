@@ -1,7 +1,7 @@
 //! Surface action form rendering and key handling. The form reuses the T4.2
 //! A2UI widgets; the differences from the modal-interaction form: no deny
-//! shortcut (`deny` is not a surface action), and Esc closes without
-//! submitting — surfaces are non-modal, so closing cancels nothing.
+//! shortcut (`deny` is not a surface action), and Esc closes an idle form
+//! without submitting — surfaces are non-modal, so closing cancels nothing.
 use super::{SurfaceActionModal, Tui};
 use crate::markdown_render::RenderedEntry;
 use crate::types::{ModalState, TranscriptItem};
@@ -50,14 +50,31 @@ impl Tui {
         RenderedEntry::from_lines(vec![line], width)
     }
 
+    /// Swallow every key while a submission task runs, including Esc and
+    /// Ctrl-C, which normally close the form. Closing mid-submit is unsafe,
+    /// not just untidy: `state.submitting` on the still-open modal is the
+    /// only in-flight guard (`submit_surface_action`), and the row stays
+    /// unresolved until the record lands, so a reopened form passes that
+    /// guard and starts a second concurrent submission. The runtime has no
+    /// cross-call gate; the client's idle fallback runs a direct tool
+    /// before its CAS append (`submit_surface_action_idle`), so two
+    /// in-flight submissions can execute a non-idempotent tool twice.
+    /// Regression: `esc_and_ctrl_c_are_swallowed_while_surface_submission_runs`.
+    fn ignore_surface_key_while_submitting(&self) -> bool {
+        matches!(
+            self.app.modal.as_ref(),
+            Some(ModalState::SurfaceAction(state)) if state.submitting
+        )
+    }
+
     // qual:allow(complexity, max_cyclomatic=12) reason: "key dispatch mirrors handle_interaction_key's flat match, per key kind"
     pub(crate) fn handle_surface_key(&mut self, key: KeyEvent) {
+        if self.ignore_surface_key_while_submitting() {
+            return;
+        }
         let Some(ModalState::SurfaceAction(state)) = self.app.modal.as_mut() else {
             return;
         };
-        if state.submitting {
-            return;
-        }
         let now = Instant::now();
         match (key.code, key.modifiers) {
             // Non-modal: closing the form cancels nothing, so Esc suffices.
@@ -213,7 +230,7 @@ fn surface_body(state: &SurfaceActionModal) -> Vec<Line<'static>> {
 
 fn surface_footer(state: &SurfaceActionModal) -> String {
     let help = if state.submitting {
-        "Submitting… · Esc close".to_string()
+        "Submitting…".to_string()
     } else if state.a2ui.is_some() {
         "Enter activate · Tab navigate · Space select · Shift+Enter newline · Esc close · PgUp/PgDn scroll"
             .to_string()
@@ -223,5 +240,23 @@ fn surface_footer(state: &SurfaceActionModal) -> String {
     match state.error.as_deref() {
         Some(error) => format!("{help}\n{error}"),
         None => help,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submitting_footer_does_not_advertise_close_key() {
+        let mut state = SurfaceActionModal::new(super::super::SurfaceSnapshot {
+            surface_id: "deploy-1".into(),
+            publish_seq: 1,
+            payload: serde_json::json!({}),
+            action: None,
+        });
+        state.submitting = true;
+
+        assert_eq!(surface_footer(&state), "Submitting…");
     }
 }

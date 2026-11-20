@@ -30,6 +30,13 @@ use super::stub::surface_call_fn;
 use harnx_core::abort::create_abort_signal;
 use harnx_core::require_nextest;
 
+/// The recovery budget the fixture arms through the unsupported
+/// `HARNX_SURFACE_ACTION_RECOVERY_TIMEOUT_MS` test knob: idle-fallback
+/// tests reach the fallback quickly, and parked-window tests that must
+/// outlast the client's budget wait exactly this long, so the knob value
+/// and the wait cannot drift apart.
+pub(super) const RECOVERY_BUDGET: Duration = Duration::from_millis(800);
+
 #[derive(Clone, Default)]
 pub(super) struct SurfaceTools {
     pub(super) counter: Arc<AtomicUsize>,
@@ -147,7 +154,7 @@ impl SurfaceFixture {
         // because the worker acknowledges before the budget can elapse.
         env.push(EnvGuard::set(
             "HARNX_SURFACE_ACTION_RECOVERY_TIMEOUT_MS",
-            "800",
+            &RECOVERY_BUDGET.as_millis().to_string(),
         ));
         let env: [EnvGuard; 4] = [
             env.pop().unwrap(),

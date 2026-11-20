@@ -289,15 +289,55 @@ async fn submit_marks_row_on_success_and_keeps_form_open_on_rejection() {
     assert!(tui.app.modal.is_none());
 }
 
+#[tokio::test]
+async fn esc_and_ctrl_c_are_swallowed_while_surface_submission_runs() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut tui = tui_with_surface().await;
+    let index = focus_surface_row(&mut tui);
+    tui.app.transcript_focus = Some(index);
+    assert!(tui.open_focused_root_surface());
+
+    tui.submit_surface_action("ship".into());
+    let decisions_before = tui.surfaces.decisions.len();
+    assert_eq!(decisions_before, 1, "one submission task should be running");
+
+    for key in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    ] {
+        tui.handle_surface_key(key);
+        let Some(ModalState::SurfaceAction(state)) = tui.app.modal.as_ref() else {
+            panic!("form must stay open while submission runs");
+        };
+        assert!(state.submitting, "keys are swallowed while submitting");
+    }
+
+    // The public submit path also refuses a second call while this form is busy.
+    tui.submit_surface_action("ship".into());
+    assert_eq!(tui.surfaces.decisions.len(), decisions_before);
+}
+
 #[test]
 fn surface_decision_errors_cover_append_failure_and_pending_outcomes() {
     assert_eq!(
         surface_decision_error(&Ok(SurfaceActionOutcome::AppendFailed)).as_deref(),
-        Some("append_failed: the action could not be recorded; nothing is durable")
+        Some(
+            "append_failed: a handler panic or record failure left the action outcome \
+             uncertain; a direct tool may have run. Check the session before retrying."
+        )
     );
     assert_eq!(
         surface_decision_error(&Ok(SurfaceActionOutcome::Pending)).as_deref(),
-        Some("pending: the action is still being processed")
+        Some("pending: the action is still being processed; check its outcome before retrying.")
+    );
+    assert_eq!(
+        surface_decision_error(&Ok(SurfaceActionOutcome::LeaseLost)).as_deref(),
+        Some(
+            "lease_lost: the action outcome is uncertain; a direct tool may have run. \
+             Check the session before retrying."
+        )
     );
 }
 

@@ -443,7 +443,7 @@ First-wins semantics:
 
 Exit status:
 - Exits **0** when the action is accepted, or when an identical action was already recorded (`Already applied`).
-- Exits **1** with the rejection message on `stderr` when rejected (`conflicting`, `unknown_surface`, `undeclared_action`, `invalid_visibility`, `invalid_data`, `unauthorized_tool`, `tool_failed`, `lease_lost`, `append_failed`).
+- Exits **1** with the rejection message on `stderr` when rejected (`conflicting`, `unknown_surface`, `undeclared_action`, `invalid_visibility`, `invalid_tool`, `invalid_data`, `unauthorized_tool`, `tool_failed`, `lease_lost`, `append_failed`). `lease_lost` and `append_failed` have uncertain outcomes: a direct tool may have run or the action may already be recorded. Check the session before retrying.
 - Exits nonzero with an error when the surface is not published or the session cannot be reached.
 
 ### `harnx list tools [<pattern>] [--json]`

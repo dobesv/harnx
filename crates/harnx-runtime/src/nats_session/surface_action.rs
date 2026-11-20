@@ -347,14 +347,18 @@ async fn drain_ack_window(
         };
         match answer.outcome {
             SurfaceActionOutcome::Pending => *acked = true,
-            // A non-holder's prompt refusal (review N-B): before any
-            // acknowledgement it is a redirect hint, not an outcome — this
-            // worker never claimed the attempt, so keep resending until the
-            // actual holder acknowledges or the recovery budget runs out.
-            // After the ack the refusal is final: the owning worker lost
-            // the attempt with nothing recorded, and a client-driven
-            // resend could re-run a non-idempotent tool under the new
-            // holder, so the client returns instead of retrying itself.
+            // A pre-acknowledgement `lease_lost` is a mixed-version
+            // tolerance arm, not an outcome: current workers never reply
+            // before proving ownership (review F1 — a stale non-holder's
+            // reply could land after the real holder's `Pending` and read
+            // as terminal), but an older worker still sends the refusal,
+            // and this worker never claimed the attempt. Keep resending
+            // until the actual holder acknowledges or the recovery budget
+            // runs out. After the ack the reply is final: the owning
+            // worker lost the attempt with nothing recorded, and a
+            // client-driven resend could re-run a non-idempotent tool
+            // under the new holder, so the client returns instead of
+            // retrying itself.
             SurfaceActionOutcome::LeaseLost if !*acked => {}
             _ => return Some(answer),
         }
@@ -397,8 +401,11 @@ fn self_turn_row(entry: &SessionLogEntry, turn_text: &str) -> bool {
 }
 
 /// The control-plane recovery budget before a surface action gives up on the
-/// lease holder. The `HARNX_SURFACE_ACTION_RECOVERY_TIMEOUT_MS` override is a
-/// test knob; production keeps [`CONTROL_RECOVERY_TIMEOUT`].
+/// lease holder. The `HARNX_SURFACE_ACTION_RECOVERY_TIMEOUT_MS` override is an
+/// unsupported, test-only knob: it exists so integration tests can shorten
+/// the fallback window against the production binary path, is not part of
+/// any supported configuration surface, and may change or be removed
+/// without notice. Production keeps [`CONTROL_RECOVERY_TIMEOUT`].
 fn surface_action_recovery_timeout() -> std::time::Duration {
     std::env::var("HARNX_SURFACE_ACTION_RECOVERY_TIMEOUT_MS")
         .ok()

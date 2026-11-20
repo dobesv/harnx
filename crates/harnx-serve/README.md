@@ -798,11 +798,12 @@ Outcomes:
   - `unknown_surface`: no published surface matches `surface_id` at `publish_seq`.
   - `undeclared_action`: the action is not a declared button on the surface (`deny` is also rejected; non-modal surfaces have no dismissal action).
   - `invalid_visibility`: the button declares an unknown visibility value.
+  - `invalid_tool`: the declared target tool is malformed.
   - `invalid_data`: submitted data keys or types conflict with surface input bindings.
   - `unauthorized_tool`: the direct tool target is not permitted for this session.
   - `tool_failed`: the direct target tool executed and returned a failure.
-  - `lease_lost`: the worker lost its session lease during execution.
-  - `append_failed`: the action record could not be appended after repeated CAS conflicts.
+  - `lease_lost`: the worker lost its session lease during execution. A direct tool may have run; check the session before retrying.
+  - `append_failed`: the action record could not be confirmed after repeated CAS conflicts or a handler panic. A direct tool may have run, and the record may already be durable; check the session before retrying.
 - On malformed arguments: Returns JSON-RPC error `-32602` (`invalid params`).
 - On routing failure: Returns JSON-RPC error `-32003`.
 

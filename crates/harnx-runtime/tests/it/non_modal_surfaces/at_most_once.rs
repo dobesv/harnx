@@ -16,9 +16,12 @@ async fn non_modal_resends_of_slow_direct_tool_dispatch_once() -> Result<()> {
     let (fixture, surface_id, publish_seq) = gated_surface().await?;
 
     // The single execution parks; a new-style client is acknowledged up
-    // front and never resends, never mind falls back to its own execution.
+    // front and never resends, never mind falls back to its own execution
+    // — hold the window past the client's whole recovery budget so a
+    // buggy fallback would have had its chance to re-run the target.
+    let submitted_at = std::time::Instant::now();
     let submit = start_parked_slow_action(&fixture, &surface_id, publish_seq).await?;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    hold_parked_past_recovery_budget(&fixture, submitted_at).await?;
     fixture.slow_release.store(true, Ordering::SeqCst);
 
     let outcome = submit.await??;
@@ -82,12 +85,17 @@ async fn non_modal_resends_of_slow_direct_tool_dispatch_once() -> Result<()> {
 async fn non_modal_concurrent_identical_submits_dispatch_once() -> Result<()> {
     let (fixture, surface_id, publish_seq) = gated_surface().await?;
 
+    // Barrier instead of a fixed sleep: wait until both submissions'
+    // commands are on the control subject, so the race is provably live
+    // (one execution parked, the other queued at or racing for the
+    // generation gate) before the parked window ends.
+    let commands = subscribe_control_commands(&fixture).await?;
     let submission = action_submission(&surface_id, publish_seq, "slow_act", None);
     let first = spawn_submission(fixture.session.clone(), submission.clone());
     let second = spawn_submission(fixture.session.clone(), submission.clone());
 
     wait_slow_started(&fixture).await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_control_commands(&commands, 2).await?;
     fixture.slow_release.store(true, Ordering::SeqCst);
 
     let (first, second) = (first.await??, second.await??);

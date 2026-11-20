@@ -8,6 +8,7 @@ use harnx_runtime::nats_session::NatsSession;
 use harnx_runtime::surfaces::{SurfaceActionOutcome, SurfaceActionSubmission};
 use serde_json::Value;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::fixture::SurfaceFixture;
@@ -162,6 +163,78 @@ pub(super) async fn wait_slow_started(fixture: &SurfaceFixture) -> Result<()> {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "slow tool never started executing"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+/// Hold the parked slow-tool window until the client's whole recovery
+/// budget has elapsed since `submitted_at` (the budget is the fixture's
+/// [`RECOVERY_BUDGET`] knob). An acknowledged client must neither resend
+/// nor fall back to its own idle execution — which would re-run the target
+/// — while the worker owns the attempt, and only an elapsed budget can
+/// prove that negative, so this wait is temporal by necessity. The counter
+/// poll fails fast on the at-most-once violation the window exists to
+/// catch instead of failing later on the final counts.
+pub(super) async fn hold_parked_past_recovery_budget(
+    fixture: &SurfaceFixture,
+    submitted_at: std::time::Instant,
+) -> Result<()> {
+    // Scheduling slack so "elapsed" is certain, not marginal.
+    const BUDGET_SLACK: Duration = Duration::from_millis(200);
+    let deadline = submitted_at + super::fixture::RECOVERY_BUDGET + BUDGET_SLACK;
+    while std::time::Instant::now() < deadline {
+        anyhow::ensure!(
+            fixture.slow_counter.load(Ordering::SeqCst) == 1,
+            "the parked window re-ran the target tool"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Ok(())
+}
+
+/// Count the `SurfaceAction` commands published on the session's control
+/// subject: the concurrent at-most-once tests use this as their dispatch
+/// barrier — waiting until every submission's command is on the wire
+/// proves the race is live before the parked window ends, where a fixed
+/// sleep only guessed at it.
+pub(super) async fn subscribe_control_commands(
+    fixture: &SurfaceFixture,
+) -> Result<Arc<std::sync::atomic::AtomicUsize>> {
+    let subject = harnx_runtime::nats_worker::control_subject(fixture.session.storage_key());
+    let mut commands = fixture.client.subscribe(subject).await?;
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = count.clone();
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        while let Some(message) = commands.next().await {
+            if matches!(
+                harnx_runtime::nats_worker::ControlCommand::from_bytes(&message.payload),
+                Ok(harnx_runtime::nats_worker::ControlCommand::SurfaceAction { .. })
+            ) {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    // The subscription must be live before the submissions spawn, or an
+    // early command could slip past the count.
+    fixture.client.flush().await?;
+    Ok(count)
+}
+
+/// Wait until the control-subject barrier has observed `expected`
+/// `SurfaceAction` commands, bounded by [`CI_SAFE_TIMEOUT`].
+pub(super) async fn wait_control_commands(
+    commands: &Arc<std::sync::atomic::AtomicUsize>,
+    expected: usize,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + CI_SAFE_TIMEOUT;
+    while commands.load(Ordering::SeqCst) < expected {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "only {} of {expected} surface action commands reached the control subject",
+            commands.load(Ordering::SeqCst)
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

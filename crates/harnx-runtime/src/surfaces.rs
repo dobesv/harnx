@@ -30,9 +30,7 @@ pub use tool::{run_surface_tool, SurfaceToolRoute};
 /// failed. Shared by the lease-holder worker path and the client idle path so
 /// both fail identically. A turn that is actively appending (tool calls and
 /// results) moves the tail constantly, so a tight handful of retries can lose
-/// every race; the budget is generous and each retry backs off. The
-/// `HARNX_SURFACE_ACTION_CAS_ROUNDS` override is a test knob for
-/// deterministic exhaustion; production keeps the default.
+/// every race; the budget is generous and each retry backs off.
 pub const APPEND_CONFLICT_ROUNDS: usize = 25;
 
 /// Pause between CAS conflict rounds, so a hot log tail and the retry
@@ -40,7 +38,11 @@ pub const APPEND_CONFLICT_ROUNDS: usize = 25;
 pub const APPEND_CONFLICT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// The effective CAS conflict budget, from [`APPEND_CONFLICT_ROUNDS`] or the
-/// test-only `HARNX_SURFACE_ACTION_CAS_ROUNDS` override.
+/// `HARNX_SURFACE_ACTION_CAS_ROUNDS` override. The override is an
+/// unsupported, test-only knob: it exists so integration tests can force
+/// deterministic CAS exhaustion against the production binary path, is not
+/// part of any supported configuration surface, and may change or be
+/// removed without notice.
 pub fn append_conflict_rounds() -> usize {
     std::env::var("HARNX_SURFACE_ACTION_CAS_ROUNDS")
         .ok()
@@ -96,13 +98,10 @@ pub enum SurfaceActionOutcome {
     LeaseLost,
     /// The action validated and its tool (if any) ran once, but the durable
     /// record could not be appended — bounded CAS retries against a log tail
-    /// that kept moving. Nothing is durable, so a resubmit is safe; if a tool
-    /// ran, its result is quoted only once the record lands. Also the
-    /// containment answer when the worker's handler panicked after
-    /// acknowledging (review N-B): the same nothing-recorded contract, with
-    /// the panic logged worker-side; a resubmission re-validates from the
-    /// log and re-runs any tool under the documented execute-then-record
-    /// window.
+    /// that kept moving. Also the containment answer when the worker's handler
+    /// panicked after acknowledging: the record may already be durable, and a
+    /// direct tool may have run before either failure. Callers must check the
+    /// session before retrying, since a retry can run the tool again.
     AppendFailed,
     /// Wire-only early acknowledgement: the lease-holding worker received the
     /// command and is processing it. Never returned by

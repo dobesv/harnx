@@ -102,9 +102,11 @@ pub(super) type SurfaceActionGates = Arc<std::sync::Mutex<SurfaceActionGateMap>>
 impl SessionControlHandler {
     /// Publish a JSON reply to a control command's reply subject. The
     /// decision and surface-action handlers share this. The surface-action
-    /// path also publishes early acknowledgements and lease refusals
-    /// here, so it proves lease ownership before any reply that claims
-    /// the attempt (review N-B).
+    /// path also publishes the early `Pending` acknowledgement here, so
+    /// every reply that claims an attempt follows the lease proof; a
+    /// non-holder never replies at all (review N-B/F1), and a
+    /// post-acknowledgement `lease_lost` can only come from a worker that
+    /// proved ownership when it acknowledged.
     pub(super) async fn publish_control_reply<T: serde::Serialize>(
         &self,
         reply: Option<async_nats::Subject>,

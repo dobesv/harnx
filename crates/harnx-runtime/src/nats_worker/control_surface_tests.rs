@@ -1,7 +1,8 @@
-//! Worker-side surface action control tests (review N-B): a worker that
-//! cannot prove lease ownership must refuse the attempt promptly instead of
-//! acknowledging `Pending`, and a panicking handler must still answer the
-//! client rather than leaving it to time out.
+//! Worker-side surface action control tests (review N-B/F1): a worker that
+//! cannot prove lease ownership must refuse the attempt without
+//! acknowledging `Pending` and without any wire reply a stale listener could
+//! turn into the client's terminal outcome, and a panicking handler must
+//! still answer the client rather than leaving it to time out.
 
 use super::*;
 
@@ -67,9 +68,14 @@ async fn no_more_replies(replies: &mut async_nats::Subscriber) -> bool {
         .is_err()
 }
 
-/// N-B: a worker that cannot prove lease ownership must refuse the surface
-/// action promptly — `lease_lost`, never a `Pending` ack — and must run and
-/// append nothing.
+/// N-B/F1: a worker that cannot prove lease ownership must refuse the
+/// surface action wordlessly — no `Pending` ack, and no `lease_lost` on the
+/// wire. Control commands use a plain subscribe, so a paused or
+/// reconnecting stale listener still sees resends; its `lease_lost` could
+/// land after the real holder's `Pending` and become the client's terminal
+/// outcome while the holder's action proceeds (the client treats a
+/// post-ack `lease_lost` as final). Without the fix this test sees the
+/// stale worker's prompt `lease_lost` reply and fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn surface_action_non_holder_refuses_instead_of_acking_pending() -> Result<()> {
     let mut fixture = SurfaceCommandFixture::start().await?;
@@ -91,15 +97,9 @@ async fn surface_action_non_holder_refuses_instead_of_acking_pending() -> Result
         .apply(command, Some(fixture.inbox.clone()))
         .await;
 
-    let reply = next_reply(&mut fixture.replies).await?;
-    assert_eq!(
-        reply.outcome,
-        SurfaceActionOutcome::LeaseLost,
-        "non-holder must refuse promptly"
-    );
     assert!(
         no_more_replies(&mut fixture.replies).await,
-        "the refusal must be the only answer — no Pending, no record"
+        "a non-holder must stay silent on the wire — no `lease_lost` refusal, no `Pending`"
     );
     assert_eq!(
         fixture.entry_count().await?,
@@ -110,8 +110,8 @@ async fn surface_action_non_holder_refuses_instead_of_acking_pending() -> Result
 }
 
 /// N-B: a handler panic after the early ack must still answer the client —
-/// the nothing-recorded outcome instead of silence the client would wait
-/// out for its whole acked-outcome budget.
+/// `append_failed` instead of silence the client would wait out for its whole
+/// acked-outcome budget. A direct tool may already have run before the panic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn surface_action_panic_is_contained_and_answered() -> Result<()> {
     let mut fixture = SurfaceCommandFixture::start().await?;
@@ -128,7 +128,7 @@ async fn surface_action_panic_is_contained_and_answered() -> Result<()> {
     assert_eq!(
         reply.outcome,
         SurfaceActionOutcome::AppendFailed,
-        "a contained panic must answer with the nothing-recorded outcome"
+        "a contained panic must answer with append_failed"
     );
     assert!(reply.turn_text.is_none());
     assert_eq!(
