@@ -909,6 +909,14 @@ impl Toolset for SubagentToolset {
     /// call was running, by appending a `Cancel` to the CHILD's own log. Never
     /// created (no checkpoint recorded yet): nothing to interrupt.
     async fn cancel(&self, invocation: ToolInvocation) -> Result<(), ToolInvokeError> {
+        // Async dispatch and observation own no child cancellation authority,
+        // even when a cancelled inline wait has a dispatch checkpoint.
+        if !matches!(
+            invocation.tool.as_str(),
+            SUBAGENT_SESSION_PROMPT_TOOL | SUBAGENT_SESSION_NEW_TOOL
+        ) {
+            return Ok(());
+        }
         let Some(child) = invocation
             .context
             .checkpoint

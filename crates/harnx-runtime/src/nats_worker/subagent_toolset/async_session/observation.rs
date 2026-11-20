@@ -42,6 +42,12 @@ use serde_json::Value;
 use snapshot::Snapshot;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+tokio::task_local! {
+    // Lets cancellation tests stop the caller after dispatch, inside observation.
+    pub(in crate::nats_worker::subagent_toolset) static OBSERVATION_ENTERED: std::sync::Arc<tokio::sync::Notify>;
+}
+
 /// Dispatch remains synchronous through durable acceptance; only observation
 /// has a soft budget. No future is spawned or left running when this returns.
 pub(in crate::nats_worker::subagent_toolset) async fn send(
@@ -298,6 +304,8 @@ async fn observe(
         dispatch,
         tool_call_id,
     } = request;
+    #[cfg(test)]
+    let _ = OBSERVATION_ENTERED.try_with(|entered| entered.notify_one());
     let (budget, single_pass) = observation_budget(&wait, cancel, context);
     let mut frame = Frame::new(&handle, wait.read.max_output_bytes);
     frame.preflight(None)?;

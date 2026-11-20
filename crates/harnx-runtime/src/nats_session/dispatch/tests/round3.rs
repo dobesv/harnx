@@ -18,6 +18,7 @@ async fn own_live_invocation_is_never_joined() -> Result<()> {
     // different raw retry text; its fresh active lookup sees its own live
     // reservation P (I1).
     let authority = AdmissionAuthority::Inherited {
+        detached: false,
         parent: f.parent.clone(),
         edge: InvocationEdgeKind::Delegation,
         admitted_at: f.parent.admitted_at,
@@ -90,6 +91,7 @@ async fn stale_captured_join_receipt_reports_current_binding() -> Result<()> {
     // R1 resumes with its captured record: the receipt must report the
     // CURRENT binding, not the dead captured invocation (I2).
     let authority = AdmissionAuthority::Inherited {
+        detached: false,
         parent: parent.clone(),
         edge: InvocationEdgeKind::Delegation,
         admitted_at: parent.admitted_at,
@@ -130,6 +132,7 @@ async fn leftover_candidate_content_does_not_block_void_recovery() -> Result<()>
     // A busy reserve against the live turn A leaves candidate P/X behind.
     let entries = session.load_durable_entries().await?;
     let authority = AdmissionAuthority::Inherited {
+        detached: false,
         parent: parent.clone(),
         edge: InvocationEdgeKind::Delegation,
         admitted_at: parent.admitted_at,

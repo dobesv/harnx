@@ -7,6 +7,7 @@ use super::*;
 /// head is active and rowless, so it can never be classified terminal.
 async fn live_admission_head(session: &NatsSession, f: &Fixture, invocation: &str) -> Result<()> {
     let authority = AdmissionAuthority::Inherited {
+        detached: false,
         parent: f.parent.clone(),
         edge: InvocationEdgeKind::Delegation,
         admitted_at: f.parent.admitted_at,
