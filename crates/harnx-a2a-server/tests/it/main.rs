@@ -9,6 +9,7 @@ mod memberships;
 mod multi_replica;
 #[cfg(feature = "fault-injection")]
 mod multi_replica_inventory;
+mod request_log;
 mod runner;
 mod store_nats;
 mod store_nats_access;

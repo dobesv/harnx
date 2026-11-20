@@ -76,6 +76,73 @@ with bounded route-template labels, plus A2A recovery diagnostics. Metrics use
 `HARNX_METRICS_ADDR`. See [operations](../../docs/a2a-operations.md#listeners-and-readiness)
 and [Kubernetes deployment](../../docs/kubernetes-deployment.md#a2a-backends-behind-ingress).
 
+## Request logging
+
+Each handled A2A request emits one `info` event on the tracing target
+`harnx_a2a_server::requests` when it finishes. Streaming requests log at stream
+EOF or drop, not when the handler returns the SSE response. Agent Card fetches
+(including the legacy alias), identity rejections, hidden exports and compatibility
+rejections are included.
+
+To see only request records, in JSON with separate structured fields:
+
+```sh
+HARNX_LOG_LEVEL=info \
+HARNX_LOG_FILTER=harnx_a2a_server::requests \
+HARNX_LOG_FORMAT=json \
+harnx-a2a-server --agent jira=team/triage
+```
+
+The server uses the shared `HARNX_LOG_LEVEL`, `HARNX_LOG_FILTER` (target prefix)
+and `HARNX_LOG_FORMAT` settings. `RUST_LOG` is a fallback for a **bare level** only,
+not per-target directives. When no `HARNX_LOG_*` setting is present, an ignored
+non-bare `RUST_LOG` value produces one startup warning without echoing its value.
+`HARNX_LOG_FILTER` matches one target prefix, so you can isolate request records
+but not exclude them while keeping other logs — there's no negation or
+per-target directive syntax. Logs go to stderr. A2A tracing JSON events store
+structured values under `fields` rather than embedding them in `message`.
+
+| Field | Meaning |
+| --- | --- |
+| `export` | Public export name, even when addressed through another lookup key |
+| `method` | Canonical `SendMessage`, `SendStreamingMessage`, `GetTask`, `SubscribeToTask`, `CancelTask`, `ListTasks`, `AgentCard`, or an optional protocol method |
+| `task_id`, `context_id` | IDs from the request or returned task/events, when available |
+| `message_id` | Incoming message ID for sends |
+| `state` | Returned/latest delivered task state, for example `Working`, `Completed`, `InputRequired` |
+| `error_code`, `error_message` | A2A error, including mapped task-not-found (`-32001`), busy (`-32000`) and invalid-params errors |
+| `duration_ms` | Elapsed milliseconds through unary completion or stream end/drop |
+| `events_sent` | Stream events yielded to the SSE codec, including snapshots and error envelopes; excludes keepalive comments |
+| `end_reason` | Stream end classification (below) |
+| `tasks_returned` | Number of tasks in a successful `ListTasks` page (no single task state applies) |
+| `http_status` | HTTP status for discovery and pre-dispatch rejections |
+
+Clients should use opaque, non-sensitive IDs: IDs are logged as sent (up to
+256 characters plus `…`), so treat info correlation logs as operational data.
+Error messages for unsupported media types, unsupported
+A2A versions and non-cancelable tasks omit echoed client values. Wire responses
+are unchanged.
+
+Stream end reasons are `terminal` (completed, canceled, failed or rejected),
+`interrupted` (input/auth required), `client_disconnect` (dropped before a response
+boundary), and `server_shutdown` (backend abort). `error` records a setup,
+rejection or delivery error; pre-stream rejections have `events_sent=0`.
+`stream_closed` means the source ended without a response boundary.
+`events_sent` counts events handed to the transport, not client acknowledgements.
+Disconnecting doesn't cancel the underlying task. Shutdown abort closes open
+streams so they don't hold graceful shutdown indefinitely.
+
+Request records never contain message parts, prompt/response text or bearer
+tokens. Resolved `user_id` is emitted only by a separate `debug` event on the same
+target (`A2A caller resolved`). It can contain a Forge account DN; enable
+`HARNX_LOG_LEVEL=debug` only when needed and protect those logs as personal data.
+
+**Coverage gap:** JSON-RPC parse, invalid-envelope, parameter-decoding and
+method-not-found errors generated inside the external `a2a_server_lf` router
+don't reach our handler and aren't recorded here. Requests to unknown export
+names or paths aren't request records either. HTTP metrics still count these
+responses. Our identity/access and compatibility rejections log only protocol
+metadata; unrecognized methods in those rejections are labeled `Unknown`.
+
 ## Endpoints and Name Resolution
 
 For each exported agent, the server exposes endpoints rooted under `/agents/{name}`:
@@ -304,7 +371,7 @@ To configure allow lists in `access.yaml` or user mappings in `users.yaml`, oper
 
 Atlassian account IDs are global across sites, while `OU` pins the specific site. Combining them as `CN=<id>,OU=<cloudId>,O=atlassian.com` restricts the user's access to that single site.
 
-For security and privacy, `harnx-a2a-server` never logs resolved caller identities or token claims in server logs. After a test call, operators can inspect the resolved identity in session metadata: `harnx info session <agent> <session-id> --format json` records the identity under `extensions["dev.harnx.session_properties"].user_id.value`.
+For security and privacy, `harnx-a2a-server` logs resolved caller identities only at `debug`, in the separate request-target caller event described under [request logging](#request-logging). Tokens and other token claims aren't logged. Without enabling debug logs, operators can inspect the resolved identity in session metadata after a test call: `harnx info session <agent> <session-id> --format json` records the identity under `extensions["dev.harnx.session_properties"].user_id.value`.
 
 ### Behavior Under Rules
 - **Authentication**: All endpoints under `/agents/{name}`, including Agent Cards and discovery GET requests, require trusted caller identity and return HTTP `401 Unauthorized` (JSON-RPC error code `-32000`) if missing. (When access rules are disabled, Agent Cards remain public).
@@ -452,8 +519,8 @@ To require a valid token, configure `forge-fit` (or `bearer-claim:CLAIM`) as the
   - Verification failures fail closed: HTTP 401 Unauthorized with JSON-RPC error code `-32000` and a static reason category (e.g. `bad bearer token signature`, `bearer token is expired`, `jwks fetch failed`).
   - No fallthrough: if a bearer source is selected and an `Authorization: Bearer` token is present, any verification or decoding failure rejects the request immediately. Subsequent identity sources are never tried.
   - Missing `Authorization` header or non-`Bearer` scheme falls through to the next configured identity source.
-- **Logging**: JWKS fetch failures and invalid responses are logged at `warn` with a reason category, bounded by the 30-second refetch throttle. Per-request rejections, including invalid keys and `jwks unavailable (expired set, refresh throttled)`, are logged at `debug`, so forged-token noise doesn't hide an outage.
-- **Redaction**: Raw tokens, claim values, and JWKS response payloads are never logged or echoed in error responses. Only the resolved identity (DN or claim string) is stored as the session or task owner.
+- **Logging**: JWKS fetch failures and invalid responses are logged at `warn` with a reason category, bounded by the 30-second refetch throttle. Rejection diagnostics, including invalid keys and `jwks unavailable (expired set, refresh throttled)`, are logged at `debug`. Request completion records still report the generic unauthorized error at `info` on `harnx_a2a_server::requests`.
+- **Redaction**: Raw tokens, other claim values, and JWKS response payloads are never logged or echoed in error responses. The resolved identity (DN or claim string) is stored as the session or task owner and appears only at `debug` in caller-resolution logs.
 - **Startup Validation**:
   - Setting any of `--bearer-jwks-url`, `--bearer-issuer`, or `--bearer-audience` without the others fails startup: `"--bearer-jwks-url, --bearer-issuer and --bearer-audience are all required to enable bearer token verification"`.
   - A non-https `--bearer-jwks-url` on a non-loopback host fails startup: `"--bearer-jwks-url must use https; http is only allowed on loopback hosts"`.

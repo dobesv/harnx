@@ -18,6 +18,7 @@ mod hitl;
 pub mod identity;
 pub mod input_map;
 mod lifecycle;
+mod request_log;
 pub mod runner;
 mod sse;
 pub mod store;

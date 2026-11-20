@@ -65,6 +65,11 @@ pub fn router_with_access_rules<H: a2a_server_lf::handler::RequestHandler>(
             ))
             .merge(cards)
         }
+        // Must stay outermost so rejection hooks receive the request-log metadata.
+        .layer(axum::middleware::from_fn_with_state(
+            export.public_name.clone(),
+            crate::request_log::http::start,
+        ))
     }))
 }
 

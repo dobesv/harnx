@@ -81,10 +81,12 @@ starts.
 - **HARNX_LOG_LEVEL**: `off`, `error`, `warn`, `info`, `debug`, or `trace`.
   Default `info`. Falls back to a bare level in `RUST_LOG` if unset.
 - **HARNX_LOG_FORMAT**: `text` (default) or `json`. JSON writes one object per
-  line: `{"ts","level","pid","target","message"}`. Parse the log leniently:
-  it also collects raw bytes from subprocesses that know nothing about the
-  format — `nats-server`'s startup banner, a panic message, a wrapped MCP
-  server's stderr.
+  line, normally `{"ts","level","pid","target","message"}`.
+  `harnx-a2a-server` tracing events use `{"timestamp","level","target","fields"}`
+  so request metadata remains structured; `fields.message` contains the event
+  text. Parse the log leniently: it also collects raw bytes from subprocesses
+  that know nothing about the format — `nats-server`'s startup banner, a panic
+  message, a wrapped MCP server's stderr.
 - **HARNX_LOG_FILTER**: Only log records whose target starts with this prefix.
   Default `harnx`, which matches every `harnx_*` crate. Narrow it to one crate
   with e.g. `HARNX_LOG_FILTER=harnx_mcp_bridge`.
