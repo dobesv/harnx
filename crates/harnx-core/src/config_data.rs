@@ -254,9 +254,10 @@ pub struct ConfigData {
     pub serve_public_url: Option<String>,
     /// Ordered header/cookie sources for the identity recorded on new HTTP sessions.
     pub serve_user_id_sources: Vec<String>,
-    /// Trusted raw HTTP header names for request-local groups. Empty by default.
+    /// Trusted group header specs: header:NAME (or NAME) is opaque;
+    /// header-csv:NAME parses quoted comma lists. Empty by default.
     pub serve_group_headers: Vec<String>,
-    /// Trusted raw HTTP header names for request-local roles. Empty by default.
+    /// Trusted role header specs, with the same syntax as serve_group_headers.
     pub serve_role_headers: Vec<String>,
     /// Default identity for newly created sessions, unless their cluster or caller supplies one.
     #[serde(default, skip_serializing_if = "Option::is_none")]

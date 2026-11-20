@@ -33,11 +33,11 @@ rules:
 "#;
 const FLAGS: &[&str] = &[
     "--group-header",
-    "x-groups",
+    "header-csv:x-groups",
     "--group-header",
-    "x-other-groups",
+    "header-csv:x-other-groups",
     "--role-header",
-    "x-roles",
+    "header-csv:x-roles",
 ];
 
 fn request(f: &HttpFixture, method: Method, path: &str, user: Option<&str>) -> RequestBuilder {
@@ -116,6 +116,82 @@ async fn membership_discovery_namespaces_and_all_configured_occurrences() -> Res
 }
 
 #[tokio::test]
+async fn membership_opaque_and_bare_specs_preserve_dn_groups() -> Result<()> {
+    let rules = "rules:\n  - agents: [allowed]\n    groups: ['CN=admins,OU=*,O=Acme']\n";
+    for source in ["X-Groups", "HeAdEr:X-Groups"] {
+        let args = ["--group-header", source];
+        let f = HttpFixture::start_memberships(
+            Some(rules),
+            None,
+            MembershipSettings {
+                args: &args,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(
+            visible(
+                request(&f, Method::GET, "/v1/agents", Some("alice"))
+                    .header("x-groups", " CN=admins,OU=eng,O=Acme ")
+            )
+            .await?
+        );
+        assert!(
+            !visible(
+                request(&f, Method::GET, "/v1/agents", Some("alice"))
+                    .header("x-groups", r#""CN=admins,OU=eng,O=Acme""#)
+            )
+            .await?
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn membership_quoted_dns_match_globs_and_invalid_quotes_fail_closed() -> Result<()> {
+    let rules =
+        "rules:\n  - agents: [allowed]\n    groups: ['CN=*,O=Acme']\n    roles: ['CN=*,O=Acme']\n";
+    let f = HttpFixture::start_memberships(
+        Some(rules),
+        None,
+        MembershipSettings {
+            args: FLAGS,
+            ..Default::default()
+        },
+    )
+    .await?;
+    for header in ["x-groups", "x-roles"] {
+        assert!(
+            visible(
+                request(&f, Method::GET, "/v1/agents", Some("alice"))
+                    .header(header, r#""CN=admins,OU=eng"#)
+                    .header(header, r#"O=Acme", "CN=ops,O=Acme", plain-group"#)
+            )
+            .await?
+        );
+        assert!(
+            !visible(
+                request(&f, Method::GET, "/v1/agents", Some("alice"))
+                    .header(header, r#""CN=admins,OU=eng,O=Other Corp", plain-group"#)
+            )
+            .await?
+        );
+        for invalid in [r#""secret"#, r#""secret"junk, later"#] {
+            let response = request(&f, Method::GET, "/v1/agents", Some("alice"))
+                .header("x-groups", r#""CN=ops,O=Acme""#)
+                .header(header, invalid)
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body = response.text().await?;
+            assert!(body.contains("invalid user identity source"));
+            assert!(!body.contains("secret"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn membership_malformed_later_values_fail_closed_without_echo_and_user_is_required(
 ) -> Result<()> {
     let f = HttpFixture::start_memberships(
@@ -170,10 +246,10 @@ async fn membership_malformed_later_values_fail_closed_without_echo_and_user_is_
 }
 
 fn precedence_cases() -> [(MembershipSettings<'static>, Vec<&'static str>); 4] {
-    let yaml = "serve_group_headers: [x-yaml]\nserve_role_headers: [r-yaml]\n";
+    let yaml = "serve_group_headers: [header-csv:x-yaml]\nserve_role_headers: [header:r-yaml]\n";
     let env = &[
-        ("HARNX_SERVE_GROUP_HEADERS", "x-env"),
-        ("HARNX_SERVE_ROLE_HEADERS", "r-env"),
+        ("HARNX_SERVE_GROUP_HEADERS", "HeAdEr-CsV:x-env"),
+        ("HARNX_SERVE_ROLE_HEADERS", "header:r-env"),
     ];
     let args = &[
         "--group-header",
@@ -265,7 +341,7 @@ async fn membership_invalid_startup_names_fail_even_with_rules_disabled() -> Res
         ),
         (
             MembershipSettings {
-                env: &[("HARNX_SERVE_GROUP_HEADERS", "header:groups")],
+                env: &[("HARNX_SERVE_GROUP_HEADERS", "bearer-claim:groups")],
                 ..Default::default()
             },
             "serve_group_headers",

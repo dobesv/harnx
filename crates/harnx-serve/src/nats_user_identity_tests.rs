@@ -139,7 +139,7 @@ async fn explicit_create_stores_header_cookie_and_default_identity_in_summaries(
     };
     let header = f
         .create(Headers(&[
-            ("x-user", "header-owner, ignored"),
+            ("x-user", " CN=alice,OU=eng,O=Acme Corp "),
             ("cookie", "owner=cookie-owner"),
         ]))
         .await?;
@@ -150,7 +150,10 @@ async fn explicit_create_stores_header_cookie_and_default_identity_in_summaries(
         )]))
         .await?;
     let missing = f.create(Headers(&[])).await?;
-    assert_eq!(f.user_id(&header).await?.as_deref(), Some("header-owner"));
+    assert_eq!(
+        f.user_id(&header).await?.as_deref(),
+        Some("CN=alice,OU=eng,O=Acme Corp")
+    );
     assert_eq!(f.user_id(&cookie).await?.as_deref(), Some("cookie-owner"));
     assert_eq!(f.user_id(&missing).await?.as_deref(), Some("cluster-owner"));
     let summaries: Value = f
@@ -163,7 +166,7 @@ async fn explicit_create_stores_header_cookie_and_default_identity_in_summaries(
         .json()
         .await?;
     for (session, user) in [
-        (&header, "header-owner"),
+        (&header, "CN=alice,OU=eng,O=Acme Corp"),
         (&cookie, "cookie-owner"),
         (&missing, "cluster-owner"),
     ] {
@@ -178,7 +181,10 @@ async fn explicit_create_stores_header_cookie_and_default_identity_in_summaries(
     // Explicit creation also remains immutable on later prompts from another caller.
     f.prompt(&header, Headers(&[("x-user", "later-owner")]))
         .await?;
-    assert_eq!(f.user_id(&header).await?.as_deref(), Some("header-owner"));
+    assert_eq!(
+        f.user_id(&header).await?.as_deref(),
+        Some("CN=alice,OU=eng,O=Acme Corp")
+    );
     f.handle.shutdown().await?;
     Ok(())
 }

@@ -25,7 +25,7 @@ impl Fixture {
             rules,
             aliases,
             MembershipSettings {
-                config: "serve_group_headers: [x-groups]\nserve_role_headers: [x-roles]\n",
+                config: "serve_group_headers: [header-csv:x-groups]\nserve_role_headers: [header-csv:x-roles]\n",
                 ..Default::default()
             },
         )

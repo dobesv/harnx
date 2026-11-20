@@ -7,18 +7,25 @@
 
 use std::{fmt, str::FromStr};
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use http::{header::COOKIE, HeaderMap, HeaderName};
 
 mod bearer;
+mod header;
 mod membership;
 pub use bearer::BearerIdentity;
+pub use header::HeaderSpec;
 pub use membership::{merge_memberships, MembershipHeaders};
 
 /// First comma-separated entry of the first header field, trimmed.
 ///
 /// Missing, empty or non-text headers return `None`. Identity resolution checks
 /// presence separately so an unusable first source cannot trigger a fallback.
+///
+/// Unlike `HeaderSpec::values`, the comma split here is deliberate: this is for
+/// forwarded host/proto fields (`web_url.rs`), which proxies may comma-join when
+/// aggregating repeated fields, so only the first entry is trusted. Identity
+/// header sources must stay opaque (`header:`) or use `header-csv:` instead.
 pub fn first_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get(name)?
@@ -33,7 +40,7 @@ pub fn first_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// A request identity source. Cookie names are case-sensitive; header names aren't.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IdentitySource {
-    Header(HeaderName),
+    Header(HeaderSpec),
     Cookie(String),
     ForgeFit,
     BearerClaim(String),
@@ -75,17 +82,20 @@ impl IdentitySource {
         headers: &'a HeaderMap,
     ) -> Result<Option<IdentitySelection<'a>>, IdentityError> {
         let value = match self {
-            Self::Header(name) => {
-                let Some(header) = headers.get(name) else {
+            Self::Header(source) => {
+                let Some(_) = headers.get(source.name()) else {
                     return Ok(None);
                 };
-                let value = header.to_str().map_err(|_| IdentityError::InvalidValue)?;
-                let value = value.split(',').next().unwrap_or_default().trim();
-                if value.is_empty() {
+                let value = source
+                    .values(headers, header::HeaderFields::First)?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                return if value.is_empty() {
                     Err(IdentityError::EmptyValue)
                 } else {
-                    Ok(Some(value))
-                }
+                    Ok(Some(IdentitySelection::Resolved(value)))
+                };
             }
             Self::Cookie(name) => cookie_value(headers, name),
             Self::ForgeFit | Self::BearerClaim(_) => {
@@ -100,7 +110,8 @@ impl IdentitySource {
 impl FromStr for IdentitySource {
     type Err = anyhow::Error;
 
-    /// Parse `header:NAME`, `cookie:NAME`, `forge-fit`, or `bearer-claim:CLAIM`.
+    /// Parse `header:NAME`, `header-csv:NAME`, `cookie:NAME`, `forge-fit`, or
+    /// `bearer-claim:CLAIM`.
     /// Bare names are headers, except `forge-fit` (use `header:forge-fit` for that header).
     /// Prefixes are case-insensitive. Header/cookie names must be HTTP tokens;
     /// claim names are nonempty, case-sensitive top-level JSON keys, not paths.
@@ -108,25 +119,18 @@ impl FromStr for IdentitySource {
         if raw.eq_ignore_ascii_case("forge-fit") {
             return Ok(Self::ForgeFit);
         }
-        let (cookie, name) = match raw.split_once(':') {
+        match raw.split_once(':') {
             Some((prefix, name)) if prefix.eq_ignore_ascii_case("bearer-claim") => {
                 anyhow::ensure!(!name.is_empty(), "empty bearer identity claim name");
-                return Ok(Self::BearerClaim(name.to_owned()));
+                Ok(Self::BearerClaim(name.to_owned()))
             }
-            Some((prefix, name)) if prefix.eq_ignore_ascii_case("header") => (false, name),
-            Some((prefix, name)) if prefix.eq_ignore_ascii_case("cookie") => (true, name),
-            Some(_) => {
-                bail!("invalid identity source '{raw}': expected header:NAME, cookie:NAME, forge-fit or bearer-claim:CLAIM")
+            Some((prefix, name)) if prefix.eq_ignore_ascii_case("cookie") => {
+                HeaderName::from_bytes(name.as_bytes())
+                    .with_context(|| format!("invalid identity source name '{name}'"))?;
+                Ok(Self::Cookie(name.to_owned()))
             }
-            None => (false, raw),
-        };
-        let header = HeaderName::from_bytes(name.as_bytes())
-            .with_context(|| format!("invalid identity source name '{name}'"))?;
-        Ok(if cookie {
-            Self::Cookie(name.to_owned())
-        } else {
-            Self::Header(header)
-        })
+            _ => raw.parse().map(Self::Header).with_context(|| format!("invalid identity source '{raw}': expected header:NAME, header-csv:NAME, cookie:NAME, forge-fit or bearer-claim:CLAIM")),
+        }
     }
 }
 
@@ -158,9 +162,10 @@ impl IdentitySources {
     }
 
     /// The first present source wins. Empty or invalid values return an error,
-    /// without considering later comma values, repeated fields or fallback sources.
+    /// without considering repeated fields or fallback sources.
     ///
-    /// Headers retain `first_value` semantics (including HTTP horizontal tabs).
+    /// Headers use only the first field. `header:` and bare names preserve the
+    /// whole trimmed value; `header-csv:` selects the first parsed list item.
     /// Cookies use the first exact name match across all Cookie fields. Values
     /// may be quoted, must contain RFC 6265 cookie-octets, and aren't URL-decoded.
     /// Malformed unrelated cookies are ignored; a matching cookie without `=` is invalid.
@@ -278,10 +283,16 @@ mod tests {
     #[test]
     fn sources_parse_prefixes_and_preserve_cookie_case() {
         harnx_core::require_nextest();
-        let header = IdentitySource::Header(HeaderName::from_static("x-user"));
+        let header = IdentitySource::Header("x-user".parse().unwrap());
         for raw in ["X-User", "header:X-User", "HeAdEr:X-User"] {
             assert_eq!(raw.parse::<IdentitySource>().unwrap(), header);
         }
+        let csv = "HeAdEr-CsV:X-User".parse::<IdentitySource>().unwrap();
+        assert_eq!(
+            csv,
+            IdentitySource::Header("header-csv:x-user".parse().unwrap())
+        );
+        assert_ne!(csv, header);
         assert_eq!(
             "CoOkIe:User".parse::<IdentitySource>().unwrap(),
             IdentitySource::Cookie("User".into())
@@ -294,6 +305,9 @@ mod tests {
         for raw in [
             "",
             "header:",
+            "header-csv:",
+            "header-csv:bad header",
+            "header-csv:a:b",
             "cookie:",
             "bad header",
             "user:id",
@@ -344,23 +358,111 @@ mod tests {
     }
 
     #[test]
-    fn headers_keep_first_comma_and_repeated_field_semantics() {
+    fn headers_keep_commas_and_use_first_repeated_field() {
         let sources = policy(&["X-USER"]);
         let mut headers = HeaderMap::new();
-        headers.append("x-user", " \t first-user \t , second-user".parse().unwrap());
+        headers.append(
+            "x-user",
+            " \t first-user \t , second-user \t ".parse().unwrap(),
+        );
         headers.append("x-user", "third-user".parse().unwrap());
         assert_eq!(first_value(&headers, "x-user"), Some("first-user"));
         assert_eq!(
             sources.resolve(&headers).unwrap().as_deref(),
-            Some("first-user")
+            Some("first-user \t , second-user")
         );
         assert_eq!(first_value(&headers, "absent"), None);
     }
 
     #[test]
+    fn csv_identity_uses_first_item_and_fails_closed_on_empty_or_malformed_lists() {
+        let sources = policy(&["HeAdEr-CsV:X-User", "x-fallback"]);
+        for (raw, expected) in [
+            (" first-user , second-user ", "first-user"),
+            ("CN=alice,OU=eng,O=Acme", "CN=alice"),
+            (
+                r#""CN=alice,OU=eng,O=Acme", other"#,
+                "CN=alice,OU=eng,O=Acme",
+            ),
+            (r"CN=Smith\, Alice, second", r"CN=Smith\, Alice"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.append("x-user", raw.parse().unwrap());
+            headers.append("x-user", "ignored".parse().unwrap());
+            assert_eq!(
+                sources.resolve(&headers).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+        for raw in ["", " \t ", ",later", " ,later", r#""",later"#] {
+            let mut headers = HeaderMap::new();
+            headers.append("x-user", raw.parse().unwrap());
+            headers.append("x-user", "ignored".parse().unwrap());
+            headers.insert("x-fallback", "fallback".parse().unwrap());
+            assert!(sources.resolve(&headers).is_err());
+        }
+        for raw in [
+            r#""unterminated"#,
+            r#"valid, "unterminated"#,
+            r#""closed"junk, later"#,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-user", raw.parse().unwrap());
+            headers.insert("x-fallback", "fallback".parse().unwrap());
+            assert_eq!(sources.resolve(&headers), Err(IdentityError::InvalidValue));
+        }
+    }
+
+    #[test]
+    fn headers_preserve_distinguished_names_including_escaped_commas() {
+        for source in [
+            "header:X-Amzn-Mtls-Clientcert-Subject",
+            "X-Amzn-Mtls-Clientcert-Subject",
+        ] {
+            let sources = policy(&[source]);
+            for dn in [
+                "CN=alice,OU=eng,O=Acme Corp",
+                r"CN=Smith\, Alice,OU=eng",
+                "O=Acme Corp,OU=eng,CN=alice",
+            ] {
+                let mut headers = HeaderMap::new();
+                headers.append(
+                    "x-amzn-mtls-clientcert-subject",
+                    format!(" \t {dn} \t ").parse().unwrap(),
+                );
+                headers.append("x-amzn-mtls-clientcert-subject", "ignored".parse().unwrap());
+                assert_eq!(sources.resolve(&headers).unwrap().as_deref(), Some(dn));
+            }
+        }
+    }
+
+    #[test]
+    fn headers_accept_nonempty_comma_values_as_opaque_identities() {
+        let sources = policy(&["x-user"]);
+        for raw in [",", " , second", ",second"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-user", raw.parse().unwrap());
+            assert_eq!(
+                sources.resolve(&headers).unwrap().as_deref(),
+                Some(raw.trim())
+            );
+            assert_eq!(first_value(&headers, "x-user"), None);
+        }
+    }
+
+    #[test]
+    fn opaque_identity_headers_do_not_decode_list_quoting() {
+        let sources = policy(&["x-user"]);
+        let raw = r#""CN=Smith\, Alice,OU=eng""#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user", raw.parse().unwrap());
+        assert_eq!(sources.resolve(&headers).unwrap().as_deref(), Some(raw));
+    }
+
+    #[test]
     fn empty_or_invalid_header_fails_closed() {
         let sources = policy(&["x-user", "cookie:user", "x-fallback"]);
-        for raw in [b"".as_slice(), b" \t ", b" , second", b",second", b"\xff"] {
+        for raw in [b"".as_slice(), b" \t ", b"\xff"] {
             let mut headers = HeaderMap::new();
             headers.append("x-user", HeaderValue::from_bytes(raw).unwrap());
             headers.append("x-user", "later-user".parse().unwrap());
@@ -515,7 +617,7 @@ mod tests {
         );
         assert_eq!(
             "header:forge-fit".parse::<IdentitySource>().unwrap(),
-            IdentitySource::Header(HeaderName::from_static("forge-fit"))
+            IdentitySource::Header("forge-fit".parse().unwrap())
         );
         assert!("bearer-claim:".parse::<IdentitySource>().is_err());
         assert!("forge-fit:principal".parse::<IdentitySource>().is_err());
@@ -527,7 +629,9 @@ mod tests {
             .parse::<IdentitySource>()
             .unwrap_err()
             .to_string();
-        assert!(error.contains("header:NAME, cookie:NAME, forge-fit or bearer-claim:CLAIM"));
+        assert!(error.contains(
+            "header:NAME, header-csv:NAME, cookie:NAME, forge-fit or bearer-claim:CLAIM"
+        ));
     }
 
     #[test]

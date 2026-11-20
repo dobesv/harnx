@@ -15,8 +15,8 @@ fn aliases_request_and_service_params_expand_only_users() {
     harnx_core::require_nextest();
     let policy = Identity::with_memberships(
         &["x-user".into()],
-        &["x-groups".into()],
-        &["x-roles".into()],
+        &["header-csv:x-groups".into()],
+        &["header-csv:x-roles".into()],
     )
     .unwrap()
     .with_user_aliases(Some(aliases()));
@@ -51,6 +51,49 @@ fn aliases_request_and_service_params_expand_only_users() {
     }
 }
 
+#[tokio::test]
+async fn mtls_subject_identity_matches_full_dn_rules_and_aliases() {
+    harnx_core::require_nextest();
+    let policy = Identity::new(&["header:X-Amzn-Mtls-Clientcert-Subject".into()])
+        .unwrap()
+        .with_user_aliases(Some(Arc::new(
+            UserAliases::from_yaml(
+                "- name: Alice\n  identities: ['CN=alice,OU=eng,O=Acme Corp', alice@example.com]\n",
+            )
+            .unwrap(),
+        )));
+    let rules = harnx_core::access_rules::AccessRules::from_yaml(
+        "rules:\n  - agents: [dn-agent]\n    users: ['CN=*,OU=eng,O=Acme Corp']\n  - agents: [alias-agent]\n    users: [alice@example.com]\n",
+    )
+    .unwrap();
+    for (dn, allowed) in [
+        ("CN=alice,OU=eng,O=Acme Corp", true),
+        ("CN=alice,OU=finance,O=Other Corp", false),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amzn-mtls-clientcert-subject", dn.parse().unwrap());
+        let params =
+            ServiceParams::from([("x-amzn-mtls-clientcert-subject".into(), vec![dn.into()])]);
+        for request in [
+            policy.resolve_request(&headers).unwrap(),
+            policy.resolve_request_params(&params).unwrap(),
+            policy.resolve_request_verified(&headers).await.unwrap(),
+            policy
+                .resolve_request_params_verified(&params)
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(request.principal.user_id(), Some(dn));
+            let caller = request.caller();
+            assert_eq!(rules.can_create_session("dn-agent", caller.view()), allowed);
+            assert_eq!(
+                rules.can_create_session("alias-agent", caller.view()),
+                allowed
+            );
+        }
+    }
+}
+
 #[test]
 fn aliases_anonymous_does_not_expand_empty_identity() {
     harnx_core::require_nextest();
@@ -67,8 +110,8 @@ fn aliases_configured_groups_and_roles_merge_with_headers() {
     harnx_core::require_nextest();
     let policy = Identity::with_memberships(
         &["x-user".into()],
-        &["x-groups".into()],
-        &["x-roles".into()],
+        &["header-csv:x-groups".into()],
+        &["header-csv:x-roles".into()],
     )
     .unwrap()
     .with_user_aliases(Some(aliases_with_memberships()));
@@ -104,8 +147,8 @@ fn aliases_unmatched_caller_gets_no_configured_memberships() {
     harnx_core::require_nextest();
     let policy = Identity::with_memberships(
         &["x-user".into()],
-        &["x-groups".into()],
-        &["x-roles".into()],
+        &["header-csv:x-groups".into()],
+        &["header-csv:x-roles".into()],
     )
     .unwrap()
     .with_user_aliases(Some(aliases_with_memberships()));
@@ -142,8 +185,8 @@ fn aliases_configured_memberships_do_not_mask_malformed_headers() {
     harnx_core::require_nextest();
     let policy = Identity::with_memberships(
         &["x-user".into()],
-        &["x-groups".into()],
-        &["x-roles".into()],
+        &["header-csv:x-groups".into()],
+        &["header-csv:x-roles".into()],
     )
     .unwrap()
     .with_user_aliases(Some(Arc::new(
