@@ -4,7 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use hudsucker::rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair};
+use hudsucker::rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
+};
 use tempfile::TempDir;
 
 pub struct CaSetup {
@@ -35,6 +37,7 @@ pub fn setup() -> Result<(CaSetup, TempDir)> {
     let key_pair = KeyPair::generate()?;
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params
         .distinguished_name
         .push(DnType::CommonName, "harnx auth proxy CA");

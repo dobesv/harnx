@@ -266,7 +266,9 @@ pub struct ConfigData {
     pub sync_models_url: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<HooksConfig>,
+    // Boxed for the same reason as `AgentConfig::hooks`: `ConfigData` lives
+    // inline in `Config`, which every turn dispatch future copies by value.
+    pub hooks: Option<Box<HooksConfig>>,
 
     #[serde(
         default,

@@ -49,7 +49,7 @@ fn config_with_hooks(event: HookEventKind, entries: Vec<EventHookEntry>) -> Glob
     }
     let config = Config {
         data: harnx_core::config_data::ConfigData {
-            hooks: Some(hooks),
+            hooks: Some(Box::new(hooks)),
             ..Default::default()
         },
         ..Config::default()

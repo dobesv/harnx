@@ -87,7 +87,7 @@ fn daemon_config_with_hooks(
         url: server_url,
         token: None,
     });
-    config.data.hooks = Some(hooks);
+    config.data.hooks = Some(Box::new(hooks));
     Arc::new(ConfigLock::new(config))
 }
 

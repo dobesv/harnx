@@ -102,7 +102,7 @@ fn session_start_event_config(
     };
     let config = Config {
         data: harnx_core::config_data::ConfigData {
-            hooks: Some(hooks),
+            hooks: Some(Box::new(hooks)),
             ..Default::default()
         },
         ..Config::default()

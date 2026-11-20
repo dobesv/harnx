@@ -73,7 +73,7 @@ impl PromptLog {
 
 fn session_config_with_hooks(hooks: HooksConfig) -> (GlobalConfig, Arc<PromptLog>) {
     let mut config = Config::default();
-    config.data.hooks = Some(hooks);
+    config.data.hooks = Some(Box::new(hooks));
     let mut session = crate::config::session::new(&config, "event-hooks", None).unwrap();
     let log = Arc::new(PromptLog::default());
     session.runtime = Some(Arc::new(log.clone() as Arc<dyn SessionAppendSink>));

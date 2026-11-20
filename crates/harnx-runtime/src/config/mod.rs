@@ -669,7 +669,7 @@ impl Config {
                 return HooksConfig::merge(&global, agent_hooks);
             }
         }
-        global
+        *global
     }
 
     pub fn info(&self) -> Result<String> {

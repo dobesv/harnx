@@ -24,6 +24,7 @@ assert "fixture-github-token" not in json.dumps(dict(os.environ))
 assert "fixture-jira-token" not in json.dumps(dict(os.environ))
 proxy = urlsplit(os.environ["HTTPS_PROXY"])
 context = ssl.create_default_context()
+context.verify_flags |= ssl.VERIFY_X509_STRICT
 
 def headers(host):
     connection = http.client.HTTPSConnection(proxy.hostname, proxy.port, context=context, timeout=10)

@@ -141,7 +141,7 @@ fn middleware_coexists_with_event_hooks_and_legacy_hooks_fail() {
     .unwrap();
     assert_eq!(global.hooks, combined.hooks);
     let agent = AgentConfig::from_markdown("test", &format!("---\n{hooks}---\nPrompt")).unwrap();
-    assert_eq!(agent.hooks(), global.hooks.as_ref());
+    assert_eq!(agent.hooks(), global.hooks.as_deref());
 
     // The retired process-hook shape fails configuration load with guidance.
     let legacy = "hooks:\n  entries:\n    - command: legacy-hook --event PreToolUse\n";

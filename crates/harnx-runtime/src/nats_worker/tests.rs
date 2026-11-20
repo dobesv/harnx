@@ -404,7 +404,7 @@ pub(super) fn spawn_metis_worker_with_hooks(
     let worker_config = Config {
         data: harnx_core::config_data::ConfigData {
             model_id: "test:test-model".to_string(),
-            hooks,
+            hooks: hooks.map(Box::new),
             ..Default::default()
         },
         agent: Some(crate::config::Agent::new(worker_agent)),

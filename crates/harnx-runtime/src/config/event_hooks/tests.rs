@@ -358,6 +358,6 @@ fn event_hooks_resolution_survives_default_config() {
     let resolved = config.resolved_event_hooks().unwrap();
     assert!(resolved.is_empty());
     assert!(resolved.list(HookEventKind::Stop).is_empty());
-    let _: Option<HooksConfig> = config.hooks.clone();
+    let _: Option<Box<HooksConfig>> = config.hooks.clone();
     let _: Option<ToolServerConfig> = None;
 }

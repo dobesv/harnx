@@ -240,50 +240,29 @@ fn test_working_dir_option() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn test_hook_cli_injects_env() {
-    if skips_without_sandbox() {
-        return;
-    }
-
-    let dir = temp_test_dir("hook-env");
-    let hook_path = dir.join("hook.sh");
-    make_unix_script(
-        &hook_path,
-        r#"#!/bin/sh
-cat >/dev/null
-printf '%s' '{"hookSpecificOutput":{"toolInput":{"command":"env","env":{"HOOK_TEST_VAR":"from_hook"}}}}'
-"#,
-    );
-
+fn test_unsupported_hook_type_reports_migration_message() {
     let output = Command::new(binary_path())
         .args([
             "--hook",
             "claude-command",
-            hook_path.to_str().expect("utf8 hook path"),
+            "unsupported-hook-command",
             ";",
-            "--allow-exec",
-            "/bin",
-            "--allow-exec",
-            "/usr",
-            "--working-dir",
-            "/tmp",
             "--",
-            "env",
+            "--help",
         ])
         .output()
-        .expect("failed to spawn sandbox");
+        .expect("failed to spawn sandbox-run");
 
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "unsupported hook type must fail");
     assert!(
-        output.status.success(),
-        "sandbox should exit successfully with hook, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("hook type 'claude-command' is not supported in harnx-sandbox-run"),
+        "unsupported hook error missing from stderr: {stderr:?}"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.lines().any(|line| line == "HOOK_TEST_VAR=from_hook"),
-        "hook-injected env var missing from output: {stdout:?}"
+        stderr.contains("Migrate to '--hook environment <COMMAND> [ARGS...] ;' using MCP stdio"),
+        "migration guidance missing from stderr: {stderr:?}"
     );
 }
 
