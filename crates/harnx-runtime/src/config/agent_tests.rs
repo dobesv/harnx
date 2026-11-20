@@ -767,6 +767,112 @@ fn apply_agent_patch_matches_bare_name_and_preserves_qualified_name() {
     assert_eq!(config.name(), "pantheon/atlas");
 }
 
+#[test]
+fn package_transform_added_user_patches_are_validated_at_load() {
+    with_test_config_dir(|config_dir| {
+        let agents_dir = config_dir.join("packages/demo/agents");
+        fs::create_dir_all(&agents_dir)?;
+        let path = agents_dir.join("tailored.md");
+        fs::write(&path, "Package agent instructions\n")?;
+        let filter = ".instructions = $user.user_id";
+        let transform = format!(".patches = [{}]", serde_json::to_string(filter)?);
+        fs::write(
+            harnx_core::config_paths::package_patch_file("demo"),
+            serde_yaml::to_string(&make_patch(vec![&transform]))?,
+        )?;
+
+        let mut agent = super::load_with_qualified_name(&path, "demo/tailored")?;
+        assert_eq!(agent.name(), "demo/tailored");
+        assert_eq!(agent.patches(), &[filter.to_string()]);
+        agent.apply_user_patches(&harnx_core::user_principals::legacy_fallback(Some("alice")))?;
+        assert_eq!(agent.interpolated_instructions()?, "alice");
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn package_transform_added_invalid_user_patches_fail_load() {
+    with_test_config_dir(|config_dir| {
+        let agents_dir = config_dir.join("packages/demo/agents");
+        fs::create_dir_all(&agents_dir)?;
+        let path = agents_dir.join("tailored.md");
+        fs::write(&path, "Package agent instructions\n")?;
+        for filter in [".instructions =", ".instructions = $undeclared.user_id"] {
+            let transform = format!(".patches = [{}]", serde_json::to_string(filter)?);
+            fs::write(
+                harnx_core::config_paths::package_patch_file("demo"),
+                serde_yaml::to_string(&make_patch(vec![&transform]))?,
+            )?;
+
+            let error = super::load_with_qualified_name(&path, "demo/tailored").unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("validate `patches` of agent 'demo/tailored'"),
+                "package-added filter {filter:?} must fail load: {message}"
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn write_package_model_fixture(config_dir: &Path) -> Result<PathBuf> {
+    let agents_dir = config_dir.join("packages/demo/agents");
+    fs::create_dir_all(&agents_dir)?;
+    for relative_dir in ["clients", "packages/demo/clients", "packages/other/clients"] {
+        let clients_dir = config_dir.join(relative_dir);
+        fs::create_dir_all(&clients_dir)?;
+        fs::write(
+            clients_dir.join("local.yaml"),
+            "type: openai\napi_key: sk-test\nmodels:\n  - name: small\n    type: chat\n  - name: baseline\n    type: chat\n  - name: vendor/small\n    type: chat\n",
+        )?;
+    }
+    Ok(agents_dir)
+}
+
+#[test]
+fn patched_package_models_match_regular_agent_namespace_resolution() {
+    with_test_config_dir(|config_dir| {
+        let agents_dir = write_package_model_fixture(config_dir)?;
+        let mut config = Config::load_from_file(&config_dir.join("config.yaml"))?;
+        for (target, expected_id) in [
+            ("local:small", "demo/local:small"),
+            ("local", "demo/local:small"),
+            ("/local:small", "local:small"),
+            ("other/local:small", "other/local:small"),
+            ("local:vendor/small", "demo/local:vendor/small"),
+        ] {
+            fs::write(
+                agents_dir.join("plain.md"),
+                format!("---\nmodel: {target}\n---\nBody\n"),
+            )?;
+            fs::write(
+                agents_dir.join("tailored.md"),
+                format!(
+                    "---\nmodel: local:baseline\npatches: '.model = \"{target}\"'\n---\nBody\n"
+                ),
+            )?;
+            let plain = config.retrieve_agent("demo/plain")?;
+            assert_eq!(plain.model().id(), expected_id);
+            config.use_agent_by_name("demo/tailored")?;
+            assert_eq!(config.extract_agent().model().id(), "demo/local:baseline");
+
+            config.apply_session_agent_patches(
+                &harnx_core::user_principals::anonymous(),
+                &AgentVariables::default(),
+            )?;
+
+            let patched = config.extract_agent();
+            assert_eq!(patched.model().id(), expected_id, "patched {target}");
+            assert_eq!(patched.model().id(), plain.model().id());
+            assert_eq!(patched.model_id(), Some(expected_id));
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
 // -------------------------------------------------------------------------
 // Tests for list_assistant_agents_for_display (TUI/CLI display helper)
 // -------------------------------------------------------------------------
@@ -995,4 +1101,77 @@ async fn test_list_assistant_agents_for_display_snapshots_routing_before_await()
     let discovery = list_assistant_agents_for_display(&config);
     config.nats_routing = NatsRouting::Default;
     assert_eq!(discovery.await, ["remote-assistant"]);
+}
+
+#[test]
+fn patched_package_fallbacks_qualify_new_targets_without_requalifying_baseline() {
+    with_test_config_dir(|config_dir| {
+        let agents_dir = write_package_model_fixture(config_dir)?;
+        let baseline = ["demo/local:baseline", "local:small", "other/local:baseline"];
+        for (filter, expected) in [
+            (".", baseline.to_vec()),
+            (".instructions = \"changed\"", baseline.to_vec()),
+            (".model_fallbacks |= reverse", baseline.into_iter().rev().collect()),
+            (".model_fallbacks = [\"local:small\"]", vec!["demo/local:small"]),
+            (".model_fallbacks = [\"local\"]", vec!["demo/local"]),
+            (
+                ".model_fallbacks += [\"local:small\", \"/local:baseline\", \"other/local:small\", \"local:vendor/small\"]",
+                vec!["demo/local:baseline", "local:small", "other/local:baseline", "demo/local:small", "local:baseline", "other/local:small", "demo/local:vendor/small"],
+            ),
+        ] {
+            let frontmatter = serde_json::json!({
+                "model": "local:baseline",
+                "model_fallbacks": ["local:baseline", "/local:small", "other/local:baseline"],
+                "patches": filter
+            });
+            fs::write(
+                agents_dir.join("tailored.md"),
+                format!("---\n{}---\nBody\n", serde_yaml::to_string(&frontmatter)?),
+            )?;
+            let mut config = Config::load_from_file(&config_dir.join("config.yaml"))?;
+            config.use_agent_by_name("demo/tailored")?;
+            assert_eq!(config.extract_agent().model_fallbacks(), baseline);
+
+            config.apply_session_agent_patches(&harnx_core::user_principals::anonymous(), &AgentVariables::default())?;
+
+            let patched = config.extract_agent();
+            assert_eq!(patched.model().id(), "demo/local:baseline", "{filter}");
+            assert_eq!(patched.model_fallbacks(), expected, "{filter}");
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn patched_package_bare_model_replaces_an_equal_inherited_top_level_id() {
+    with_test_config_dir(|config_dir| {
+        let agents_dir = write_package_model_fixture(config_dir)?;
+        for (filter, expected) in [
+            (".model = \"local:small\"", "demo/local:small"),
+            (".instructions = \"changed\"", "local:small"),
+            (".", "local:small"),
+            (".model = \"/local:small\"", "local:small"),
+        ] {
+            let frontmatter = serde_json::json!({"model": "/local:small", "patches": filter});
+            fs::write(
+                agents_dir.join("tailored.md"),
+                format!("---\n{}---\nBody\n", serde_yaml::to_string(&frontmatter)?),
+            )?;
+            let mut config = Config::load_from_file(&config_dir.join("config.yaml"))?;
+            config.use_agent_by_name("demo/tailored")?;
+            assert_eq!(config.extract_agent().model_id(), Some("local:small"));
+
+            config.apply_session_agent_patches(
+                &harnx_core::user_principals::anonymous(),
+                &AgentVariables::default(),
+            )?;
+
+            let patched = config.extract_agent();
+            assert_eq!(patched.model_id(), Some(expected), "{filter}");
+            assert_eq!(patched.model().id(), expected, "{filter}");
+        }
+        Ok(())
+    })
+    .unwrap();
 }

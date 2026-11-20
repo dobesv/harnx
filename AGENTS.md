@@ -1332,11 +1332,15 @@ Don't add a typed field to `SessionMetadata`. It denies unknown fields, so
 every older reader fails on the records that carry the field, and during a
 rolling deploy older workers stop running those sessions. Use an extension
 namespace, which older readers keep as opaque JSON. Descriptive values that
-agents or frontends set, such as a user identity, belong in session
+agents or frontends set, such as a branch or issue link, belong in session
 properties (`dev.harnx.session_properties`): a row in `PROPERTY_DEFINITIONS`
 (`nats_session_metadata/session_properties.rs`) brings its validation, its
 line in `harnx_write_session_meta`'s description and whether sub-agent
-sessions inherit it. See "Session properties" in `docs/nats-ha.md`.
+sessions inherit it. Identity-bearing properties (`user_id`,
+`user_principals`) are the opposite: `read_only: true` and written only by
+trusted creation code through `SessionInitializer`, because access rules and
+agent tailoring trust what they hold. See "Session properties" in
+`docs/nats-ha.md`.
 
 ### HTTP Test Clients and Proxy Environments
 
@@ -1368,6 +1372,28 @@ access checks requiring ownership match (admin scope can bypass ownership). See
 `user_id` is defined with `read_only: true`, and tests in
 `session_properties_tests.rs` guarding this invariance.
 
+The caller's resolved principals (user id, expanded aliases, groups, roles)
+are snapshotted at the same creation moment into a second read-only session
+property, `user_principals` (`USER_PRINCIPALS_PROPERTY` in
+`nats_session_metadata/session_properties.rs`, inherit-by-default). Only
+trusted creation code writes it: `RequestIdentity::stampable_principals`
+(harnx-serve, harnx-a2a-server) through
+`SessionInitializer::with_user_principals`. A2A stores it with the
+first-message reservation, so retries and background recovery stamp the
+original caller, never the retrying caller's current memberships. No client
+request field, session override, session variable, or tool can set it.
+Sub-agent and handoff sessions copy it verbatim (`inherited()` /
+`inherited_identity()`) and never recompute it — group or role revocations
+reach only new sessions. Reads go through
+`nats_session_metadata::user_principals` / `SessionProperties::user_principals`,
+which never fail: a missing snapshot reads as a legacy fallback derived from
+`user_id` (pre-snapshot sessions, CLI/TUI/ACP), so does a property value that
+can't be parsed, and an extension that fails to decode entirely reads as
+anonymous (warn-logged). The snapshot drives agent `patches` and the
+`__user__` template variable. It is customization, never authorization —
+access checks keep using live request memberships. See "Agent Patches" in
+`docs/agent-guide.md` for the user-facing semantics.
+
 Shared request identity resolution lives in `harnx_runtime::identity`
 (`identity.rs`), used by `harnx-a2a-server` and `harnx-serve`. It extracts from
 configured headers, cookies, or `Authorization: Bearer` tokens (`forge-fit`,
@@ -1390,8 +1416,9 @@ Precedence at metadata creation:
 4. Global `user_id` in `config.yaml` / `HARNX_USER_ID`.
 
 Blank explicit or inherited strings count as absent, so defaults apply. Handoffs
-use `SessionProperties::inherited_user_id` to copy only the user identity, not
-execution-context properties like `git_branch`.
+use `SessionProperties::inherited_identity` to copy only the identity —
+`user_id` plus the `user_principals` snapshot — not execution-context
+properties like `git_branch`.
 
 Control commands in `harnx-serve` (cancel, compact) must not create metadata.
 They check for an existing canonical record via `control_session()` before

@@ -24,6 +24,8 @@ const RECORDED_BY_KEY: &str = "recorded_by";
 const WORKER_RECORDER: &str = "worker";
 /// The property holding a session's labels.
 pub const LABELS_PROPERTY: &str = "labels";
+/// The property holding the caller principals a session was created for.
+pub const USER_PRINCIPALS_PROPERTY: &str = "user_principals";
 /// Most labels one session keeps.
 pub const SESSION_LABELS_MAX: usize = 50;
 /// Most custom properties one session keeps.
@@ -48,6 +50,8 @@ enum PropertyKind {
     Url,
     Path,
     Labels,
+    /// A `harnx_core::user_principals::UserPrincipals` JSON object.
+    Principals,
 }
 
 /// Whether sub-agent sessions copy a property.
@@ -147,6 +151,15 @@ pub const PROPERTY_DEFINITIONS: &[PropertyDefinition] = &[
         Inheritance::OnRequest,
         "list of labels",
     ),
+    PropertyDefinition {
+        read_only: true,
+        ..definition(
+            USER_PRINCIPALS_PROPERTY,
+            PropertyKind::Principals,
+            Inheritance::ByDefault,
+            "the caller principals the session was created for, with user_id, users, groups and roles",
+        )
+    },
 ];
 
 impl PropertyKind {
@@ -166,6 +179,7 @@ impl PropertyKind {
             Self::Labels => format!(
                 "be a list of at most {SESSION_LABELS_MAX} labels, each at most {LABEL_MAX_CHARS} characters with no control characters"
             ),
+            Self::Principals => "be a caller-principals object: user_id (text or null) with users, groups and roles lists".to_string(),
         }
     }
 
@@ -181,7 +195,7 @@ impl PropertyKind {
             }
             Self::Url => is_http_url(text),
             Self::Path => text.len() <= PATH_MAX_BYTES && !text.chars().any(char::is_control),
-            Self::Number | Self::Labels => false,
+            Self::Number | Self::Labels | Self::Principals => false,
         }
     }
 }
@@ -193,6 +207,7 @@ impl PropertyDefinition {
         let normalized = match self.kind {
             PropertyKind::Number => normalize_number(value),
             PropertyKind::Labels => normalize_labels(value),
+            PropertyKind::Principals => normalize_principals(value),
             kind => normalize_text(value).and_then(|text| match text {
                 Some(text) if !kind.accepts_text(&text) => None,
                 text => Some(text.map(Value::String)),
@@ -281,11 +296,26 @@ impl SessionProperties {
         )
     }
 
-    /// A handoff carries identity, not the source session's execution context.
-    pub fn inherited_user_id(&self) -> Self {
+    /// A handoff carries identity, not the source session's execution context:
+    /// the owner id and the caller-principals snapshot, nothing else.
+    pub fn inherited_identity(&self) -> Self {
         let mut properties = self.inherited();
-        properties.0.retain(|name, _| name == "user_id");
         properties
+            .0
+            .retain(|name, _| name == "user_id" || name == USER_PRINCIPALS_PROPERTY);
+        properties
+    }
+
+    /// The session's caller principals: the snapshot stored at creation, or
+    /// the legacy fallback derived from `user_id` when none was recorded.
+    /// Never fails: a stored value that can't be parsed reads as the legacy
+    /// fallback.
+    pub fn user_principals(&self) -> harnx_core::user_principals::UserPrincipals {
+        let legacy = || harnx_core::user_principals::legacy_fallback(self.text("user_id"));
+        let Some(property) = self.get(USER_PRINCIPALS_PROPERTY) else {
+            return legacy();
+        };
+        harnx_core::user_principals::from_property_value(&property.value).unwrap_or_else(legacy)
     }
 
     pub(super) fn remove(&mut self, name: &str) {
@@ -480,6 +510,16 @@ fn normalize_number(value: &Value) -> Option<Option<Value>> {
     Some((number != 0).then(|| Value::from(number)))
 }
 
+/// A caller-principals object, kept as stored. The property is read-only, so
+/// this validation only guards Harnx's own writes; a `null` value removes it.
+fn normalize_principals(value: &Value) -> Option<Option<Value>> {
+    match value {
+        Value::Null => Some(None),
+        value => harnx_core::user_principals::from_property_value(value)
+            .map(|principals| Some(principals.to_property_value())),
+    }
+}
+
 /// A list of distinct trimmed labels; a single string is one label.
 fn normalize_labels(value: &Value) -> Option<Option<Value>> {
     let items = match value {
@@ -564,6 +604,23 @@ pub fn session_properties(metadata: &SessionMetadata) -> Result<SessionPropertie
         return Ok(SessionProperties::default());
     };
     serde_json::from_value(value.clone()).context("decode dev.harnx.session_properties extension")
+}
+
+/// The caller principals a session was created for: the stored snapshot, or
+/// the legacy fallback when the session predates it. This is the worker-side
+/// accessor consumers of the snapshot (templates, agent patches) should use;
+/// it never fails and never consults users.yaml or live memberships.
+pub fn user_principals(metadata: &SessionMetadata) -> harnx_core::user_principals::UserPrincipals {
+    match session_properties(metadata) {
+        Ok(properties) => properties.user_principals(),
+        Err(_) => {
+            log::warn!(
+                "cannot decode caller principals for session {} (category=session_properties_decode); using anonymous identity",
+                metadata.session_id
+            );
+            harnx_core::user_principals::anonymous()
+        }
+    }
 }
 
 pub(super) fn store_properties(

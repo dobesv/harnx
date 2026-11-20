@@ -18,6 +18,7 @@ mod surface_action;
 mod web_address;
 
 pub use crate::session_actor_types::*;
+pub(crate) use handoff::lookup_identity_for_tests;
 pub use registry::SessionRegistry;
 pub use test_log::load_test_session_messages;
 
@@ -400,7 +401,8 @@ async fn run_actor_turn_supervised(
     } else {
         None
     };
-    let body = std::panic::AssertUnwindSafe(run_actor_turn(params)).catch_unwind();
+    // This future includes the injected executor path; keep its large state off the supervisor stack.
+    let body = std::panic::AssertUnwindSafe(Box::pin(run_actor_turn(params))).catch_unwind();
     let result = match deadline {
         Some(deadline) => tokio::time::timeout(
             deadline
@@ -714,14 +716,15 @@ impl SessionActor {
                 .await
             {
                 Ok(prepared) => {
-                    self.dispatch_handoff_to_target(
+                    // Identity lookup makes this dispatch future stack-heavy on Windows' 1 MiB default stack.
+                    Box::pin(self.dispatch_handoff_to_target(
                         &done,
                         handoff::HandoffRequest {
                             prepared,
                             prompt: prompt.clone(),
                             handoff_tool_call_id: tool_call_id.clone(),
                         },
-                    )
+                    ))
                     .await;
                 }
                 Err(error) => self.fail_handoff(&done, error),

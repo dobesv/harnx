@@ -51,17 +51,7 @@ pub(super) async fn remove_owner_lease(t: &TwoBackends, storage: &str) -> Result
 async fn initialization_reservation_has_lease_before_metadata_and_sibling_does_not_orphan_it(
 ) -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut pause =
-        t.a.backend
-            .runner
-            .fault_hooks()
-            .pause(Boundary::FirstReservation, 1);
-    let send = tokio::spawn({
-        let app = t.a.app.clone();
-        async move { rpc(app, "alice", "SendMessage", first_message()).await }
-    });
-    pause.reached().await;
-    let saved = reservation(&t).await?;
+    let (pause, send, saved) = supervision::pause_first_reservation(&t).await?;
     assert_no_metadata(&t, &saved.allocation.storage_key).await?;
     assert!(t
         .b
@@ -160,13 +150,7 @@ async fn shared_dedupe_ignores_poisoned_lru_and_checks_identity_before_busy_and_
 
 async fn crashed_boundary(boundary: Boundary, prompt_count: usize) -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut pause = t.a.backend.runner.fault_hooks().pause(boundary, 1);
-    let send = tokio::spawn({
-        let app = t.a.app.clone();
-        async move { rpc(app, "alice", "SendMessage", first_message()).await }
-    });
-    pause.reached().await;
-    let saved = reservation(&t).await?;
+    let (pause, send, saved) = supervision::paused_first_message(&t, boundary, 1).await?;
     remove_owner_lease(&t, &saved.allocation.storage_key).await?;
     let response = t.b.rpc("alice", "SendMessage", first_message()).await?;
     assert_eq!(result_task(&response)?["id"], saved.allocation.task_id);

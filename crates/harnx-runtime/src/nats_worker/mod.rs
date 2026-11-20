@@ -62,6 +62,8 @@ pub fn subagent_async_tool_specs(agent: &str) -> Vec<harnx_toolset::ToolSpec> {
 }
 
 #[cfg(test)]
+mod agent_patch_tests;
+#[cfg(test)]
 mod compaction_tests;
 #[cfg(test)]
 mod session_start_hook_tests;

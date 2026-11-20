@@ -1352,6 +1352,7 @@ pub async fn ag_ui_run_with_call_fn(
         body: req_body,
         web_base_url: None,
         user_id: None,
+        user_principals: None,
     };
     ag_ui_run_for_target(
         base_config,
@@ -1371,13 +1372,17 @@ pub(crate) struct AgUiRunRequest<'a> {
     /// [`SessionPromptOptions::web_base_url`].
     pub(crate) web_base_url: Option<String>,
     pub(crate) user_id: Option<String>,
+    /// Caller principals resolved from the request; recorded read-only when
+    /// the prompt creates the session's metadata.
+    pub(crate) user_principals: Option<harnx_core::user_principals::UserPrincipals>,
 }
 
 impl AgUiRunRequest<'_> {
-    fn prompt_options(&self, timeout_secs: Option<u64>) -> SessionPromptOptions {
+    fn into_prompt_options(mut self, timeout_secs: Option<u64>) -> SessionPromptOptions {
         SessionPromptOptions {
-            web_base_url: self.web_base_url.clone(),
-            user_id: self.user_id.clone(),
+            web_base_url: self.web_base_url.take(),
+            user_id: self.user_id.take(),
+            user_principals: self.user_principals.take(),
             timeout_secs,
             ..Default::default()
         }
@@ -1393,7 +1398,7 @@ pub(crate) async fn ag_ui_run_for_target(
     let (target, session, req_body) = (request.target, request.session, request.body);
     let relaxed_run_input: RelaxedRunAgentInput<JsonValue> = serde_json::from_slice(req_body)
         .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI request body: {err}")))?;
-    let prompt_options = request.prompt_options(relaxed_run_input.timeout_secs);
+    let prompt_options = request.into_prompt_options(relaxed_run_input.timeout_secs);
     let run_id = relaxed_run_input
         .run_id
         .clone()

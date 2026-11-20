@@ -54,6 +54,9 @@ pub struct RpcContext<'a> {
     pub web_base_url: Option<String>,
     /// Identity resolved from request headers, never from JSON-RPC parameters.
     pub user_id: Option<String>,
+    /// Caller principals resolved from the request; recorded read-only when
+    /// a prompt creates the session's metadata.
+    pub user_principals: Option<harnx_core::user_principals::UserPrincipals>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +134,7 @@ pub async fn handle_ag_ui_rpc_bytes(
         persistence,
         web_base_url: None,
         user_id: None,
+        user_principals: None,
     };
     handle_ag_ui_rpc_bytes_for_target(request, context).await
 }
@@ -394,6 +398,7 @@ fn build_prompt_options(params: &PromptParams, context: &RpcContext<'_>) -> Sess
         attachment_refs: params.attachment_refs.clone(),
         web_base_url: params.web_base_url.clone(),
         user_id: context.user_id.clone(),
+        user_principals: context.user_principals.clone(),
         timeout_secs: params.timeout_secs,
         ..Default::default()
     }

@@ -2,11 +2,16 @@
 use super::*;
 use crate::store::{validate_stored_owner, TaskAllocation};
 
-/// Only allocation and background recovery construct this request. No memberships
-/// are restored: recovery can settle retained work, never admit a new prompt.
+/// Only allocation and background recovery construct this request. Memberships
+/// are restored from the allocation's stored snapshot, never from live state:
+/// recovery can settle retained work, never admit a new prompt.
 pub(super) struct StoredSessionRequest<'a> {
     pub export: &'a Export,
     pub owner: &'a Principal,
+    /// The caller-principals snapshot recorded with the allocation's
+    /// reservation; `None` for active recovery of an existing session and for
+    /// records written before snapshots existed.
+    pub principals: Option<&'a harnx_core::user_principals::UserPrincipals>,
     pub global_config: &'a GlobalConfig,
     pub activation_route: SessionActivationRoute,
     pub abort: AbortSignal,
@@ -19,6 +24,7 @@ impl Runner {
         &self,
         request: SessionRequest<'_>,
         allocation: &TaskAllocation,
+        principals: Option<&harnx_core::user_principals::UserPrincipals>,
     ) -> Result<NatsSession> {
         let binding = self.store.get_binding(&allocation.storage_key).await?;
         if let Some(binding) = &binding {
@@ -43,6 +49,7 @@ impl Runner {
             StoredSessionRequest {
                 export: request.export,
                 owner: &request.owner.principal,
+                principals,
                 global_config: request.global_config,
                 activation_route: request.activation_route,
                 abort: request.abort,
@@ -79,6 +86,7 @@ impl Runner {
         let initializer = session_initializer(
             request.export,
             request.owner,
+            request.principals,
             binding.as_ref().map(|_| allocation.local_id.as_str()),
         )?;
         let session = Box::pin(NatsSession::from_global_config(

@@ -33,7 +33,7 @@ fn definitions_have_unique_lowercase_names() {
         .filter(|definition| definition.read_only)
         .map(|definition| definition.name)
         .collect();
-    assert_eq!(read_only, ["user_id"]);
+    assert_eq!(read_only, ["user_id", "user_principals"]);
 }
 
 #[test]
@@ -188,6 +188,233 @@ fn user_id_is_read_only() {
         let message = error(update);
         assert!(message.contains("user_id is set by Harnx"), "{message}");
     }
+}
+
+#[test]
+fn user_principals_are_read_only() {
+    // I1: no client, agent or model tool can set or change the snapshot.
+    for update in [
+        json!({"set": [{
+            "name": "user_principals",
+            "value": {"user_id": "mallory", "users": ["mallory"], "groups": ["admins"], "roles": []}
+        }]}),
+        json!({"set": [{"name": "user_principals", "value": null}]}),
+        json!({"clear": ["user_principals"]}),
+    ] {
+        let message = error(update);
+        assert!(
+            message.contains("user_principals is set by Harnx"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn user_principals_round_trip_through_metadata() {
+    // I5: the snapshot travels in the session-properties extension, so the
+    // existing reader keeps records with it, and records without it load.
+    let principals = harnx_core::user_principals::from_resolved(
+        Some("alice"),
+        Some(&["alice".into(), "bob".into()]),
+        &["engineering".into()],
+        &["reviewer".into()],
+    );
+    let initializer = super::super::SessionInitializer::named("metis", Default::default())
+        .with_user_principals(&principals);
+    assert!(
+        initializer
+            .properties
+            .get(USER_PRINCIPALS_PROPERTY)
+            .unwrap()
+            .inherit
+    );
+
+    let metadata = SessionMetadata::new("session-1", initializer);
+    assert_eq!(
+        session_properties(&metadata)
+            .unwrap()
+            .get(USER_PRINCIPALS_PROPERTY)
+            .unwrap()
+            .value,
+        principals.to_property_value()
+    );
+    assert_eq!(user_principals(&metadata), principals);
+
+    // A metadata record carrying the property survives a JSON round trip,
+    // and one written before the property existed still loads.
+    for expected in [Some(principals.clone()), None] {
+        let mut record = SessionMetadata::new(
+            "session-1",
+            super::super::SessionInitializer::named("metis", Default::default()),
+        );
+        if let Some(principals) = &expected {
+            let mut properties = session_properties(&record).unwrap();
+            properties.put(
+                USER_PRINCIPALS_PROPERTY,
+                principals.to_property_value(),
+                None,
+            );
+            store_properties(&mut record, &properties).unwrap();
+        }
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let decoded: SessionMetadata = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate("session-1").unwrap();
+        assert_eq!(
+            user_principals(&decoded),
+            expected.unwrap_or_else(harnx_core::user_principals::anonymous)
+        );
+    }
+}
+
+#[test]
+fn maximum_combined_user_principals_fit_session_properties_validation() {
+    let long = "\0".repeat(harnx_core::user_principals::USER_PRINCIPALS_MAX_TEXT);
+    let max_list = vec![long.clone(); harnx_core::user_principals::USER_PRINCIPALS_MAX_LIST];
+    let principals = harnx_core::user_principals::from_resolved(
+        Some(&long),
+        Some(&max_list),
+        &max_list,
+        &max_list,
+    );
+    let initializer = super::super::SessionInitializer::named("metis", Default::default())
+        .with_user_principals(&principals);
+    let metadata = SessionMetadata::new("maximum-principals", initializer);
+
+    metadata
+        .validate("maximum-principals")
+        .expect("maximum combined principals fit session-properties namespace");
+}
+
+#[test]
+fn user_principals_accessor_falls_back_to_the_stored_owner() {
+    // Legacy sessions: no snapshot, so the owner id alone decides.
+    let legacy =
+        super::super::SessionInitializer::named("metis", Default::default()).with_user_id("owner");
+    let metadata = SessionMetadata::new("legacy", legacy);
+    assert_eq!(
+        user_principals(&metadata),
+        harnx_core::user_principals::legacy_fallback(Some("owner"))
+    );
+
+    // No identity at all reads as anonymous.
+    let anonymous = SessionMetadata::new(
+        "anon",
+        super::super::SessionInitializer::named("metis", Default::default()),
+    );
+    assert_eq!(
+        user_principals(&anonymous),
+        harnx_core::user_principals::anonymous()
+    );
+
+    // A stored value beats the owner fallback, and a corrupt one falls back.
+    let mut properties = SessionProperties::default();
+    properties.put(
+        USER_PRINCIPALS_PROPERTY,
+        json!({"user_id": "alice", "users": ["alice"], "groups": ["a"], "roles": []}),
+        None,
+    );
+    assert_eq!(
+        properties.user_principals().user_id.as_deref(),
+        Some("alice")
+    );
+    let mut corrupt = properties;
+    corrupt.put(USER_PRINCIPALS_PROPERTY, json!("not-an-object"), None);
+    assert_eq!(
+        corrupt.user_principals(),
+        harnx_core::user_principals::anonymous()
+    );
+}
+
+#[test]
+fn malformed_snapshot_user_id_uses_only_the_stored_owner() {
+    let mut metadata = SessionMetadata::new(
+        "malformed-snapshot",
+        super::super::SessionInitializer::named("metis", Default::default()).with_user_id("owner"),
+    );
+    let mut properties = session_properties(&metadata).unwrap();
+    properties.put(
+        USER_PRINCIPALS_PROPERTY,
+        json!({
+            "user_id": 42,
+            "users": ["snapshot-alias"],
+            "groups": ["engineering"],
+            "roles": ["reviewer"],
+        }),
+        None,
+    );
+    store_properties(&mut metadata, &properties).unwrap();
+    let stored: SessionMetadata =
+        serde_json::from_value(serde_json::to_value(metadata).unwrap()).unwrap();
+
+    assert_eq!(
+        user_principals(&stored),
+        harnx_core::user_principals::legacy_fallback(Some("owner")),
+        "malformed snapshot must not retain aliases, groups, or roles"
+    );
+}
+
+#[test]
+fn corrupt_session_properties_extension_returns_anonymous_principals() {
+    let mut metadata = SessionMetadata::new(
+        "corrupt-properties",
+        super::super::SessionInitializer::named("metis", Default::default()),
+    );
+    metadata
+        .extensions
+        .insert(SESSION_PROPERTIES_NAMESPACE.into(), json!("not-a-map"));
+
+    assert_eq!(
+        user_principals(&metadata),
+        harnx_core::user_principals::anonymous()
+    );
+}
+
+#[test]
+fn inherited_identity_keeps_owner_and_principals_only() {
+    // I2: handoff children copy the snapshot verbatim, with no execution
+    // context and no recomputation.
+    let parent = properties(json!({
+        "user_id": {"value": "alice", "inherit": true},
+        "user_principals": {
+            "value": {"user_id": "alice", "users": ["alice", "bob"], "groups": ["g"], "roles": ["r"]},
+            "inherit": true
+        },
+        "git_branch": {"value": "main", "inherit": true},
+        "web_session_url": {"value": "https://harnx.example/", "inherit": false},
+    }));
+    let inherited = parent.inherited_identity();
+    assert_eq!(
+        serde_json::to_value(&inherited).unwrap(),
+        json!({
+            "user_id": {"value": "alice", "inherit": true},
+            "user_principals": {
+                "value": {"user_id": "alice", "users": ["alice", "bob"], "groups": ["g"], "roles": ["r"]},
+                "inherit": true
+            },
+        })
+    );
+    assert_eq!(
+        inherited.user_principals(),
+        harnx_core::user_principals::from_resolved(
+            Some("alice"),
+            Some(&["alice".into(), "bob".into()]),
+            &["g".into()],
+            &["r".into()],
+        )
+    );
+
+    // A snapshot recorded with inherit disabled (a foreign record) is not copied.
+    let foreign = properties(json!({
+        "user_id": {"value": "alice", "inherit": true},
+        "user_principals": {
+            "value": {"user_id": "alice", "users": ["alice"], "groups": [], "roles": []},
+            "inherit": false
+        },
+    }));
+    assert_eq!(
+        serde_json::to_value(foreign.inherited_identity()).unwrap(),
+        json!({"user_id": {"value": "alice", "inherit": true}})
+    );
 }
 
 #[test]

@@ -388,11 +388,14 @@ extension but do not copy it into new sub-agent sessions.
 ### Session properties
 
 The reserved `dev.harnx.session_properties` extension records what a session
-is working on: the user it acts for, the GitHub repository, branch, issue and
-pull request, an external task URL, a working directory, the Web UI address,
+is working on: the user it acts for (`user_id`), the caller principals
+snapshot (`user_principals`), the GitHub repository, branch, issue and pull
+request, an external task URL, a working directory, the Web UI address,
 labels, and custom properties agents define. Agents read and change it with
 the `harnx_read_session_meta` and `harnx_write_session_meta` built-in tools
-(see the [Agent Guide](agent-guide.md#session-metadata-tools)).
+(see the [Agent Guide](agent-guide.md#session-metadata-tools)). Read-only
+properties like `user_id` and `user_principals` are stamped by Harnx at
+session creation and cannot be changed by agents.
 
 The extension is one object keyed by property name. Each entry holds the
 value, an `inherit` flag, and a `source` when Harnx recorded the value itself
@@ -427,6 +430,15 @@ says which properties are copied by default, which only on request, and which
 never: `web_session_url` names one session's page, so it is never copied,
 even from a record that says otherwise. A parent whose properties can't be
 decoded still delegates; the child starts without them.
+
+During a rolling upgrade, update workers before upgrading frontends
+(`harnx-serve`, `harnx-a2a-server`) or deploying agent `patches`. Older
+workers treat `user_principals` as an unknown custom property rather than a
+read-only property, and they ignore `patches` in agent front-matter (running
+the unpatched configuration). Once all workers are upgraded, update frontends
+to capture caller principals at session creation, and enable agent `patches`
+last. When rolling back, remove `patches` from agent definitions before
+rolling back workers.
 
 harnx-serve records `web_session_url` when it sends a session a prompt. It
 builds the address from `serve_public_url` (`HARNX_SERVE_PUBLIC_URL`, or

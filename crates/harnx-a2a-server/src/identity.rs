@@ -93,6 +93,23 @@ impl RequestIdentity {
             roles: self.roles.iter().map(String::as_str).collect(),
         }
     }
+
+    /// The caller-principals snapshot for this request, as resolved at entry.
+    pub fn user_principals(&self) -> harnx_core::user_principals::UserPrincipals {
+        harnx_core::user_principals::from_resolved(
+            self.principal.user_id(),
+            self.expanded_users.as_deref(),
+            &self.groups,
+            &self.roles,
+        )
+    }
+
+    /// The snapshot to record when this request creates a session: none for
+    /// an anonymous caller, so the session resolves the legacy fallback.
+    pub fn stampable_principals(&self) -> Option<harnx_core::user_principals::UserPrincipals> {
+        let principals = self.user_principals();
+        (!principals.is_anonymous()).then_some(principals)
+    }
 }
 
 /// Ordered identity policy. Empty configuration enables shared anonymous mode.

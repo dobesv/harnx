@@ -25,7 +25,10 @@ impl SessionActor {
             session_id: &self.key.session,
         });
         let session = self
-            .control_session_with_user_id(options.user_id.as_deref())
+            .control_session_with_identity(
+                options.user_id.as_deref(),
+                options.user_principals.as_ref(),
+            )
             .await?;
         // Before admission, so the turn this prompt starts can already read it.
         self.record_web_session_url(&session, options).await;
@@ -125,12 +128,18 @@ impl SessionActor {
         {
             return Ok(None);
         }
-        self.control_session_with_user_id(None).await.map(Some)
+        self.control_session_with_identity(None, None)
+            .await
+            .map(Some)
     }
 
-    async fn control_session_with_user_id(
+    /// Build the session handle, stamping the request identity (owner id and
+    /// caller principals) only when metadata is created; existing metadata is
+    /// never changed by these values.
+    async fn control_session_with_identity(
         &self,
         user_id: Option<&str>,
+        user_principals: Option<&harnx_core::user_principals::UserPrincipals>,
     ) -> anyhow::Result<NatsSession> {
         let abort = create_abort_signal();
         let config = self.prompt_config().await;
@@ -140,6 +149,10 @@ impl SessionActor {
         );
         let initializer = match user_id {
             Some(user_id) => initializer.with_user_id(user_id),
+            None => initializer,
+        };
+        let initializer = match user_principals {
+            Some(principals) => initializer.with_user_principals(principals),
             None => initializer,
         };
         let cluster = self.key.cluster().to_string();

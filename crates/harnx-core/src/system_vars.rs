@@ -159,22 +159,34 @@ pub fn render_template(
     for (k, v) in agent.variables() {
         ctx.insert(k.clone(), Value::from(v.clone()));
     }
+    // Session/agent variables must not replace the trusted caller snapshot.
+    let anonymous = crate::user_principals::anonymous();
+    ctx.insert(
+        "__user__".to_string(),
+        Value::from_serialize(agent.user_principals().unwrap_or(&anonymous)),
+    );
 
-    env.render_str(template, ctx).map_err(|e| {
-        let expr = e
-            .range()
-            .and_then(|range| template.get(range))
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty());
-        match expr {
-            Some(expr) => anyhow::anyhow!(
-                "Template error in agent '{}' at line {}: {} `{}`",
-                agent.name(),
-                e.line().unwrap_or(0),
-                e.kind(),
-                expr,
-            ),
-            None => anyhow::anyhow!("Template error in agent '{}': {}", agent.name(), e),
-        }
-    })
+    env.render_str(template, ctx)
+        .map_err(|e| template_error(e, template, agent.name()))
 }
+
+fn template_error(error: minijinja::Error, template: &str, agent_name: &str) -> anyhow::Error {
+    let expr = error
+        .range()
+        .and_then(|range| template.get(range))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    match expr {
+        Some(expr) => anyhow::anyhow!(
+            "Template error in agent '{}' at line {}: {} `{}`",
+            agent_name,
+            error.line().unwrap_or(0),
+            error.kind(),
+            expr,
+        ),
+        None => anyhow::anyhow!("Template error in agent '{}': {}", agent_name, error),
+    }
+}
+
+#[cfg(test)]
+mod tests;

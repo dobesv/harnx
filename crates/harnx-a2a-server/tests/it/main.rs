@@ -17,6 +17,7 @@ mod streaming;
 mod support;
 mod unary;
 mod unary_listing;
+mod user_principals;
 mod wait_costs;
 
 mod operations;
