@@ -170,7 +170,9 @@ impl Server {
                 "--port",
                 "0",
             ])
-            .env("RUST_LOG", "harnx_a2a_server=info")
+            .env("HARNX_LOG_LEVEL", "info")
+            .env("HARNX_LOG_FILTER", "harnx_a2a_server")
+            .env("HARNX_LOG_FORMAT", "text")
             .env_remove("HARNX_A2A_AGENTS")
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone()?)

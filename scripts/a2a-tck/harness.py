@@ -75,12 +75,16 @@ def start_llm(reports):
 
 def prepare_environment(work):
     env = os.environ.copy()
-    env["RUST_LOG"] = "harnx_a2a_server=info"
+    env.pop("RUST_LOG", None)
     env["NO_COLOR"] = "1"
     # Don't inherit routing, credentials, or paths from a developer's live setup.
     for key in list(env):
         if key.startswith("HARNX_"):
             del env[key]
+    env["HARNX_LOG_LEVEL"] = "info"
+    # Keep worker diagnostics too; the worker and server share this environment.
+    env["HARNX_LOG_FILTER"] = "harnx"
+    env["HARNX_LOG_FORMAT"] = "text"
     for kind in ("config", "data", "state"):
         directory = work / kind
         directory.mkdir()

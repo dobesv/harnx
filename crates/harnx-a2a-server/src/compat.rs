@@ -59,7 +59,13 @@ const TASK_STATE_VARIANTS: &[&str] = &[
 pub(crate) async fn normalize(mut request: Request, next: Next) -> Response {
     let body = match to_bytes(std::mem::take(request.body_mut()), MAX_REQUEST_BODY_BYTES).await {
         Ok(body) => body,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => {
+            return crate::request_log::http::compatibility_rejection(
+                &request,
+                None,
+                StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            )
+        }
     };
     let mut value = serde_json::from_slice::<Value>(&body).ok();
     // Let upstream produce parse/invalid-request errors before interpreting params.
@@ -67,7 +73,11 @@ pub(crate) async fn normalize(mut request: Request, next: Next) -> Response {
     let valid_envelope = envelope.as_ref().filter(|rpc| rpc.jsonrpc == "2.0");
 
     if let Err(response) = check_version(request.headers_mut(), valid_envelope) {
-        return *response;
+        return crate::request_log::http::compatibility_rejection(
+            &request,
+            value.as_ref(),
+            *response,
+        );
     }
 
     if let (Some(rpc), Some(value)) = (valid_envelope, value.as_mut()) {
@@ -76,7 +86,13 @@ pub(crate) async fn normalize(mut request: Request, next: Next) -> Response {
                 *request.body_mut() = Body::from(bytes);
                 request.headers_mut().remove(CONTENT_LENGTH);
             }
-            Err(response) => return *response,
+            Err(response) => {
+                return crate::request_log::http::compatibility_rejection(
+                    &request,
+                    Some(value),
+                    *response,
+                )
+            }
         }
     } else {
         *request.body_mut() = Body::from(body);
@@ -144,10 +160,12 @@ fn supported_version(version: &str) -> bool {
 
 fn error(id: JsonRpcId, error: A2AError) -> Response {
     // Match upstream JSON-RPC envelopes, including typed ErrorInfo details.
-    Json(JsonRpcResponse::error(id, error.to_jsonrpc_error())).into_response()
+    let mut response = Json(JsonRpcResponse::error(id, error.to_jsonrpc_error())).into_response();
+    response.extensions_mut().insert(error);
+    response
 }
 
-fn canonical_method(method: &str) -> &str {
+pub(crate) fn canonical_method(method: &str) -> &str {
     METHOD_ALIASES
         .iter()
         .find_map(|&(alias, canonical)| (alias == method).then_some(canonical))

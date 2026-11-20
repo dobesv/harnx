@@ -237,6 +237,7 @@ fn test_logs() -> Logs {
     let logs = Logs::default();
     let writer = logs.clone();
     tracing_subscriber::fmt()
+        .json()
         .with_max_level(tracing::Level::INFO)
         .with_ansi(false)
         .with_writer(move || writer.clone())

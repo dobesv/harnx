@@ -456,6 +456,7 @@ pub(crate) async fn require_identity(
     let resolved = identity.resolve_request_verified(request.headers()).await;
     match resolved {
         Ok(caller) => {
+            crate::request_log::http::caller(&request, &caller);
             request.extensions_mut().insert(caller.principal.clone());
             request.extensions_mut().insert(caller);
             next.run(request).await
@@ -465,29 +466,33 @@ pub(crate) async fn require_identity(
 }
 
 pub(crate) async fn rpc_error_response(
-    request: Request,
+    mut request: Request,
     status: StatusCode,
     error: A2AError,
 ) -> Response {
     // Bound rejected input too. An unreadable body has no recoverable id.
-    let id = to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
+    let body = to_bytes(std::mem::take(request.body_mut()), MAX_REQUEST_BODY_BYTES)
         .await
         .ok()
-        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
+    let id = body
+        .as_ref()
         .and_then(|body| body.get("id").cloned())
         .filter(|id| id.is_string() || id.is_number() || id.is_null())
         .unwrap_or(Value::Null);
-    let error = if status == StatusCode::UNAUTHORIZED {
+    let wire_error = if status == StatusCode::UNAUTHORIZED {
         // Preserve the existing identity error envelope when rules are off.
         json!({"code": error.code, "message": error.message})
     } else {
         json!(error.to_jsonrpc_error())
     };
-    (
+    let mut response = (
         status,
-        Json(json!({"jsonrpc": "2.0", "id": id, "error": error})),
+        Json(json!({"jsonrpc": "2.0", "id": id, "error": wire_error})),
     )
-        .into_response()
+        .into_response();
+    crate::request_log::http::rejected(&request, body.as_ref(), &mut response, Some(&error));
+    response
 }
 
 #[cfg(test)]
