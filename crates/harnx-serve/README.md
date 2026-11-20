@@ -35,9 +35,9 @@ cargo install --path crates/harnx-serve
 | Option | Short | Description |
 | :--- | :--- | :--- |
 | `--addr <ADDRESS>` | `-a` | Listen address (default from `config.yaml` or `127.0.0.1:8000`). |
-| `--user-id-source <SOURCE>` | | Identity source (`header:NAME`, `cookie:NAME`, or bare `NAME`); repeat in priority order. Replaces `serve_user_id_sources` from config when supplied. |
-| `--group-header <NAME>` | | Trusted raw group header name; repeat to collect values from every header. Replaces `serve_group_headers` from config/environment when supplied. |
-| `--role-header <NAME>` | | Trusted raw role header name; repeat to collect values from every header. Replaces `serve_role_headers` from config/environment when supplied. |
+| `--user-id-source <SOURCE>` | | Identity source (`header:NAME`, `header-csv:NAME`, `cookie:NAME`, or bare `NAME`); repeat in priority order. Replaces `serve_user_id_sources` from config when supplied. |
+| `--group-header <NAME>` | | Trusted group header spec (`header:NAME`/bare `NAME` for one opaque item per field; `header-csv:NAME` for quoted lists); repeat to collect all items. Replaces `serve_group_headers` from config/environment when supplied. |
+| `--role-header <NAME>` | | Trusted role header spec (same syntax as `--group-header`); repeat to collect all items. Replaces `serve_role_headers` from config/environment when supplied. |
 | `--access-rules <PATH>` | | Access rules file (default: `access.yaml` in the harnx config directory; env `HARNX_ACCESS_RULES`). Enables identity-based access control. |
 | `--public-url <URL>` | | URL a browser uses to reach the Web UI (default from `config.yaml`; inferred from request when unset). |
 | `--model <MODEL>` | `-m` | Select a specific LLM model to use. |
@@ -820,7 +820,8 @@ Execution semantics:
 Identity sources can be configured via `serve_user_id_sources` in `config.yaml`, the `HARNX_SERVE_USER_ID_SOURCES` environment variable, or repeated `--user-id-source` CLI flags. CLI flags replace configuration file sources when supplied.
 
 Each source is an ordered entry:
-- `header:NAME` — reads HTTP request header `NAME` (case-insensitive header name).
+- `header:NAME` — reads one opaque, trimmed value from HTTP request header `NAME` (case-insensitive header name); no comma splitting or unquoting.
+- `header-csv:NAME` — parses a quoted comma-separated list and selects its first item (legacy first-item identity behavior). An empty first item or malformed list fails closed. See [Group and Role Memberships](#group-and-role-memberships) for quoting syntax; the parser is shared.
 - `cookie:NAME` — reads cookie `NAME` from `Cookie` request headers (case-sensitive cookie name).
 - `NAME` (bare name) — alias for `header:NAME`.
 
@@ -848,9 +849,20 @@ harnx-serve \
   --user-id-source "header:x-amzn-oidc-identity"
 ```
 
+#### AWS Application Load Balancer (ALB) mTLS
+
+For ALB mTLS verify mode, use the client certificate subject header:
+
+```bash
+harnx-serve \
+  --user-id-source "header:X-Amzn-Mtls-Clientcert-Subject"
+```
+
+`header:` and bare-name identity sources use the whole trimmed value of the first header field. Commas and backslashes remain intact: `X-Amzn-Mtls-Clientcert-Subject: CN=alice,OU=eng,O=Acme Corp` resolves to `CN=alice,OU=eng,O=Acme Corp`. Escaped commas, such as `CN=Smith\, Alice,OU=eng`, are preserved without DN parsing or unescaping. `header-csv:` explicitly selects the first list item instead. Both modes inspect only the first repeated field for user IDs; group/role headers collect all repeated fields.
+
 ### Security Warning
 
-`harnx-serve` does not authenticate identity headers or cookies; it treats resolved values as opaque strings. The upstream proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. Header sources use the first comma-separated value, so appending a trusted identity after an untrusted value still permits spoofing. Cookie sources must also contain only proxy-trusted identity values.
+`harnx-serve` does not authenticate identity headers or cookies; it treats resolved values as opaque strings. The upstream proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. Appending a trusted field leaves an untrusted first field in control; comma-joining values changes the identity rather than selecting the trusted value. Cookie sources must also contain only proxy-trusted identity values.
 
 `user_id` is visible in session listings to callers permitted to view those sessions. When access rules are disabled, there is no per-user listing authorization. Use a non-secret account identifier, not access tokens, signed JWTs, or secret-bearing session cookies such as `_oauth2_proxy`. Values are stored as-is, not decrypted or verified; they remain in session metadata until the session is removed.
 
@@ -869,12 +881,23 @@ Session user identity is stored once when the session metadata is created. It is
 ### Group and Role Memberships
 
 In addition to user identity, `harnx-serve` can extract group and role memberships from trusted HTTP request headers for use in access rules:
-- Configured via `serve_group_headers` and `serve_role_headers` in `config.yaml`, the `HARNX_SERVE_GROUP_HEADERS` and `HARNX_SERVE_ROLE_HEADERS` environment variables (comma-separated header names), or repeated `--group-header` and `--role-header` CLI flags. Non-empty CLI flags replace configuration file and environment settings.
-- **Trusted raw headers**: Header names are validated at startup. By default, no group or role headers are trusted; unconfigured headers are ignored.
-- **Parsing**: Every configured header name contributes values. Repeated headers and comma-separated tokens are split, trimmed, and empty tokens are dropped. All configured membership headers contribute values.
-- **Fail closed**: If any configured membership header contains invalid bytes that fail UTF-8 header value conversion, `harnx-serve` immediately rejects the request with HTTP `401 Unauthorized` without echoing header contents.
+- Configured via `serve_group_headers` and `serve_role_headers` in `config.yaml`, the `HARNX_SERVE_GROUP_HEADERS` and `HARNX_SERVE_ROLE_HEADERS` environment variables (comma-separated header specs), or repeated `--group-header` and `--role-header` CLI flags. Non-empty CLI flags replace configuration file and environment settings.
+- **Shared header specs**: `header:NAME` or bare `NAME` keeps each whole trimmed field as one opaque membership, without splitting commas or unquoting. `header-csv:NAME` enables quoted comma lists. Prefixes are case-insensitive. Unsupported source kinds (`cookie:`, `forge-fit`, `bearer-claim:`) and invalid names fail startup. By default, no membership headers are trusted.
+- **List parsing (`header-csv:` only)**: All configured headers contribute values. Repeated fields of each name are comma-joined before parsing. Commas outside double quotes separate items, except backslash-escaped commas (`\,`), which stay literal. Unquoted items are trimmed; empty items (including `""`) are dropped. Order and duplicates are preserved.
+- **Quoted items**: Double-quote an entire item to include DN commas. Inside quotes, `\"` becomes `"` and `\\` becomes `\`; other escapes stay literal, so RFC 4514 `\,` is preserved. Whitespace inside quotes is part of the value. After a closing quote, only whitespace and a comma or the end of the list are allowed.
+- **Fail closed**: Invalid header bytes or malformed `header-csv:` lists (unterminated quotes or junk after a closing quote) reject the request with HTTP `401 Unauthorized` without echoing header contents.
 - **Request-local authorization**: Memberships are evaluated on each request for access control and are not used for authorization persistence. Membership changes or revocations take effect on the next HTTP request. For prompt and tool tailoring, a snapshot of resolved caller principals (`user_id`, expanded `users`, `groups`, `roles`) is captured at session creation into the read-only `user_principals` session property (`__user__` in templates, `$user` in agent `patches`); access control never consults this snapshot. See [Customizing Agents by Caller](../../docs/configuration-guide.md#customizing-agents-by-caller-patches-and-__user__) and the [Agent Guide](../../docs/agent-guide.md#agent-patches-patches).
 - **User ownership**: Groups and roles do not satisfy required user identification, do not act as user aliases, and never satisfy session ownership. Sessions are owned solely by immutable user IDs. Admin scope granted by group or role rules retains administrative access across all sessions.
+
+**Migration:** Bare group/role names used to split comma lists. Change `X-Groups` to `header-csv:X-Groups` (and similarly for roles) wherever a proxy sends multiple memberships in one field. Use `header:X-Groups` for a single DN group with commas.
+
+For example, configure `serve_group_headers: ["header-csv:X-Groups"]` or pass `--group-header header-csv:X-Groups`; this header supplies two DN groups and one plain group:
+
+```http
+X-Groups: "CN=admins,OU=eng,O=Acme", "CN=ops,O=Acme", plain-group
+```
+
+The group values are `CN=admins,OU=eng,O=Acme`, `CN=ops,O=Acme`, and `plain-group`. Access-rule `groups:` globs match each full value. The same list syntax applies to `header-csv:` user-id sources, which select only the first item; `header:` and bare names never unquote or split commas.
 
 ### User Aliases (`users.yaml`)
 

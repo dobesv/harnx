@@ -29,8 +29,8 @@ pub(super) fn revoked(user: &str) -> RequestIdentity {
 fn policy() -> Result<Identity> {
     Identity::with_memberships(
         &["X-User-ID".into()],
-        &["X-Groups".into()],
-        &["X-Roles".into()],
+        &["header-csv:X-Groups".into()],
+        &["header-csv:X-Roles".into()],
     )
 }
 pub(super) async fn start() -> Result<TwoBackends> {

@@ -242,16 +242,16 @@ mod tests {
             "http://public.example",
         )
         .await;
-        for value in ["", "  ", " , ignored", " user , ignored"] {
+        for (value, expected) in [
+            ("", StatusCode::UNAUTHORIZED),
+            ("  ", StatusCode::UNAUTHORIZED),
+            (" , opaque", StatusCode::OK),
+            (" user , opaque", StatusCode::OK),
+        ] {
             let mut req = request("/agents/tools");
             req.headers_mut()
                 .insert("x-user-id", value.parse().unwrap());
             let response = app.clone().oneshot(req).await.unwrap();
-            let expected = if value.starts_with(" user") {
-                StatusCode::OK
-            } else {
-                StatusCode::UNAUTHORIZED
-            };
             assert_eq!(response.status(), expected);
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();

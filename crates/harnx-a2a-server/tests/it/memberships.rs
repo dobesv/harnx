@@ -58,8 +58,14 @@ async fn start(enabled: bool, user_required: bool) -> Result<Http> {
     };
     let policy = Identity::with_memberships(
         &users,
-        &["X-Groups".into(), "X-Other-Groups".into()],
-        &["X-Roles".into(), "X-Other-Roles".into()],
+        &[
+            "header-csv:X-Groups".into(),
+            "header-csv:X-Other-Groups".into(),
+        ],
+        &[
+            "header-csv:X-Roles".into(),
+            "header-csv:X-Other-Roles".into(),
+        ],
     )?;
     Http::with_identity(h, rules, policy).await
 }

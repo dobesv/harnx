@@ -82,8 +82,10 @@ pub struct Args {
     #[arg(long, value_name = "URL")]
     pub public_base_url: Option<String>,
 
-    /// Trusted User-ID source: NAME, header:NAME, cookie:NAME, forge-fit, or
-    /// bearer-claim:CLAIM (repeatable, first match wins; enables user isolation).
+    /// Trusted User-ID source: NAME, header:NAME, header-csv:NAME, cookie:NAME,
+    /// forge-fit, or bearer-claim:CLAIM (repeatable, first match wins; user isolation).
+    /// header/NAME is one opaque field; header-csv selects its first list item.
+    /// Use header:X-Amzn-Mtls-Clientcert-Subject for a full mTLS certificate DN.
     /// Bare forge-fit is the Forge token source, not a header name. Without
     /// verification flags, bearer sources are decode-only and safe only behind a
     /// verifying proxy with nothing else able to reach the server. Cookies must
@@ -91,11 +93,14 @@ pub struct Args {
     #[arg(long, value_name = "NAME")]
     pub user_id_header: Vec<String>,
 
-    /// Trusted group membership header name (repeatable, all values contribute).
+    /// Trusted group header spec: header:NAME (or NAME) is one opaque item per
+    /// field; header-csv:NAME parses quoted comma lists. Repeatable; all items count.
+    /// Use header-csv:X-Groups for lists such as "CN=admins,O=Acme", plain-group.
     #[arg(long, value_name = "NAME")]
     pub group_header: Vec<String>,
 
-    /// Trusted role membership header name (repeatable, all values contribute).
+    /// Trusted role header spec: header:NAME (or NAME) is one opaque item per
+    /// field; header-csv:NAME parses quoted comma lists. Repeatable; all items count.
     #[arg(long, value_name = "NAME")]
     pub role_header: Vec<String>,
 

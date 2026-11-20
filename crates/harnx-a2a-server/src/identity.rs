@@ -118,7 +118,6 @@ pub struct Identity {
     sources: IdentitySources,
     groups: MembershipHeaders,
     roles: MembershipHeaders,
-    membership_names: Vec<HeaderName>,
     aliases: Option<Arc<UserAliases>>,
     // Present only when bearer verification is configured; the sync resolve
     // paths fail closed when it is set, see `with_bearer_verification`.
@@ -144,11 +143,6 @@ impl Identity {
             sources: IdentitySources::new(sources).context("invalid user-id-header sources")?,
             groups: group_headers,
             roles: role_headers,
-            membership_names: groups
-                .iter()
-                .chain(roles)
-                .map(|name| name.parse())
-                .collect::<Result<_, _>>()?,
             verifier: None,
         })
     }
@@ -295,7 +289,7 @@ impl Identity {
         params: &ServiceParams,
     ) -> Result<RequestIdentity, A2AError> {
         let mut headers = HeaderMap::new();
-        for name in &self.membership_names {
+        for name in self.groups.names().chain(self.roles.names()) {
             Self::add_membership_params(name, params, &mut headers)?;
         }
         let principal = self.resolve_service_params(params)?;
@@ -310,7 +304,7 @@ impl Identity {
         params: &ServiceParams,
     ) -> Result<RequestIdentity, A2AError> {
         let mut headers = HeaderMap::new();
-        for name in &self.membership_names {
+        for name in self.groups.names().chain(self.roles.names()) {
             Self::add_membership_params(name, params, &mut headers)?;
         }
         let principal = self.resolve_service_params_verified(params).await?;
@@ -407,7 +401,7 @@ impl Identity {
         headers: &mut HeaderMap,
     ) -> Result<(), A2AError> {
         let (name, limit) = match source {
-            IdentitySource::Header(name) => (name.clone(), 1),
+            IdentitySource::Header(source) => (source.name().clone(), 1),
             IdentitySource::Cookie(_) => (HeaderName::from_static("cookie"), usize::MAX),
             IdentitySource::ForgeFit | IdentitySource::BearerClaim(_) => {
                 (HeaderName::from_static("authorization"), 1)
@@ -522,7 +516,7 @@ mod tests {
                 ),
             )
             .route_layer(axum::middleware::from_fn_with_state(
-                identity(&["x-user"]),
+                identity(&["header:X-Amzn-Mtls-Clientcert-Subject"]),
                 require_identity,
             ));
         let response = app
@@ -530,7 +524,10 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/")
-                    .header("x-user", " user , ignored")
+                    .header(
+                        "X-Amzn-Mtls-Clientcert-Subject",
+                        " CN=alice,OU=eng,O=Acme Corp ",
+                    )
                     .body(Body::from("unchanged request body"))
                     .unwrap(),
             )
@@ -539,7 +536,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
-            "user"
+            "CN=alice,OU=eng,O=Acme Corp"
         );
     }
 
@@ -600,21 +597,27 @@ mod tests {
     }
 
     #[test]
-    fn identity_comma_lists_and_repeated_headers_use_first_value() {
+    fn identity_preserves_commas_and_uses_first_repeated_header() {
         let identity = identity(&["x-user"]);
         let mut headers = HeaderMap::new();
-        headers.append("x-user", "  first-user  , second-user".parse().unwrap());
+        headers.append("x-user", "  first-user  , second-user  ".parse().unwrap());
         headers.append("x-user", "third-user".parse().unwrap());
-        assert_eq!(
-            identity.resolve(&headers).unwrap().user_id(),
-            Some("first-user")
-        );
+        let params = ServiceParams::from([(
+            "x-user".into(),
+            vec!["  first-user  , second-user  ".into(), "third-user".into()],
+        )]);
+        for principal in [
+            identity.resolve(&headers).unwrap(),
+            identity.resolve_service_params(&params).unwrap(),
+        ] {
+            assert_eq!(principal.user_id(), Some("first-user  , second-user"));
+        }
     }
 
     #[test]
     fn identity_empty_or_whitespace_first_value_is_rejected() {
         let identity = identity(&["x-user", "x-fallback"]);
-        for value in ["", "  \t ", " , second-user", ",second-user"] {
+        for value in ["", "  \t "] {
             let mut headers = HeaderMap::new();
             headers.insert("x-user", value.parse().unwrap());
             headers.insert("x-fallback", "fallback".parse().unwrap());

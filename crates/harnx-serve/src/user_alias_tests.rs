@@ -10,8 +10,8 @@ fn config(sandbox: &TestConfigSandbox) -> GlobalConfig {
     harnx_core::require_nextest();
     let mut config = sandbox.config();
     config.serve_user_id_sources = vec!["x-user".into()];
-    config.serve_group_headers = vec!["x-groups".into()];
-    config.serve_role_headers = vec!["x-roles".into()];
+    config.serve_group_headers = vec!["header-csv:x-groups".into()];
+    config.serve_role_headers = vec!["header-csv:x-roles".into()];
     Arc::new(ConfigLock::new(config))
 }
 
@@ -98,6 +98,34 @@ fn aliases_embedded_missing_config_and_loaded_snapshot() -> Result<()> {
     }
     let anonymous = with.resolve_identity(&hyper::Request::new(()))?;
     assert!(anonymous.caller().view().users.is_empty());
+    Ok(())
+}
+
+#[test]
+fn mtls_subject_identity_matches_full_dn_access_rule() -> Result<()> {
+    harnx_core::require_nextest();
+    let sandbox = TestConfigSandbox::new();
+    let mut config = sandbox.config();
+    config.serve_user_id_sources = vec!["header:X-Amzn-Mtls-Clientcert-Subject".into()];
+    let config = Arc::new(ConfigLock::new(config));
+    let rules = AccessRules::from_yaml(
+        "rules:\n  - agents: [agent]\n    users: ['CN=*,OU=eng,O=Acme Corp']\n",
+    )?;
+    let server = Server::new_with_access_rules(&config, PathBuf::new(), None)?;
+    for (dn, allowed) in [
+        ("CN=alice,OU=eng,O=Acme Corp", true),
+        ("CN=alice,OU=finance,O=Other Corp", false),
+    ] {
+        let request = hyper::Request::builder()
+            .header("X-Amzn-Mtls-Clientcert-Subject", dn)
+            .body(())?;
+        let identity = server.resolve_identity(&request)?;
+        assert_eq!(identity.user_id.as_deref(), Some(dn));
+        assert_eq!(
+            rules.can_create_session("agent", identity.caller().view()),
+            allowed
+        );
+    }
     Ok(())
 }
 

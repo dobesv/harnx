@@ -663,7 +663,17 @@ Harnx can record an opaque user identity string (such as a username, email, or a
 
 Harnx treats user identity as an opaque string; it does not authenticate users itself. Upstream authentication proxies or callers provide the identity. `user_id` is visible in session listings to anyone who can list that agent's sessions; listing is not authorized per user. Don't configure secret-bearing cookies or headers (such as `_oauth2_proxy`, access tokens, or signed JWTs) as sources. Their values would be stored and exposed as-is.
 
-A trusted proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. Header sources use the first comma-separated value, so appending a trusted value still allows spoofing. Cookie identity values must also come from the trusted proxy. `header:NAME` and bare `NAME` select a header; `cookie:NAME` selects an exact, case-sensitive cookie name.
+A trusted proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. `header:NAME` and bare `NAME` select the whole trimmed value of the first header field, with commas and backslashes preserved. Repeated fields use only the first field, so appending a trusted field after an untrusted one still allows spoofing; comma-joining values changes the identity rather than selecting the trusted value. `cookie:NAME` selects an exact, case-sensitive cookie name, whose value must also come from the trusted proxy.
+
+For example, with `serve_user_id_sources: ["header:X-Amzn-Mtls-Clientcert-Subject"]` behind an AWS ALB in mTLS verify mode, `X-Amzn-Mtls-Clientcert-Subject: CN=alice,OU=eng,O=Acme Corp` resolves to the full identity `CN=alice,OU=eng,O=Acme Corp`. RFC 2253 escaped commas such as `CN=Smith\, Alice,OU=eng` remain unchanged; Harnx doesn't parse or unescape DNs. The same header semantics apply to `harnx-a2a-server --user-id-header header:X-Amzn-Mtls-Clientcert-Subject`.
+
+Comma handling is explicit and identical for user-id and group/role header specifications:
+
+- `header:NAME` or bare `NAME`: one opaque, trimmed item per field; no comma splitting or unquoting.
+- `header-csv:NAME`: a quoted comma-separated list. User IDs select the first item (legacy first-item behavior); memberships use every item. An empty first user-id item or any malformed list fails closed. User IDs inspect only the first repeated field; memberships collect all fields and join them with commas before list parsing.
+- Prefixes are case-insensitive. Identity sources also support `cookie:NAME`, `forge-fit`, and `bearer-claim:CLAIM` where available; these kinds are rejected for memberships at startup.
+
+**Migration:** Existing group/role configurations using comma-separated lists must change `X-Groups` to `header-csv:X-Groups` and `X-Roles` to `header-csv:X-Roles`. Bare names now preserve commas as part of a single membership. This applies to config keys, environment variables, and both servers' CLI flags. Use `header-csv:NAME` for user IDs only when the legacy first-list-item behavior is intended.
 
 - **user_id** (env: `HARNX_USER_ID`, including from `.env`): Global default user identity for new sessions.
 - **user_id** in `nats_servers/<cluster>.yaml`: Default user identity for new sessions created on that NATS cluster.
@@ -711,13 +721,13 @@ serve_user_id_sources:
   - "header:X-Forwarded-Email"
   - "cookie:session_user"
 
-# Trusted raw group membership headers for harnx-serve (all values contribute)
+# Trusted group lists for harnx-serve (all items contribute)
 serve_group_headers:
-  - "X-Forwarded-Groups"
+  - "header-csv:X-Forwarded-Groups"
 
-# Trusted raw role membership headers for harnx-serve (all values contribute)
+# Trusted role lists for harnx-serve (all items contribute)
 serve_role_headers:
-  - "X-Forwarded-Roles"
+  - "header-csv:X-Forwarded-Roles"
 ```
 
 ## Access Control (`access.yaml`)
@@ -763,19 +773,29 @@ At least one selector category (`users`, `groups`, or `roles`) must be non-empty
 #### Group and Role Memberships
 
 In addition to user identity, callers can supply group and role memberships via trusted HTTP headers configured on the server:
-- `harnx-serve`: `serve_group_headers` / `serve_role_headers` in `config.yaml`, environment variables `HARNX_SERVE_GROUP_HEADERS` / `HARNX_SERVE_ROLE_HEADERS` (comma-separated header names), or repeatable `--group-header <NAME>` / `--role-header <NAME>` CLI flags. Non-empty CLI flags replace config and environment settings.
+- `harnx-serve`: `serve_group_headers` / `serve_role_headers` in `config.yaml`, environment variables `HARNX_SERVE_GROUP_HEADERS` / `HARNX_SERVE_ROLE_HEADERS` (comma-separated header specs), or repeatable `--group-header <NAME>` / `--role-header <NAME>` CLI flags. Non-empty CLI flags replace config and environment settings.
 - `harnx-a2a-server`: repeatable `--group-header <NAME>` and `--role-header <NAME>` CLI flags.
 
 Header and membership rules:
 - **No defaults**: No trusted group or role headers are enabled by default. Unconfigured membership headers sent by clients are ignored.
-- **Header parsing**: Every configured header name is read from the request. When a header appears multiple times or contains comma-separated values, each comma-separated entry is trimmed and empty tokens are dropped. All configured membership headers contribute values.
-- **Fail closed on malformed values**: If any configured membership header contains invalid bytes that fail UTF-8 header value conversion, the request is rejected immediately with HTTP 401 Unauthorized without echoing header contents.
+- **Shared header specs**: `header:NAME` or bare `NAME` keeps each whole trimmed field as one opaque membership without splitting or unquoting. `header-csv:NAME` enables quoted comma lists. Prefixes are case-insensitive; non-header kinds such as `cookie:`, `forge-fit`, and `bearer-claim:` fail startup.
+- **List parsing (`header-csv:` only)**: All configured membership headers contribute values. Repeated fields of each name are comma-joined before parsing. Commas outside double quotes separate items, except backslash-escaped commas (`\,`), which stay literal. Unquoted items are trimmed, empty items (including `""`) are dropped, and order and duplicates are preserved.
+- **Quoted items**: Double-quote an entire item to include commas. Inside quotes, `\"` becomes `"` and `\\` becomes `\`; other escapes stay literal, so RFC 4514 `\,` survives. Whitespace inside quotes is preserved. After a closing quote, only whitespace and a comma or the end of the list are allowed.
+- **Fail closed on malformed values**: Invalid header bytes or malformed `header-csv:` lists (unterminated quotes or junk after a closing quote) reject the request immediately with HTTP 401 Unauthorized (JSON-RPC `-32000` for A2A) without echoing header contents.
 - **Distinct namespaces**: Users, groups, and roles occupy completely distinct namespaces. The same string value in different namespaces never matches across categories.
 - **OR within rules, union across rules**: A rule matches when its `agents` pattern matches AND at least one selector category (`users`, `groups`, or `roles`) matches the caller's request. Scopes are unioned across all matching rules.
 - **Request-local authorization**: Groups and roles are evaluated fresh per request for access control, and live authorization never relies on persisted memberships. Revoking or changing a membership takes effect on the caller's next HTTP request. For agent customization, the caller's resolved principals at session creation are snapshotted into the read-only `user_principals` session property (`__user__` in templates, `$user` in agent `patches`); access rules never consult that snapshot for authorization.
 - **User ownership unchanged**: Groups and roles grant access scopes, but they never satisfy session ownership. Sessions are owned solely by immutable user IDs. Callers with `prompt` scope can only access sessions where `user_id == caller.user_id`. Callers with `admin` scope (granted by any user, group, or role rule) can access sessions across all users.
 - **User identity required**: Memberships do not satisfy required caller authentication. When access rules are enabled, protected routes still require a valid user identity.
 - **Reverse proxy trust**: Upstream proxies must authenticate callers and replace or strip all configured user, group, and role headers before forwarding requests.
+
+To send two DN-format group IDs plus a plain group, configure `serve_group_headers: ["header-csv:X-Groups"]` or `--group-header header-csv:X-Groups`, then send:
+
+```http
+X-Groups: "CN=admins,OU=eng,O=Acme", "CN=ops,O=Acme", plain-group
+```
+
+The resulting group IDs are `CN=admins,OU=eng,O=Acme`, `CN=ops,O=Acme`, and `plain-group`. A `groups: ['CN=admins,OU=*,O=Acme']` access-rule selector matches the first full group ID. An unquoted `CN=Smith\, Alice` is also one item, with the backslash preserved. This quoting syntax applies to `header-csv:` for both user IDs and memberships, not opaque `header:` values or configured `users.yaml` memberships.
 
 #### Reusable Groups with YAML Anchors
 
@@ -960,7 +980,7 @@ Alias expansion applies **only** to the incoming caller during request authoriza
 
 #### Configured groups and roles
 In both `harnx-serve` and `harnx-a2a-server`, configured `groups` and `roles` on the matched alias entry participate in request authorization:
-- **Comma-separated values**: List items such as `"a, b"` are split on commas, like membership header values.
+- **Comma-separated values**: Configured list items such as `"a, b"` are split on commas. These values do not use the `header-csv:` quoting parser.
 - **Merged with header memberships**: When membership headers (`--group-header`, `--role-header`, `serve_group_headers`, `serve_role_headers`) are configured and present, header values come first and retain their exact order and duplicates. Configured values from `users.yaml` are normalized (split on commas, trimmed, empty tokens dropped) and appended without adding duplicates of values already present.
 - **Applies without membership headers**: If no membership headers are configured on the server (or none are supplied in the request), matching an alias entry still assigns its configured groups and roles to the caller.
 - **Header failures fail closed**: Malformed membership headers (such as non-UTF-8 bytes) fail closed immediately with HTTP 401 Unauthorized (or JSON-RPC `-32000`). Configured groups and roles do not bypass or mask header validation failures.

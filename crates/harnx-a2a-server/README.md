@@ -25,9 +25,9 @@ Usage: harnx-a2a-server [OPTIONS] --agent <SPEC>
 | `--config-dir <PATH>` | `HARNX_CONFIG_DIR` | Path to the harnx configuration directory containing `config.yaml`. |
 | `--access-rules <PATH>` | `<config dir>/access.yaml` if present | Access rules file, also set by `HARNX_ACCESS_RULES`. Requires `--user-id-header` when rules are enabled. |
 | `--public-base-url <URL>` | none | Base URL used in Agent Card interface URLs (for example, `https://agents.example.com`). If omitted, inferred from `X-Forwarded-*` or `Host` headers. |
-| `--user-id-header <NAME>` | none | Trusted identity source: bare header name, `header:NAME`, `cookie:NAME`, `forge-fit`, or `bearer-claim:CLAIM` (repeatable, first present source wins). Bare `forge-fit` is the Forge token source, not a header name. Without verification flags, bearer sources operate in decode-only mode. Empty or invalid values fail closed. Enables user isolation mode. |
-| `--group-header <NAME>` | none | Trusted group membership header name (repeatable, all values contribute). |
-| `--role-header <NAME>` | none | Trusted role membership header name (repeatable, all values contribute). |
+| `--user-id-header <NAME>` | none | Trusted identity source: bare header name, `header:NAME` (opaque), `header-csv:NAME` (first list item), `cookie:NAME`, `forge-fit`, or `bearer-claim:CLAIM` (repeatable, first present source wins). Bare `forge-fit` is the Forge token source, not a header name. Without verification flags, bearer sources operate in decode-only mode. Empty or invalid values fail closed. Enables user isolation mode. |
+| `--group-header <NAME>` | none | Trusted group header spec: `header:NAME`/bare `NAME` for an opaque item per field, `header-csv:NAME` for quoted comma lists (repeatable, all items contribute). |
+| `--role-header <NAME>` | none | Trusted role header spec (same syntax as `--group-header`; repeatable, all items contribute). |
 | `--bearer-jwks-url <URL>` | none | Verify bearer identity sources against this JWKS URL. Requires `--bearer-issuer` and `--bearer-audience`; off by default. |
 | `--bearer-issuer <ISSUER>` | none | Expected bearer token issuer (requires `--bearer-jwks-url` and `--bearer-audience`). |
 | `--bearer-audience <AUDIENCE>` | none | Expected bearer token audience (requires `--bearer-jwks-url` and `--bearer-issuer`). Pinning audience is essential because all Forge apps share signing keys. |
@@ -218,10 +218,13 @@ Configure caller identity sources with `--user-id-header <SPEC>`. The flag is re
 
 | Source Syntax | Wire Location | Resolved Identity | Description |
 |---|---|---|---|
-| `NAME` or `header:NAME` | Header `NAME` | Header value | Reads first comma-separated token, trimmed. Fails closed on empty values. |
+| `NAME` or `header:NAME` | Header `NAME` | Header value | Reads the whole trimmed value of the first header field, preserving commas and backslashes without unquoting. Fails closed on empty or invalid values. |
+| `header-csv:NAME` | Header `NAME` | First list item | Explicit legacy first-item user-id behavior. Parses the first field with the shared quoted-list parser; an empty first item or malformed list fails closed. |
 | `cookie:NAME` | Cookie `NAME` | Cookie value | Cookie names are case-sensitive. Must carry a proxy-verified user ID, not a token. |
 | `forge-fit` | `Authorization: Bearer <FIT>` | X.500 DN | Base64url-decodes Atlassian Forge Invocation Token payload and formats a DN. Bare `forge-fit` is the source name, not a header name. |
 | `bearer-claim:CLAIM` | `Authorization: Bearer <JWT>` | Claim value | Reads named top-level string claim from the decoded token payload. |
+
+For AWS ALB mTLS verify mode, configure `--user-id-header header:X-Amzn-Mtls-Clientcert-Subject`. A subject value of `CN=alice,OU=eng,O=Acme Corp` becomes the full user ID; RFC 2253 escaped commas such as `CN=Smith\, Alice,OU=eng` are preserved without DN parsing or unescaping. Repeated identity header fields still use only the first field. Use `header-csv:NAME` only to select the first comma-list item instead. Header prefixes are case-insensitive. Both user-id and group/role options use these same header specs; membership lists require `header-csv:`. The proxy must replace client-supplied identity headers, not append fields or comma-join values.
 
 #### Forge DN Format
 
@@ -313,7 +316,21 @@ For security and privacy, `harnx-a2a-server` never logs resolved caller identiti
   - Context creation without `prompt` scope returns JSON-RPC permission error code `-32010` (`session creation requires prompt scope`).
   - Accessing another user's context without `admin` scope returns JSON-RPC `-32001` (`task not found`).
 - **ListTasks Scoping**: `ListTasks` requires `contextId`. Callers with `prompt` scope can list tasks in their own contexts; callers with `admin` scope can list tasks in any authorized context.
-- **Group and Role Memberships**: Callers can supply group and role memberships via `--group-header <NAME>` and `--role-header <NAME>` flags. All configured headers contribute values; repeated headers and comma-separated tokens are split and trimmed. Any invalid header bytes fail closed with JSON-RPC error code `-32000` (HTTP 401). Memberships are evaluated per request for access control and are not used for authorization persistence. For agent prompt and tool customization, a snapshot of resolved caller principals (`user_id`, expanded `users`, `groups`, `roles`) is captured at session creation (and with first-message reservations) into the read-only `user_principals` session property (`__user__` in templates, `$user` in agent `patches`); access rules never consult that snapshot. Memberships never satisfy context ownership (which remains tied solely to caller `user_id`), but rules granting `admin` scope allow full task management across all contexts. See [Customizing Agents by Caller](../../docs/configuration-guide.md#customizing-agents-by-caller-patches-and-__user__) and the [Agent Guide](../../docs/agent-guide.md#agent-patches-patches).
+- **Group and Role Memberships**: Configure repeatable `--group-header <SPEC>` and `--role-header <SPEC>` flags. `header:NAME` or bare `NAME` keeps each whole trimmed field as one opaque membership, with no comma splitting or unquoting. `header-csv:NAME` enables the same quoted-list parser as user-id sources, but contributes every item rather than only the first. Prefixes are case-insensitive; non-header kinds (`cookie:`, `forge-fit`, `bearer-claim:`) fail startup.
+  - **Migration:** Change `--group-header X-Groups` to `--group-header header-csv:X-Groups` when a proxy sends a comma-separated list (similarly for roles). Bare names no longer split lists.
+  - With `header-csv:`, repeated fields of each name are comma-joined before parsing. Commas outside double quotes separate items, except escaped commas (`\,`), which stay literal. Unquoted items are trimmed; empty items (including `""`) are dropped. Order and duplicates are retained.
+  - Double-quote an entire item to include DN commas. Inside quotes, `\"` becomes `"`, `\\` becomes `\`, and other escapes stay literal, preserving RFC 4514 `\,`. Whitespace inside quotes stays part of the value. After a closing quote, only whitespace and a comma or the end of the list are allowed.
+  - Invalid bytes or malformed `header-csv:` quoting fail closed with JSON-RPC `-32000` (HTTP 401), without echoing header contents.
+  - Memberships are evaluated per request for access control and are not used for authorization persistence. For agent prompt and tool customization, a snapshot of resolved caller principals (`user_id`, expanded `users`, `groups`, `roles`) is captured at session creation (and with first-message reservations) into the read-only `user_principals` session property (`__user__` in templates, `$user` in agent `patches`); access rules never consult that snapshot. See [Customizing Agents by Caller](../../docs/configuration-guide.md#customizing-agents-by-caller-patches-and-__user__) and the [Agent Guide](../../docs/agent-guide.md#agent-patches-patches).
+  - Memberships never satisfy context ownership (tied solely to caller `user_id`), but rules granting `admin` allow task management across contexts.
+
+  For example, `--group-header header-csv:X-Groups` accepts two DN groups and a plain group:
+
+  ```http
+  X-Groups: "CN=admins,OU=eng,O=Acme", "CN=ops,O=Acme", plain-group
+  ```
+
+  Access-rule `groups:` globs match each full DN. For a single unquoted DN group, use `--group-header header:X-Groups` instead.
 - **User Aliases (`users.yaml`)**: Optional user alias configuration loaded once at startup from `<config-dir>/users.yaml`. See the [User Aliases section in the Configuration Guide](../../docs/configuration-guide.md#user-aliases-usersyaml) for schema, semantics, and examples.
   - An authenticated caller's identity expands into the first matching entry's `identities` list for agent export visibility and context access.
   - Optional `groups` and `roles` declared on the matched entry are merged into caller memberships (appended after header values and deduped) and matched against `access.yaml` rules, even without membership headers configured.
