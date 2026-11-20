@@ -3,7 +3,9 @@ use super::*;
 #[tokio::test(flavor = "multi_thread")]
 async fn middleware_confirm_documentation_examples_execute_verbatim() {
     let examples = super::super::documentation::blocks();
-    assert_eq!(examples.len(), 12);
+    // Blocks 10 and 11 are the interact section's bash/python examples,
+    // executed by middleware::interact.
+    assert_eq!(examples.len(), 14);
     for (index, (language, source)) in examples.into_iter().take(10).enumerate().skip(6) {
         let entry = match language.as_str() {
             "bash" => bash(&source),

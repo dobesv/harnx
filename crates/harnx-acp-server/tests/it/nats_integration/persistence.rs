@@ -494,6 +494,7 @@ fn load_fixture_entries() -> Vec<SessionLogEntry> {
                 output: serde_json::json!("file contents"),
                 markdown: Some("read result".to_string()),
                 content: vec![],
+                user_surfaces: vec![],
                 switch_agent: None,
             }],
             timestamp: None,

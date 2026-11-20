@@ -21,7 +21,7 @@ pub(super) fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
-fn fenced_blocks(text: &str) -> Vec<(String, String)> {
+pub(super) fn fenced_blocks(text: &str) -> Vec<(String, String)> {
     normalize_line_endings(text)
         .split("```")
         .enumerate()
@@ -107,7 +107,7 @@ async fn middleware_documentation_examples_execute_verbatim() {
             .collect::<Vec<_>>(),
         [
             "yaml", "bash", "python", "python", "bash", "python", "bash", "python", "bash",
-            "python", "yaml", "yaml"
+            "python", "bash", "python", "yaml", "yaml"
         ],
         "update execution coverage when adding an example"
     );

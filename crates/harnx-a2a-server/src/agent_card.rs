@@ -29,8 +29,12 @@ fn card(export: &Export, base: &str) -> AgentCard {
             extended_agent_card: Some(false),
             extensions: None,
         },
-        default_input_modes: vec!["text/plain".into(), "application/json".into()],
-        default_output_modes: vec!["text/plain".into()],
+        default_input_modes: vec![
+            "text/plain".into(),
+            "application/json".into(),
+            "application/a2ui+json".into(),
+        ],
+        default_output_modes: vec!["text/plain".into(), "application/a2ui+json".into()],
         skills: vec![AgentSkill {
             id: export.public_name.clone(),
             name: meta.name.clone(),

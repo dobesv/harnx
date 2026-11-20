@@ -1,0 +1,7 @@
+---
+harnx: minor
+---
+
+Non-modal A2UI surfaces, backend half. Completed tool results may carry user-audience A2UI parts (`application/a2ui+json` embedded resources annotated `audience: ["user"]` for MCP tools, `user_surfaces` on native tool results): they are validated with the shared subset checks, persisted durably, published to frontends through new AG-UI `a2ui_surface` snapshot events, and stripped from model input. Frontends submit actions through the new `session/surface_action` RPC (and serve control path), which validates the action against the surface's declared generation and button, then routes it: `harnx.visibility` `invisible` records the action only, `note` (the default for direct tool actions) passes the action's user message to the model at its next call without starting a turn, and `turn` starts or joins a turn. An action may declare a direct tool target, executed through the operator tool RPC path with the session's effective tool permissions and middleware — no synthetic model tool calls.
+
+Rollout warning: Actions write the new durable log variant `SessionLogEntry::SurfaceAction`. The writers are `harnx surface act`, the TUI surface action modal, the `harnx-serve` `session/surface_action` JSON-RPC method, and the worker control path. Transcripts containing new variants hard-reject on older binaries. Upgrade all cluster readers (`harnx-serve`, workers, `harnx-a2a-server`, ACP, TUI, CLI) before producers write any `SurfaceAction` entries. Rollback below this release is one-way once any `SurfaceAction` exists in a transcript.

@@ -1,7 +1,7 @@
 //! Strict middleware declarations and the resolved chain shared by runtime consumers.
 
-mod fetch;
-use fetch::parse_fetch_hosts;
+pub(crate) mod fetch;
+pub(crate) use fetch::parse_fetch_hosts;
 
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 
@@ -121,23 +121,72 @@ impl<'de> Deserialize<'de> for MiddlewareEntry {
     }
 }
 
-const DEFAULT_MIDDLEWARE_TIMEOUT_SECS: u64 = 30;
-
-fn parse_entry(value: &serde_json::Value) -> Result<MiddlewareEntry, String> {
-    let raw: RawMiddlewareEntry =
-        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+/// Strict-entry checks shared by middleware and event-hook lists: no null
+/// fields and a non-empty name.
+pub(crate) fn validate_entry_shape(value: &serde_json::Value, name: &str) -> Result<(), String> {
     if let Some(fields) = value.as_object() {
         if let Some((field, _)) = fields.iter().find(|(_, value)| value.is_null()) {
             return Err(format!("{field} must not be null"));
         }
     }
-    if raw.name.trim().is_empty() {
+    if name.trim().is_empty() {
         return Err("name must not be empty".into());
     }
-    if raw.enabled == Some(false) {
-        if value.as_object().is_some_and(|fields| fields.len() != 2) {
-            return Err("a disable entry accepts only name and enabled: false".into());
+    Ok(())
+}
+
+/// `enabled: false` marks a disable entry, which may carry no other fields.
+pub(crate) fn disable_entry(
+    value: &serde_json::Value,
+    enabled: Option<bool>,
+) -> Result<bool, String> {
+    if enabled != Some(false) {
+        return Ok(false);
+    }
+    if value.as_object().is_some_and(|fields| fields.len() != 2) {
+        return Err("a disable entry accepts only name and enabled: false".into());
+    }
+    Ok(true)
+}
+
+/// Exactly one of `bash`, `python` or `script`.
+pub(crate) fn parse_entry_source(
+    bash: Option<String>,
+    python: Option<String>,
+    script: Option<PathBuf>,
+) -> Result<MiddlewareSourceConfig, String> {
+    match (bash, python, script) {
+        (Some(bash), None, None) => Ok(MiddlewareSourceConfig::Bash { bash }),
+        (None, Some(python), None) => Ok(MiddlewareSourceConfig::Python { python }),
+        (None, None, Some(script)) => {
+            script_language(&script)?;
+            Ok(MiddlewareSourceConfig::Script { script })
         }
+        _ => Err("a full entry requires exactly one of bash, python or script".into()),
+    }
+}
+
+pub(crate) fn parse_entry_timeout(
+    timeout: Option<String>,
+    default_secs: u64,
+) -> Result<Duration, String> {
+    let duration = timeout
+        .map(|text| humantime::parse_duration(&text).map_err(|e| format!("invalid timeout: {e}")))
+        .transpose()?
+        .unwrap_or_else(|| Duration::from_secs(default_secs));
+    if duration.is_zero() {
+        return Err("timeout must be greater than zero".into());
+    }
+    Ok(duration)
+}
+
+const DEFAULT_MIDDLEWARE_TIMEOUT_SECS: u64 = 30;
+
+fn parse_entry(value: &serde_json::Value) -> Result<MiddlewareEntry, String> {
+    let raw: RawMiddlewareEntry =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    validate_entry_shape(value, &raw.name)?;
+    if disable_entry(value, raw.enabled)? {
         return Ok(MiddlewareEntry::Disable {
             name: raw.name,
             enabled: false,
@@ -145,23 +194,8 @@ fn parse_entry(value: &serde_json::Value) -> Result<MiddlewareEntry, String> {
     }
     let matcher = raw.matcher.ok_or("a full entry requires match")?;
     Regex::new(&matcher).map_err(|e| format!("invalid match regex: {e}"))?;
-    let source = match (raw.bash, raw.python, raw.script) {
-        (Some(bash), None, None) => MiddlewareSourceConfig::Bash { bash },
-        (None, Some(python), None) => MiddlewareSourceConfig::Python { python },
-        (None, None, Some(script)) => {
-            script_language(&script)?;
-            MiddlewareSourceConfig::Script { script }
-        }
-        _ => return Err("a full entry requires exactly one of bash, python or script".into()),
-    };
-    let timeout = raw
-        .timeout
-        .map(|text| humantime::parse_duration(&text).map_err(|e| format!("invalid timeout: {e}")))
-        .transpose()?
-        .unwrap_or(Duration::from_secs(DEFAULT_MIDDLEWARE_TIMEOUT_SECS));
-    if timeout.is_zero() {
-        return Err("timeout must be greater than zero".into());
-    }
+    let source = parse_entry_source(raw.bash, raw.python, raw.script)?;
+    let timeout = parse_entry_timeout(raw.timeout, DEFAULT_MIDDLEWARE_TIMEOUT_SECS)?;
     Ok(MiddlewareEntry::Full(MiddlewareDefinition {
         name: raw.name,
         matcher,

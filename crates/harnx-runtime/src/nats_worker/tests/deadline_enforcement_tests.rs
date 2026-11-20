@@ -583,6 +583,7 @@ async fn journal_retired_delegation(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// qual:allow(complexity, max_function_lines=160) reason: "End-to-end expiry replay fixture: journals a completed child round and replays it without a live tool server; the scenario is one linear flow."
 async fn expired_worker_replay_recovers_completed_child_without_live_tool_server_or_redispatch() {
     let _env_guard = env_lock().await;
     let Some((url, _nats, _dir)) = spawn_test_nats().await else {
@@ -679,6 +680,8 @@ async fn expired_worker_replay_recovers_completed_child_without_live_tool_server
         .await
         .unwrap();
     let request = harnx_toolset::ToolRequest {
+        input_responses: None,
+        request_state: None,
         run_context: Some(harnx_toolset::AutonomousRunContext {
             snapshot: serde_json::to_value(&parent).unwrap(),
             started_at_ms: original_time.timestamp_millis().try_into().unwrap(),

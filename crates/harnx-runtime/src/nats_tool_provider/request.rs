@@ -35,6 +35,8 @@ fn probe_request(
 ) -> ToolRequest {
     let call_id = Uuid::new_v4().to_string();
     ToolRequest {
+        input_responses: None,
+        request_state: None,
         run_context: run_context
             .as_ref()
             .map(|record| harnx_toolset::AutonomousRunContext {
@@ -168,7 +170,17 @@ impl NatsToolProvider {
         if self.dispatch_with_message_pending(route) {
             capabilities.insert(CAPABILITY_NEW_MESSAGE_PENDING.to_string());
         }
+        // T4.3: a rerun after a tool challenge carries the latest challenge's
+        // accepted responses and opaque state beside `run_context`, never
+        // inside the arguments. Absent on first calls and on every dispatch
+        // outside the challenge owner's leaf (allowlisted `call_tool`).
+        let tool_input = crate::middleware::current_tool_input();
         let request = ToolRequest {
+            input_responses: tool_input.as_ref().map(|input| input.responses.clone()),
+            request_state: tool_input
+                .as_ref()
+                .map(|input| input.request_state.clone())
+                .filter(|state| !state.is_null()),
             run_context: run_context.map(|record| harnx_toolset::AutonomousRunContext {
                 snapshot: serde_json::to_value(record).expect("run limits serialize"),
                 started_at_ms: chrono::Utc::now()
@@ -310,14 +322,21 @@ impl NatsToolProvider {
         )
     }
 
+    // qual:allow(iosp) — reply decoding routes one wire shape per arm: challenge, result, recoverable error; the input_required fast path must run before result normalization so a challenge never becomes an error result.
     pub(super) fn decode_recorded_reply(
         reply: ToolReply,
         provenance: ToolObservationProvenance,
     ) -> Result<ToolProviderOutput, ToolError> {
+        // A challenge rides next to the compatibility error in `result`;
+        // newer callers suspend on it and ignore `result` entirely.
+        if let Some(input) = reply.input_required {
+            return Self::decode_input_required(input, &provenance);
+        }
         match reply.result {
             Ok(mut value) => {
                 let execution_context = extract_execution_context(&mut value, provenance);
                 Ok(ToolProviderOutput {
+                    input_required: None,
                     value,
                     execution_context,
                 })
@@ -330,6 +349,34 @@ impl NatsToolProvider {
                 Err(ToolError::Fatal(anyhow!(interrupted)))
             }
         }
+    }
+
+    /// Map a wire `input_required` challenge onto the core typed outcome.
+    /// The producer identity is infrastructure-owned (`tool:<server>/<tool>`),
+    /// never tool-supplied: a tool cannot forge another tool's interactions.
+    fn decode_input_required(
+        input: harnx_toolset::ToolInputRequired,
+        provenance: &ToolObservationProvenance,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        input
+            .validate()
+            .map_err(|error| ToolError::Recoverable(anyhow!("tool server: {error}")))?;
+        Ok(ToolProviderOutput {
+            value: Value::Null,
+            execution_context: None,
+            input_required: Some(harnx_core::tool::ToolInputRequired {
+                producer: format!(
+                    "tool:{}/{}",
+                    provenance.server_identity, provenance.tool_name
+                ),
+                key: input.key,
+                kind: input.kind,
+                message: input.message,
+                surface: input.surface,
+                summary: input.summary,
+                request_state: input.request_state,
+            }),
+        })
     }
 }
 

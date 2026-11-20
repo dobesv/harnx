@@ -182,6 +182,10 @@ pub enum SessionCommand {
             Result<harnx_runtime::interactions::InteractionDecisionOutcome, String>,
         >,
     },
+    SurfaceAction {
+        submission: harnx_runtime::surfaces::SurfaceActionSubmission,
+        reply: oneshot::Sender<Result<harnx_runtime::surfaces::SurfaceActionOutcome, String>>,
+    },
     Get {
         reply: oneshot::Sender<SessionInfo>,
     },

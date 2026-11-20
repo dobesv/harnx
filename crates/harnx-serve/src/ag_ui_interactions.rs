@@ -14,14 +14,18 @@ pub(crate) fn pending_value(entries: &[(u64, SessionLogEntry)]) -> Option<Value>
         }
     };
     let first = pending.first()?;
-    Some(json!({
+    let mut val = json!({
         "interaction_id": first.interaction_id,
         "request_seq": first.request_seq,
         "tool_call_id": first.tool_call_id,
         "kind": first.request.kind,
         "message": first.summary(),
         "pending_count": pending.len() - 1,
-    }))
+    });
+    if first.request.kind == "a2ui" && !first.request.payload.is_null() {
+        val["payload"] = first.request.payload.clone();
+    }
+    Some(val)
 }
 
 /// A null snapshot clears a previously displayed request after acceptance or cancellation.

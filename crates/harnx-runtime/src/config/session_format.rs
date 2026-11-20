@@ -429,6 +429,7 @@ mod tests {
             SessionLogEntry::ToolResults {
                 handoff_selection: None,
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("call-id".into()),
                     name: "read".into(),
                     output: json!({"content": [{"type": "text", "text": "line 1\nline 2"}]}),

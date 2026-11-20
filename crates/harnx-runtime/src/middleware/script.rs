@@ -20,6 +20,7 @@ pub(super) async fn execute(frame: &Arc<Frame>, entry: &ResolvedMiddleware) -> R
     let cancel = CancellationToken::new();
     let _cancel_on_drop = cancel.clone().drop_guard();
     let backend = BashKitBackend;
+    // qual:allow(dry, fragment) reason: "Interpreter admission mirrors the event-hook runner by design; extracting a constructor would couple middleware policy to lifecycle hooks."
     let run = backend.run(ScriptRequest {
         script: &script,
         limits: ScriptLimits {

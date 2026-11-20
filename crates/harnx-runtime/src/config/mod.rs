@@ -6,6 +6,7 @@ mod compaction;
 mod completion_split;
 mod env_identity;
 mod env_split;
+mod event_hooks;
 pub mod input;
 mod loader_split;
 pub mod lock;
@@ -38,6 +39,7 @@ mod tool_servers_split;
 pub(crate) use self::bash_declaration::{synthesize_bash_declaration, BASH_TOOL_NAME};
 pub(crate) use self::compaction::is_turn_prompt;
 pub use self::env_split::load_env_file;
+pub use self::event_hooks::{ResolvedEventHook, ResolvedEventHooks};
 pub use self::macros_split::macro_execute;
 pub use self::nats_split::{
     nats_routing_from_env, resolve_local_nats_server_config, NatsRouting, NatsServerConfig,
@@ -123,7 +125,7 @@ use crate::commands::{run_command, split_args_text};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::tool_selector::{is_glob, ToolSelector};
 use crate::utils::*;
-use harnx_hooks::HooksConfig;
+use harnx_core::hooks::HooksConfig;
 use harnx_rag::Rag;
 use harnx_render::{MarkdownRender, RenderOptions};
 
@@ -395,7 +397,7 @@ pub struct Config {
     pub tui_before_editor: Option<Box<dyn FnMut() + Send + Sync>>,
     pub tui_after_editor: Option<Box<dyn FnMut() + Send + Sync>>,
     /// Runtime-only override for tool-use confirmation prompts. When set (via
-    /// worker-side NATS message), a `PreToolUse` hook returning `ask` is
+    /// worker-side NATS message), tool-use confirmation requests are
     /// resolved through this callback instead of the default `inquire`
     /// terminal prompt, so confirmation renders as a native ratatui modal
     /// rather than fighting the alternate-screen TUI. `None` keeps the
@@ -667,7 +669,7 @@ impl Config {
                 return HooksConfig::merge(&global, agent_hooks);
             }
         }
-        global
+        *global
     }
 
     pub fn info(&self) -> Result<String> {
@@ -693,6 +695,7 @@ impl Config {
         }
     }
 
+    // qual:allow(complexity, max_function_lines=69) reason: "sysinfo is a single flat YAML dump of the effective config; splitting it per section would hurt greppability for operators."
     pub fn sysinfo(&self) -> Result<String> {
         let display_path = |path: &Path| path.display().to_string();
         let wrap = self
@@ -745,7 +748,11 @@ impl Config {
             ("messages_file", display_path(&self.messages_file())),
         ];
         if let Some(hooks) = &self.hooks {
-            items.push(("hooks", hooks.entries.len().to_string()));
+            let count = harnx_core::hooks::HookEventKind::ALL
+                .iter()
+                .map(|event| hooks.list(*event).entries.len())
+                .sum::<usize>();
+            items.push(("hooks", count.to_string()));
         }
         if let Some(settings) = harnx_core::logging::current() {
             items.push(("log_level", settings.level.to_string()));

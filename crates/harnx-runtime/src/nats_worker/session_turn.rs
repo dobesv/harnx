@@ -26,7 +26,6 @@ use std::sync::{
 pub(super) struct TurnWorker {
     pub cluster: String,
     pub instance_id: harnx_core::instance::ServerScope,
-    pub manage_servers: bool,
     pub activation_route: super::SessionActivationRoute,
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
     pub session_metadata: crate::nats_session_metadata::SessionMetadataStore,
@@ -43,7 +42,6 @@ impl From<&WorkerRuntime> for TurnWorker {
         Self {
             cluster: worker.cluster.clone(),
             instance_id: worker.instance_id.clone(),
-            manage_servers: worker.manage_servers,
             activation_route: worker.activation_route.clone(),
             call_fn: worker.call_fn.clone(),
             session_metadata: worker.session_metadata.clone(),
@@ -61,6 +59,8 @@ pub(super) struct SessionTurn {
     pub lease: Arc<NatsSessionLease>,
     pub abort_signal: crate::utils::AbortSignal,
     pub hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<AppliedHitlDecision>,
+    /// Control-handler/loop share: mid-turn surface notes and the running flag.
+    pub surface_actions: crate::surfaces::SurfaceActionQueue,
     pub per_session: GlobalConfig,
     pub backend: NatsSessionLogBackend,
     pub event_sink: Arc<NatsEventSink>,
@@ -425,12 +425,16 @@ impl SessionTurn {
             replicas: self.worker.replicas,
         };
         let on_tool_round = build_durable_tool_round_callback(injection, attachment_sync);
+        // Surface `note` actions push into the live loop's pending-context
+        // queue only while a turn is running; between turns the next turn's
+        // durable fold delivers them, so nothing is delivered twice.
+        self.surface_actions.set_turn_running(true);
         // Recovery and model/tool dispatch make this future large. Inline
         // construction and polling can exhaust a Tokio worker's debug stack.
         let outcome = Box::pin(run_agent_loop_with_nats_outcome(
             RunAgentLoopArgs {
+                surface_notes: Some(self.surface_actions.pending_context()),
                 cluster_key: &self.worker.cluster,
-                manage_servers: self.worker.manage_servers,
                 session_id: &self.activation.session_id,
                 config: self.per_session.clone(),
                 instance_id: self.worker.instance_id.clone(),
@@ -450,6 +454,9 @@ impl SessionTurn {
             .with_after_seq_observer(Arc::clone(&self.after_seq_observer)),
         ))
         .await?;
+        // Beyond this point no round is running; late surface notes rely on
+        // the next turn's durable fold instead of the live queue.
+        self.surface_actions.set_turn_running(false);
         // Compaction/title tasks can still append through the lease-fenced sink.
         // Wait before publishing TurnEnd or allowing ownership to be released.
         WorkerRuntime::wait_for_post_turn_maintenance(&self.per_session, &self.lease).await;

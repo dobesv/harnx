@@ -24,23 +24,20 @@ fn assert_malformed_result(result: &ToolResult) {
 #[tokio::test]
 async fn malformed_image_is_recoverable_and_keeps_valid_batch_siblings() {
     for names in [["bad", "good"], ["good", "bad"]] {
-        let ctx = test_context(
-            vec![
-                Arc::new(MockToolProvider::ok(
-                    "bad",
-                    Duration::ZERO,
-                    malformed_output(),
-                )),
-                Arc::new(MockToolProvider::ok(
-                    "good",
-                    Duration::ZERO,
-                    json!({
-                        "content": [{"type": "image", "mimeType": "image/jpeg", "data": "Zm9v"}]
-                    }),
-                )),
-            ],
-            |_| continue_hook_outcome(),
-        );
+        let ctx = test_context(vec![
+            Arc::new(MockToolProvider::ok(
+                "bad",
+                Duration::ZERO,
+                malformed_output(),
+            )),
+            Arc::new(MockToolProvider::ok(
+                "good",
+                Duration::ZERO,
+                json!({
+                    "content": [{"type": "image", "mimeType": "image/jpeg", "data": "Zm9v"}]
+                }),
+            )),
+        ]);
         let results = eval_tool_calls(
             &ctx,
             names.into_iter().map(test_call).collect(),
@@ -64,14 +61,11 @@ async fn malformed_image_is_recoverable_and_keeps_valid_batch_siblings() {
 
 #[tokio::test]
 async fn malformed_image_replay_preserves_diagnostic_without_hooks_or_dispatch() {
-    let ctx = test_context(
-        vec![Arc::new(MockToolProvider::ok(
-            "replay_only",
-            Duration::ZERO,
-            malformed_output(),
-        ))],
-        |_| panic!("replay must not repeat hooks"),
-    );
+    let ctx = test_context(vec![Arc::new(MockToolProvider::ok(
+        "replay_only",
+        Duration::ZERO,
+        malformed_output(),
+    ))]);
     let call = test_call("replay_only");
     let result = replay_tool_call(
         &ctx,
@@ -94,14 +88,11 @@ async fn malformed_image_replay_preserves_diagnostic_without_hooks_or_dispatch()
 #[tokio::test]
 async fn malformed_image_operator_result_stays_lossless() {
     let original = malformed_output();
-    let mut ctx = test_context(
-        vec![Arc::new(MockToolProvider::ok(
-            "bad",
-            Duration::ZERO,
-            original.clone(),
-        ))],
-        |_| continue_hook_outcome(),
-    );
+    let mut ctx = test_context(vec![Arc::new(MockToolProvider::ok(
+        "bad",
+        Duration::ZERO,
+        original.clone(),
+    ))]);
     ctx.allowed_tool_names.insert("bad".into());
     let result = eval_operator_tool_call(ctx, test_call("bad"), &create_abort_signal())
         .await

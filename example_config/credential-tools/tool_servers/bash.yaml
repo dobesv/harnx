@@ -1,0 +1,12 @@
+command: harnx-bash-tools
+description: Shell execution — lets agents run commands and scripts
+
+# Standalone bash tool server for credential-tools testing or custom deployments.
+# When opting into AWS or Kubernetes credentials in an existing package (such as
+# packages/coding or packages/pantheon), keep the existing bash.yaml and copy only
+# the relevant creds tool server and middleware files.
+
+args:
+  - --allow-common-default
+  - --allow-dev-tools
+  - --allow-repo-work

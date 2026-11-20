@@ -17,6 +17,7 @@ impl Tui {
     {
         self.sync_session_activity_monitor();
         self.sync_interaction_client();
+        self.sync_surface_client();
         terminal.draw(|frame| self.draw(frame))?;
         Ok(())
     }

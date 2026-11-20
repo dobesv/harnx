@@ -45,6 +45,63 @@ fn sample_interaction_request(seq: u64, round_seq: u64, id: &str) -> (u64, Sessi
     )
 }
 
+/// The deploy form from the middleware guide: a `ChoicePicker` and a
+/// `TextField` bound to the data model, answered through a `deploy` button.
+fn a2ui_surface() -> serde_json::Value {
+    json!({
+        "version": "1.0",
+        "createSurface": {
+            "dataModel": {"choice": [], "name": ""},
+            "components": [
+                {"id": "root", "component": "Card", "child": "col"},
+                {"id": "col", "component": "Column",
+                 "children": ["title", "choice", "name", "go_label", "go"]},
+                {"id": "title", "component": "Text", "text": "Pick a deployment target"},
+                {"id": "choice", "component": "ChoicePicker",
+                 "options": [{"label": "Staging", "value": "staging"},
+                             {"label": "Production", "value": "prod"}],
+                 "value": {"@path": "/choice"}},
+                {"id": "name", "component": "TextField", "label": "Release name",
+                 "value": {"@path": "/name"}},
+                {"id": "go_label", "component": "Text", "text": "Deploy"},
+                {"id": "go", "component": "Button", "child": "go_label",
+                 "action": {"event": {"name": "deploy"}}}
+            ]
+        }
+    })
+}
+
+fn a2ui_interaction_request(seq: u64, round_seq: u64, id: &str) -> (u64, SessionLogEntry) {
+    (
+        seq,
+        SessionLogEntry::InteractionRequested {
+            tool_round_seq: round_seq,
+            tool_call_id: "call-1".into(),
+            interaction_id: id.into(),
+            producer: "middleware:integration".into(),
+            step_path: vec![InteractionStep {
+                middleware: "integration".into(),
+                key: "form".into(),
+            }],
+            key: "form".into(),
+            kind: "a2ui".into(),
+            payload: a2ui_surface(),
+            summary: "Pick a deployment target".into(),
+            chain_version: "v1".into(),
+            checkpoint: "cp-int".into(),
+            fence_token: 100,
+        },
+    )
+}
+
+fn response(action: &str, data: serde_json::Value) -> InteractionResponse {
+    InteractionResponse {
+        action: action.into(),
+        data: data.as_object().cloned().unwrap_or_default(),
+        note: None,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interaction_acceptance_nats_lifecycle() -> Result<()> {
     require_nextest();
@@ -237,5 +294,107 @@ async fn assert_retries_until_complete(
         accept_interaction_response(backend, lease, "int-deploy", 2, response).await?,
         InteractionDecisionOutcome::AfterComplete
     );
+    Ok(())
+}
+
+/// Durable acceptance validates `a2ui` responses against the requested
+/// surface: the one check every frontend's answer passes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a2ui_response_validation_at_durable_acceptance() -> Result<()> {
+    require_nextest();
+    let fixture::AcceptanceFixture {
+        _server,
+        js,
+        backend,
+        lease,
+        log,
+    } = fixture::AcceptanceFixture::start().await?;
+    let _ = js;
+    let form_seq = log
+        .append_event_async(&a2ui_interaction_request(3, 1, "int-form").1)
+        .await?;
+    let mut manifest = SessionLogEntry::SuspensionReady {
+        tool_round_seq: 1,
+        pending: vec!["int-form".into()],
+        fence_token: lease.fence_token(),
+    };
+    log.append_event_async(&manifest).await?;
+
+    // Undeclared action and wrong data shape are rejected, nothing appended.
+    assert_eq!(
+        accept_interaction_response(
+            &backend,
+            &lease,
+            "int-form",
+            3,
+            &response("publish", json!({}))
+        )
+        .await?,
+        InteractionDecisionOutcome::InvalidResponse
+    );
+    assert_eq!(
+        accept_interaction_response(
+            &backend,
+            &lease,
+            "int-form",
+            3,
+            &response("deploy", json!({"bogus": 1}))
+        )
+        .await?,
+        InteractionDecisionOutcome::InvalidResponse
+    );
+    assert_eq!(
+        accept_interaction_response(
+            &backend,
+            &lease,
+            "int-form",
+            3,
+            &response("deploy", json!({"choice": ["canary"]}))
+        )
+        .await?,
+        InteractionDecisionOutcome::InvalidResponse
+    );
+    let entries = log.load_events_async().await?;
+    assert!(
+        !entries
+            .iter()
+            .any(|(_, entry)| matches!(entry, SessionLogEntry::InteractionResponse { .. })),
+        "rejected responses must not append"
+    );
+
+    // A declared action with consistent data is applied, retried idempotently.
+    let valid = response("deploy", json!({"choice": ["staging"], "name": "rel-1"}));
+    assert_eq!(
+        accept_interaction_response(&backend, &lease, "int-form", form_seq, &valid).await?,
+        InteractionDecisionOutcome::Applied
+    );
+    assert_eq!(
+        accept_interaction_response(&backend, &lease, "int-form", form_seq, &valid).await?,
+        InteractionDecisionOutcome::AlreadyApplied
+    );
+
+    // Deny is dismissal: accepted whatever a frontend echoes in `data`.
+    let cancel_seq = log
+        .append_event_async(&a2ui_interaction_request(4, 1, "int-cancel").1)
+        .await?;
+    if let SessionLogEntry::SuspensionReady {
+        ref mut pending, ..
+    } = manifest
+    {
+        *pending = vec!["int-cancel".into()];
+    }
+    log.append_event_async(&manifest).await?;
+    assert_eq!(
+        accept_interaction_response(
+            &backend,
+            &lease,
+            "int-cancel",
+            cancel_seq,
+            &response("deny", json!({"choice": ["prod"]}))
+        )
+        .await?,
+        InteractionDecisionOutcome::Applied
+    );
+
     Ok(())
 }

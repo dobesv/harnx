@@ -177,3 +177,65 @@ fn remote_follow_finishes_attachment_at_ready_interaction_not_at_request() {
         Some(1)
     );
 }
+
+#[test]
+fn pending_interaction_includes_payload_for_a2ui_kind_only() {
+    let a2ui_payload = json!({
+        "version": "1.0",
+        "createSurface": {
+            "surfaceId": "surf-1",
+            "components": [
+                { "id": "root", "component": "Card", "child": "btn" },
+                { "id": "label", "component": "Text", "text": "Click" },
+                { "id": "btn", "component": "Button", "child": "label", "action": { "event": { "name": "click" } } }
+            ]
+        }
+    });
+
+    let entries = vec![
+        (
+            1,
+            SessionLogEntry::ToolCalls {
+                text: String::new(),
+                thought: None,
+                timestamp: None,
+                fence_token: None,
+                calls: vec![ToolCall::new(
+                    "tool_1".into(),
+                    json!({}),
+                    Some("tool_1".into()),
+                    None,
+                )],
+            },
+        ),
+        (
+            2,
+            SessionLogEntry::InteractionRequested {
+                tool_round_seq: 1,
+                tool_call_id: "tool_1".into(),
+                interaction_id: "a2ui_int".into(),
+                producer: "middleware:interact".into(),
+                step_path: vec![],
+                key: "1".into(),
+                kind: "a2ui".into(),
+                payload: a2ui_payload.clone(),
+                summary: "Form summary".into(),
+                chain_version: "v1".into(),
+                checkpoint: "private".into(),
+                fence_token: 1,
+            },
+        ),
+        (
+            3,
+            SessionLogEntry::SuspensionReady {
+                tool_round_seq: 1,
+                pending: vec!["a2ui_int".into()],
+                fence_token: 1,
+            },
+        ),
+    ];
+
+    let val = pending_value(&entries).expect("pending value");
+    assert_eq!(val["kind"], "a2ui");
+    assert_eq!(val["payload"], a2ui_payload);
+}

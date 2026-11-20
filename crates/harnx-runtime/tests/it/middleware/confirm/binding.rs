@@ -54,8 +54,8 @@ respond({'output': {'answer': response, 'unanswered': answer('missing')}, 'is_er
         let mut harness = Harness::new(vec![entry]).await;
         let request = pending(harness.attempt(arguments.clone()).await);
         harness.accept(&request, "deny");
-        harness.store.responses[0]
-            .response
+        harness
+            .last_response_mut()
             .data
             .insert("source".into(), json!("human"));
         let result = completed(harness.attempt(arguments.clone()).await);
@@ -104,7 +104,7 @@ async fn middleware_confirm_rejects_response_with_tampered_binding() {
     let mut harness = Harness::new(vec![bash(super::BASH_DECISION)]).await;
     let request = pending(harness.attempt(json!({})).await);
     harness.accept(&request, "approve");
-    harness.store.responses[0].request.payload["createSurface"]["components"][0]["text"] =
+    harness.last_request_payload_mut()["createSurface"]["components"][0]["text"] =
         json!("Tampered");
     let again = pending(harness.attempt(json!({})).await);
     assert_eq!(
@@ -120,7 +120,7 @@ async fn middleware_confirm_checkpoint_round_session_and_chain_are_bound() {
         let mut harness = Harness::new(vec![bash(super::BASH_DECISION)]).await;
         let request = pending(harness.attempt(json!({})).await);
         harness.accept(&request, "approve");
-        let state = &mut harness.store.checkpoint.as_mut().unwrap().state;
+        let state = &mut harness.checkpoint_mut().unwrap().state;
         state[field] = if field == "tool_round_seq" {
             json!(99)
         } else {

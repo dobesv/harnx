@@ -478,8 +478,8 @@ remotes:
 
 ## Interactive tool approval
 
-When a tool requires confirmation (for example, a `PreToolUse` hook returns
-`permissionDecision: ask`), the task pauses at `TASK_STATE_INPUT_REQUIRED`.
+When a tool requires confirmation (for example, middleware calls `confirm`),
+the task pauses at `TASK_STATE_INPUT_REQUIRED`.
 Its agent status message contains a plain-text Markdown challenge with the tool
 name, persisted JSON arguments (truncated above 8 KiB), and approval reason.
 Blocking `SendMessage` returns at this boundary. `SendStreamingMessage` and
@@ -511,10 +511,10 @@ The first whitespace-delimited word selects the decision, case-insensitively:
 Trailing `.`, `!`, and `,` on the first word are accepted (`Y!`, `no.`).
 The rest is an optional note. Approval notes are **audit-only**, not new messages
 to the model. Rejection notes are **model-visible** in the blocked-tool result.
-Only text parts are accepted as decisions. Data parts, mixed text/data messages,
-and unrecognized words such as `yesterday` return the challenge and reply
-instructions without adding agent context, calling the model, or deciding anything.
-There is no A2UI or structured JSON approval format.
+For confirmations, only text parts are accepted as decisions. Data parts, mixed
+text/data messages, and unrecognized words such as `yesterday` return the challenge
+and reply instructions without adding agent context, calling the model, or deciding
+anything. Forms requested by `interact` use the [A2UI answer format](#a2ui-form-interactions) below.
 
 For example, reply using values returned by the challenge:
 
@@ -565,8 +565,89 @@ remains of the original invocation budget. See
 [publisher segments and frozen deadlines](src/runner/README.md#hitl-publisher-segments)
 and the [tool confirmation guide](../../docs/tool-confirmation-guide.md).
 
+## A2UI form interactions
+
+Middleware `interact` forms use the same `TASK_STATE_INPUT_REQUIRED` boundary,
+original invocation, and exact-request receipt binding as confirmations. Only the
+pending head is shown, after `SuspensionReady`. Agent Cards advertise
+`application/a2ui+json` in input and output modes. The status message has two parts:
+
+- A TextPart from `harnx_core::interaction::text::render`, with form text, options,
+  inputs, and available actions.
+- A DataPart with `mediaType: "application/a2ui+json"` and `data` equal to the
+  pending A2UI v1.0 `createSurface` envelope, including its runtime-stamped
+  `surfaceId`. **A2A 1.0 uses `mediaType`, not MCP's `mimeType`.**
+
+Reply with one DataPart or text only, not mixed parts. A structured reply follows
+[A2UI v1.0's action envelope](https://github.com/a2ui-project/a2ui/blob/07735d6a654ae3ba25951a8753ddd57b344b1169/specification/v1_0/json/renderer_to_agent.json):
+exactly `version` and `action` at the root; all five required action fields
+(`name`, `surfaceId`, `sourceComponentId`, RFC3339 `timestamp`, `context`). Use
+`action.metadata.extensions.harnx_response` for input `data` and optional `note`.
+The underscore is deliberate: extension keys must be Unicode identifiers.
+
+For the deployment form in the [middleware guide](../../docs/middleware-guide.md#interact-a2ui-surfaces),
+a `SendMessage` or `SendStreamingMessage` parameter object looks like:
+
+```json
+{
+  "message": {
+    "messageId": "form-answer-1",
+    "role": "ROLE_USER",
+    "contextId": "<returned contextId>",
+    "taskId": "<returned taskId>",
+    "parts": [{
+      "mediaType": "application/a2ui+json",
+      "data": {
+        "version": "1.0",
+        "action": {
+          "name": "deploy",
+          "surfaceId": "<surfaceId from the challenge>",
+          "sourceComponentId": "submit",
+          "timestamp": "2026-06-30T12:00:00Z",
+          "context": {"choice": ["prod"], "name": "rel-1"},
+          "metadata": {
+            "extensions": {
+              "harnx_response": {
+                "data": {"choice": ["prod"], "name": "rel-1"},
+                "note": "Release approved"
+              }
+            }
+          }
+        }
+      }
+    }]
+  }
+}
+```
+
+`name` must match a Button event declared by `sourceComponentId`, and `surfaceId`
+must match the pending surface. Extension `data` contains **input values**, not
+pre-resolved action context. Keys are binding pointers without the leading `/`
+(`/a/b` becomes `a/b`). ChoicePicker values are arrays of option **values**;
+TextField values are strings, including spaces. Missing inputs use the surface's
+`dataModel`, then empty defaults. The server rebuilds canonical response data
+with shared `build_data`, resolving declared context itself rather than trusting
+client `action.context`. Extension `data` and `note` are optional.
+
+For text fallback, send `parts: [{"text": "deploy choice=prod name=rel-1"}]`.
+The shared parser accepts `<action> [key=value ...]`; actions may also use an
+unambiguous button label. Picker options accept values or labels, comma-separated
+for multi-select. TextField values cannot contain whitespace in text replies;
+use a DataPart when needed. Text replies have no note field. Both forms produce
+identical canonical `InteractionResponse.data` for identical input values.
+
+`deny` dismisses the form with empty data. Send text `deny`, or a structured
+action named `deny` with the required envelope fields (no declared button is
+needed for dismissal). Malformed replies, undeclared actions, wrong input types,
+and bad picker options return `INPUT_REQUIRED` with a visible `Reply rejected:`
+correction and the same surface. Nothing is journaled or applied. Correct and
+resubmit with a new `messageId`. Retry an accepted answer with its original ID;
+that receipt can never answer a later form. Structured replies aren't prompts
+and aren't forwarded to the model. Confirmation yes/no behavior is unchanged.
+
 ## Limitations
 
+- **Non-modal surfaces not rendered**: A2A supports modal A2UI forms that suspend execution via `TASK_STATE_INPUT_REQUIRED`. It does not render or accept actions for non-modal user-audience surfaces (`ToolResult.user_surfaces`). A2A has no out-of-band user channel: task messages are model-facing turn inputs (which would leak user surfaces to model text), and `TASK_STATE_INPUT_REQUIRED` is turn-suspending by design. Non-modal surfaces are excluded from the A2A stream, allowing the task to run uninterrupted. Users can inspect and act on published surfaces using the Web UI, TUI, or CLI (`harnx surface list|act`) for the same session.
 - **Multi-replica routing**: Shared admission, ownership, cancellation and streaming work through any backend without sticky sessions. Drain old turns and exclude mixed writers when upgrading; deploy runtime readers before `admission_closed` writers. See [operations](../../docs/a2a-operations.md). Recovery is eventual and TTL-based, not a fixed failover SLO. Interrupted work is never replayed and tool side effects aren't rolled back.
 - **No push notifications**: Push notification methods (`CreateTaskPushNotificationConfig`, etc.) return `PushNotificationNotSupportedError` (`-32003`). `capabilities.pushNotifications` is set to `false`.
 - **Anonymous mode lacks isolation**: When `--user-id-header` is not configured, all requests operate as a single anonymous principal. Any client reaching the endpoint can access or resume sessions.

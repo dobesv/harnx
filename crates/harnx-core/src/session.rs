@@ -127,6 +127,28 @@ pub enum SessionLogEntry {
         response: crate::interaction::InteractionResponse,
         fence_token: u64,
     },
+    /// First-wins user action on a published non-modal A2UI surface (plan
+    /// T5.1). Identity is `(surface_id, publish_seq)` naming the `ToolResults`
+    /// entry that published the surface. `visibility` is the action's
+    /// effective visibility (`invisible`/`note`/`turn`); `note_text` is the
+    /// passive context line delivered to the model at its next call when
+    /// visibility is `note`. Control entries never become model context.
+    #[serde(rename = "surface_action")]
+    SurfaceAction {
+        surface_id: String,
+        publish_seq: u64,
+        action: String,
+        #[serde(default)]
+        data: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_message: Option<String>,
+        visibility: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note_text: Option<String>,
+        fence_token: u64,
+    },
     #[serde(rename = "data_urls")]
     DataUrls { urls: HashMap<String, String> },
     #[serde(rename = "compress")]
@@ -395,6 +417,10 @@ pub struct ToolOutput {
     pub markdown: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<crate::message::MessageContentPart>,
+    /// User-audience A2UI surfaces carried by this completed result. Never
+    /// projected into model input; frontends render them alongside the chat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_surfaces: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_agent: Option<SwitchAgentData>,
 }

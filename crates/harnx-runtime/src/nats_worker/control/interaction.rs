@@ -38,28 +38,8 @@ impl SessionControlHandler {
         }
         // A stale subscriber must not beat the current lease holder's reply.
         if outcome != InteractionDecisionOutcome::LeaseLost {
-            self.reply_interaction_outcome(reply, &outcome).await;
-        }
-    }
-
-    async fn reply_interaction_outcome(
-        &self,
-        reply: Option<async_nats::Subject>,
-        outcome: &InteractionDecisionOutcome,
-    ) {
-        let Some(reply) = reply else {
-            return;
-        };
-        let result = async {
-            self.client
-                .publish(reply, serde_json::to_vec(outcome)?.into())
-                .await?;
-            self.client.flush().await?;
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        if let Err(error) = result {
-            log::warn!("failed to reply to interaction decision: {error:#}");
+            self.publish_control_reply(reply, &outcome, "interaction decision")
+                .await;
         }
     }
 }

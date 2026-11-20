@@ -1,97 +1,76 @@
-# harnx-aws-creds
+# AWS credentials for bash tools
 
-`harnx-aws-creds` is a persistent hook that injects AWS credentials into sandboxed processes. It runs as a sidecar alongside `harnx-bash-tools` or `harnx-sandbox-run`, resolving credentials from the host and making them available inside the sandbox without mounting `~/.aws` or leaking raw key material.
+`harnx-aws-creds` lets sandboxed AWS clients use the host's AWS credential provider without mounting `~/.aws`. Run it beside `harnx-bash-tools`, then use in-process middleware to inject a local credential endpoint before `bash_exec` and `bash_spawn`.
 
-## The Problem It Solves
+Authorized child processes can retrieve actual AWS credentials from this endpoint. This keeps source credentials out of ambient child environment variables; it does not hide credentials from an authorized AWS client.
 
-The birdcage sandbox blocks access to `~/.aws`, and the bash toolset server strips `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` from the child environment by default (they're not in the allowlist). Without `harnx-aws-creds`, any AWS CLI or SDK call inside the sandbox fails with "no credentials found".
+## Enable the tool service
 
-## How It Works
+Neither credential service is enabled in shipped packages. Copy these opt-in example files into your active package, keeping their relative paths:
 
-1. **Resolves credentials on the host** using the standard [AWS credential chain](https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html): environment variables → `~/.aws/credentials` → `~/.aws/config` profiles → IAM instance role → SSO → etc.
-2. **Starts a local HTTP server** on `127.0.0.1:<random-port>` implementing the [AWS container credentials protocol](https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html). This is a standard protocol all AWS SDKs support natively.
-3. **Injects three environment variables** into every `bash_exec`/`bash_spawn` tool call via the hook's `PreToolUse` mutation:
-   - `AWS_CONTAINER_CREDENTIALS_FULL_URI` — URL of the local server (`http://127.0.0.1:<port>/creds`)
-   - `AWS_CONTAINER_AUTHORIZATION_TOKEN` — a per-session UUID bearer token
-   - `AWS_REGION` — the region resolved from config
+- [`tool_servers/aws_creds.yaml`](../example_config/credential-tools/tool_servers/aws_creds.yaml)
+- [`middleware/aws-creds.py`](../example_config/credential-tools/middleware/aws-creds.py)
 
-When the sandboxed process calls any AWS SDK, the SDK fetches credentials from the local server. The sandbox process never sees `~/.aws` or raw `AWS_ACCESS_KEY_ID` values — it only knows the loopback URL.
+Keep your existing `bash.yaml`. AWS can be enabled without Kubernetes. Optionally add `--profile my-profile` to the service's `args`; otherwise the AWS SDK uses its standard credential chain, including host environment variables, profiles, SSO and role providers.
 
-## Installation
+The YAML starts `harnx-aws-creds --tool-server` and declares middleware matching `^bash_(exec|spawn)$`. The stage calls `aws_creds_environment {}`, merges its `env` over the caller's matching keys, then calls `next`. Unrelated caller keys survive. This preserves the old AWS hook's overwrite behavior, unlike proxy-auth's caller-wins policy. Missing/null `env` means `{}`; non-object `env`, helper failures and malformed helper replies deny the call.
+
+The exact YAML and Python files above are loaded by runtime integration tests for managed and independently deployed services. The tests run both exec and spawn, check precedence and credential refresh, and use a local fixture provider rather than live AWS credentials.
+
+## Tool API and credential lifetime
+
+The toolset is `aws_creds`; its bare tool is `environment`. It accepts only `{}` and returns:
+
+```json
+{
+  "env": {
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:<port>/creds",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN": "<capability>",
+    "AWS_REGION": "<resolved-region>"
+  },
+  "filesystem": {}
+}
+```
+
+The three AWS keys above replace matching caller values. Other credential sources, including explicit caller `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, aren't cleared; the client's provider precedence still applies. Remove conflicting sources when you want the client to use this endpoint. The tool returns no raw access key, secret key or session token. AWS provisions no files; `filesystem` is empty.
+
+The loopback listener and random capability token stay valid for the tool service's lifetime. AWS SDKs and the AWS CLI fetch credentials from `/creds` on demand, sending the capability token directly as the `Authorization` header (no `Bearer ` prefix). The HTTP handler asks the existing AWS SDK provider for credentials on each request. Expiring provider credentials can refresh without restarting either tool server or changing middleware.
+
+The host provider controls credential scope and expiry. Static host credentials can be returned without an expiration; this service doesn't turn them into short-lived credentials. Protect the capability, returned credentials and command output/logs accordingly.
+
+## Deployment requirements
+
+Both native services must share a network namespace because the credential endpoint binds `127.0.0.1:<random-port>`. The supplied package's local managed supervisor starts them on the same host. If bash runs in another container, remote tool host or Kubernetes sandbox, arrange the shared loopback namespace yourself; NATS connectivity alone isn't enough.
+
+For unmanaged deployment, use the same `HARNX_NATS_URL`, `HARNX_NATS_TOKEN` and `HARNX_SERVER_SCOPE` as the worker. Set `HARNX_SERVER_PACKAGE` to the loaded package name; set `HARNX_SERVER_CONFIG` and `--name` to each service's YAML basename (`aws_creds` or `bash`). Set `HARNX_PACKAGE_DIR` to the package directory on that host. The worker executing middleware may be remote. See [configuration](configuration-guide.md) for tool server setup.
+
+No AWS filesystem sharing is required. Only Kubernetes needs access to a generated kubeconfig.
+
+## Transports and flags
+
+Install with `cargo install --path crates/harnx-aws-creds`, or use the binary included in Harnx releases and Docker images.
+
+| Flag | Purpose |
+|------|---------|
+| `--profile <NAME>` | Select host AWS profile |
+| `--tool-server` | Optional legacy compatibility flag; tool server mode is default |
+| `--mcp-stdio` | MCP stdio instead of NATS |
+| `--mcp-http` | MCP Streamable HTTP instead of NATS |
+| `--host <HOST>` | MCP HTTP bind host, default `0.0.0.0`; requires `--mcp-http` |
+| `--port <PORT>` | MCP HTTP port, default `3010`; requires `--mcp-http` |
+| `--name <NAME>` | Override toolset registration name |
+| `--enable-tool <GLOB>` | Repeatable tool filter, e.g. `environment` |
+
+Metrics and healthz flags use the shared native server implementation. The MCP HTTP listener is separate from the loopback credential endpoint; expose it only on a trusted interface.
+
+## Standalone sandbox-run usage
+
+`harnx-sandbox-run` runs `harnx-aws-creds` directly via native MCP stdio environment hooks:
 
 ```bash
-cargo install harnx-aws-creds
+harnx-sandbox-run \
+  --hook environment harnx-aws-creds --profile my-profile \; \
+  -- aws s3 ls
 ```
 
-## Usage
-
-### With `harnx-sandbox-run`
-
-```bash
-# Default credential chain (env vars, ~/.aws default profile, IAM role, SSO, etc.)
-harnx-sandbox-run --hook claude-command-persistent harnx-aws-creds \; -- aws s3 ls
-
-# Specific named profile from ~/.aws/config
-harnx-sandbox-run --hook claude-command-persistent harnx-aws-creds --profile my-profile \; -- aws s3 ls
-```
-
-### With `harnx-bash-tools` (via agent config)
-
-In your agent's YAML config:
-
-```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --matcher "bash_exec|bash_spawn"
-        --persistent
-        -- harnx-aws-creds
-```
-
-With a specific profile:
-
-```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --matcher "bash_exec|bash_spawn"
-        --persistent
-        -- harnx-aws-creds --profile my-profile
-```
-
-## CLI Reference
-
-```text
-harnx-aws-creds [OPTIONS]
-
-Options:
-  --profile <PROFILE>  AWS profile name to use (default: standard credential chain)
-  -h, --help           Print help
-```
-
-### `--profile`
-
-Selects a named profile from `~/.aws/config` or `~/.aws/credentials`. Equivalent to setting `AWS_PROFILE=<name>` on the host before running the hook, but scoped to this hook process only.
-
-If omitted, the AWS SDK default credential chain applies:
-1. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` env vars on the host
-2. `[default]` profile in `~/.aws/credentials` and `~/.aws/config`
-3. IAM instance/task/pod role (EC2, ECS, EKS)
-4. AWS SSO (`aws sso login`)
-5. Process credentials provider
-6. Web identity token
-
-## Security Notes
-
-- The HTTP server binds to **loopback only** (`127.0.0.1`), never to `0.0.0.0`
-- The bearer token is a **random UUID generated per session** — it changes every time `harnx-aws-creds` starts
-- Credentials are fetched on-demand from the provider, so short-lived credentials (STS, SSO) are refreshed automatically
-- `~/.aws` is never mounted into the sandbox — the credential files remain inaccessible to the sandboxed process
-
-## Relationship to `harnx-bash-tools`
-
-When `harnx-bash-tools` runs a command in the sandbox, it strips most environment variables (including `AWS_*`) from the child process to prevent accidental credential leakage. `harnx-aws-creds` is the approved re-injection path: it uses the hook mechanism to add only the container credential protocol variables, which point to a localhost proxy rather than exposing raw keys.
+The hook type `environment` launches the tool service over MCP stdio, queries its `environment` tool, injects the credential endpoint variables into the sandbox, and holds the service process alive for the duration of the command. See [sandbox-run](sandbox-run.md) and the [opt-in example package](../example_config/credential-tools/README.md).

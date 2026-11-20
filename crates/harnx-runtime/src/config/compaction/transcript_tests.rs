@@ -167,6 +167,7 @@ fn all_three_tool_tiers_strip_before_truncating_so_tails_do_not_leak() {
     ];
     for (output, expected_limit) in cases {
         let out = ToolOutput {
+            user_surfaces: Vec::new(),
             id: None,
             name: "read".into(),
             output,

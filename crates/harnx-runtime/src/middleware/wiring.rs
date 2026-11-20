@@ -97,16 +97,34 @@ fn callback(chain: Arc<Chain>) -> Arc<ToolMiddlewareFn> {
                 .await;
             let terminal = invocation.terminal.lock().take();
             let mut outcome = terminal.unwrap_or(outcome)?;
-            if let harnx_engine::tool::ToolMiddlewareOutcome::InputRequired { checkpoint, .. } =
-                &mut outcome
-            {
-                *checkpoint = invocation
-                    .resume
-                    .lock()
-                    .checkpoint()
-                    .map_err(ToolError::Recoverable)?;
-            }
+            merge_frame_checkpoint(&mut outcome, &invocation)?;
             Ok(outcome)
         })
     })
+}
+
+/// A tool challenge's checkpoint (T4.3) carries the tool's request state;
+/// the chain's frames carry the middleware stash. Keep both: the leaf built
+/// the tool state, the invocation owns the frames. Middleware-produced
+/// suspensions already carry their frames and pass through unchanged.
+fn merge_frame_checkpoint(
+    outcome: &mut harnx_engine::tool::ToolMiddlewareOutcome,
+    invocation: &Arc<Invocation>,
+) -> Result<(), ToolError> {
+    if let harnx_engine::tool::ToolMiddlewareOutcome::InputRequired { checkpoint, .. } = outcome {
+        let tool_request_state = checkpoint
+            .state
+            .get("tool_request_state")
+            .cloned()
+            .filter(|state| !state.is_null());
+        *checkpoint = invocation
+            .resume
+            .lock()
+            .checkpoint()
+            .map_err(ToolError::Recoverable)?;
+        if let Some(state) = tool_request_state {
+            checkpoint.state["tool_request_state"] = state;
+        }
+    }
+    Ok(())
 }

@@ -105,10 +105,7 @@ impl Publisher {
         self.sync_suspension_output(pending.request_seq).await?;
         let request =
             pending.approval_ref(self.authority.ticket(&self.storage_key)?.invocation_id());
-        let challenge = status(
-            TaskState::InputRequired,
-            Some(&crate::hitl::interaction::render_challenge(&self.session, pending).await?),
-        );
+        let challenge = crate::hitl::interaction::challenge_status(&self.session, pending).await?;
         let commit_id = format!(
             "{}:hitl:{}:input-required",
             self.record().task.id,

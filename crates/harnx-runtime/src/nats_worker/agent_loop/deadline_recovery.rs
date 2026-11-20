@@ -71,6 +71,7 @@ async fn saved_recovery_outputs(
                     output: result.output,
                     markdown: result.markdown,
                     content: result.content,
+                    user_surfaces: result.user_surfaces,
                     switch_agent,
                 })
             }
@@ -162,6 +163,7 @@ async fn recover_child_reply(
     let was_cancelled =
         harnx_core::session_reconstruct::prompt_interrupted_at(&entries, prompt).is_some();
     Ok(Some(harnx_toolset::ToolReply {
+        input_required: None,
         call_id: record.request.call_id.clone(),
         final_progress: None,
         result: Ok(

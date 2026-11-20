@@ -460,8 +460,8 @@ async fn direct_turn(
     );
     input.skip_user_log_append = replay;
     run_agent_loop_with_nats(RunAgentLoopArgs {
+        surface_notes: None,
         cluster_key: "local",
-        manage_servers: false,
         session_id: &storage_key("timing-recovery"),
         config,
         instance_id: harnx_core::instance::ServerScope::new(),

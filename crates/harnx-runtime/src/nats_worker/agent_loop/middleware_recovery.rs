@@ -102,7 +102,12 @@ pub(super) async fn reconcile(
     }
     let entries = backend.load_events_latest_async().await?;
     let decisions = legacy_decisions(&entries, orphan.seq);
-    Ok(Some(round_continuation(orphan, decisions)))
+    let legacy_request_ids = managed.into_iter().map(str::to_owned).collect();
+    Ok(Some(round_continuation(
+        orphan,
+        decisions,
+        legacy_request_ids,
+    )))
 }
 
 async fn recover_legacy_slot(

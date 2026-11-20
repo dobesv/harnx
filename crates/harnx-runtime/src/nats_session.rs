@@ -70,6 +70,7 @@ pub use hitl::{
 pub mod interrupt;
 mod prompt_append;
 mod steering;
+mod surface_action;
 pub use compaction_request::{request_compaction_session, CompactSubmit, CompactionRequest};
 pub use completion::completed_subagent_progress;
 pub mod fixed_admission;
@@ -1361,38 +1362,6 @@ impl NatsSession {
         self.run_turn_content(content, event_sink, pending_cancel, None, options)
             .await
     }
-    /// Run a text turn while routing `PreToolUse` approval requests from the
-    /// worker to an interactive frontend.
-    pub async fn run_turn_with_tool_confirmation(
-        &self,
-        user_message: &str,
-        event_sink: Arc<dyn AgentEventSink>,
-        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
-        handler: Arc<crate::nats_tool_confirmation::ToolConfirmationHandler>,
-    ) -> Result<NatsTurnResult> {
-        let route = self.tool_confirmation_route(handler).await?;
-        self.run_turn_with_tool_confirmation_route(user_message, event_sink, pending_cancel, &route)
-            .await
-    }
-
-    /// Run a text turn through an existing frontend-scoped confirmation route.
-    pub async fn run_turn_with_tool_confirmation_route(
-        &self,
-        user_message: &str,
-        event_sink: Arc<dyn AgentEventSink>,
-        pending_cancel: Option<tokio::sync::mpsc::Receiver<()>>,
-        route: &crate::nats_tool_confirmation::ToolConfirmationRoute,
-    ) -> Result<NatsTurnResult> {
-        self.run_turn_content(
-            MessageContent::Text(user_message.to_string()),
-            event_sink,
-            pending_cancel,
-            Some(route.subject()),
-            RunTurnOptions::default(),
-        )
-        .await
-    }
-
     /// Run a turn from an already-composed input. Inline and local attachment
     /// references are uploaded to JetStream before the user message is logged.
     pub async fn run_turn_input(
@@ -1883,7 +1852,8 @@ fn render_log_entry_to_sink(
         | SessionLogEntry::ToolCallCompleted { .. }
         | SessionLogEntry::InteractionRequested { .. }
         | SessionLogEntry::SuspensionReady { .. }
-        | SessionLogEntry::InteractionResponse { .. } => false,
+        | SessionLogEntry::InteractionResponse { .. }
+        | SessionLogEntry::SurfaceAction { .. } => false,
         SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Compress { .. }
         | SessionLogEntry::TurnEnd { .. }
@@ -2863,6 +2833,7 @@ mod tests {
         let entry = SessionLogEntry::ToolResults {
             handoff_selection: None,
             results: vec![ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some("test".to_string()),
                 name: "echo".to_string(),
                 output: serde_json::json!({"result": "ok"}),

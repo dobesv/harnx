@@ -152,14 +152,47 @@ async fn append_crash_decision(
     request: &ApprovalRef,
     before: &ContextSnapshot,
 ) -> Result<()> {
-    NatsSessionLog::new(t.h.jetstream.clone(), session.storage_key())
-        .append_event_async(&SessionLogEntry::HitlApprovalDecision {
-            tool_call_id: request.tool_call_id.clone(),
-            approved: true,
-            note: None,
-            fence_token: 1,
-        })
+    let entries = NatsSessionLog::new(t.h.jetstream.clone(), session.storage_key())
+        .load_events_latest_required_async()
         .await?;
+    let interaction = entries.iter().find_map(|(seq, e)| match e {
+        SessionLogEntry::InteractionRequested {
+            interaction_id,
+            tool_round_seq,
+            tool_call_id,
+            ..
+        } if *seq == request.request_seq
+            && *tool_round_seq == request.tool_round_seq
+            && *tool_call_id == request.tool_call_id =>
+        {
+            Some(interaction_id.clone())
+        }
+        _ => None,
+    });
+    if let Some(interaction_id) = interaction {
+        NatsSessionLog::new(t.h.jetstream.clone(), session.storage_key())
+            .append_event_async(&SessionLogEntry::InteractionResponse {
+                request_seq: request.request_seq,
+                interaction_id,
+                tool_call_id: request.tool_call_id.clone(),
+                response: harnx_core::interaction::InteractionResponse {
+                    action: "approve".into(),
+                    data: Default::default(),
+                    note: None,
+                },
+                fence_token: 1,
+            })
+            .await?;
+    } else {
+        NatsSessionLog::new(t.h.jetstream.clone(), session.storage_key())
+            .append_event_async(&SessionLogEntry::HitlApprovalDecision {
+                tool_call_id: request.tool_call_id.clone(),
+                approved: true,
+                note: None,
+                fence_token: 1,
+            })
+            .await?;
+    }
     seed_following(t, session, before).await?;
     Ok(())
 }

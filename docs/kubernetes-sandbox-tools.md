@@ -37,7 +37,7 @@ putting only the stateful execution boundary in the sandbox.
 
 The gateway is an independently deployed native tool server. Give it and every
 worker the same `HARNX_SERVER_SCOPE`, NATS connection variables, and JetStream
-replica count as described in [NATS HA deployment](nats-ha.md#independently-deployed-tool-and-hook-servers).
+replica count as described in [NATS HA deployment](nats-ha.md#independently-deployed-tool-servers).
 The process publishes three registrations (`bash`, `fs`, and `sandbox`) and is
 ready only after all three are visible.
 

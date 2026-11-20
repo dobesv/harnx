@@ -48,7 +48,7 @@ struct Cli {
     /// exit without serving sessions.
     #[arg(long)]
     diagnose: bool,
-    /// Launch this worker's tool and hook servers as child processes instead of
+    /// Launch this worker's tool servers as child processes instead of
     /// discovering independently deployed ones. Local runs set this; cloud
     /// deployments leave it off and supply HARNX_SERVER_SCOPE.
     #[arg(long)]

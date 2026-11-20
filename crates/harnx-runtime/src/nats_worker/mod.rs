@@ -37,10 +37,6 @@ mod daemon_runtime;
 mod daemon_session_exec;
 mod daemon_turn_input;
 mod diagnostics;
-mod hook_crash;
-mod hook_process;
-mod hook_registration;
-mod hook_supervisor;
 mod operator_tools;
 mod remote_cleanup;
 pub mod server_reconciler;
@@ -91,10 +87,7 @@ mod wind_up_tests;
 // Re-export test-only items for integration tests
 pub use agent_loop::derive_attention_seq;
 pub(crate) use agent_loop::derive_pending_hitl_approvals;
-pub use agent_loop::{
-    reconcile_hook_supervisor, run_agent_loop_with_nats, run_agent_loop_with_nats_inner,
-    RunAgentLoopArgs,
-};
+pub use agent_loop::{run_agent_loop_with_nats, run_agent_loop_with_nats_inner, RunAgentLoopArgs};
 pub use backend::{FencedSessionLogSink, NatsSessionLogBackend};
 pub use control::{
     control_subject, publish_control_command, request_control_command, ControlCommand,
@@ -112,9 +105,6 @@ pub use daemon::{
 pub use daemon_background::start_local_tool_servers_for_test;
 pub use daemon_runtime::MAX_ACTIVATION_DELIVERIES;
 pub use diagnostics::diagnose_tool_servers;
-#[doc(hidden)]
-pub use hook_crash::{publish_crash_rejector, RejectorTarget};
-pub use hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 pub use tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};
 
 mod execution_control;

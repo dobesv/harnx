@@ -49,6 +49,7 @@ pub(super) async fn repair_single_orphan(
                 output: result.output,
                 markdown: result.markdown,
                 content: result.content,
+                user_surfaces: result.user_surfaces,
                 switch_agent: result.switch_agent,
             }),
             None => {
@@ -128,6 +129,7 @@ pub(super) fn index_rerun_results(
                     output: result.output,
                     markdown: result.markdown,
                     content: result.content,
+                    user_surfaces: result.user_surfaces,
                     switch_agent: result.switch_agent,
                 },
             )

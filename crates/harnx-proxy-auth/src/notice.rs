@@ -65,11 +65,3 @@ pub fn parse_notice_line(value: &Value) -> Option<HookNotice> {
         message: message.to_string(),
     })
 }
-
-/// Render a notice as its JSONL wire form (without trailing newline).
-pub fn to_line(notice: &HookNotice) -> String {
-    serde_json::json!({
-        "notice": {"level": notice.level, "message": notice.message}
-    })
-    .to_string()
-}

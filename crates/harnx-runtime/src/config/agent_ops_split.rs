@@ -98,6 +98,7 @@ impl Config {
             self::agent::builtin(name)?
         };
         self.resolved_middleware_for_agent(Some(&agent))?;
+        self.resolved_event_hooks_for_agent(Some(&agent))?;
         let current_model = self.current_model().clone();
         match agent.model_id() {
             Some(model_id) => {
@@ -171,6 +172,7 @@ impl Config {
 
     pub fn use_agent_obj(&mut self, agent: Agent) -> Result<()> {
         self.resolved_middleware_for_agent(Some(&agent))?;
+        self.resolved_event_hooks_for_agent(Some(&agent))?;
         self.exit_active_agent()?;
         self.set_active_agent(agent);
         Ok(())

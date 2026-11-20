@@ -7,24 +7,19 @@ pub(super) use handoff_dispatch::HandoffDispatchArgs;
 pub(super) use handoff_recovery::{reconcile as reconcile_pending_handoff, HandoffRecovery};
 
 mod deadline_recovery;
-mod hitl_attention;
 mod middleware_recovery;
 mod tool_recovery;
 use super::backend::{FencedSessionLogSink, NatsSessionLogBackend};
-use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use crate::agent_loop::OnToolRoundFn;
-use crate::config::{resolve_local_nats_server_config, GlobalConfig, Input};
+use crate::config::{GlobalConfig, Input};
 use crate::nats_attachments::SessionAttachmentSync;
 use crate::nats_event_sink::NatsEventSink;
-use crate::nats_hook_provider::{
-    dispatch_hook_event, HookDispatchMeta, HookEventDispatch, NatsHookProvider,
-};
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
 use crate::nats_session::PendingHitlApproval;
 use crate::nats_session_metadata::{SessionMetadata, SessionMetadataStore};
 use crate::nats_tool_provider::NatsInFlightCalls;
-use crate::tool_context::{discover_nats_hook_provider_fresh, discover_nats_tool_provider_fresh};
+use crate::tool_context::discover_nats_tool_provider_fresh;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
@@ -39,10 +34,14 @@ use tool_recovery::repair_single_orphan;
 
 #[derive(Clone)]
 pub struct RunAgentLoopArgs<'a> {
+    /// The activation's shared surface-note queue. The daemon passes the
+    /// control handler's queue so mid-turn surface notes reach the running
+    /// loop; other callers leave it `None` and surface notes are
+    /// durable-fold-only. This is deliberately not the hook-context
+    /// `pending_async_context` queue: that one also feeds the turn-end resume
+    /// path, which would turn a passive note into a new user prompt.
+    pub surface_notes: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
     pub cluster_key: &'a str,
-    /// Whether this worker launches its own agent-level hook servers (session
-    /// and handoff hooks) rather than discovering independently deployed ones.
-    pub manage_servers: bool,
     pub session_id: &'a str,
     pub config: GlobalConfig,
     pub instance_id: harnx_core::instance::ServerScope,
@@ -247,6 +246,7 @@ fn hitl_managed_tool_call_ids(
 fn round_continuation(
     orphan: PendingToolCalls,
     decisions: Vec<crate::agent_loop::ToolApprovalDecision>,
+    legacy_request_ids: std::collections::BTreeSet<String>,
 ) -> HitlToolRoundContinuation {
     HitlToolRoundContinuation {
         round: crate::agent_loop::PendingToolRound {
@@ -256,6 +256,7 @@ fn round_continuation(
             calls: orphan.calls,
         },
         decisions,
+        legacy_request_ids,
     }
 }
 
@@ -263,6 +264,7 @@ fn round_continuation(
 struct HitlToolRoundContinuation {
     round: crate::agent_loop::PendingToolRound,
     decisions: Vec<crate::agent_loop::ToolApprovalDecision>,
+    legacy_request_ids: std::collections::BTreeSet<String>,
 }
 
 fn derive_hitl_tool_round_continuation(
@@ -320,7 +322,12 @@ fn derive_hitl_tool_round_continuation(
             })
         })
         .collect();
-    Ok(Some(round_continuation(orphan, decisions)))
+    let legacy_request_ids = request_ids.into_iter().map(str::to_owned).collect();
+    Ok(Some(round_continuation(
+        orphan,
+        decisions,
+        legacy_request_ids,
+    )))
 }
 
 #[allow(dead_code)]
@@ -354,10 +361,11 @@ fn is_executable_user_message(
     role: &harnx_core::message::MessageRole,
     content: &harnx_core::message::MessageContent,
 ) -> bool {
-    // Replayed runtime notes and valid timing notices are context, not prompts.
+    // Replayed runtime notes, hook-added context and valid timing notices are
+    // context, not prompts.
     role.is_user()
         && !harnx_core::timing_identity::is_timing_notice(&content.to_text())
-        && !harnx_core::runtime_note::is_runtime_note_id(id)
+        && !harnx_core::runtime_note::is_runtime_context_id(id)
 }
 
 /// Verify that the durable user rows the fold selected for injection are all
@@ -503,10 +511,10 @@ async fn setup_agent_loop_context(
     params: AgentContextParams,
     session_origin: SessionOrigin,
     session_id: &str,
-) -> crate::agent_loop::AgentLoopContext {
+) -> Result<crate::agent_loop::AgentLoopContext> {
     let ctx = Box::pin(build_agent_loop_context(params)).await;
-    dispatch_context_session_start(&ctx, session_origin, session_id).await;
-    ctx
+    dispatch_context_session_start(&ctx, session_origin, session_id).await?;
+    Ok(ctx)
 }
 
 async fn run_nats_loop_segment(
@@ -590,41 +598,31 @@ async fn run_unparked_agent_loop(args: RunAgentLoopArgs<'_>) -> Result<NatsAgent
     let (jetstream_ctx, session_origin, attachment_sync, prepare_handoff_fn) =
         prepare_session_for_agent_loop(&args).await?;
 
-    let hook_supervisor = setup_agent_hooks(
-        args.manage_servers,
-        &args.config,
-        &jetstream_ctx,
-        &args.instance_id,
-        args.session_id,
-    )
-    .await;
-
-    let on_hitl_approval_required = args.lease.as_ref().map(|lease| {
-        hitl_attention::build_hitl_approval_request_callback(hitl_attention::HitlCallbackContext {
-            jetstream: &jetstream_ctx,
-            session_id: args.session_id,
-            lease,
-            event_sink: args.event_sink.as_ref(),
-            after_seq_observer: args.after_seq_observer.as_ref(),
-            metadata_store: args.session_metadata,
-            replicas: attachment_sync.replicas(),
-        })
-    });
-
     let ctx = setup_agent_loop_context(
         AgentContextParams {
+            pending_async_context: None,
+            surface_notes: args.surface_notes.clone(),
             config: args.config.clone(),
             instance_id: args.instance_id,
             abort_signal: args.abort_signal.clone(),
             token_budget: args.token_budget,
             call_fn: Some(attachment_sync.model_call(args.call_fn)),
             on_tool_round: args.on_tool_round,
-            on_hitl_approval_required,
             prepare_handoff_fn,
             working_dir: args.working_dir,
         },
         session_origin,
         args.session_id,
+    )
+    .await?;
+
+    // Surface notes recorded while no turn was running (idle submission) are
+    // durable; fold them into this turn's first model call as passive context.
+    fold_idle_surface_notes(
+        &jetstream_ctx,
+        args.session_id,
+        attachment_sync.replicas(),
+        ctx.surface_notes.as_ref(),
     )
     .await;
 
@@ -644,44 +642,36 @@ async fn run_unparked_agent_loop(args: RunAgentLoopArgs<'_>) -> Result<NatsAgent
         replicas,
     };
     let result = run_nats_loop_segment(segment_args, jetstream_ctx, session_id, replicas).await;
-    finish_agent_loop(hook_supervisor, attachment_sync, result).await
-}
-
-/// Set up agent-level hook servers for this session.
-async fn setup_agent_hooks(
-    manage_servers: bool,
-    config: &GlobalConfig,
-    jetstream_ctx: &jetstream::Context,
-    instance_id: &harnx_core::instance::ServerScope,
-    session_id: &str,
-) -> Option<HookServerSupervisor> {
-    let hook_start_config =
-        resolve_agent_hook_start_config(manage_servers, config, jetstream_ctx, instance_id).await;
-
-    let mut hook_supervisor = None;
-    reconcile_agent_hooks(
-        &mut hook_supervisor,
-        hook_start_config.as_ref(),
-        config,
-        session_id,
-    )
-    .await;
-    hook_supervisor
-}
-
-async fn finish_agent_loop(
-    hook_supervisor: Option<HookServerSupervisor>,
-    attachment_sync: SessionAttachmentSync,
-    result: Result<NatsAgentLoopOutcome>,
-) -> Result<NatsAgentLoopOutcome> {
-    shutdown_agent_hooks(hook_supervisor).await;
     attachment_sync.finish(result).await
 }
 
-/// Shut down activation-scoped hooks on both successful and failed turns.
-async fn shutdown_agent_hooks(mut supervisor: Option<HookServerSupervisor>) {
-    if let Some(supervisor) = supervisor.as_mut() {
-        supervisor.shutdown().await;
+/// Fold durable `note`-visibility surface actions recorded while no turn was
+/// running into this turn's first model call as passive context. Best-effort:
+/// a history read failure just skips the fold, like the pre-existing queue
+/// path, rather than failing the activation.
+async fn fold_idle_surface_notes(
+    jetstream_ctx: &jetstream::Context,
+    session_id: &str,
+    replicas: usize,
+    surface_notes: Option<&Arc<tokio::sync::Mutex<Option<String>>>>,
+) {
+    let backend = NatsSessionLogBackend::new(jetstream_ctx.clone(), session_id, replicas);
+    let Ok(entries) = backend.load_events_latest_async().await else {
+        return;
+    };
+    let Some(notes) = crate::surfaces::fold_pending_surface_notes(&entries) else {
+        return;
+    };
+    let Some(queue) = surface_notes else {
+        return;
+    };
+    let mut pending = queue.lock().await;
+    match pending.as_mut() {
+        Some(pending) => {
+            pending.push_str("\n\n");
+            pending.push_str(&notes);
+        }
+        None => *pending = Some(notes),
     }
 }
 
@@ -774,13 +764,14 @@ async fn prepare_agent_session(
 
 struct AgentContextParams {
     prepare_handoff_fn: Arc<crate::tool::PrepareHandoffFn>,
+    pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+    surface_notes: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
     config: GlobalConfig,
     instance_id: harnx_core::instance::ServerScope,
     abort_signal: AbortSignal,
     token_budget: Option<u64>,
     call_fn: Option<crate::agent_loop::AgentCallFn>,
     on_tool_round: Option<OnToolRoundFn>,
-    on_hitl_approval_required: Option<crate::agent_loop::OnHitlApprovalRequiredFn>,
     working_dir: Option<std::path::PathBuf>,
 }
 
@@ -803,8 +794,6 @@ async fn build_agent_loop_context(
         active_package.as_deref(),
     )
     .await;
-    let nats_hook_provider =
-        discover_nats_hook_provider_fresh(&config_snapshot, &params.instance_id).await;
     crate::agent_loop::AgentLoopContext {
         config: params.config,
         instance_id: params.instance_id,
@@ -813,14 +802,18 @@ async fn build_agent_loop_context(
         usage_at_start,
         call_fn: params.call_fn,
         on_tool_round: params.on_tool_round,
-        on_hitl_approval_required: params.on_hitl_approval_required,
         on_text_response: None,
         initial_with_embeddings: false,
         initial_resume_count: 0,
         max_resume: None,
-        nats_hook_provider,
         prepare_handoff_fn: Some(params.prepare_handoff_fn),
-        pending_async_context: Some(Arc::new(tokio::sync::Mutex::new(None))),
+        pending_async_context: Some(
+            params
+                .pending_async_context
+                .clone()
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(None))),
+        ),
+        surface_notes: params.surface_notes,
         working_dir: params.working_dir,
         tool_loop_guard: Default::default(),
     }
@@ -834,24 +827,23 @@ pub(crate) enum SessionOrigin {
 }
 
 struct SessionStartDispatch<'a> {
-    abort: Option<crate::utils::AbortSignal>,
     origin: SessionOrigin,
-    provider: Option<&'a NatsHookProvider>,
     session_id: &'a str,
     cwd: std::path::PathBuf,
     model: String,
     pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
 }
 
-/// Dispatch SessionStart using the loop context's provider, model, and cwd.
+/// Dispatch SessionStart through the in-process event hooks.
 ///
-/// Any additional context the hooks return rides the loop's pending queue into
-/// the first turn.
+/// Added context rides the loop's pending queue into the first turn's
+/// `hook_context`. A `deny` policy failure propagates: the activation that
+/// created the session fails with the hook's error.
 async fn dispatch_context_session_start(
     ctx: &crate::agent_loop::AgentLoopContext,
     origin: SessionOrigin,
     session_id: &str,
-) {
+) -> Result<()> {
     // Same cwd rule as the shared agent loop: the session's working directory
     // when it has one, else the worker's.
     let cwd = ctx
@@ -859,47 +851,65 @@ async fn dispatch_context_session_start(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let model = ctx.config.read().current_model().id().to_string();
-    dispatch_session_start(SessionStartDispatch {
-        abort: Some(ctx.abort_signal.clone()),
-        origin,
-        provider: ctx.nats_hook_provider.as_deref(),
-        session_id,
-        cwd,
-        model,
-        pending_async_context: ctx.pending_async_context.clone(),
-    })
-    .await;
+    dispatch_session_start(
+        SessionStartDispatch {
+            origin,
+            session_id,
+            cwd,
+            model,
+            pending_async_context: ctx.pending_async_context.clone(),
+        },
+        &ctx.config,
+        &ctx.abort_signal,
+    )
+    .await
 }
 
 /// Fire SessionStart for a session this worker just created.
 ///
-/// The worker owns this event because only it can reach the hook servers it
-/// launched. Every activation of an existing session skips it: activations
+/// The worker owns this event because it loads the session's resolved scripts.
+/// Every activation of an existing session skips it: activations
 /// happen once per turn, and the activation that created the session already
 /// fired it.
 ///
-/// The outcome is dropped on purpose. SessionStart hooks observe and contribute
-/// context; the session already exists by the time they run, so there is nothing
-/// for a `Block` to prevent.
-async fn dispatch_session_start(params: SessionStartDispatch<'_>) {
+/// SessionStart hooks observe and contribute context; the session already
+/// exists by the time they run, so there is nothing for a block to prevent —
+/// but a `deny` failure stops the activation.
+async fn dispatch_session_start(
+    params: SessionStartDispatch<'_>,
+    config: &GlobalConfig,
+    abort: &AbortSignal,
+) -> Result<()> {
     if params.origin == SessionOrigin::Resumed {
-        return;
+        return Ok(());
     }
-    let _ = dispatch_hook_event(HookEventDispatch {
-        event: harnx_core::hooks::HookEvent::SessionStart {
-            source: "startup".to_string(),
-            model: params.model,
-        },
-        provider: params.provider,
-        meta: HookDispatchMeta {
-            abort: params.abort,
+    let outcome = crate::event_hooks::run_event_hooks(
+        config,
+        &crate::event_hooks::EventHookInput {
+            event: harnx_core::hooks::HookEventKind::SessionStart,
             session_id: params.session_id.to_string(),
             cwd: params.cwd,
             resume_count: 0,
+            source: Some("startup".to_string()),
+            model: Some(params.model),
+            ..Default::default()
         },
-        pending_async_context: params.pending_async_context,
-    })
-    .await;
+        abort,
+    )
+    .await?;
+    if let Some(context) = outcome.context_text() {
+        if let Some(pending) = &params.pending_async_context {
+            let mut queue = pending.lock().await;
+            match queue.as_mut() {
+                Some(pending) => {
+                    pending.push_str("\n\n");
+                    pending.push_str(&context);
+                }
+                None => *queue = Some(context),
+            }
+        }
+    }
+    Ok(())
 }
 
 struct AgentLoopSegmentArgs<'a> {
@@ -914,63 +924,6 @@ struct AgentLoopSegmentArgs<'a> {
     event_sink: Option<Arc<NatsEventSink>>,
     lease: Option<Arc<NatsSessionLease>>,
     replicas: usize,
-}
-
-/// Resolve the active agent's hooks and hand them to [`agent_hook_start_config`].
-///
-/// Split out of `run_agent_loop_with_nats_inner` to keep that function under
-/// the line-count threshold; `reconcile_agent_hooks` re-resolves the same
-/// hooks a few lines later (a config read, not worth threading through).
-async fn resolve_agent_hook_start_config(
-    manage_servers: bool,
-    config: &GlobalConfig,
-    jetstream: &jetstream::Context,
-    instance_id: &harnx_core::instance::ServerScope,
-) -> Option<HookServerStartConfig> {
-    let hooks = agent_resolved_hooks(config);
-    agent_hook_start_config(manage_servers, &hooks, jetstream, instance_id).await
-}
-
-async fn agent_hook_start_config(
-    manage_servers: bool,
-    hooks: &harnx_core::hooks::HooksConfig,
-    jetstream: &jetstream::Context,
-    instance_id: &harnx_core::instance::ServerScope,
-) -> Option<HookServerStartConfig> {
-    // This runs once per activation, so unlike the worker-startup gates it
-    // pays for a local NATS server resolution (and, absent a broker address,
-    // a shared-server startup) on every turn unless we also check that the
-    // active agent actually has hooks to launch — mirrors `start_global_hooks`.
-    if !manage_servers || hooks.entries.is_empty() {
-        return None;
-    }
-    let result = async {
-        let server = resolve_local_nats_server_config().await?;
-        // Read before `server.token` moves out below: `NatsEndpoint::from`
-        // borrows the whole config, which a partial move would then forbid.
-        let tls_endpoint = harnx_nats_common::connect::NatsEndpoint::from(&server);
-        let token = server
-            .token
-            .context("local NATS agent hooks require HARNX_NATS_TOKEN")?;
-        Result::<_>::Ok(
-            HookServerStartConfig::new(
-                jetstream.client().clone(),
-                instance_id.clone(),
-                server.url,
-                token,
-            )
-            .with_replicas(server.replicas)
-            .with_broker_settings(&tls_endpoint),
-        )
-    }
-    .await;
-    match result {
-        Ok(config) => Some(config),
-        Err(error) => {
-            log::warn!("session NATS hook servers disabled: {error:#}");
-            None
-        }
-    }
 }
 
 async fn run_agent_loop_segment(args: AgentLoopSegmentArgs<'_>) -> Result<NatsAgentLoopOutcome> {
@@ -1025,12 +978,7 @@ async fn run_hitl_continuation_segment(
             "session lease lost before approved HITL tool execution"
         );
     }
-    let pending_interrupt_ids = continuation
-        .round
-        .calls
-        .iter()
-        .filter_map(|call| call.id.clone())
-        .collect();
+    let pending_interrupt_ids = continuation.legacy_request_ids;
     let result = crate::agent_loop::continue_agent_loop_from_tool_round(
         &args.ctx,
         args.input.clone(),
@@ -1092,57 +1040,6 @@ async fn dispatch_nats_handoff(
         tool_call_id: handoff_tool_call_id,
     })
     .await
-}
-
-fn agent_resolved_hooks(config: &GlobalConfig) -> harnx_core::hooks::HooksConfig {
-    config
-        .read()
-        .agent
-        .as_ref()
-        .and_then(|agent| agent.hooks().cloned())
-        .unwrap_or_default()
-}
-
-async fn reconcile_agent_hooks(
-    current: &mut Option<HookServerSupervisor>,
-    start: Option<&HookServerStartConfig>,
-    config: &GlobalConfig,
-    session_id: &str,
-) {
-    let hooks = agent_resolved_hooks(config);
-    let scope = format!("session-{session_id}");
-    reconcile_hook_supervisor(current, start, &hooks, &scope).await;
-}
-
-/// Replace one session's hook processes only after its previous registrations
-/// have been removed. Public for lifecycle integration coverage.
-#[doc(hidden)]
-pub async fn reconcile_hook_supervisor(
-    current: &mut Option<HookServerSupervisor>,
-    start: Option<&HookServerStartConfig>,
-    hooks: &harnx_core::hooks::HooksConfig,
-    scope: &str,
-) {
-    // Stop first so old registrations and processes are gone before new hooks register.
-    if let Some(mut previous) = current.take() {
-        previous.shutdown().await;
-    }
-    let Some(start) = start else {
-        return;
-    };
-    if hooks.entries.is_empty() {
-        return;
-    }
-    match HookServerSupervisor::start_local(start.clone(), hooks, scope).await {
-        Ok(supervisor) => *current = Some(supervisor),
-        Err(error) => {
-            // Failures happen before the supervisor can own cleanup or while its KV
-            // route is unavailable. Publishing here would either reuse the failed
-            // route or leave an unowned rejector after the session ends. Registry
-            // read failures are guarded by NatsHookProvider instead.
-            log::warn!("session NATS hook servers disabled: {error:#}");
-        }
-    }
 }
 
 /// Fence-on-resume fail-safe: if the persisted tail carries a worker fence
@@ -1564,7 +1461,7 @@ async fn build_orphan_tool_eval_context(
         agent_use_tools: repair.agent_use_tools.as_deref(),
         current_agent_package: repair.current_agent_package.clone(),
         working_dir: None,
-        nats_hook_provider: None,
+
         pending_async_context: None,
         // Orphan repair reruns calls outside the originating round; script
         // mode's `bash` must fail closed there rather than redispatch.
@@ -1663,6 +1560,7 @@ fn interrupt_error_output(call: &harnx_core::tool::ToolCall) -> harnx_core::sess
         }),
         markdown: None,
         content: Vec::new(),
+        user_surfaces: Vec::new(),
         switch_agent: None,
     }
 }
@@ -1679,6 +1577,7 @@ fn rerun_failure_output(
         }),
         markdown: None,
         content: Vec::new(),
+        user_surfaces: Vec::new(),
         switch_agent: None,
     }
 }
@@ -1690,93 +1589,6 @@ mod tests;
 #[cfg(test)]
 #[path = "mid_turn_injection_tests.rs"]
 mod mid_turn_injection_tests;
-
-/// Tests for `build_hitl_approval_request_callback` attention bump.
-#[cfg(test)]
-mod hitl_attention_tests {
-    use super::hitl_attention::{
-        build_hitl_approval_request_callback_for_test, HitlCallbackContext,
-    };
-    use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
-    use crate::tool::DeferredToolCall;
-    use harnx_core::require_nextest;
-    use harnx_core::tool::ToolCall;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::Arc;
-
-    /// Test that `build_hitl_approval_request_callback_for_test` appends
-    /// `HitlApprovalRequested` and bumps attention directly.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn hitl_approval_callback_bumps_attention_directly() {
-        require_nextest();
-        let Some((url, mut child, _store_dir)) = crate::nats_worker::tests::spawn_test_nats().await
-        else {
-            return;
-        };
-
-        let client = async_nats::connect(&url).await.unwrap();
-        let jetstream = async_nats::jetstream::new(client);
-        let store = SessionMetadataStore::ensure(&jetstream, 1).await.unwrap();
-        let session_id = crate::nats_worker::new_remote_session_id();
-        let storage_key = harnx_core::session_identity::session_key(Some("metis"), &session_id);
-
-        // Create session metadata
-        store
-            .create(&SessionMetadata::new(
-                &session_id,
-                SessionInitializer::named("metis", Default::default()),
-            ))
-            .await
-            .unwrap();
-
-        // Acquire a lease for the session
-        let lease =
-            crate::nats_worker::backend::test_session_authority(&jetstream, &storage_key, &store)
-                .await;
-        let after_seq_observer = Arc::new(AtomicU64::new(0));
-
-        // Build the callback with metadata store attached
-        let ctx = HitlCallbackContext {
-            jetstream: &jetstream,
-            session_id: &storage_key,
-            lease: &lease,
-            event_sink: None,
-            after_seq_observer: Some(&after_seq_observer),
-            metadata_store: Some(&store),
-            replicas: 1,
-        };
-        let callback = build_hitl_approval_request_callback_for_test(ctx);
-
-        // Invoke the callback with a deferred tool call
-        let deferred = DeferredToolCall {
-            call: ToolCall::new(
-                "test_tool".to_string(),
-                serde_json::json!({"arg": "value"}),
-                Some("call-123".to_string()),
-                None,
-            ),
-            arguments: serde_json::json!({"arg": "value"}),
-            reason: Some("Test approval".to_string()),
-        };
-        let result = callback(&deferred).unwrap();
-        assert_eq!(result, "call-123");
-
-        // Verify session is now unread with correct attention seq
-        let state = store.get_read_state(&storage_key).await.unwrap();
-        assert!(
-            state.is_unread(),
-            "session should be unread after HITL approval request callback"
-        );
-        assert!(
-            state.last_attention_seq >= 1,
-            "last_attention_seq should be at least 1"
-        );
-
-        lease.release().await.unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
 
 #[cfg(test)]
 mod compaction_continuity_tests;

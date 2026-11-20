@@ -8,15 +8,29 @@ fn params(action: &str) -> Value {
         "response": { "action": action, "data": {}, "note": "operator note" } })
 }
 
+fn params_with_data(action: &str, data: Value) -> Value {
+    json!({ "interaction_id": "first", "request_seq": 3,
+        "response": { "action": action, "data": data, "note": "operator note" } })
+}
+
 async fn body(response: AppResponse) -> Value {
     serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
 }
 
 #[test]
-fn interaction_response_requires_exact_identity_and_confirm_shape() {
+fn interaction_response_requires_exact_identity_and_response_shape() {
     for action in ["approve", "deny"] {
         assert!(parse_params(Some(params(action))).is_ok());
     }
+    // Any action and data pass the guard: durable acceptance validates
+    // them against the requested surface, so `a2ui` responses flow through
+    // the same one check as confirm replies.
+    assert!(parse_params(Some(params("submit"))).is_ok());
+    assert!(parse_params(Some(params_with_data(
+        "submit",
+        json!({"choice": ["staging"], "name": "rel-1"})
+    )))
+    .is_ok());
     for invalid in [
         Value::Null,
         json!({}),
@@ -24,8 +38,7 @@ fn interaction_response_requires_exact_identity_and_confirm_shape() {
         json!({ "interaction_id": "first", "request_seq": 0, "response": { "action": "approve", "data": {} } }),
         json!({ "interaction_id": "", "request_seq": 3, "response": { "action": "approve", "data": {} } }),
         json!({ "interaction_id": "first", "request_seq": 3, "response": { "action": "approve", "data": [] } }),
-        json!({ "interaction_id": "first", "request_seq": 3, "response": { "action": "approve", "data": {"approved":true} } }),
-        params("submit"),
+        params("  "),
     ] {
         assert!(
             parse_params(Some(invalid.clone())).is_err(),
@@ -46,7 +59,14 @@ async fn interaction_response_maps_every_durable_outcome_without_bool_only_fallb
         );
         assert_eq!(response["id"], 7);
     }
-    for outcome in [WrongSequence, Stale, Conflicting, AfterComplete, LeaseLost] {
+    for outcome in [
+        WrongSequence,
+        Stale,
+        Conflicting,
+        AfterComplete,
+        InvalidResponse,
+        LeaseLost,
+    ] {
         let name = outcome_name(&outcome);
         let response = body(response(json!(7), Ok(outcome), None).unwrap()).await;
         assert_eq!(response["error"]["code"], -32004);

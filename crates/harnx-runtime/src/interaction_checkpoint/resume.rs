@@ -28,15 +28,40 @@ impl DurableRound {
             return Ok(None);
         }
         let stored: CallCheckpoint = self.store.read(&self.prefix(call)?, reference).await?;
+        let restored = stored.restore()?;
         let responses = accepted_responses(&entries, self.seq, call, &self.chain_version)?;
         let answered = entries.iter().any(|(_, e)| {
             matches!(e,
             SessionLogEntry::InteractionResponse { request_seq: s, .. } if *s == request_seq)
         });
+        // A tool challenge (producer `tool:<server>/<tool>`) resumes with the
+        // latest challenge's responses and state only, never earlier ones
+        // (MRTR repeated-challenge rule).
+        let tool_input = if answered && request.producer.starts_with("tool:") {
+            responses
+                .iter()
+                .rev()
+                .find(|accepted| accepted.request.interaction_id == request.interaction_id)
+                .map(|accepted| crate::middleware::ToolInputResume {
+                    responses: std::collections::BTreeMap::from([(
+                        request.key.clone(),
+                        harnx_toolset::ToolInputResponse {
+                            action: accepted.response.action.clone(),
+                            data: accepted.response.data.clone(),
+                            note: accepted.response.note.clone(),
+                        },
+                    )]),
+                    request_state: crate::middleware::checkpoint_tool_request_state(&restored)
+                        .unwrap_or(serde_json::Value::Null),
+                })
+        } else {
+            None
+        };
         Ok(Some(ResumeCall {
             resume: MiddlewareResume {
-                checkpoint: stored.restore()?,
+                checkpoint: restored,
                 responses,
+                tool_input,
             },
             waiting: (!answered).then_some(request),
             reference: reference.into(),
@@ -58,6 +83,27 @@ impl DurableRound {
                 call.id.as_deref().context("missing changed call ID")?,
             )
             .await
+    }
+
+    /// How many times this call has challenged so far (producer `tool:*`),
+    /// counted from the journal. The current challenge is not journaled yet
+    /// when this runs, so the count is the number of completed rounds; the
+    /// MRTR round cap (SEP-2322) gives up once it is reached.
+    pub(super) async fn tool_input_rounds(&self, tool_call_id: &str) -> Result<usize> {
+        let entries = self.session.backend.load_events_latest_async().await?;
+        Ok(entries
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(
+                    entry,
+                    SessionLogEntry::InteractionRequested {
+                        tool_call_id: id,
+                        producer,
+                        ..
+                    } if id == tool_call_id && producer.starts_with("tool:")
+                )
+            })
+            .count())
     }
 
     pub(super) async fn pending_reference(

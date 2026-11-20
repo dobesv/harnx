@@ -108,6 +108,8 @@ async fn a_saved_failure_rolls_forward_with_its_reply_time_partial_result() -> a
     let client = async_nats::connect(&url).await?;
     let js = async_nats::jetstream::new(client.clone());
     let request = ToolRequest {
+        input_responses: None,
+        request_state: None,
         run_context: None,
         replay: None,
         call_id: "failed-original".into(),
@@ -220,6 +222,8 @@ async fn record_retryable_call(js: &async_nats::jetstream::Context) -> anyhow::R
         .await?
         .record(
             &ToolRequest {
+                input_responses: None,
+                request_state: None,
                 run_context: None,
                 replay: None,
                 call_id: "retryable-original".into(),
@@ -257,6 +261,7 @@ async fn replay_responder(
         };
         let request: ToolRequest = serde_json::from_slice(&message.payload).expect("tool request");
         let reply = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(json!({"answer": "replayed"})),
             final_progress: None,
@@ -273,6 +278,8 @@ async fn replay_responder(
 
 async fn save_reply(js: &async_nats::jetstream::Context) -> anyhow::Result<()> {
     let request = ToolRequest {
+        input_responses: None,
+        request_state: None,
         run_context: None,
         replay: None,
         call_id: "original".into(),
@@ -287,20 +294,19 @@ async fn save_reply(js: &async_nats::jetstream::Context) -> anyhow::Result<()> {
         tool_round: Some(5),
     };
     let journal = InvocationJournal::ensure(js, 1).await?;
+    // qual:allow(dry, fragment) reason: "Seed sequence (record then complete a saved reply) mirrors the sibling journal fixture by design: both journals must contain the same persisted shapes for replay reconciliation."
     journal
         .record(&request, ("retired_echo", "original-scope", "retired"))
         .await?;
     journal
         .complete(
             &request,
-            ToolReply {
-                call_id: "original".into(),
-                result: Ok(json!({"answer": "saved", "_meta": {
-                    EXECUTION_CONTEXT_NAMESPACE: harnx_core::execution_context::ExecutionContextObservation::observe(
-                        std::path::Path::new("/original/workspace"), std::path::Path::new("/original/workspace"))
-                }})),
-                final_progress: None,
-            },
+            ToolReply { input_required: None, call_id: "original".into(),
+            result: Ok(json!({"answer": "saved", "_meta": {
+                EXECUTION_CONTEXT_NAMESPACE: harnx_core::execution_context::ExecutionContextObservation::observe(
+                    std::path::Path::new("/original/workspace"), std::path::Path::new("/original/workspace"))
+            }})),
+            final_progress: None, },
         )
         .await?;
     Ok(())
@@ -377,6 +383,8 @@ async fn the_journal_bucket_takes_the_configured_replica_count() -> anyhow::Resu
     assert_eq!(provider.journal_replicas, 3);
 
     let request = ToolRequest {
+        input_responses: None,
+        request_state: None,
         run_context: None,
         replay: None,
         call_id: "wire-1".into(),
@@ -451,6 +459,8 @@ async fn expired_pending_replay_reports_scope_but_completed_reply_still_recovers
             None,
         );
         let request = ToolRequest {
+            input_responses: None,
+            request_state: None,
             call_id: format!("wire-{index}"),
             operation_id: format!("wire-{index}"),
             tool: "echo".into(),
@@ -490,6 +500,7 @@ async fn expired_pending_replay_reports_scope_but_completed_reply_still_recovers
             .complete(
                 &request,
                 ToolReply {
+                    input_required: None,
                     call_id: request.call_id.clone(),
                     result: Ok(json!({"answer": "saved"})),
                     final_progress: None,

@@ -404,7 +404,7 @@ pub(super) fn spawn_metis_worker_with_hooks(
     let worker_config = Config {
         data: harnx_core::config_data::ConfigData {
             model_id: "test:test-model".to_string(),
-            hooks,
+            hooks: hooks.map(Box::new),
             ..Default::default()
         },
         agent: Some(crate::config::Agent::new(worker_agent)),
@@ -618,6 +618,7 @@ fn test_orphan_partition_logic() {
 #[test]
 fn test_non_idempotent_output_is_synthesized() {
     let lost = ToolOutput {
+        user_surfaces: Vec::new(),
         id: Some("call_1".to_string()),
         name: "write_file".to_string(),
         output: json!({

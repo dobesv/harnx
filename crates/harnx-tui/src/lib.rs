@@ -31,6 +31,7 @@ mod subagent_render;
 mod subagent_rows;
 mod subagent_sessions;
 mod subagent_transcript;
+mod surfaces;
 pub mod terminal;
 pub mod terminal_status;
 pub mod test_utils;

@@ -14,6 +14,7 @@ pub(super) const OPERATIONS: &[&str] = &[
     "answer",
     "save",
     "saved",
+    "interact",
 ];
 
 pub(super) fn commands(frame: &Arc<Frame>) -> Vec<Arc<dyn ScriptCommand>> {
@@ -81,6 +82,14 @@ impl Command {
                     self.frame.saved(&args[0])?
                 };
                 Ok(optional_output(value))
+            }
+            "interact" => {
+                let (args, id) = keyed_arguments(args)?;
+                let text = json_text(args, stdin)?
+                    .ok_or_else(|| anyhow::anyhow!("interact requires a surface JSON"))?;
+                let message: Value = serde_json::from_str(text)?;
+                let response = self.frame.interact(message, id, host)?;
+                Ok(optional_output(Some(response)))
             }
             "save" => {
                 ensure!(!args.is_empty(), "save requires a key and JSON value");

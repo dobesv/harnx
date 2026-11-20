@@ -104,6 +104,7 @@ async fn decision(path: &str, tool: &str, action: &str, message: &str, denial: &
     );
     let resumed = with_resume(
         MiddlewareResume {
+            tool_input: None,
             checkpoint: pending.checkpoint.clone(),
             responses: vec![AcceptedInteraction {
                 request: pending.interaction.clone(),

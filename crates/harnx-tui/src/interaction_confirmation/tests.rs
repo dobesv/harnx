@@ -2,6 +2,7 @@ use super::decision::decision_response;
 use super::*;
 use harnx_core::session::SessionLogEntry;
 use serde_json::json;
+mod a2ui;
 mod ui;
 
 fn request(seq: u64, id: &str, kind: &str) -> (u64, SessionLogEntry) {

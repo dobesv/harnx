@@ -154,6 +154,7 @@ fn tool_outputs(results: &[ToolResult]) -> Vec<ToolOutput> {
             output: result.output.clone(),
             markdown: result.markdown.clone(),
             content: result.content.clone(),
+            user_surfaces: result.user_surfaces.clone(),
             switch_agent: result.switch_agent.clone(),
         })
         .collect()
@@ -186,6 +187,10 @@ fn accept_tool_result_replacements(
             }
             slot.output = replacement.output;
             slot.content = replacement.content;
+            // User-audience surfaces must survive the replacement: the
+            // durable ToolResults rows are built from the pending slots,
+            // and frontends read the surface envelopes from them (T5.1).
+            slot.user_surfaces = replacement.user_surfaces;
             slot.switch_agent = replacement.switch_agent;
         }
     }

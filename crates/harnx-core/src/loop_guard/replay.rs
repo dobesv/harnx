@@ -444,6 +444,7 @@ mod tests {
         SessionLogEntry::ToolResults {
             handoff_selection: None,
             results: vec![ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some(id.to_string()),
                 name: "fs_read".into(),
                 output: json!("same"),
@@ -620,6 +621,7 @@ mod tests {
             results: results
                 .into_iter()
                 .map(|(id, output)| ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some(id.to_string()),
                     name: "fs_read".into(),
                     output,

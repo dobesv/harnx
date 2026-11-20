@@ -809,12 +809,18 @@ fn daedalus_research_and_review_tools_keep_the_execution_approval_middleware() {
     }
     assert!(
         agent.hooks().is_none_or(|hooks| {
-            hooks
-                .entries
-                .iter()
-                .all(|hook| !hook.command.contains("^atlas_session_handoff$"))
+            harnx_core::hooks::HookEventKind::ALL.iter().all(|event| {
+                hooks.list(*event).entries.iter().all(|entry| match entry {
+                    harnx_core::hooks::EventHookEntry::Full(definition) => !matches!(
+                        &definition.source,
+                        harnx_core::middleware::MiddlewareSourceConfig::Bash { bash }
+                            if bash.contains("^atlas_session_handoff$")
+                    ),
+                    harnx_core::hooks::EventHookEntry::Disable { .. } => true,
+                })
+            })
         }),
-        "Atlas handoff approval must not use a legacy hook"
+        "Atlas handoff approval must not use an event hook"
     );
     let config = Config {
         agent: Some(agent),

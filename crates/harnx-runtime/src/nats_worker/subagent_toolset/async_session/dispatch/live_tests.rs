@@ -97,6 +97,8 @@ async fn journaled_context(
         ..Default::default()
     };
     let request = harnx_toolset::ToolRequest {
+        input_responses: None,
+        request_state: None,
         operation_id: "live-operation".into(),
         call_id: context.call_id.clone(),
         tool: "session_send".into(),

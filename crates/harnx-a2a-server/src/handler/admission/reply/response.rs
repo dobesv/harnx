@@ -8,6 +8,7 @@ impl HarnxHandler {
         owner: &RequestIdentity,
         local_id: &str,
         candidate: ReplyCandidate<'_>,
+        reason: &str,
     ) -> Result<Admission, A2AError> {
         let session = self.session(owner, Some(local_id)).await?;
         let active = candidate.active;
@@ -30,19 +31,19 @@ impl HarnxHandler {
                 .await
                 .map_err(map_error)?
         {
-            record.task.status.message = Some(Message::new(
-                a2a_lf::Role::Agent,
-                vec![Part::text(if pending.interaction_id.is_some() {
-                    format!(
-                        "Reply not recognized or not supported by this client.\n\n{}",
-                        crate::hitl::interaction::render_challenge(&session, &pending)
-                            .await
-                            .map_err(map_error)?
-                    )
-                } else {
-                    render_unrecognized(&pending)
-                })],
-            ));
+            record.task.status = crate::hitl::interaction::challenge_status(&session, &pending)
+                .await
+                .map_err(map_error)?;
+            if pending.interaction_id.is_none() {
+                record.task.status.message = Some(Message::new(
+                    a2a_lf::Role::Agent,
+                    vec![a2a_lf::Part::text(crate::hitl::render_unrecognized(
+                        &pending,
+                    ))],
+                ));
+            } else {
+                crate::hitl::interaction::correction(&mut record.task.status, reason);
+            }
         }
         Ok(Admission::reply_snapshot(record))
     }

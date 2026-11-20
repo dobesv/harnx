@@ -6,16 +6,11 @@ use crate::config::{
     macro_execute, remote_session_ops, AgentVariables, Config, ConfigLock, GlobalConfig, Input,
     LastMessage,
 };
-use crate::nats_hook_provider::{
-    discover_process_nats_hook_provider, dispatch_hook_event, HookDispatchMeta, HookEventDispatch,
-};
+
 use crate::utils::{dimmed_text, set_text, AbortSignal};
-use harnx_hooks::{HookEvent, HookResultControl};
-use harnx_render::render_error;
 
 use anyhow::{anyhow, bail, Context, Result};
 use fancy_regex::Regex;
-use std::env;
 use std::sync::{Arc, LazyLock};
 
 /// Outcome of running a dot-command.
@@ -790,62 +785,9 @@ pub fn run_command_with_output_and_local_worker<'a>(
             _ => unknown_command()?,
         },
         None => {
-            let (session_id, config_snapshot) = {
-                let config = config.read();
-                (
-                    config
-                        .session
-                        .as_ref()
-                        .map(|session| session.id().to_string())
-                        .unwrap_or_else(|| "default".to_string()),
-                    config.clone(),
-                )
-            };
-            let nats_hook_provider =
-                Box::pin(discover_process_nats_hook_provider(&config_snapshot)).await;
-            let cwd = env::current_dir().unwrap_or_default();
-            let event = HookEvent::UserPromptSubmit {
-                prompt: line.to_string(),
-            };
-            let outcome = Box::pin(dispatch_hook_event(
-                HookEventDispatch {
-                    event,
-                    provider: nats_hook_provider.as_deref(),
-                    meta: HookDispatchMeta {
-            abort: None,
-                        session_id: session_id.clone(),
-                        cwd: cwd.clone(),
-                        resume_count: 0,
-                    },
-                    pending_async_context: None,
-                },
-            ))
-            .await;
-            match outcome.control {
-                HookResultControl::Block { reason } => {
-                    render_error(anyhow!(reason));
-                }
-                HookResultControl::Ask { .. } => {
-                    // Ask is not applicable for UserPromptSubmit event, treat as Continue
-                }
-                HookResultControl::Continue => {
-                    let input_text = match outcome.result.additional_context {
-                        Some(additional_context) if !additional_context.is_empty() => {
-                            format!("{line}\n\n{additional_context}")
-                        }
-                        _ => line.to_string(),
-                    };
-                    let input = crate::config::input::from_str(config, &input_text, None);
-                    Box::pin(ask(
-                        config,
-                        local_worker,
-                        abort_signal.clone(),
-                        input,
-                        true,
-                    ))
-                    .await?;
-                }
-            }
+            // Prompt hooks run in the worker's canonical loop, including remote turns.
+            let input = crate::config::input::from_str(config, line, None);
+            Box::pin(ask(config, local_worker, abort_signal.clone(), input, true)).await?;
         }
     }
 

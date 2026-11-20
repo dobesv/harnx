@@ -65,6 +65,7 @@ async fn append_compressed_tool_fixture(log: &NatsSessionLog) {
     log.append_event_async(&SessionLogEntry::ToolResults {
         handoff_selection: None,
         results: vec![ToolOutput {
+            user_surfaces: Vec::new(),
             id: tool_call.id.clone(),
             name: tool_call.name.clone(),
             output: json!({"ok": true}),

@@ -145,8 +145,12 @@ pub struct AgentConfig {
     documents: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
+    // Boxed: `AgentConfig` is cloned into `Input` and the turn dispatch path's
+    // async state machines, and `HooksConfig` carries four per-event lists plus
+    // a file origin, so an inline copy measurably inflates every future frame
+    // holding an agent (CI stack overflow in harnx-serve dispatch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    hooks: Option<HooksConfig>,
+    hooks: Option<Box<HooksConfig>>,
     #[serde(default, skip_serializing_if = "MiddlewareConfig::is_empty")]
     pub middleware: MiddlewareConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,7 +215,7 @@ impl AgentConfig {
             conversation_starters: frontmatter.conversation_starters,
             documents: frontmatter.documents,
             instructions: frontmatter.instructions,
-            hooks: frontmatter.hooks,
+            hooks: frontmatter.hooks.map(Box::new),
             middleware: frontmatter.middleware,
             compaction_agent: frontmatter.compaction_agent,
             compaction_keep_recent_turns: frontmatter.compaction_keep_recent_turns,
@@ -382,7 +386,12 @@ impl AgentConfig {
     }
 
     pub fn hooks(&self) -> Option<&HooksConfig> {
-        self.hooks.as_ref()
+        self.hooks.as_deref()
+    }
+
+    /// Mutable hooks access for load-time origin binding.
+    pub fn hooks_mut(&mut self) -> Option<&mut HooksConfig> {
+        self.hooks.as_deref_mut()
     }
 
     pub fn loop_detection(&self) -> Option<&LoopDetectionOverride> {
@@ -652,7 +661,7 @@ impl AgentFrontMatter {
             conversation_starters: config.conversation_starters.clone(),
             documents: config.documents.clone(),
             instructions: config.instructions.clone(),
-            hooks: config.hooks.clone(),
+            hooks: config.hooks.as_deref().cloned(),
             middleware: config.middleware.clone(),
             compaction_agent: config.compaction_agent.clone(),
             compaction_keep_recent_turns: config.compaction_keep_recent_turns,

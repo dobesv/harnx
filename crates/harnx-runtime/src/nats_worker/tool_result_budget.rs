@@ -138,6 +138,7 @@ fn size_error_output(original: &ToolOutput, message: String) -> ToolOutput {
         output: serde_json::json!({"is_error": true, "error": message}),
         markdown: None,
         content: Vec::new(),
+        user_surfaces: original.user_surfaces.clone(),
         switch_agent: original.switch_agent.clone(),
     }
 }
@@ -188,6 +189,7 @@ mod tests {
 
     fn output(id: &str, value: serde_json::Value) -> ToolOutput {
         ToolOutput {
+            user_surfaces: Vec::new(),
             id: Some(id.to_string()),
             name: "echo".to_string(),
             output: value,

@@ -747,6 +747,7 @@ mod transcript_tests {
                 SessionLogEntry::ToolResults {
                     handoff_selection: None,
                     results: vec![harnx_core::session::ToolOutput {
+                        user_surfaces: Vec::new(),
                         id: Some("call-1".to_string()),
                         name: "bash_exec".to_string(),
                         output: serde_json::json!({"ok": true}),

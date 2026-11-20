@@ -118,6 +118,8 @@ async fn seed_session_journal_and_attachment(
     journal
         .record(
             &ToolRequest {
+                input_responses: None,
+                request_state: None,
                 run_context: None,
                 replay: None,
                 operation_id: "worker-gc-operation".into(),

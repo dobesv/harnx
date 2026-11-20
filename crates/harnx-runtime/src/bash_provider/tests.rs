@@ -10,7 +10,6 @@ use std::{
 
 use harnx_core::{
     abort::{create_abort_signal, AbortSignal},
-    hooks::{HookEvent, HookOutcome, HookResult, HookResultControl},
     instance::ServerScope,
     partial_result::{error_with_partial_result, partial_result_of},
     tool::{
@@ -185,7 +184,6 @@ fn inner_declarations() -> Vec<harnx_core::tool::ToolDeclaration> {
 type Harness = (
     Arc<BashProvider>,
     Arc<BashEvalContextSlot>,
-    Arc<Mutex<Vec<HookEvent>>>,
     Arc<ToolEvalContext>,
 );
 
@@ -198,38 +196,6 @@ fn harness_with_attachments(
     extra: Vec<Arc<dyn ToolProvider>>,
     fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
 ) -> Harness {
-    harness_with_hooks(
-        inner,
-        extra,
-        fetcher,
-        HarnessPolicy {
-            hook_outcome: HookOutcome {
-                control: HookResultControl::Continue,
-                result: HookResult::default(),
-            },
-            operator_inner_consent: false,
-        },
-    )
-}
-
-struct HarnessPolicy {
-    hook_outcome: HookOutcome,
-    operator_inner_consent: bool,
-}
-
-/// Harness variant with a controllable PreToolUse outcome and consent flag,
-/// for #2630 coverage: `Ask` reaches the fork's confirmation, which the
-/// provider's `operator_inner_consent` either approves or leaves deferred.
-fn harness_with_hooks(
-    inner: Arc<dyn ToolProvider>,
-    extra: Vec<Arc<dyn ToolProvider>>,
-    fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
-    policy: HarnessPolicy,
-) -> Harness {
-    let HarnessPolicy {
-        hook_outcome,
-        operator_inner_consent,
-    } = policy;
     let slot = Arc::new(BashEvalContextSlot::default());
     let bash = Arc::new(
         BashProvider::new(BashProviderConfig {
@@ -238,12 +204,9 @@ fn harness_with_hooks(
             base_providers: vec![inner.clone()],
             slot: Some(slot.clone()),
             payload_limit: None,
-            operator_inner_consent,
         })
         .with_attachment_fetcher(fetcher),
     );
-    let hooks: Arc<Mutex<Vec<HookEvent>>> = Arc::default();
-    let hook_collector = hooks.clone();
     let mut providers: Vec<Arc<dyn ToolProvider>> = vec![bash.clone()];
     providers.extend(extra);
     providers.push(inner);
@@ -264,15 +227,10 @@ fn harness_with_hooks(
         emit_tool_blocked_fn: Arc::new(|_, _| {}),
         emit_tool_update_fn: Arc::new(|_, _| {}),
         confirm_tool_use_fn: Arc::new(|_, _, _| panic!("inner calls must not confirm")),
-        dispatch_hook_fn: Arc::new(move |event| {
-            hook_collector.lock().unwrap().push(event);
-            let hook_outcome = hook_outcome.clone();
-            Box::pin(async move { hook_outcome })
-        }),
         prepare_handoff_fn: None,
     });
     slot.set(&ctx);
-    (bash, slot, hooks, ctx)
+    (bash, slot, ctx)
 }
 
 fn bash_call(script: &str) -> Value {
@@ -300,7 +258,7 @@ async fn run(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runs_tool_pipeline_and_reports_result() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     let abort = create_abort_signal();
     let output = ok(run(&bash, "fs_read --path a | wc -l", &abort).await);
     let payload = output.value;
@@ -316,34 +274,8 @@ async fn runs_tool_pipeline_and_reports_result() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn three_inner_calls_fire_three_pre_tool_use_hooks() {
-    let (bash, _slot, hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
-    let abort = create_abort_signal();
-    ok(run(
-        &bash,
-        "fs_read --path a; fs_read --path b; fs_read --path c",
-        &abort,
-    )
-    .await);
-    let pre = hooks
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|event| matches!(event, HookEvent::PreToolUse { .. }))
-        .count();
-    assert_eq!(pre, 3, "one PreToolUse per inner call");
-    let post = hooks
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|event| matches!(event, HookEvent::PostToolUse { .. }))
-        .count();
-    assert_eq!(post, 3);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nonzero_exit_is_recoverable_with_partial_output_and_trace() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     let abort = create_abort_signal();
     let error = recoverable(
         run(&bash, "fs_read --path a; broken --path x", &abort).await,
@@ -370,7 +302,7 @@ async fn timeout_reports_partial_result() {
     let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let inner = FakeProvider::gated(started_tx, release.clone());
-    let (bash, _slot, _hooks, _ctx) = harness(inner, Vec::new());
+    let (bash, _slot, _ctx) = harness(inner, Vec::new());
     let abort = create_abort_signal();
     let task = tokio::spawn(async move {
         bash.call_tool_with_progress(
@@ -400,7 +332,7 @@ async fn parent_abort_is_fatal_with_partial_result() {
     let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let inner = FakeProvider::gated(started_tx, release.clone());
-    let (bash, _slot, _hooks, _ctx) = harness(inner, Vec::new());
+    let (bash, _slot, _ctx) = harness(inner, Vec::new());
     let abort = create_abort_signal();
     let task_abort = abort.clone();
     let task = tokio::spawn(async move {
@@ -427,7 +359,7 @@ async fn parent_abort_is_fatal_with_partial_result() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn huge_stdout_spills_into_limit_marker() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     let abort = create_abort_signal();
     let output = ok(run(&bash, "big --path x", &abort).await);
     let payload = output.value;
@@ -450,7 +382,7 @@ async fn huge_stdout_spills_into_limit_marker() {
 /// stderr-only failure must not report 0/0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn report_totals_sum_stdout_and_stderr() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     let abort = create_abort_signal();
     let error = recoverable(
         run(&bash, "echo out; echo err >&2; exit 3", &abort).await,
@@ -470,7 +402,7 @@ async fn report_totals_sum_stdout_and_stderr() {
 /// rendered report.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_trace_count_surfaces_in_result() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     let abort = create_abort_signal();
     let script = "fs_read --path a\n".repeat(MAX_RETAINED_TRACE_ENTRIES + 4);
     let output = ok(run(&bash, &script, &abort).await);
@@ -493,7 +425,6 @@ async fn missing_slot_fails_closed() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
-        operator_inner_consent: false,
     });
     let abort = create_abort_signal();
     let error = recoverable(run(&bash, "fs_read --path a", &abort).await, "no slot");
@@ -511,7 +442,6 @@ async fn inactive_provider_does_not_claim_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
-        operator_inner_consent: false,
     });
     assert!(!bash.has_tool(BASH_TOOL_NAME));
 }
@@ -520,7 +450,7 @@ async fn inactive_provider_does_not_claim_bash() {
 async fn dispatch_prefers_bash_script_provider_over_raw_alias() {
     // R2-2: with both providers in the context, the engine must route
     // `bash` to the script provider, not the raw external alias.
-    let (_bash, _slot, _hooks, ctx) = harness(FakeProvider::new(), vec![Arc::new(RawBashProvider)]);
+    let (_bash, _slot, ctx) = harness(FakeProvider::new(), vec![Arc::new(RawBashProvider)]);
     let abort = create_abort_signal();
     let results = eval_tool_calls(
         &ctx,
@@ -556,7 +486,6 @@ async fn replay_reports_interrupted_for_bash_only() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
-        operator_inner_consent: false,
     });
     let abort = create_abort_signal();
     let replay_bash = match bash
@@ -628,7 +557,6 @@ async fn inactive_provider_replay_falls_through_for_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
-        operator_inner_consent: false,
     });
     let abort = create_abort_signal();
     let replay = bash
@@ -666,7 +594,7 @@ async fn inactive_provider_replay_falls_through_for_bash() {
 /// references (round ended, context gone) behave exactly like a missing slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dangling_slot_context_fails_closed() {
-    let (bash, slot, _hooks, ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, slot, ctx) = harness(FakeProvider::new(), Vec::new());
     // Sanity: the weak reference upgrades while the round's context is alive.
     assert!(
         slot.get().is_some(),
@@ -688,7 +616,7 @@ async fn dangling_slot_context_fails_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn progress_updates_reach_outer_handle() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     let abort = create_abort_signal();
     let progress = Arc::new(CollectingProgress(Mutex::new(Vec::new())));
     ok(bash
@@ -709,7 +637,7 @@ async fn progress_updates_reach_outer_handle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inner_calls_cannot_recurse_into_bash() {
-    let (bash, _slot, _hooks, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
     let abort = create_abort_signal();
     let error = recoverable(
         run(&bash, "bash --script 'fs_read --path a'", &abort).await,
@@ -729,77 +657,6 @@ async fn inner_calls_cannot_recurse_into_bash() {
     );
 }
 
-/// #2630: an asking PreToolUse hook is auto-approved for operator script
-/// runs only when the provider carries the operator inner consent. The same
-/// script without consent stays approval-required.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn operator_inner_consent_approves_asking_hooks_end_to_end() {
-    let ask = HookOutcome {
-        control: HookResultControl::Ask {
-            reason: Some("needs review".into()),
-        },
-        result: HookResult::default(),
-    };
-    let (bash, _slot, hooks, _ctx) = harness_with_hooks(
-        FakeProvider::new(),
-        Vec::new(),
-        None,
-        HarnessPolicy {
-            hook_outcome: ask.clone(),
-            operator_inner_consent: true,
-        },
-    );
-    let abort = create_abort_signal();
-    let output = ok(run(&bash, "fs_read --path a", &abort).await);
-    assert_eq!(output.value["status"], "ok", "{}", output.value);
-    assert_eq!(output.value["trace"][0]["status"], "ok", "{}", output.value);
-    assert_eq!(hooks.lock().unwrap().len(), 2, "Pre and Post hooks fired");
-
-    let (bash, _slot, _hooks, _ctx) = harness_with_hooks(
-        FakeProvider::new(),
-        Vec::new(),
-        None,
-        HarnessPolicy {
-            hook_outcome: ask,
-            operator_inner_consent: false,
-        },
-    );
-    let abort = create_abort_signal();
-    let error = recoverable(run(&bash, "fs_read --path a", &abort).await, "ask denied");
-    let partial = partial_result_of(&error).expect("failure carries partial result");
-    assert_eq!(
-        partial["trace"][0]["status"], "approval_required",
-        "{}",
-        partial
-    );
-    assert_ne!(partial["status"], "ok", "{}", partial);
-}
-
-/// #2630: consent only covers the confirmation branch — a blocking hook
-/// still stops the inner call before any dispatch.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn operator_inner_consent_does_not_stop_hook_blocks() {
-    let block = HookOutcome {
-        control: HookResultControl::Block {
-            reason: "denied by policy".into(),
-        },
-        result: HookResult::default(),
-    };
-    let (bash, _slot, _hooks, _ctx) = harness_with_hooks(
-        FakeProvider::new(),
-        Vec::new(),
-        None,
-        HarnessPolicy {
-            hook_outcome: block,
-            operator_inner_consent: true,
-        },
-    );
-    let abort = create_abort_signal();
-    let error = recoverable(run(&bash, "fs_read --path a", &abort).await, "block");
-    let partial = partial_result_of(&error).expect("failure carries partial result");
-    assert_eq!(partial["trace"][0]["status"], "blocked", "{}", partial);
-}
-
 /// #2630 command-scoped catalog: the provider stays active with an empty
 /// inner set (pure shell), unknown tool names are never dispatched, and the
 /// slot's installed owner keeps the weak reference alive for exactly the run.
@@ -813,12 +670,9 @@ async fn command_scoped_catalog_stays_active_and_fails_closed_without_tools() {
         base_providers: Vec::new(),
         slot: Some(slot.clone()),
         payload_limit: None,
-        operator_inner_consent: true,
     }));
     assert!(bash.has_tool(BASH_TOOL_NAME));
 
-    let hooks: Arc<Mutex<Vec<HookEvent>>> = Arc::default();
-    let hook_collector = hooks.clone();
     let ctx = slot.install(ToolEvalContext {
         on_tool_call_completed: None,
         on_interaction: None,
@@ -836,15 +690,6 @@ async fn command_scoped_catalog_stays_active_and_fails_closed_without_tools() {
         emit_tool_blocked_fn: Arc::new(|_, _| {}),
         emit_tool_update_fn: Arc::new(|_, _| {}),
         confirm_tool_use_fn: Arc::new(|_, _, _| panic!("no approval expected")),
-        dispatch_hook_fn: Arc::new(move |event| {
-            hook_collector.lock().unwrap().push(event);
-            Box::pin(async {
-                HookOutcome {
-                    control: HookResultControl::Continue,
-                    result: HookResult::default(),
-                }
-            })
-        }),
         prepare_handoff_fn: None,
     });
 

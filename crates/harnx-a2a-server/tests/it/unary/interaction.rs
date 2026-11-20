@@ -9,14 +9,14 @@ use crate::{
     unary::{fixtures::*, hitl::assert::*},
 };
 
-fn response_count(entries: &[(u64, SessionLogEntry)]) -> usize {
+pub(super) fn response_count(entries: &[(u64, SessionLogEntry)]) -> usize {
     entries
         .iter()
         .filter(|(_, e)| matches!(e, SessionLogEntry::InteractionResponse { .. }))
         .count()
 }
 
-fn executions() -> usize {
+pub(super) fn executions() -> usize {
     std::fs::read_to_string(Config::config_dir().join("executions"))
         .unwrap_or_default()
         .lines()

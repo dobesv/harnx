@@ -60,6 +60,7 @@ fn subagent_pending_interaction_catchup_survives_persisted_tool_results_and_ag_u
             4,
             SessionLogEntry::ToolResults {
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("parent-call".into()),
                     name: "session_prompt".into(),
                     output: json!({"status":"blocked","terminal":false,"sub_agent_progress":persisted}),

@@ -27,10 +27,8 @@ fn parse_params(params: Option<Value>) -> Result<ResponseParams, &'static str> {
     if params.interaction_id.trim().is_empty() || params.request_seq == 0 {
         return Err("interaction_id must be non-empty and request_seq must be positive");
     }
-    if !matches!(params.response.action.as_str(), "approve" | "deny")
-        || !params.response.data.is_empty()
-    {
-        return Err("this client supports only approve/deny responses with empty data");
+    if params.response.action.trim().is_empty() {
+        return Err("response.action must be non-empty");
     }
     Ok(params)
 }
@@ -105,6 +103,7 @@ fn outcome_name(outcome: &InteractionDecisionOutcome) -> &'static str {
         InteractionDecisionOutcome::WrongSequence => "wrong_sequence",
         InteractionDecisionOutcome::Stale => "stale",
         InteractionDecisionOutcome::AfterComplete => "after_complete",
+        InteractionDecisionOutcome::InvalidResponse => "invalid_response",
         InteractionDecisionOutcome::LeaseLost => "lease_lost",
     }
 }

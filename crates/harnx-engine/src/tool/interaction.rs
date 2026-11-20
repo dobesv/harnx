@@ -4,8 +4,8 @@ use super::{
     dispatch_authorized_call, ensure_tool_call_ids, materialize_dispatch_result,
     normalize_outer_result, prepare_tool_call, publish_tool_call, run_middleware, work_boundary,
     ApprovedToolCall, EvaluatedInnerCall, InnerToolCallStatus, MaterializedToolResult,
-    ToolAdmission, ToolApprovalRequiredError, ToolEvalContext, ToolEvaluation,
-    ToolMiddlewareOrigin, ToolMiddlewareOutcome, WorkBoundary,
+    ToolAdmission, ToolEvalContext, ToolEvaluation, ToolMiddlewareOrigin, ToolMiddlewareOutcome,
+    WorkBoundary,
 };
 use anyhow::{anyhow, Result};
 use futures_util::future::join_all;
@@ -101,7 +101,6 @@ pub(super) async fn evaluate_round(
         all_null: true,
     };
     let mut approved = Vec::new();
-    let mut deferred = Vec::new();
     for call in &calls {
         if let Some(result) = call.id.as_ref().and_then(|id| completed.remove(id)) {
             round.all_null = false;
@@ -112,17 +111,13 @@ pub(super) async fn evaluate_round(
             continue;
         }
         match prepare_tool_call(evaluation.ctx, call.clone(), evaluation.abort_signal).await? {
-            ToolAdmission::Approved(call) => approved.push(call),
+            ToolAdmission::Approved(call) => approved.push(*call),
             ToolAdmission::Immediate(result, status) => {
                 let result = finalize_immediate(evaluation, *result, status).await?;
                 round.completed.push(EvaluatedInnerCall { result, status });
                 round.all_null = false;
             }
-            ToolAdmission::Deferred(call) => deferred.push(call),
         }
-    }
-    if !deferred.is_empty() {
-        return Err(ToolApprovalRequiredError::new(calls, deferred).into());
     }
     // Finalization lives inside each future, not after join_all. A slow sibling
     // must not delay another call's durable completion or terminal publication.
@@ -173,9 +168,7 @@ async fn dispatch_outcome(
             evaluation.authorization,
         )
         .await;
-        materialize_dispatch_result(&evaluation, call, output)
-            .await
-            .map(ToolMiddlewareOutcome::Completed)
+        materialize_dispatch_result(&evaluation, call, output).await
     };
     outcome.map_err(|error| match error {
         ToolError::Fatal(error) | ToolError::Recoverable(error) => error,
@@ -193,6 +186,27 @@ async fn finalize_dispatch(
 ) -> Result<FinalizedCall> {
     match dispatch_outcome(evaluation, call).await? {
         ToolMiddlewareOutcome::Completed(result) => {
+            finalize_materialized(evaluation, call, result).await
+        }
+        ToolMiddlewareOutcome::ToolInputRequired(input) => {
+            // Raw provider challenges only suspend through the runtime's
+            // durable layer, which completes their identity. Reaching this
+            // arm means no such layer is installed (inner or operator
+            // origin, or a round without the durable interaction path).
+            let name = input.producer.rsplit('/').next().unwrap_or_default();
+            let result = MaterializedToolResult::new(
+                ToolResult::new(
+                    call.call.clone(),
+                    json!({
+                        "is_error": true,
+                        "error": format!(
+                            "tool '{name}' requires user input; interactions are not supported here"
+                        ),
+                        "input_required": input.key,
+                    }),
+                ),
+                InnerToolCallStatus::ToolError,
+            );
             finalize_materialized(evaluation, call, result).await
         }
         ToolMiddlewareOutcome::InputRequired {

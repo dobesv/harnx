@@ -131,14 +131,14 @@ fn context(config: GlobalConfig, instance_id: ServerScope, model: AgentCallFn) -
         usage_at_start: Default::default(),
         call_fn: Some(model),
         on_tool_round: None,
-        on_hitl_approval_required: None,
         on_text_response: None,
         initial_with_embeddings: false,
         initial_resume_count: 0,
         max_resume: None,
         prepare_handoff_fn: None,
-        nats_hook_provider: None,
+
         pending_async_context: None,
+        surface_notes: None,
         working_dir: None,
         tool_loop_guard: Default::default(),
     }

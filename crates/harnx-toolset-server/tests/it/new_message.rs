@@ -68,6 +68,8 @@ impl Toolset for Waiting {
 
 fn request(tool: &str, call_id: &str) -> ToolRequest {
     ToolRequest {
+        input_responses: None,
+        request_state: None,
         tool: tool.into(),
         ..common::request("new-message-session", call_id)
     }

@@ -194,6 +194,9 @@ pub enum Script {
     SameRoundTools,
     CountedTool,
     ReadOnlyTool,
+    A2uiTool,
+    A2uiSerial,
+    A2uiSameRound,
     ConfirmTool,
     ConfirmHeld,
     ConfirmSerial,
@@ -327,7 +330,12 @@ fn write_fixture_support_configs(
     }
     if matches!(
         script,
-        Script::CountedTool | Script::ConfirmTool | Script::ConfirmHeld | Script::ConfirmSerial
+        Script::CountedTool
+            | Script::ConfirmTool
+            | Script::ConfirmHeld
+            | Script::ConfirmSerial
+            | Script::A2uiTool
+            | Script::A2uiSerial
     ) {
         write_counted_tool_config(dir)?;
     }
@@ -351,17 +359,25 @@ fn write_same_round_tools_agent(dir: &std::path::Path) -> Result<String> {
                 .context("time tool path")?
         ),
     )?;
-    let hook = binary("harnx-claude-compatible-hook-server")?;
-    let command = shell_words::join([hook.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^time_get_current_time$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve time lookup?\"}}"]);
-    Ok(format!("---\nmodel: mock:test\nuse_tools: [time_get_current_time]\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest same-round approvals\n"))
+    let middleware = serde_json::json!([{
+        "name": "confirmation",
+        "match": "^time_get_current_time$",
+        "bash": "if confirm --id first 'Approve time lookup?'; then next; else reason=\"$(answer first | jq -r '.note // empty')\"; deny \"${reason:-Denied by user}\"; fi",
+    }]);
+    Ok(format!("---\nmodel: mock:test\nuse_tools: [time_get_current_time]\nmiddleware: {middleware}\n---\nTest same-round approvals\n"))
 }
 
 fn write_tool_handoff_agent() -> Result<String> {
-    let binary = binary("harnx-claude-compatible-hook-server")?;
-    let command = shell_words::join([binary.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^target_session_handoff$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve handoff?\"}}"]);
-    Ok(format!("---\nmodel: mock:test\nuse_tools:\n- target_session_handoff\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest runner agent\n"))
+    let middleware = serde_json::json!([{
+        "name": "confirmation",
+        "match": "^target_session_handoff$",
+        "bash": "if confirm --id first 'Approve handoff?'; then next; else reason=\"$(answer first | jq -r '.note // empty')\"; deny \"${reason:-Denied by user}\"; fi",
+    }]);
+    Ok(format!("---\nmodel: mock:test\nuse_tools:\n- target_session_handoff\nmiddleware: {middleware}\n---\nTest runner agent\n"))
 }
 
+#[path = "support/a2ui.rs"]
+pub(crate) mod a2ui;
 #[path = "support/interaction.rs"]
 mod interaction;
 

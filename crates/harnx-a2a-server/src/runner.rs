@@ -51,6 +51,7 @@ mod reconciler;
 mod recovery;
 mod remote;
 mod reply;
+mod reply_delivery;
 mod reply_note;
 mod resume;
 mod segment;

@@ -16,6 +16,7 @@ mod cancellation;
 mod compaction;
 mod hitl_exact;
 mod interaction;
+mod surface_action;
 
 pub const JSON_RPC_UNKNOWN_SESSION_CODE: i64 = -32001;
 const JSON_RPC_METHOD_NOT_FOUND_CODE: i64 = -32601;
@@ -190,6 +191,7 @@ async fn handle_ag_ui_rpc_bytes_for_target(
     dispatch_rpc(rpc, context, key).await
 }
 
+// qual:allow(complexity, max_cyclomatic=11) reason: "the match is the RPC dispatch table: one arm per session method; merging or splitting arms would obscure the method map, and every arm is a one-line delegation."
 async fn dispatch_rpc(
     rpc: JsonRpcRequest,
     context: RpcContext<'_>,
@@ -216,6 +218,9 @@ async fn dispatch_rpc(
         }
         "session/interaction_response" => {
             interaction::handle(rpc.id, rpc.params, (config, registry, key)).await
+        }
+        "session/surface_action" => {
+            surface_action::handle(rpc.id, rpc.params, (config, registry, key)).await
         }
         "session/cancel" => cancellation::handle(rpc.id, (config, registry, key)).await,
         "session/compact" => compaction::handle(rpc.id, (config, registry, key)).await,

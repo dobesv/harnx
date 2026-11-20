@@ -9,6 +9,8 @@
 
 #[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
+use std::path::Path;
 use std::process::Command;
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -238,50 +240,29 @@ fn test_working_dir_option() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn test_hook_cli_injects_env() {
-    if skips_without_sandbox() {
-        return;
-    }
-
-    let dir = temp_test_dir("hook-env");
-    let hook_path = dir.join("hook.sh");
-    make_unix_script(
-        &hook_path,
-        r#"#!/bin/sh
-cat >/dev/null
-printf '%s' '{"hookSpecificOutput":{"toolInput":{"command":"env","env":{"HOOK_TEST_VAR":"from_hook"}}}}'
-"#,
-    );
-
+fn test_unsupported_hook_type_reports_migration_message() {
     let output = Command::new(binary_path())
         .args([
             "--hook",
             "claude-command",
-            hook_path.to_str().expect("utf8 hook path"),
+            "unsupported-hook-command",
             ";",
-            "--allow-exec",
-            "/bin",
-            "--allow-exec",
-            "/usr",
-            "--working-dir",
-            "/tmp",
             "--",
-            "env",
+            "--help",
         ])
         .output()
-        .expect("failed to spawn sandbox");
+        .expect("failed to spawn sandbox-run");
 
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "unsupported hook type must fail");
     assert!(
-        output.status.success(),
-        "sandbox should exit successfully with hook, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("hook type 'claude-command' is not supported in harnx-sandbox-run"),
+        "unsupported hook error missing from stderr: {stderr:?}"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.lines().any(|line| line == "HOOK_TEST_VAR=from_hook"),
-        "hook-injected env var missing from output: {stdout:?}"
+        stderr.contains("Migrate to '--hook environment <COMMAND> [ARGS...] ;' using MCP stdio"),
+        "migration guidance missing from stderr: {stderr:?}"
     );
 }
 
@@ -459,4 +440,159 @@ fn test_symlinked_grant_stays_reachable() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Verify MCP stdio environment hook execution, environment precedence
+/// (credential provider-wins vs proxy caller-wins), and service lifetime.
+#[cfg(unix)]
+fn write_mock_cred_service(path: &Path) {
+    make_unix_script(
+        path,
+        r#"#!/usr/bin/env python3
+import sys, json, os
+
+canary = sys.argv[1]
+with open(canary, "w") as f:
+    f.write(str(os.getpid()))
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "mock-cred-service", "version": "1.0"}}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/call":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps({"env": {"AWS_REGION": "us-west-2", "OVERRIDDEN": "from_provider"}, "filesystem": {}})}]}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#,
+    );
+}
+
+#[cfg(unix)]
+fn write_mock_proxy_service(path: &Path) {
+    make_unix_script(
+        path,
+        r#"#!/usr/bin/env python3
+import sys, json, os
+
+canary = sys.argv[1]
+with open(canary, "w") as f:
+    f.write(str(os.getpid()))
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "harnx-proxy_auth-server", "version": "1.0"}}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/call":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps({"env": {"HTTP_PROXY": "http://127.0.0.1:3009", "CALLER_WINS": "from_proxy"}, "filesystem": {}})}]}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#,
+    );
+}
+
+#[cfg(unix)]
+fn assert_pid_terminated(pid: i32) {
+    let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
+    if let Ok(exit_status) = status {
+        assert!(!exit_status.success(), "process {pid} should be terminated");
+    }
+}
+
+/// Integration test covering MCP stdio environment hooks in sandbox-run:
+/// verifies sidecar startup, precedence order
+/// (credential provider-wins vs proxy caller-wins), and service lifetime.
+#[cfg(unix)]
+#[test]
+fn test_mcp_environment_hooks_precedence_and_lifetime() {
+    if skips_without_sandbox() {
+        return;
+    }
+
+    let dir = temp_test_dir("mcp-hook-test");
+    let cred_script = dir.join("mock_cred_server.py");
+    let proxy_script = dir.join("mock_proxy_server.py");
+    let cred_canary = dir.join("cred_alive.txt");
+    let proxy_canary = dir.join("proxy_alive.txt");
+
+    write_mock_cred_service(&cred_script);
+    write_mock_proxy_service(&proxy_script);
+
+    let assert_script = format!(
+        r#"
+test "$AWS_REGION" = "us-west-2" || exit 10
+test "$OVERRIDDEN" = "from_provider" || exit 11
+test "$HTTP_PROXY" = "http://127.0.0.1:3009" || exit 12
+test "$CALLER_WINS" = "from_cli" || exit 13
+test -f "{}" || exit 14
+test -f "{}" || exit 15
+exit 0
+"#,
+        cred_canary.display(),
+        proxy_canary.display(),
+    );
+
+    let output = Command::new(binary_path())
+        .args([
+            "--hook",
+            "environment",
+            cred_script.to_str().unwrap(),
+            cred_canary.to_str().unwrap(),
+            ";",
+            "--hook",
+            "environment",
+            proxy_script.to_str().unwrap(),
+            proxy_canary.to_str().unwrap(),
+            ";",
+            "--env",
+            "OVERRIDDEN=from_cli",
+            "--env",
+            "CALLER_WINS=from_cli",
+            "--allow-rwx",
+            dir.to_str().unwrap(),
+            "--working-dir",
+            "/tmp",
+            "--",
+            "sh",
+            "-c",
+            &assert_script,
+        ])
+        .output()
+        .expect("run sandbox-run with hooks");
+
+    assert!(
+        output.status.success(),
+        "sandbox command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(cred_canary.exists() && proxy_canary.exists());
+    let cred_pid: i32 = fs::read_to_string(&cred_canary)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let proxy_pid: i32 = fs::read_to_string(&proxy_canary)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    assert_pid_terminated(cred_pid);
+    assert_pid_terminated(proxy_pid);
 }

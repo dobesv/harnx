@@ -22,6 +22,7 @@ const FUNCTIONS: &[&str] = &[
     "answer",
     "save",
     "saved",
+    "interact",
 ];
 
 pub(super) fn functions(frame: &Arc<Frame>) -> ScriptPythonFunctions {
@@ -94,6 +95,15 @@ impl Handler {
                 .0
                 .answer(&string(required(&mut values, "key")?)?)
                 .map(|value| value.unwrap_or(Value::Null)),
+            "interact" => {
+                let message = required(&mut values, "surface")?;
+                let id = values
+                    .remove("id")
+                    .filter(|value| !value.is_null())
+                    .map(string)
+                    .transpose()?;
+                self.0.interact(message, id, host)
+            }
             "saved" => self
                 .0
                 .saved(&string(required(&mut values, "key")?)?)
@@ -127,6 +137,7 @@ fn parameters(name: &str) -> Result<&'static [&'static str]> {
         "confirm" => &["message", "id"],
         "answer" | "saved" => &["key"],
         "save" => &["key", "value"],
+        "interact" => &["surface", "id"],
         _ => bail!("unknown middleware function '{name}'"),
     })
 }

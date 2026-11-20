@@ -206,6 +206,7 @@ fn child_result_history(
                 markdown: None,
                 content: vec![],
                 switch_agent: None,
+                user_surfaces: Vec::new(),
             }],
             timestamp: None,
         },

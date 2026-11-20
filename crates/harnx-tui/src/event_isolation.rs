@@ -54,9 +54,11 @@ impl Tui {
         Box::pin(self.handle_tui_event_inner(event)).await
     }
 
+    // qual:allow(complexity, max_function_lines=69) reason: "flat one-line dispatch per TuiEvent; the surface arm matches the existing style"
     pub(super) async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
         match event {
             TuiEvent::Interaction(event) => self.handle_interaction_event(event),
+            TuiEvent::Surface(event) => self.handle_surface_event(event),
             event @ (TuiEvent::OperatorToolFinished { .. }
             | TuiEvent::PromptTaskFinished { .. }) => {
                 self.handle_task_completion(event).await;

@@ -113,6 +113,9 @@ async fn clone_once(
     match result {
         Ok(result) => Ok(parse_clone_result(result)),
         Err(error @ (ToolInvokeError::Fatal(_) | ToolInvokeError::Interrupted(_))) => Err(error),
+        Err(ToolInvokeError::InputRequired(_)) => Err(ToolInvokeError::Recoverable(
+            "repository clone does not support interactive input".to_string(),
+        )),
         Err(error @ ToolInvokeError::Recoverable(_)) => Ok(CloneAttempt::Failed(error.to_string())),
     }
 }

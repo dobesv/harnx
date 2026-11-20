@@ -39,6 +39,22 @@ pub const RUNTIME_NOTE_PREFIX: &str = "[Runtime note] ";
 /// Prefix of the structured message id assigned to synthesized runtime notes.
 pub const RUNTIME_NOTE_ID_PREFIX: &str = "runtime-note-v1-";
 
+/// Prefix of the structured message id for hook-added context rows
+/// (`Input::hook_context`, issue #2198). Event hooks add context that must
+/// reach the next model request and the transcript, but it is not a prompt:
+/// nobody submitted or admitted it. The reserved id gives the row a durable
+/// non-prompt identity that survives compaction's verbatim re-log and keeps
+/// it out of every executable-prompt check (fold, admission verification,
+/// queued-input reconstruction, prompt selection) the same way a runtime
+/// note is. It also serves as provenance: a row with this id was written by
+/// a lifecycle event hook, not a client (review F14).
+///
+/// The event that produced the context is not encoded in the id: context
+/// from SessionStart and UserPromptSubmit hooks accumulates into one row
+/// per round (`Input::push_hook_context`), so there is no single event to
+/// name.
+pub const HOOK_CONTEXT_ID_PREFIX: &str = "hook-context-v1-";
+
 /// Fresh identity for a synthesized runtime note. Unique per note: two
 /// identical cancel notes in one session are separate context rows.
 pub fn new_runtime_note_message_id() -> String {
@@ -48,6 +64,31 @@ pub fn new_runtime_note_message_id() -> String {
 /// Whether a message id was minted by runtime-note synthesis.
 pub fn is_runtime_note_message_id(id: &str) -> bool {
     id.starts_with(RUNTIME_NOTE_ID_PREFIX)
+}
+
+/// Fresh identity for a hook-added context row. Unique per row.
+pub fn new_hook_context_message_id() -> String {
+    format!("{HOOK_CONTEXT_ID_PREFIX}{}", uuid::Uuid::new_v4())
+}
+
+/// Whether a message id marks a hook-added context row.
+pub fn is_hook_context_message_id(id: &str) -> bool {
+    id.starts_with(HOOK_CONTEXT_ID_PREFIX)
+}
+
+/// Whether a durable user row's id marks hook-added context rather than an
+/// executable prompt. Structured id only — see the module docs for why the
+/// text is not a signal.
+pub fn is_hook_context_id(id: Option<&str>) -> bool {
+    id.is_some_and(is_hook_context_message_id)
+}
+
+/// Whether a durable user row's id marks it as runtime-authored context —
+/// a replay-synthesized note or hook-added context — rather than an
+/// executable prompt. Every executable-prompt classifier should use this so
+/// new runtime-context identities are excluded everywhere at once.
+pub fn is_runtime_context_id(id: Option<&str>) -> bool {
+    is_runtime_note_id(id) || is_hook_context_id(id)
 }
 
 /// Whether a durable user row is runtime-authored context rather than an
@@ -64,6 +105,7 @@ pub fn is_runtime_note_id(id: Option<&str>) -> bool {
 /// verbatim and never pass through admission, so they are unaffected.
 pub fn is_reserved_message_id(id: &str) -> bool {
     is_runtime_note_message_id(id)
+        || is_hook_context_message_id(id)
         || id.starts_with(crate::timing_identity::TIMING_MESSAGE_ID_PREFIX)
 }
 
@@ -143,6 +185,19 @@ mod tests {
     }
 
     #[test]
+    fn hook_context_ids_classify_as_runtime_context() {
+        let id = new_hook_context_message_id();
+        assert_ne!(id, new_hook_context_message_id());
+        assert!(is_hook_context_id(Some(&id)));
+        assert!(is_runtime_context_id(Some(&id)));
+        // Runtime notes keep classifying through the shared helper.
+        assert!(is_runtime_context_id(Some(&new_runtime_note_message_id())));
+        // Ordinary and ID-less rows stay executable prompts.
+        assert!(!is_runtime_context_id(Some("admitted-prompt")));
+        assert!(!is_runtime_context_id(None));
+    }
+
+    #[test]
     fn other_ids_and_idless_rows_are_not_runtime_notes() {
         // Admitted prompts carry admission ids; a user prompt that happens to
         // start with the note prefix keeps its id and stays executable.
@@ -156,6 +211,7 @@ mod tests {
     #[test]
     fn reserved_ids_cover_runtime_note_and_timing_prefixes() {
         assert!(is_reserved_message_id(&new_runtime_note_message_id()));
+        assert!(is_reserved_message_id(&new_hook_context_message_id()));
         assert!(is_reserved_message_id("timing-v1-abc123"));
         // Ordinary caller ids (uuids) stay admissible.
         assert!(!is_reserved_message_id(&uuid::Uuid::new_v4().to_string()));

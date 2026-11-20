@@ -30,6 +30,7 @@ async fn subagent_blocked_persisted_parent_results_and_catchup() -> Result<()> {
     let parent_log = NatsSessionLog::new_with_replicas(harness.js.clone(), &parent_key, 1);
 
     let tool_output = harnx_core::session::ToolOutput {
+        user_surfaces: Vec::new(),
         id: Some("parent-call-1".into()),
         name: format!("{AGENT_NAME}_session_wait"),
         output: wait_out.clone(),

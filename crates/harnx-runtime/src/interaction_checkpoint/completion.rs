@@ -175,6 +175,7 @@ pub(crate) fn public_output(result: &ToolResult) -> ToolOutput {
         output: result.output.clone(),
         markdown: result.markdown.clone(),
         content: result.content.clone(),
+        user_surfaces: result.user_surfaces.clone(),
         switch_agent: result.switch_agent.clone(),
     }
 }

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -183,6 +183,32 @@ impl ToolSpec {
             .unwrap_or(false)
     }
 
+    /// `_meta` key a tool sets to `true` when it may suspend a call by
+    /// returning `input_required` (see [`ToolInputRequired`]). The runtime
+    /// reads it to open the durable interaction path for rounds containing
+    /// such a call even when no middleware is configured; a challenge from
+    /// an undeclared tool degrades to an error result there.
+    pub const INPUT_REQUIRED_META_KEY: &'static str = "harnx:input_required";
+
+    /// Declare that this tool may return an input-required challenge; see
+    /// [`ToolSpec::INPUT_REQUIRED_META_KEY`].
+    #[must_use]
+    pub fn with_input_required(mut self) -> Self {
+        self.meta
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(Self::INPUT_REQUIRED_META_KEY.to_string(), Value::Bool(true));
+        self
+    }
+
+    /// Whether this tool declared [`ToolSpec::with_input_required`].
+    pub fn requests_input(&self) -> bool {
+        self.meta
+            .as_ref()
+            .and_then(|meta| meta.get(Self::INPUT_REQUIRED_META_KEY))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// Retrieve the static kind declaration from this tool spec.
     ///
     /// Returns `None` if no kind was declared or if the value is malformed.
@@ -218,12 +244,153 @@ impl fmt::Display for InterruptedCall {
     }
 }
 
+/// One tool challenge asking the user for input before the call can finish —
+/// the wire mapping of MCP MRTR `input_required` (SEP-2322).
+///
+/// A tool that needs to challenge again after a response issues a new
+/// request with its own key and state; the caller re-dispatches with only
+/// the latest challenge's responses and state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInputRequired {
+    /// The tool's own request key (the MRTR `inputRequests` key). Distinct
+    /// challenges need distinct keys: an exact repeat of an answered
+    /// (key, kind, payload) gets its previous answer back.
+    pub key: String,
+    /// Interaction kind: `confirm` or `a2ui`.
+    pub kind: String,
+    /// The question text for `confirm` challenges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The A2UI envelope for `a2ui` challenges (validated before suspending).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<Value>,
+    #[serde(default)]
+    pub summary: String,
+    /// Opaque tool state resent beside the responses on the rerun, never
+    /// inside `args`. Bounded by [`MAX_TOOL_REQUEST_STATE_BYTES`].
+    #[serde(default)]
+    pub request_state: Value,
+}
+
+impl ToolInputRequired {
+    /// Frontends route on this kind with their confirm UI.
+    pub const KIND_CONFIRM: &'static str = "confirm";
+    /// Frontends route on this kind with their A2UI rendering.
+    pub const KIND_A2UI: &'static str = "a2ui";
+
+    /// Build a `confirm` challenge: a question with Approve/Deny semantics.
+    pub fn confirm(
+        key: impl Into<String>,
+        message: impl Into<String>,
+        request_state: Value,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            kind: Self::KIND_CONFIRM.into(),
+            message: Some(message.into()),
+            surface: None,
+            summary: String::new(),
+            request_state,
+        }
+    }
+
+    /// Build an `a2ui` challenge from a full A2UI envelope.
+    pub fn a2ui(
+        key: impl Into<String>,
+        surface: Value,
+        summary: impl Into<String>,
+        request_state: Value,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            kind: Self::KIND_A2UI.into(),
+            message: None,
+            surface: Some(surface),
+            summary: summary.into(),
+            request_state,
+        }
+    }
+
+    /// Check the wire shape. The runtime re-validates before suspending; this
+    /// keeps oversized or malformed challenges from leaving the tool server.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.key.is_empty() {
+            return Err("input_required key must not be empty".into());
+        }
+        if self.key.len() > MAX_TOOL_INPUT_KEY_BYTES {
+            return Err(format!(
+                "input_required key exceeds {MAX_TOOL_INPUT_KEY_BYTES} bytes"
+            ));
+        }
+        match self.kind.as_str() {
+            Self::KIND_CONFIRM => {
+                if self.message.as_deref().map(str::is_empty).unwrap_or(true) {
+                    return Err("confirm input_required needs a message".into());
+                }
+            }
+            Self::KIND_A2UI => {
+                if self.surface.as_ref().is_none_or(Value::is_null) {
+                    return Err("a2ui input_required needs a surface".into());
+                }
+            }
+            other => return Err(format!("unsupported input_required kind '{other}'")),
+        }
+        let state = serde_json::to_vec(&self.request_state).unwrap_or_default();
+        if state.len() > MAX_TOOL_REQUEST_STATE_BYTES {
+            return Err(format!(
+                "input_required request_state exceeds {MAX_TOOL_REQUEST_STATE_BYTES} bytes"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Answers to a tool's input-required challenges, keyed by the challenge's
+/// request key (the MRTR `inputResponses` map).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInputResponse {
+    pub action: String,
+    #[serde(default)]
+    pub data: serde_json::Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Serialized bound on a tool's opaque `request_state`, enforced when the
+/// challenge is built and again before the runtime suspends the call.
+pub const MAX_TOOL_REQUEST_STATE_BYTES: usize = 64 * 1024;
+
+/// Maximum number of input-required challenge rounds one tool call may
+/// drive before the runtime gives up with an error result, matching rmcp's
+/// MRTR client default (`DEFAULT_MRTR_MAX_ROUNDS`, SEP-2322); harnx
+/// toolset-server asserts the two stay equal. Applies to every
+/// `input_required` tool, native or MCP-bridged, so a looping tool cannot
+/// keep a call suspended indefinitely.
+pub const MAX_TOOL_INPUT_ROUNDS: usize = 10;
+
+/// Serialized bound on a challenge's request key.
+pub const MAX_TOOL_INPUT_KEY_BYTES: usize = 256;
+
+/// Compatibility `result` error carried next to `ToolReply::input_required`
+/// so callers that do not understand the field see a clear failure instead
+/// of a silent success. Newer callers must ignore `result` when
+/// `input_required` is set.
+pub const INPUT_REQUIRED_COMPAT_ERROR: &str =
+    "tool requires user input before it can finish; this caller cannot ask for it";
+
 /// Error returned directly by a [`Toolset`] implementation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolInvokeError {
     Recoverable(String),
     Fatal(String),
     Interrupted(InterruptedCall),
+    /// The tool cannot finish without user input (MRTR `input_required`).
+    /// Not a failure: the caller suspends the call and re-dispatches with the
+    /// accepted responses in [`ToolInvocationContext::input_responses`],
+    /// never inside the tool's arguments. Boxed to keep the error type
+    /// small (clippy `result_large_err`).
+    InputRequired(Box<ToolInputRequired>),
 }
 
 impl fmt::Display for ToolInvokeError {
@@ -231,6 +398,13 @@ impl fmt::Display for ToolInvokeError {
         match self {
             Self::Recoverable(message) | Self::Fatal(message) => message.fmt(f),
             Self::Interrupted(interrupted) => interrupted.fmt(f),
+            Self::InputRequired(input) => {
+                write!(
+                    f,
+                    "tool input required ({}, kind {})",
+                    input.key, input.kind
+                )
+            }
         }
     }
 }
@@ -288,6 +462,14 @@ pub struct ToolInvocationContext {
     /// Defaults to a token that never fires, for transports that cannot
     /// deliver the signal.
     pub new_message: CancellationToken,
+    /// Answers to the tool's latest input-required challenge, keyed by the
+    /// challenge's request key (MRTR `inputResponses`). Runtime-owned input
+    /// delivered beside the arguments: never read from, or echoed into,
+    /// model-authored tool arguments.
+    pub input_responses: BTreeMap<String, ToolInputResponse>,
+    /// The tool's opaque request state from its latest challenge (MRTR
+    /// `requestState`), resent beside the responses. Null on a first call.
+    pub request_state: Value,
 }
 
 /// Re-export SessionRef to allow harnx-toolset-server to pass it through
@@ -329,6 +511,8 @@ impl fmt::Debug for ToolInvocationContext {
             )
             .field("progress", &self.progress)
             .field("new_message", &self.new_message.is_cancelled())
+            .field("input_responses", &self.input_responses)
+            .field("request_state", &self.request_state)
             .finish()
     }
 }
@@ -477,6 +661,15 @@ pub struct ToolRequest {
     /// private result metadata must not be returned.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub capabilities: BTreeSet<String>,
+    /// Answers to the tool's latest input-required challenge, keyed by the
+    /// challenge's request key (MRTR `inputResponses`). Runtime-owned input,
+    /// never read from model-authored tool arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_responses: Option<BTreeMap<String, ToolInputResponse>>,
+    /// The tool's opaque request state from its latest challenge (MRTR
+    /// `requestState`), resent beside the responses, never inside `args`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_state: Option<Value>,
 }
 
 /// One attempt to replay a call whose original result was never observed,
@@ -561,6 +754,13 @@ pub struct ToolReply {
     /// model-facing tool output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_progress: Option<ToolProgressPatch>,
+    /// The tool cannot finish without user input (MRTR `input_required`).
+    /// When present, `result` carries the compatibility error
+    /// [`INPUT_REQUIRED_COMPAT_ERROR`] for older callers and must be ignored
+    /// by newer ones: the call suspends and is re-dispatched with the
+    /// accepted responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_required: Option<ToolInputRequired>,
 }
 
 /// Progress update published on the per-instance control subject.
@@ -941,6 +1141,136 @@ mod tests {
     }
 
     #[test]
+    fn input_required_reply_round_trips() {
+        let reply = ToolReply {
+            call_id: "call-9".to_string(),
+            result: Err(ToolErrorPayload::Recoverable(
+                INPUT_REQUIRED_COMPAT_ERROR.to_string(),
+            )),
+            final_progress: None,
+            input_required: Some(ToolInputRequired::confirm(
+                "ask-1",
+                "Deploy to production?",
+                json!({ "round": 1 }),
+            )),
+        };
+        let back: ToolReply =
+            serde_json::from_value(serde_json::to_value(&reply).unwrap()).unwrap();
+        assert_eq!(back, reply);
+        let input = back.input_required.expect("input_required round trips");
+        input.validate().expect("constructed challenge validates");
+    }
+
+    #[test]
+    fn old_callers_see_compatibility_error_and_new_callers_skip_result() {
+        let reply = ToolReply {
+            call_id: "call-9".to_string(),
+            result: Err(ToolErrorPayload::Recoverable(
+                INPUT_REQUIRED_COMPAT_ERROR.to_string(),
+            )),
+            final_progress: None,
+            input_required: Some(ToolInputRequired::confirm("k", "Proceed?", Value::Null)),
+        };
+        // Newer callers ignore `result` entirely when a challenge is present.
+        assert!(reply.input_required.is_some());
+        assert!(reply.result.is_err());
+
+        // An older caller decodes the same JSON and never sees the unknown
+        // field, so it surfaces the compatibility error instead of a silent
+        // success. Reply JSON without the field still decodes. `result`
+        // is serde's externally tagged `{"Err": payload}` on the wire.
+        let json = serde_json::to_value(&reply).unwrap();
+        assert_eq!(json["result"]["Err"]["kind"], json!("recoverable"));
+        let input_required = json.get("input_required").unwrap().clone();
+        let legacy: serde_json::Value = serde_json::json!({
+            "call_id": "call-9",
+            "result": { "Err": { "kind": "recoverable", "message": INPUT_REQUIRED_COMPAT_ERROR } },
+        });
+        let legacy_reply: ToolReply = serde_json::from_value(legacy).unwrap();
+        assert!(legacy_reply.input_required.is_none());
+        assert!(legacy_reply.result.is_err());
+        // Round-tripped challenges survive a decode by a caller that knows
+        // the field but nothing else about the tool.
+        let decoded: ToolInputRequired = serde_json::from_value(input_required).unwrap();
+        assert_eq!(decoded.key, "k");
+    }
+
+    #[test]
+    fn input_required_request_fields_round_trip() {
+        let request = ToolRequest {
+            run_context: None,
+            replay: None,
+            operation_id: "call-1".to_string(),
+            call_id: "call-1".to_string(),
+            tool: "deploy".to_string(),
+            args: json!({ "target": "prod" }),
+            parent_session_id: None,
+            parent_agent: None,
+            parent_local_session_id: None,
+            tool_call_id: None,
+            tool_round: None,
+            capabilities: BTreeSet::new(),
+            input_responses: Some(BTreeMap::from([(
+                "ask-1".to_string(),
+                ToolInputResponse {
+                    action: "approve".to_string(),
+                    data: serde_json::Map::new(),
+                    note: Some("human response".to_string()),
+                },
+            )])),
+            request_state: Some(json!({ "round": 2 })),
+        };
+        let back: ToolRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        assert_eq!(back, request);
+        // Older servers decode the same JSON without the new fields.
+        let legacy: ToolRequest = serde_json::from_value(json!({
+            "operation_id": "call-1",
+            "call_id": "call-1",
+            "tool": "deploy",
+            "args": {},
+        }))
+        .unwrap();
+        assert!(legacy.input_responses.is_none());
+        assert!(legacy.request_state.is_none());
+    }
+
+    #[test]
+    fn input_required_validate_rejects_bad_shapes() {
+        let mut input = ToolInputRequired::confirm("", "Proceed?", Value::Null);
+        assert!(input.validate().is_err());
+        input = ToolInputRequired::confirm("k", "", Value::Null);
+        assert!(input.validate().is_err());
+        input = ToolInputRequired::a2ui("k", Value::Null, "s", Value::Null);
+        assert!(input.validate().is_err());
+        input = ToolInputRequired {
+            kind: "mystery".to_string(),
+            ..ToolInputRequired::confirm("k", "m", Value::Null)
+        };
+        assert!(input.validate().is_err());
+        input = ToolInputRequired::confirm(
+            "k",
+            "m",
+            json!({ "blob": "x".repeat(MAX_TOOL_REQUEST_STATE_BYTES) }),
+        );
+        assert!(input.validate().is_err());
+        input =
+            ToolInputRequired::confirm("x".repeat(MAX_TOOL_INPUT_KEY_BYTES + 1), "m", Value::Null);
+        assert!(input.validate().is_err());
+    }
+
+    #[test]
+    fn spec_input_required_round_trips_through_meta() {
+        let spec = tool_spec();
+        assert!(!spec.requests_input());
+        let spec = spec.with_input_required();
+        assert!(spec.requests_input());
+        assert_eq!(ToolSpec::INPUT_REQUIRED_META_KEY, "harnx:input_required");
+        let back: ToolSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert!(back.requests_input());
+    }
+
+    #[test]
     fn wire_types_round_trip_through_serde() {
         assert_round_trip(tool_spec());
         let request = ToolRequest {
@@ -956,6 +1286,8 @@ mod tests {
             tool_call_id: Some("model-call".to_string()),
             tool_round: Some(7),
             capabilities: BTreeSet::new(),
+            input_responses: None,
+            request_state: None,
         };
         assert_round_trip(request.clone());
         assert_round_trip(ToolRequest {
@@ -972,6 +1304,7 @@ mod tests {
             call_id: "call-1".to_string(),
             result: Ok(json!({ "time": "12:00:00" })),
             final_progress: None,
+            input_required: None,
         });
         assert_round_trip(ToolReply {
             call_id: "call-2".to_string(),
@@ -982,6 +1315,7 @@ mod tests {
                 title: Some("Checking timezone".into()),
                 ..Default::default()
             }),
+            input_required: None,
         });
         assert_round_trip(ControlMessage {
             protocol_version: TOOL_PROTOCOL_VERSION,

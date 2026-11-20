@@ -437,6 +437,7 @@ compaction_tool_output_max_chars: 50\n\
         use harnx_core::session::ToolOutput;
         use serde_json::json;
         let out = ToolOutput {
+            user_surfaces: Vec::new(),
             id: None,
             name: "bash".into(),
             output: json!({
@@ -455,6 +456,7 @@ compaction_tool_output_max_chars: 50\n\
         use harnx_core::session::ToolOutput;
         use serde_json::json;
         let out = ToolOutput {
+            user_surfaces: Vec::new(),
             id: None,
             name: "fs".into(),
             output: json!({
@@ -475,6 +477,7 @@ compaction_tool_output_max_chars: 50\n\
         use harnx_core::session::ToolOutput;
         use serde_json::json;
         let out = ToolOutput {
+            user_surfaces: Vec::new(),
             id: None,
             name: "bash".into(),
             output: json!({
@@ -518,6 +521,7 @@ compaction_tool_output_max_chars: 50\n\
                 sequence: false,
                 rounds: Vec::new(),
                 tool_results: vec![ToolResult {
+                    user_surfaces: Vec::new(),
                     call: ToolCall::new("read".into(), json!({}), Some(id.into()), None),
                     output: json!({"text": "word ".repeat(words)}),
                     markdown: None,
@@ -856,6 +860,7 @@ compaction_tool_output_max_chars: 50\n\
                     sequence: false,
                     rounds: Vec::new(),
                     tool_results: vec![ToolResult {
+                        user_surfaces: Vec::new(),
                         call: ToolCall::new(
                             "bash".into(),
                             json!({"cmd": "ls"}),

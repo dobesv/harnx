@@ -17,6 +17,10 @@
   --danger: #dc3545;
   --danger-hover: #c82333;
   --danger-bg: rgba(207, 19, 34, 0.1);
+  --danger-border: rgba(207, 19, 34, 0.25);
+  --success: #15803d;
+  --success-bg: rgba(34, 197, 94, 0.12);
+  --success-border: rgba(34, 197, 94, 0.3);
   --shadow:
     rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
   --radius-md: 8px;
@@ -57,6 +61,10 @@
     --danger: #ef4444;
     --danger-hover: #dc2626;
     --danger-bg: rgba(239, 68, 68, 0.15);
+    --danger-border: rgba(239, 68, 68, 0.35);
+    --success: #4ade80;
+    --success-bg: rgba(74, 222, 128, 0.15);
+    --success-border: rgba(74, 222, 128, 0.3);
     --shadow:
       rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
   }

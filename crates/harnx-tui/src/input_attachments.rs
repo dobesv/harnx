@@ -211,6 +211,9 @@ impl Tui {
         if self.paste_interaction_note(&text) {
             return;
         }
+        if self.paste_surface_note(&text) {
+            return;
+        }
         if let Some(crate::types::ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
             state.last_key_at = std::time::Instant::now();
             state.message.insert_str(text);

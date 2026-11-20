@@ -49,6 +49,7 @@ pub(crate) fn interrupted_tool_outputs(
             }),
             markdown: None,
             content: Vec::new(),
+            user_surfaces: Vec::new(),
             switch_agent: None,
         })
         .collect()
@@ -251,6 +252,7 @@ impl<'a> ReplayState<'a> {
             | SessionLogEntry::InteractionRequested { .. }
             | SessionLogEntry::SuspensionReady { .. }
             | SessionLogEntry::InteractionResponse { .. }
+            | SessionLogEntry::SurfaceAction { .. }
             | SessionLogEntry::CompactRequest { .. }
             | SessionLogEntry::CompactResult { .. }
             | SessionLogEntry::AdmissionClosed { .. }
@@ -449,6 +451,7 @@ fn assemble_synthetic_tool_message(pending: PendingToolCalls, error: &str) -> Me
         output: serde_json::json!({ "error": error }),
         markdown: None,
         content: Vec::new(),
+        user_surfaces: Vec::new(),
         switch_agent: None,
     };
     // Fabricate one lost-response per call, matched by id/position.
@@ -509,6 +512,7 @@ fn assemble_tool_message(
                     output: out.output,
                     markdown: out.markdown,
                     content: out.content,
+                    user_surfaces: out.user_surfaces,
                     switch_agent: out.switch_agent,
                     execution_context: None,
                 },

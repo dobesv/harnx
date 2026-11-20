@@ -193,6 +193,7 @@ fn tool_sections(calls: &harnx_core::message::MessageContentToolCalls, cap: usiz
             output: result.output.clone(),
             markdown: result.markdown.clone(),
             content: result.content.clone(),
+            user_surfaces: result.user_surfaces.clone(),
             switch_agent: result.switch_agent.clone(),
         };
         let failed = ["isError", "is_error"]

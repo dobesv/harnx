@@ -81,6 +81,7 @@ async fn subagent_blocked_parent_continues_and_grandchild_nonpropagation() -> Re
             SessionLogEntry::ToolResults {
                 handoff_selection: None,
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("call-grandchild".into()),
                     name: "grandchild_session_wait".into(),
                     output: json!({

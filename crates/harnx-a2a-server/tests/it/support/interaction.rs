@@ -2,6 +2,12 @@
 use super::*;
 
 pub(super) fn agent(script: Script, dir: &std::path::Path) -> Result<Option<String>> {
+    if matches!(
+        script,
+        Script::A2uiTool | Script::A2uiSerial | Script::A2uiSameRound
+    ) {
+        return super::a2ui::agent(script, dir).map(Some);
+    }
     if script == Script::ShippedDaedalus {
         return shipped_daedalus(dir).map(Some);
     }

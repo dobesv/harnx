@@ -9,6 +9,7 @@ mod ag_ui_interactions;
 mod ag_ui_lifecycle;
 mod ag_ui_remote_follow;
 pub mod ag_ui_rpc;
+mod ag_ui_surfaces;
 mod ag_ui_sync;
 mod ag_ui_usage;
 mod agent_access;

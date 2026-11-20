@@ -139,6 +139,7 @@ async fn restart_recovers_saved_reply() -> Result<()> {
     let mut fixture = Fixture::new(TestToolset::default()).await?;
     // Larger than a control-plane record; the whole reply lives in the row.
     let reply = ToolReply {
+        input_required: None,
         call_id: fixture.request.call_id.clone(),
         result: Ok(json!({"text": "x".repeat(96 * 1024)})),
         final_progress: None,

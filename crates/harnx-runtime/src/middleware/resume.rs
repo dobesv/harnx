@@ -13,11 +13,50 @@ pub struct AcceptedInteraction {
     pub response: InteractionResponse,
 }
 
+/// Rerun input for a suspended tool challenge: the latest challenge's
+/// accepted responses (MRTR `inputResponses`) plus its opaque request state
+/// (MRTR `requestState`), delivered beside the arguments, never inside them.
+#[derive(Clone, Debug)]
+pub struct ToolInputResume {
+    pub responses: std::collections::BTreeMap<String, harnx_toolset::ToolInputResponse>,
+    pub request_state: Value,
+}
+
+tokio::task_local! {
+    static TOOL_INPUT: ToolInputResume;
+}
+
+/// The tool challenge request state (MRTR `requestState`) stored in a
+/// restored call checkpoint, if the call ever challenged. Private checkpoint
+/// JSON; only the T4.3 tool rerun path reads it.
+pub(crate) fn checkpoint_tool_request_state(checkpoint: &ToolCallCheckpoint) -> Option<Value> {
+    checkpoint
+        .state
+        .get("tool_request_state")
+        .cloned()
+        .filter(|state| !state.is_null())
+}
+
+/// Scope one tool challenge's rerun input to its owning call's leaf dispatch.
+/// Allowlisted middleware `call_tool` dispatches run outside this scope, so
+/// they never see another tool's answers.
+pub async fn with_tool_input<F: Future>(input: ToolInputResume, future: F) -> F::Output {
+    TOOL_INPUT.scope(input, future).await
+}
+
+/// The tool challenge rerun input for the current leaf dispatch, if any.
+pub fn current_tool_input() -> Option<ToolInputResume> {
+    TOOL_INPUT.try_with(Clone::clone).ok()
+}
+
 /// Restore one call from its last interaction boundary. This doesn't replay tools.
 #[derive(Clone, Debug)]
 pub struct MiddlewareResume {
     pub checkpoint: ToolCallCheckpoint,
     pub responses: Vec<AcceptedInteraction>,
+    /// Rerun input for the call's latest tool challenge, when the call was
+    /// suspended by a tool (producer `tool:<server>/<tool>`).
+    pub tool_input: Option<ToolInputResume>,
 }
 
 tokio::task_local! {
@@ -62,6 +101,11 @@ pub(super) struct CheckpointState {
     pub tool_call_id: String,
     pub chain_version: String,
     pub frames: Vec<FrameCheckpoint>,
+    /// The latest tool challenge's opaque request state (MRTR `requestState`),
+    /// stored in the call's checkpoint and resent beside the responses on the
+    /// rerun. Absent on calls that never challenged.
+    #[serde(default)]
+    pub tool_request_state: Option<Value>,
 }
 
 impl CheckpointState {
@@ -73,6 +117,7 @@ impl CheckpointState {
             tool_call_id: prepared.call.id.clone().unwrap_or_default(),
             chain_version,
             frames: vec![],
+            tool_request_state: None,
         }
     }
 

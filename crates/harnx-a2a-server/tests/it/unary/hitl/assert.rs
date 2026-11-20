@@ -46,7 +46,13 @@ pub(crate) async fn entries(http: &Http, task: &Value) -> Result<Vec<(u64, Sessi
 pub(crate) fn decisions(entries: &[(u64, SessionLogEntry)]) -> usize {
     entries
         .iter()
-        .filter(|(_, entry)| matches!(entry, SessionLogEntry::HitlApprovalDecision { .. }))
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                SessionLogEntry::HitlApprovalDecision { .. }
+                    | SessionLogEntry::InteractionResponse { .. }
+            )
+        })
         .count()
 }
 

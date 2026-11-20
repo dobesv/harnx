@@ -6,8 +6,9 @@ helper tools. It runs in the worker, including cloud/unmanaged workers without
 `manage_servers`; it doesn't launch a hook-server process. Helper tool servers
 still need to be available to that worker.
 
-Legacy `hooks:` continues to work separately. See the [Hooks Guide](hooks-guide.md)
-for lifecycle events and existing NATS hook servers.
+Lifecycle `hooks:` are in-process event scripts now; see the [Hooks Guide](hooks-guide.md).
+To call an existing Claude hook command from middleware, use the
+[Claude compatibility tool](middleware-claude-hooks.md).
 
 ## Configure middleware
 
@@ -54,10 +55,12 @@ tool, B-after, A-after. Each entry sees the arguments passed to it by its parent
 Tool-server entries join the resolved chain; their `match` controls which calls
 they wrap, so use a narrow matcher if they should affect only that server's tools.
 
-A full entry with the same name at a later level replaces the earlier entry
-without moving its position. A later `{name: label-bash, enabled: false}` removes
-it. Disabling an unknown earlier name is an error, as are duplicate names at the
-same level (including across tool-server files).
+A full entry with the same name at a later level — or in a later tool-server
+file — replaces the earlier entry without moving its position. A later
+`{name: label-bash, enabled: false}` removes it. Disabling an unknown earlier
+name is an error, as are duplicate names within one file. The same name across
+tool-server files follows the replacement rule, so packages shipping the same
+middleware (for example `proxy-auth` on `bash`) resolve to a single chain entry.
 
 ## Script operations
 
@@ -79,6 +82,7 @@ host operations. Scripts are trusted configuration, not model-authored code.
 | `save KEY JSON` | `save(key, value)` | Save bounded JSON in this frame's resume stash; envelopes retain their host-owned snapshots. |
 | `saved KEY` | `saved(key)` | Restore a value from an earlier run of this frame, or exit 1 / return `None` if absent. |
 | `fetch URL` | `fetch(url)` | GET a URL on this entry's `fetch:` allowlist; return `{status, body}`. |
+| `interact [--id KEY] SURFACE_JSON` | `interact(surface, id=None)` | Ask the user to answer an A2UI form. Suspends until answered, then returns `{action, data, note?}`. Bash also accepts the surface JSON on stdin. |
 
 `tool_input` returns `tool`, `arguments`, `tool_call_id`, `session_id`, `agent`,
 and `middleware`. Optional context such as session or agent can be null.
@@ -289,6 +293,346 @@ observations). Exceeding a limit fails the call rather than returning a partial
 checkpoint. Plain `next; confirm 'Keep?'` still executes `next` again on resume.
 Neither helper provides exactly-once effects across crashes.
 
+## Interact: A2UI surfaces
+
+`interact` asks the user to answer a form instead of a yes/no question. It uses
+the same durable interaction path as `confirm`: without an accepted answer the
+interpreter stops and the call suspends, and a resume reruns the chain from the
+start with the host-supplied answer. Once answered it returns
+`{action, data, note?}`, where `action` is the triggered button action name and
+`data` carries the values the user entered.
+
+The surface is a single A2UI `createSurface` message with `"version": "1.0"`
+and its components and data model inline:
+
+```bash
+surface='{"version":"1.0","createSurface":{"dataModel":{"choice":[],"name":""},"components":[
+  {"id":"root","component":"Card","child":"col"},
+  {"id":"col","component":"Column","children":["title","choice","name","submit_label","submit"]},
+  {"id":"title","component":"Text","text":"Pick a deployment target"},
+  {"id":"choice","component":"ChoicePicker","variant":"mutuallyExclusive",
+   "options":[{"label":"Staging","value":"staging"},{"label":"Production","value":"prod"}],
+   "value":{"@path":"/choice"}},
+  {"id":"name","component":"TextField","label":"Release name","value":{"@path":"/name"}},
+  {"id":"submit_label","component":"Text","text":"Deploy"},
+  {"id":"submit","component":"Button","child":"submit_label","action":{"event":{"name":"deploy",
+   "context":{"choice":{"@path":"/choice"},"name":{"@path":"/name"}}}}}]}}'
+response=$(interact --id deploy "$surface")
+respond "$(echo "$response" | jq '{output: {action: .action, data: .data}, is_error: false}')"
+```
+
+Python equivalent:
+
+```python
+surface = {
+    "version": "1.0",
+    "createSurface": {
+        "dataModel": {"choice": [], "name": ""},
+        "components": [
+            {"id": "root", "component": "Card", "child": "col"},
+            {"id": "col", "component": "Column",
+             "children": ["title", "choice", "name", "submit_label", "submit"]},
+            {"id": "title", "component": "Text", "text": "Pick a deployment target"},
+            {"id": "choice", "component": "ChoicePicker", "variant": "mutuallyExclusive",
+             "options": [{"label": "Staging", "value": "staging"},
+                         {"label": "Production", "value": "prod"}],
+             "value": {"@path": "/choice"}},
+            {"id": "name", "component": "TextField", "label": "Release name",
+             "value": {"@path": "/name"}},
+            {"id": "submit_label", "component": "Text", "text": "Deploy"},
+            {"id": "submit", "component": "Button", "child": "submit_label",
+             "action": {"event": {"name": "deploy",
+                "context": {"choice": {"@path": "/choice"}, "name": {"@path": "/name"}}}}}
+        ]
+    }
+}
+response = interact(surface, id="deploy")
+respond({"output": {"action": response["action"], "data": response["data"]}, "is_error": False})
+```
+
+Surfaces are validated at request time against the A2UI v1.0 Basic Catalog
+subset harnx supports: **Text, Button, ChoicePicker, TextField, Card and
+Column**. Anything else fails with an error naming the problem, before any
+suspension. The rules:
+
+- `createSurface.components` is required and must contain a component with
+  `id: "root"`; child references must name defined components.
+- At least one `Button` must carry an `action.event.name`, so the surface can
+  be answered. Renderer function-call actions (`action.functionCall`) are
+  rejected.
+- Input component values (`TextField.value`, `ChoicePicker.value`) must be
+  data-model bindings like `{"@path": "/name"}` so an answer can carry the
+  user's input back. Bind `{"@path": ...}` values in the button's
+  `action.event.context` to receive them in `data`.
+- Function calls (`{"@call": ...}`) are rejected everywhere: harnx implements
+  no A2UI catalog functions, including inside `@checks` conditions.
+- Unknown components, properties or fields are rejected (the schema is strict),
+  as are wrong envelope versions.
+
+The runtime stamps what it owns: a fresh `surfaceId` per attempt (surface IDs
+are unique for a renderer's lifetime, and identity ignores them), the Basic
+Catalog `catalogId` when the surface doesn't declare one, and
+`harnx.kind: "a2ui"` in `createSurface.metadata.extensions`. Changing any
+user-visible surface text or action semantics produces a new interaction and a
+new prompt, exactly as changing a `confirm` message does. `answer KEY` works
+for `interact` keys like `confirm` keys.
+
+### How an answer maps into `data`
+
+Every frontend answers through the same acceptance check, and the same
+mapping produces `data` for the same form and answer. When the user triggers
+an action:
+
+- Every input component contributes `data["<path>"]` — its value binding's
+  data-model path without the leading `/`. A binding `{"@path": "/choice"}`
+  lands at `data.choice`. A `TextField` contributes a string; a
+  `ChoicePicker` an array of the selected option `value`s. An untouched input
+  contributes the surface's declared `dataModel` value at that path (else `""`
+  or `[]`).
+- Each entry of the chosen button's `action.event.context` is resolved per
+  A2UI semantics — a `{"@path": ...}` binding against the current input
+  values (falling back to `dataModel`), a literal unchanged — and lands in
+  `data` under its context key.
+- `deny` is dismissal, not an action: it carries no data.
+
+Acceptance rejects, without appending: an action the surface doesn't declare
+(other than `deny`), a `data` key that is neither an input binding nor a
+context entry of the chosen action, a non-string `TextField` value, a
+`ChoicePicker` value that isn't an array of declared option values, or more
+than one selection where the variant is exclusive. A renderer may omit
+untouched inputs. Non-graphical frontends render the same surface as text
+(`harnx_core::interaction::text::render`) and parse a one-line answer
+(`...text::parse`, grammar: `<action> [key=value ...]`) into this same
+response.
+
+The Web UI (`harnx-serve`) and TUI (`harnx-tui`) render `a2ui` interactions as modal forms supporting the pinned Basic Catalog subset (Text, Button, ChoicePicker, TextField, Card, Column). Operators can inspect fields, select choices, edit inputs, and submit any declared button action (or deny). In the TUI, Tab navigates between form fields, buttons, and an optional note, while arrow keys edit text or navigate choices. If server-side acceptance rejects a response (for example, undeclared actions or mismatched input types), the rejection message is shown and the operator can correct values and resubmit.
+
+ACP has no form widgets, so it renders the same surface with the shared text fallback and offers one `AllowOnce` option per declared button action (labelled by the button text, option ID `action:<event name>`) plus Reject, which denies. ACP's permission reply carries only an option ID — it cannot collect input values — so each bound input is answered with its declared default through the shared response builder, and the dialog text tells the user so. Frontends that lack even that fallback show a "not supported by this client" message and offer deny-only dismissal; a `deny` action reaches the script as `{action: "deny", data: {}}`. The CLI answers pending interactions from any session without a frontend: `harnx interact list <agent> <session>` prints them with their exact identity and `harnx interact answer ... --id <id> --action <action> [--data KEY=VALUE ...] [--data-json <json>] [--note <text>]` submits through the same durable acceptance, including structured input values the ACP dialog cannot collect. Inner bash-tool calls fail with the same "can't be answered inside a script" error as `confirm`, and operator root calls fail outright: operators have no form UI, and only `confirm` auto-approves.
+
+### A2A form answers
+
+A2A status messages carry the pending `a2ui` surface as a DataPart with
+`mediaType: "application/a2ui+json"` (A2A 1.0's field name, not `mimeType`) plus
+the shared readable text fallback. Only the current pending head is exposed.
+Answer on the same task/context with either:
+
+- One DataPart containing an A2UI v1.0 `action` envelope. Put raw input values
+  in `action.metadata.extensions.harnx_response.data` and an optional operator
+  remark in `...harnx_response.note`. Copy `surfaceId` from the challenge and
+  include the action's `name`, `sourceComponentId`, RFC3339 `timestamp`, and
+  resolved `context`. The server calls `build_data` to rebuild canonical data
+  from the declared surface, not client-supplied context.
+- Text `<action> [key=value ...]`, for example
+  `deploy choice=prod name=rel-1`, or `deny` to dismiss. Text replies split on
+  whitespace; use a DataPart for TextField values containing spaces.
+
+Invalid input returns a visible correction with the same `INPUT_REQUIRED`
+challenge and no interaction response in the journal. Send the corrected answer
+with a new `messageId`; retries of an accepted ID remain bound to the original
+interaction and request sequence, even across replica recovery. Confirmation
+interactions still use yes/no text. See the
+[A2A wire format and full reply example](../crates/harnx-a2a-server/README.md#a2ui-form-interactions).
+
+## Tool-produced interactions (`input_required`)
+
+A native tool (a `Toolset` served over NATS, or an in-process toolset behind
+the same server) can suspend its own call asking the user for input, without
+any middleware involved. The tool opts in by declaring the metadata on its
+spec (`ToolSpec::with_input_required()`, the `harnx:input_required` meta key)
+and returning `Err(ToolInvokeError::InputRequired(ToolInputRequired::...))`
+from `invoke_with_context` instead of a result:
+
+- `ToolInputRequired::confirm(key, message, request_state)` — an
+  Approve/Deny question, rendered by every frontend's confirm UI.
+- `ToolInputRequired::a2ui(key, surface, summary, request_state)` — an A2UI
+  v1.0 form, validated and stamped with a fresh surface id exactly like a
+  middleware `interact` surface before it becomes visible.
+
+The challenge rides the tool wire beside the arguments
+(`ToolReply::input_required`, MRTR SEP-2322 `input_required`), and older
+callers that do not understand it see a visible recoverable error
+(`INPUT_REQUIRED_COMPAT_ERROR`) instead of a silent success. The runtime's
+durable layer turns it into the same D6 interaction middleware uses: the
+producer is infrastructure-derived (`tool:<server>/<tool>`, e.g.
+`tool:____probe/challenge`), the key is the tool's own request key, and the
+rest of the identity — session, tool round, tool call, chain version,
+enclosing middleware step path — is unchanged. A tool challenge inside a
+middleware frame therefore has a distinct identity from the middleware's own
+interactions, and every frontend renders it with the same records and kinds
+it already handles.
+
+The tool's opaque `request_state` (bounded to 64 KiB serialized; keys to 256
+bytes) is checkpointed in the call's durable interaction state, so it
+survives worker moves and replica recovery. When the user answers, the
+runtime re-dispatches the original call with the accepted response keyed by
+the challenge's key plus the latest state, delivered through
+`ToolInvocationContext::input_responses` and
+`ToolInvocationContext::request_state` — never merged into the model-authored
+`arguments`.
+
+A tool may challenge again after an answer: each challenge is a new request
+with its own key and state, and the rerun receives only the latest
+challenge's responses and state. A challenge from a tool that did not declare
+`harnx:input_required` degrades to an error result instead of suspending.
+Calls from inner scripts and operators have no interaction driver and fail
+closed the same way, and replaying a journaled challenge returns a "not
+available" error result instead of answering.
+
+### MCP tools (`input_required` over the bridge)
+
+A tool on a bridged external MCP server participates in the same flow — no
+middleware or per-tool configuration is involved. The bridge connects with
+`server/discover` and negotiates the MCP 2026-07-28 revision (MRTR, SEP-2322)
+when the server offers it; older servers keep working over the legacy
+`initialize` handshake and their tools simply cannot suspend.
+
+The MRTR capability is server-level: when the wrapped server negotiates the
+revision, every listed tool of that server is stamped `harnx:input_required`
+and may return `input_required` from `tools/call`. The bridge maps the result
+onto the native challenge path:
+
+| MCP (MRTR) | harnx |
+|---|---|
+| one `elicitation/create` request in `inputRequests` | one `ToolInputRequired` challenge; the `inputRequests` map key is the challenge key |
+| empty `requestedSchema` | `confirm`, rendered by every frontend's confirm UI |
+| `requestedSchema` properties (documented subset) | A2UI form: `string` properties become text fields, `enum` properties become choice pickers; other types are rejected |
+| `requestState` (opaque string) | the challenge's `request_state` (JSON decoded when possible, the raw text otherwise) |
+| `inputResponses` on the re-call | the user's answers, beside the unchanged `arguments` |
+
+Kinds harnx cannot show — sampling (`createMessage`), `roots/list`, URL
+elicitation — and results with several requests or none fail with a clear
+recoverable error, never a silent success. Responses encode as ElicitResult
+(`accept`/`decline`, optional `content`) for third-party servers, with the
+original harnx action and note preserved under `_meta` so a harnx↔harnx hop
+loses nothing.
+
+The same round cap applies to native and bridged tools alike: a tool that
+keeps challenging without finishing is cut off after
+10 rounds (`MAX_TOOL_INPUT_ROUNDS`, tracking rmcp's
+`DEFAULT_MRTR_MAX_ROUNDS`) with a visible error result instead of suspending
+forever.
+
+## Non-modal user-audience surfaces
+
+Completed tool results can carry user-audience A2UI surfaces alongside normal
+output. Unlike modal `interact` or `input_required` interactions, non-modal
+surfaces do not suspend the tool round or block the turn. They are presented
+to the user inline alongside the conversation, and multiple surfaces can remain
+active at once while the user continues chatting.
+
+Native toolsets return surfaces via `ToolResult.user_surfaces`. External MCP
+tools return embedded resources with `type: "resource"`, MIME type
+`application/a2ui+json`, and `annotations.audience` containing `"user"`.
+The engine extracts and validates each surface envelope against the shared
+A2UI Basic Catalog subset, persists it in the round's durable `ToolResults`
+log entry, and strips it from model-visible output. The model never sees the
+raw surface structure.
+
+Each published surface is identified by its `surface_id` (from
+`createSurface.surfaceId`) and `publish_seq` (the sequence of the enclosing
+`ToolResults` entry). Frontends can only act on surfaces that exist in a
+durable `ToolResults` entry.
+
+### Visibility routing
+
+Buttons on a non-modal surface declare their execution and visibility behavior
+in `metadata.extensions.harnx`:
+
+    {
+      "harnx": {
+        "visibility": "note",
+        "tool": {
+          "name": "deploy_release",
+          "arguments": {"target": "staging"}
+        }
+      }
+    }
+
+The `visibility` field controls where action output goes:
+
+- `invisible`: The action is recorded in the durable session log
+  (`SessionLogEntry::SurfaceAction`). It produces no model input and does not
+  start or join a turn.
+- `note`: A passive context line is injected into the model's hook context
+  at the next model call. It does not start a new turn. This is the default
+  visibility when a direct `tool` is declared.
+- `turn`: The action's user message starts a new turn when the session is idle,
+  or joins the running turn (steering) when a turn is active. This is the
+  default visibility when no direct `tool` is declared.
+
+### Direct-tool vs conversational routing
+
+When an action declares `tool: { "name": "...", "arguments": {...} }`, the
+action executes directly through the operator tool execution path. The session's
+effective tool allowlist and configured middleware apply. If the tool is not
+permitted for the session, the submission is rejected with `unauthorized_tool`
+and nothing is executed or recorded. Action `data` keys override declared base
+arguments.
+
+When no tool target is declared, the action is purely conversational and routes
+its text to the model according to the chosen visibility. No synthetic model tool
+calls are generated anywhere in the process.
+
+Direct tools run before the `SurfaceAction` entry is appended so the tool's output
+summary can be quoted in the action note (execute-then-record). If a worker crashes
+after running the tool but before the record lands in the log, no action is recorded,
+and a subsequent retry will run the tool again (the execute-then-record crash window).
+
+At-most-once tool execution is owner-local: the active worker serializes submissions
+for the same `(surface_id, publish_seq)` generation using an in-memory gate,
+ensuring the tool runs once while concurrent retries queue and classify from the
+resulting record. However, the idle path (used when no active worker holds the session
+lease) is not serialized across processes. Two idle clients submitting at the same
+time, or an idle client racing a newly started worker, can each run a non-idempotent
+tool once before the first record commits (the durable log still accepts only one
+action under first-wins CAS).
+
+### First-wins identity and retry semantics
+
+A published surface generation `(surface_id, publish_seq)` accepts at most one
+action under first-wins semantics. The durable identity of an action is
+`(action, data)`.
+
+- If the exact same `(action, data)` is resubmitted, the system returns
+  `already_applied` (an idempotent success).
+- If an identical `(action, data)` is resubmitted with a different note or
+  `user_message`, it is still classified as `already_applied`, and the second
+  note is discarded.
+- If a submission attempts a different action or different data on an
+  already-answered generation, it is rejected with outcome `conflicting`.
+
+### Note contract
+
+Clients must pass user-typed remarks as `user_message` (e.g. `user_message`
+in `session/surface_action` or `harnx surface act --note`). The backend reads
+`user_message` to construct model-visible context and ignores `response.note`.
+This keeps model-facing input explicit. When `user_message` is omitted, the
+runtime generates fallback summary text (e.g. `[surface action '<action>']`).
+
+### Obscured text fields are visual masking only
+
+In A2UI surfaces, a `TextField` with `variant: obscured` causes frontends to
+mask input characters visually (like a password field). This is visual masking
+only. Obscured values are stored as plain text in durable `SurfaceAction.data`,
+can appear in generated action summaries, and are passed as plain arguments on
+CLI invocations. Do not pass real passwords, tokens, or private keys through
+surfaces.
+
+### Frontend and protocol support
+
+- **Web UI & TUI**: Render non-modal surfaces inline with the conversation
+  without blocking the composer. Users can open an action form, fill inputs,
+  and submit actions while other work proceeds.
+- **CLI**: `harnx surface list` and `harnx surface act` inspect and submit
+  actions against published surfaces.
+- **A2A and ACP**: Do not render or accept actions for non-modal surfaces yet.
+  Neither protocol provides an out-of-band user-audience channel. Streaming
+  surfaces into A2A task messages or ACP session prompts would leak private
+  user surfaces into model input, and their modal channels (`input_required`,
+  `request_permission`) suspend turns, which non-modal surfaces intentionally
+  avoid. Non-modal surfaces are omitted from A2A and ACP streams without
+  failing tasks. Users can inspect and act on them from Web, TUI, or CLI.
+
 ## Controlled fetch
 
 `fetch URL` (Bash) and `fetch(url)` or `fetch(url=...)` (Python) use the worker's
@@ -405,8 +749,10 @@ An inner-script call reaching `confirm` returns
 `interaction required, can't be answered inside a script`, even with
 `on_error: allow`. It cannot suspend and replay the model's whole script.
 Operator root calls auto-approve `confirm` under scoped operator consent;
-`answer` can read that approval. Other interaction kinds still fail without an
-operator interaction UI.
+`answer` can read that approval. Other interaction kinds still fail on
+operator calls — `interact` names the reason and points at `harnx interact
+answer` for sessions, where a pending interaction can be answered from the
+CLI.
 
 ## Deployment and crash limits
 
@@ -431,7 +777,7 @@ approve a request.
 
 Only the answered call reruns, from the outermost middleware with its last
 committed checkpoint and accepted responses. Completed siblings don't run their
-middleware, approval, provider or PostToolUse again. Pending unanswered calls stay
+middleware, confirmation, or provider again. Pending unanswered calls stay
 waiting. The worker merges all results in original call order into one
 `ToolResults` entry before calling the model. Handoff activation is round-level:
 Atlas can't start while a sibling still awaits a response.
@@ -481,36 +827,49 @@ may already have happened. Keep policy updates separate from unfinished work.
 Running a tool call under any non-empty `middleware:` chain enables durable
 interaction mode in the worker. This writes new `SessionLogEntry` variants
 (`ToolCallCompleted`, `InteractionRequested`, `SuspensionReady`, and
-`InteractionResponse`) to the session log. Older harnx binaries hard-reject
-transcripts containing unknown entries. In multi-instance deployments sharing
-a NATS cluster, follow a reader-first rollout:
+`InteractionResponse`) to the session log. Similarly, non-modal A2UI surface
+actions write `SessionLogEntry::SurfaceAction`. The writers of `SurfaceAction`
+are `harnx surface act`, the TUI surface action modal, the `harnx-serve`
+`session/surface_action` JSON-RPC method, and the worker control path. Older
+harnx binaries hard-reject transcripts containing unknown entries. In
+multi-instance deployments sharing a NATS cluster, follow a reader-first rollout:
 
-1. **Upgrade every session-log reader first.** Upgrade workers, `harnx-serve`,
-   `harnx-a2a-server`, ACP, and any TUI or CLI instances reading shared logs
-   before enabling middleware on workers. Older readers cannot read sessions
-   once new entries are written. Deploy confirm-capable frontends before
-   expecting them to answer confirmation requests.
+1. **Upgrade every session-log reader and control client first.** Upgrade workers,
+   `harnx-serve`, `harnx-a2a-server`, ACP, and any TUI or CLI instances reading
+   shared logs before enabling middleware on workers or submitting surface actions.
+   Older readers cannot read sessions once new entries are written. Frontends and
+   API clients must also upgrade before workers because the surface-action control
+   protocol uses an early `Pending` acknowledgement: older clients cannot
+   deserialize `Pending`, drop the acknowledgement, and fall back to idle execution
+   after 40 seconds, which can run a slow direct tool a second time while the new
+   worker is still executing it. Deploy confirm-capable and surface-capable frontends
+   before expecting them to answer confirmation requests or act on surfaces. Readers
+   across the cluster must be upgraded before producers write any new entries.
 2. **Hold back middleware writers until readers are upgraded.** Any non-empty
    `middleware:` list starts writing durable entries. The updated `pantheon`
-   package ships a middleware chain for Daedalus (`packages/pantheon/agents/daedalus.md`).
+   and `coding` packages ship middleware chains for proxy auth (`packages/{pantheon,coding}/tool_servers/bash.yaml`)
+   and Daedalus handoffs (`packages/pantheon/agents/daedalus.md`).
    To prevent workers from writing new entries during the rollout window:
-   - Keep the previous `pantheon` package pinned on workers, or
-   - Remove the `middleware:` block from `packages/pantheon/agents/daedalus.md`
-     (and any other declaring file) before deploying package files to workers.
-   - Do not try to disable Daedalus's middleware with a global `middleware:` entry
+   - Keep previous package versions pinned on workers, or
+   - Remove the `middleware:` blocks from `packages/{pantheon,coding}/tool_servers/bash.yaml`
+     and `packages/pantheon/agents/daedalus.md` (and any other declaring file) before deploying package files to workers.
+   - Do not try to disable middleware with global `middleware:` entries
      such as `{name: confirm-atlas-handoff, enabled: false}` in `config.yaml`.
      The configuration loader evaluates global entries first, before agent definitions
      exist, and errors with "cannot disable an unknown earlier entry". Later definitions
      in agent front matter would re-add the entry anyway. Remove the entry directly
      at its declaring source instead.
-3. **Understand confirmation fallback without middleware.**
-   - If the previous `pantheon` package remains pinned, Daedalus continues using
-     its legacy PreToolUse `ask` hook on `atlas_session_handoff` via
-     `harnx-claude-compatible-hook-server`, requiring confirmation through legacy
-     HITL approvals.
+3. **Understand confirmation and proxy-auth fallback without middleware.**
+   - Pinned packages containing legacy command hooks fail config loading in
+     this release. A rollback needs an older binary with its matching package.
+     Saved legacy approvals remain readable and answerable in this release. Never
+     delete session logs or checkpoint stores to unblock or roll back a session.
    - If the updated `pantheon` package is deployed with the `middleware:` block
      removed from `daedalus.md`, `atlas_session_handoff` has neither hooks nor
      middleware. Handoffs to Atlas execute directly without prompting for confirmation.
+   - If `middleware:` is removed from `tool_servers/bash.yaml`, commands run
+     without proxy-auth environment injection unless environment variables are
+     configured manually.
 4. **Drain in-flight turns before upgrading workers running middleware.** Workers
    from older releases leave no round-start or attempt-start records in the checkpoint
    store. Without those records, crash recovery must classify calls using the current
@@ -527,8 +886,9 @@ a NATS cluster, follow a reader-first rollout:
 6. **Rollback constraints.** Newer workers write a round-start record before dispatch.
    A reader-capable worker parks that work until a writer-capable worker resumes it,
    and parks marked post-results handoffs awaiting dispatch. Rolling back below the
-   reader-capable version is unsupported once any durable interaction entry or
-   round-start record exists in the session.
+   reader-capable version is unsupported once any durable interaction entry,
+   `SurfaceAction`, or round-start record exists in the session. Rollback below
+   this release is one-way once any `SurfaceAction` exists in a transcript.
 
 Private store retention is bounded to **64 MiB per call**, with **8 MiB per stored
 value** (the script checkpoint and stash have the tighter limits above). Records
@@ -538,8 +898,9 @@ through failover. It contains snapshots and execution observations that must not
 be published as transcript or model input.
 
 Middleware emits tracing events for start, finish and failure with its name.
-Legacy `PostToolUse` hooks run per actual downstream dispatch, not once per outer
-middleware result. See [hook dispatch behavior](hooks-guide.md#middleware-and-posttooluse).
+Legacy process `PostToolUse` hooks no longer run from middleware: since lifecycle
+`hooks:` became in-process event scripts (T3.4), no legacy tool hook servers can
+be configured, so each `next` dispatch fires middleware only.
 
 ## Example tests and timing
 

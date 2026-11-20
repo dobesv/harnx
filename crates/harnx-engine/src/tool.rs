@@ -1,15 +1,14 @@
 //! Tool-call loop — `eval_tool_calls` orchestrates a batch of tool
-//! dispatches with pre/post hooks, user confirmation, UI emission,
+//! dispatches with middleware, durable interactions, UI emission,
 //! and per-call abort handling. The loop is provider-agnostic: it
 //! iterates `Vec<Arc<dyn ToolProvider>>` (harnx-core trait). All
-//! harnx-specific concerns — UI rendering, hook dispatch execution,
+//! harnx-specific concerns — UI rendering, middleware execution,
 //! inquire prompts — are injected via callbacks on `ToolEvalContext`,
 //! constructed on the harnx side by `build_tool_eval_context`.
 
 use anyhow::{anyhow, Result};
 
-use harnx_core::abort::{wait_abort_signal, AbortSignal};
-use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
+use harnx_core::abort::AbortSignal;
 use harnx_core::partial_result::{output_with_partial_result, partial_result_of};
 use harnx_core::tool::{
     SwitchAgentData, ToolCall, ToolCallOrigin, ToolError, ToolProvider, ToolProviderOutput,
@@ -45,7 +44,7 @@ pub type ToolCallEmitFn = dyn Fn(&ToolCall, &Value) + Send + Sync;
 /// tools call `progress.update(patch)` without knowing their call identity.
 pub type ToolUpdateEmitFn = dyn Fn(&str, &ToolUpdatePatch) + Send + Sync;
 
-/// Callback invoked when a PreToolUse hook returns `Ask { reason }`.
+/// Frontend bridge invoked after a durable interaction is ready to show.
 /// The callback gets full `ToolCall` identity plus parsed args so
 /// callers can approve, deny, or defer execution.
 pub type ConfirmToolUseFn =
@@ -57,50 +56,6 @@ pub enum ToolUseConfirmation {
     Deny { reason: Option<String> },
     Defer,
 }
-
-#[derive(Debug, Clone)]
-pub struct DeferredToolCall {
-    pub call: ToolCall,
-    pub arguments: Value,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct ToolApprovalRequiredError {
-    tool_calls: Vec<ToolCall>,
-    deferred_calls: Vec<DeferredToolCall>,
-}
-
-impl ToolApprovalRequiredError {
-    pub fn new(tool_calls: Vec<ToolCall>, deferred_calls: Vec<DeferredToolCall>) -> Self {
-        Self {
-            tool_calls,
-            deferred_calls,
-        }
-    }
-
-    pub fn tool_calls(&self) -> &[ToolCall] {
-        &self.tool_calls
-    }
-
-    pub fn deferred_calls(&self) -> &[DeferredToolCall] {
-        &self.deferred_calls
-    }
-}
-
-impl std::fmt::Display for ToolApprovalRequiredError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "tool approval required")
-    }
-}
-
-impl std::error::Error for ToolApprovalRequiredError {}
-
-/// Async callback used to dispatch hook events. Returns a `HookOutcome`
-/// so callers can inspect `control` (Block/Ask/Continue) and any future
-/// structured data carried in `result`.
-pub type DispatchHookFn =
-    dyn Fn(HookEvent) -> Pin<Box<dyn Future<Output = HookOutcome> + Send>> + Send + Sync;
 
 /// Result of preparing a handoff through the optional callback.
 ///
@@ -152,8 +107,7 @@ pub type WorkBoundaryFn = dyn Fn(WorkBoundary, ToolCall) -> Pin<Box<dyn Future<O
 
 #[derive(Clone)]
 pub struct ToolEvalContext {
-    /// Wrap authorized model, inner, and operator calls. Legacy pre-use hooks
-    /// and approval run once before this callback; post-use hooks run per next.
+    /// Wrap authorized model, inner, and operator calls.
     pub middleware_fn: Option<Arc<ToolMiddlewareFn>>,
     /// Effective per-call completion before terminal publication (including
     /// admission errors). Runtime renders and durably checkpoints here.
@@ -199,7 +153,7 @@ pub struct ToolEvalContext {
     /// (or YAML-pretty-prints the JSON), truncates to terminal
     /// dimensions, dims the text, and writes to stdout.
     pub emit_tool_result_fn: Arc<ToolCallEmitFn>,
-    /// Called when a PreToolUse hook blocks or a user denies a tool call.
+    /// Called when middleware blocks a tool call.
     /// Receives the tool call and the blocked result JSON (contains
     /// `"error"` key). Harnx's default emits
     /// `AgentEvent::Tool(ToolEvent::Blocked { .. })`.
@@ -209,17 +163,10 @@ pub struct ToolEvalContext {
     /// emits `AgentEvent::Tool(ToolEvent::Update { .. })` via the unified
     /// AgentEvent sink. Runtime coalesces rapid updates with a 250ms budget.
     pub emit_tool_update_fn: Arc<ToolUpdateEmitFn>,
-    /// Called when a PreToolUse hook returns `Ask { reason }` and the
-    /// user needs to confirm before the tool runs. Harnx's default uses
-    /// an `inquire`-based terminal prompt (or a worker-side NATS callback
-    /// that renders a native TUI modal) and returns Approve/Deny.
+    /// Frontend confirmation bridge for durable middleware interactions.
+    /// Runtime persists the request before calling this bridge and durably
+    /// accepts its answer. `Defer` leaves the request pending.
     pub confirm_tool_use_fn: Arc<ConfirmToolUseFn>,
-    /// Called to dispatch a hook event (PreToolUse, PostToolUse,
-    /// PostToolUseFailure). Harnx's default captures `hooks.entries`,
-    /// `session_id` (currently always `"cmd"`), and the process cwd
-    /// at context-construction time and forwards to
-    /// `hooks::dispatch::dispatch_hooks`.
-    pub dispatch_hook_fn: Arc<DispatchHookFn>,
     /// Optional callback invoked after target resolution and before building
     /// the handoff result. The runtime implements this to reserve a child
     /// session ID and carry provenance through to dispatch.
@@ -262,7 +209,7 @@ pub enum InnerToolCallStatus {
     Ok,
     /// Dispatched but failed recoverably (provider error or unparsable args).
     ToolError,
-    /// A hook blocked the call or a user denied it; never dispatched.
+    /// Middleware blocked the call; never dispatched.
     Blocked,
 }
 
@@ -303,7 +250,6 @@ impl ToolEvalContext {
             emit_tool_blocked_fn: options.emit_tool_blocked_fn,
             emit_tool_update_fn: options.emit_tool_update_fn,
             confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Defer),
-            dispatch_hook_fn: Arc::clone(&self.dispatch_hook_fn),
             prepare_handoff_fn: None,
         }
     }
@@ -321,8 +267,6 @@ impl ToolEvalContext {
 struct ApprovedToolCall {
     call: ToolCall,
     json_data: Value,
-    tool_input: Value,
-    tool_use_id: String,
 }
 
 impl ApprovedToolCall {
@@ -353,8 +297,7 @@ pub fn ensure_tool_call_ids(calls: &mut [ToolCall]) {
     }
 }
 
-/// Legacy recovery still runs pre-use hooks and approval. Recheck the worker
-/// lease after those waits, immediately before each provider dispatch.
+/// Recheck the recovering worker's lease immediately before each dispatch.
 pub async fn eval_tool_calls_with_authorization(
     ctx: &ToolEvalContext,
     calls: Vec<ToolCall>,
@@ -377,11 +320,11 @@ pub async fn eval_tool_calls_with_authorization(
     Ok(evaluated.into_iter().map(|call| call.result).collect())
 }
 
-/// Evaluate one explicit operator call through the normal hooks and providers.
+/// Evaluate one explicit operator call through middleware and providers.
 /// Consent applies only to this call ID; it never changes shared configuration
 /// or the confirmation callback used by nested agent evaluations.
 pub async fn eval_operator_tool_call(
-    mut ctx: ToolEvalContext,
+    ctx: ToolEvalContext,
     mut call: ToolCall,
     abort_signal: &AbortSignal,
 ) -> Result<ToolResult> {
@@ -391,16 +334,6 @@ pub async fn eval_operator_tool_call(
         call.name
     );
     ensure_tool_call_ids(std::slice::from_mut(&mut call));
-    let root_name = call.name.clone();
-    let root_id = call.id.clone();
-    let original = ctx.confirm_tool_use_fn.clone();
-    ctx.confirm_tool_use_fn = Arc::new(move |candidate, arguments, reason| {
-        if candidate.id == root_id && candidate.name == root_name {
-            ToolUseConfirmation::Approve
-        } else {
-            original(candidate, arguments, reason)
-        }
-    });
     let mut results = eval_tool_calls_inner(
         ToolEvaluation {
             ctx: &ctx,
@@ -421,9 +354,9 @@ pub async fn eval_operator_tool_call(
 
 /// Evaluate one script-originated call through the normal admission pipeline.
 /// Unlike [`eval_operator_tool_call`], this leaves the context's confirmation
-/// callback unchanged. A deferred confirmation returns [`ToolApprovalRequiredError`];
+/// callback unchanged. A durable confirmation returns an interaction-required result;
 /// fatal errors propagate, while blocks and recoverable failures return tool results.
-/// Null outputs and inline media are preserved, including any hook mutations.
+/// Null outputs and inline media are preserved.
 ///
 /// The caller must enforce its inner-tool allowlist before calling this function.
 /// Lifecycle and progress events use the context's callbacks, so callers can
@@ -466,10 +399,9 @@ struct ToolEvaluation<'a> {
 }
 
 enum ToolAdmission {
-    Approved(ApprovedToolCall),
+    Approved(Box<ApprovedToolCall>),
     /// An admission-time result (blocked or unparsable args) with its typed status.
     Immediate(Box<ToolResult>, InnerToolCallStatus),
-    Deferred(DeferredToolCall),
 }
 
 async fn eval_tool_calls_inner(
@@ -499,79 +431,9 @@ async fn prepare_tool_call(
         }
         Err(ToolError::Fatal(err)) => return Err(err),
     };
-    let approved = ApprovedToolCall {
-        tool_input: call.arguments.clone(),
-        tool_use_id: call.id.clone().unwrap_or_default(),
-        call,
-        json_data,
-    };
-    approve_tool_call(ctx, approved, abort_signal).await
-}
-
-async fn pre_tool_outcome(
-    ctx: &ToolEvalContext,
-    call: &ApprovedToolCall,
-    abort_signal: &AbortSignal,
-) -> HookOutcome {
-    let event = HookEvent::PreToolUse {
-        tool_name: call.call.name.clone(),
-        tool_input: call.tool_input.clone(),
-        tool_use_id: call.tool_use_id.clone(),
-    };
-    tokio::select! {
-        outcome = (ctx.dispatch_hook_fn)(event) => outcome,
-        _ = wait_abort_signal(abort_signal) => HookOutcome {
-            control: HookResultControl::Block { reason: "cancelled by user".to_string() },
-            result: HookResult::default(),
-        },
-    }
-}
-
-fn blocked_admission(call: ToolCall, reason: String) -> ToolAdmission {
-    let value = json!({"error": reason, "blocked_by_hook": true});
-    ToolAdmission::Immediate(
-        Box::new(ToolResult::new(call, value)),
-        InnerToolCallStatus::Blocked,
-    )
-}
-
-async fn approve_tool_call(
-    ctx: &ToolEvalContext,
-    mut approved: ApprovedToolCall,
-    abort_signal: &AbortSignal,
-) -> Result<ToolAdmission> {
-    let outcome = pre_tool_outcome(ctx, &approved, abort_signal).await;
-    work_boundary(ctx, &approved.call, abort_signal, WorkBoundary::Accept).await?;
-    if let HookResultControl::Block { reason } = outcome.control {
-        return Ok(blocked_admission(approved.call, reason));
-    }
-    if let Some(mutated) = outcome.result.mutated_tool_input {
-        approved.json_data = mutated.clone();
-        approved.tool_input = mutated;
-    }
-    if let HookResultControl::Ask { reason } = outcome.control {
-        match (ctx.confirm_tool_use_fn)(&approved.call, &approved.json_data, reason.as_deref()) {
-            ToolUseConfirmation::Approve => {}
-            ToolUseConfirmation::Deny {
-                reason: deny_reason,
-            } => {
-                let deny_reason = deny_reason
-                    .or(reason)
-                    .unwrap_or_else(|| "Denied by user".to_string());
-                return Ok(blocked_admission(approved.call, deny_reason));
-            }
-            ToolUseConfirmation::Defer => {
-                return Ok(ToolAdmission::Deferred(DeferredToolCall {
-                    call: approved.call,
-                    arguments: approved.json_data,
-                    reason,
-                }));
-            }
-        }
-    }
-    work_boundary(ctx, &approved.call, abort_signal, WorkBoundary::Accept).await?;
+    let approved = ApprovedToolCall { call, json_data };
     (ctx.emit_tool_call_fn)(&approved.call, &approved.json_data);
-    Ok(ToolAdmission::Approved(approved))
+    Ok(ToolAdmission::Approved(Box::new(approved)))
 }
 
 async fn dispatch_authorized_call(
@@ -602,13 +464,6 @@ async fn materialize_failed_tool_call(
     abort: &AbortSignal,
 ) -> Result<ToolResult> {
     let error_display = format!("{error:#}");
-    let _ = (ctx.dispatch_hook_fn)(HookEvent::PostToolUseFailure {
-        tool_name: call.call.name.clone(),
-        tool_input: call.tool_input.clone(),
-        tool_use_id: call.tool_use_id.clone(),
-        error: error_display.clone(),
-    })
-    .await;
     work_boundary(ctx, &call.call, abort, WorkBoundary::Accept).await?;
     let value = output_with_partial_result(
         json!({"is_error": true, "error": error_display}),
@@ -631,7 +486,6 @@ async fn work_boundary(
     Ok(())
 }
 
-// qual:allow(dry, boilerplate) reason: "PostToolUse owns its input/response snapshot; the final ToolResult must retain the same call and response after the hook returns."
 async fn materialize_successful_tool_call(
     evaluation: &ToolEvaluation<'_>,
     approved: &ApprovedToolCall,
@@ -644,18 +498,16 @@ async fn materialize_successful_tool_call(
         ..
     } = *evaluation;
     let (mut value, execution_context) = provider_output.into_parts();
-    let post_event = HookEvent::PostToolUse {
-        tool_name: approved.call.name.clone(),
-        tool_input: approved.tool_input.clone(),
-        tool_use_id: approved.tool_use_id.clone(),
-        tool_response: value.clone(),
-    };
-    let post_outcome = (ctx.dispatch_hook_fn)(post_event).await;
     work_boundary(ctx, &approved.call, abort, WorkBoundary::Accept).await?;
-    if let Some(mutated_response) = post_outcome.result.mutated_tool_response {
-        value = mutated_response;
-    }
-    let images = if lossless {
+    let lossless_media = lossless;
+    // Remove private surfaces first: image projection errors may wrap the
+    // remaining output for diagnostics, which must not preserve user-only UI.
+    let surfaces = if lossless_media {
+        Vec::new()
+    } else {
+        crate::a2ui::prepare_tool_result_surfaces(&mut value)
+    };
+    let images = if lossless_media {
         vec![]
     } else {
         crate::media::prepare_tool_result_images(&mut value)
@@ -668,7 +520,13 @@ async fn materialize_successful_tool_call(
         value = json!("DONE");
     }
     Ok((
-        completed_tool_result(approved.call.clone(), value, images, execution_context),
+        completed_tool_result(
+            approved.call.clone(),
+            value,
+            images,
+            surfaces,
+            execution_context,
+        ),
         was_null,
     ))
 }
@@ -697,8 +555,8 @@ fn publish_tool_call(
     }
 }
 
-/// Recover a tool response without repeating approval or post-use hooks whose
-/// side effects may already have happened before the worker disappeared.
+/// Recover a journaled response without executing the provider again.
+/// Middleware-owned calls use durable checkpoints instead.
 pub async fn replay_tool_call(
     ctx: &ToolEvalContext,
     replay: harnx_core::tool::ToolReplay<'_>,
@@ -714,8 +572,21 @@ pub async fn replay_tool_call(
                 ToolProviderOutput::new(json!({"is_error": true, "error": error.to_string()}))
             }
         };
+        if output.input_required.is_some() {
+            // The journaled reply was a challenge, not a result. Its round is
+            // interaction-owned and reconciled by the durable path; replaying
+            // a challenge as a result would silently answer nothing.
+            return Ok(Some(ToolResult::new(
+                call.clone(),
+                json!({
+                    "is_error": true,
+                    "error": "interrupted tool call was waiting for user input; its result is not available"
+                }),
+            )));
+        }
         work_boundary(ctx, call, abort, WorkBoundary::Accept).await?;
         let (mut value, observation) = output.into_parts();
+        let surfaces = crate::a2ui::prepare_tool_result_surfaces(&mut value);
         let images = crate::media::prepare_tool_result_images(&mut value);
         if !images.is_empty() {
             crate::media::redact_image_data(&mut value);
@@ -728,6 +599,7 @@ pub async fn replay_tool_call(
             call.clone(),
             value,
             images,
+            surfaces,
             observation,
         )));
     }
@@ -760,11 +632,13 @@ fn completed_tool_result(
     call: ToolCall,
     output: Value,
     content: Vec<harnx_core::message::MessageContentPart>,
+    user_surfaces: Vec<Value>,
     execution_context: Option<harnx_core::execution_context::ExecutionContextObservation>,
 ) -> ToolResult {
     let tool_call_id = call.id.clone();
     let mut result = ToolResult::new(call, output);
     result.content = content;
+    result.user_surfaces = user_surfaces;
     result.switch_agent = detect_switch_agent(&result.output);
     if let Some(switch_agent) = &mut result.switch_agent {
         if switch_agent.tool_call_id.is_none() {
@@ -1014,6 +888,7 @@ fn normalize_outer_result(
 
 #[cfg(test)]
 mod tests {
+    mod a2ui;
     mod inner_call;
     mod inner_context;
     mod interaction;
@@ -1194,6 +1069,7 @@ mod tests {
                 Ok(ToolProviderOutput {
                     value: json!({"content": [{"type": "text", "text": "visible"}]}),
                     execution_context: Some(self.observation.clone()),
+                    input_required: None,
                 })
             })
         }
@@ -1324,7 +1200,7 @@ mod tests {
     async fn dispatch_tells_the_provider_each_calls_round_and_id() {
         let provider = Arc::new(UpdatingToolProvider::default());
         let origins = Arc::clone(&provider.origins);
-        let mut ctx = test_context(vec![provider], |_| continue_hook_outcome());
+        let mut ctx = test_context(vec![provider]);
         ctx.tool_round = Some(12);
         let call = ToolCall::new(
             "updating_tool".to_string(),
@@ -1348,15 +1224,8 @@ mod tests {
         Completed(String),
     }
 
-    fn continue_hook_outcome() -> HookOutcome {
-        HookOutcome {
-            control: HookResultControl::Continue,
-            result: HookResult::default(),
-        }
-    }
-
     #[tokio::test]
-    async fn private_execution_context_never_reaches_hooks_ui_or_serialization() {
+    async fn private_execution_context_never_reaches_middleware_ui_or_serialization() {
         let private_path = "/private/worker/workspace";
         let mut observation = harnx_core::execution_context::ExecutionContextObservation::observe(
             std::path::Path::new(private_path),
@@ -1364,15 +1233,20 @@ mod tests {
         );
         observation.workspace_root = private_path.to_string();
         observation.working_directory = private_path.to_string();
-        let hook_responses = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let hook_capture = Arc::clone(&hook_responses);
+        let middleware_responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let middleware_capture = Arc::clone(&middleware_responses);
         let provider = Arc::new(PrivateContextProvider { observation });
-        let mut ctx = test_context(vec![provider], move |event| {
-            if let HookEvent::PostToolUse { tool_response, .. } = event {
-                hook_capture.lock().unwrap().push(tool_response);
-            }
-            continue_hook_outcome()
-        });
+        let mut ctx = test_context(vec![provider]);
+        ctx.middleware_fn = Some(Arc::new(move |prep, _origin, next| {
+            let capture = Arc::clone(&middleware_capture);
+            Box::pin(async move {
+                let outcome = next(prep.arguments).await;
+                if let Ok(ToolMiddlewareOutcome::Completed(res)) = &outcome {
+                    capture.lock().unwrap().push(res.result.output.clone());
+                }
+                outcome
+            })
+        }));
         let ui_results = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ui_capture = Arc::clone(&ui_results);
         ctx.emit_tool_result_fn = Arc::new(move |_call, value| {
@@ -1396,7 +1270,7 @@ mod tests {
                 .map(|context| context.workspace_root.as_str()),
             Some(private_path)
         );
-        for value in hook_responses
+        for value in middleware_responses
             .lock()
             .unwrap()
             .iter()
@@ -1409,23 +1283,12 @@ mod tests {
             .contains(private_path));
     }
 
-    fn test_context(
-        providers: Vec<Arc<dyn ToolProvider>>,
-        dispatch_hook: impl Fn(HookEvent) -> HookOutcome + Send + Sync + 'static,
-    ) -> ToolEvalContext {
-        test_context_with_emitters(
-            providers,
-            dispatch_hook,
-            |_, _| {},
-            |_, _| {},
-            |_, _| {},
-            |_, _| {},
-        )
+    fn test_context(providers: Vec<Arc<dyn ToolProvider>>) -> ToolEvalContext {
+        test_context_with_emitters(providers, |_, _| {}, |_, _| {}, |_, _| {}, |_, _| {})
     }
 
     fn test_context_with_emitters(
         providers: Vec<Arc<dyn ToolProvider>>,
-        dispatch_hook: impl Fn(HookEvent) -> HookOutcome + Send + Sync + 'static,
         emit_tool_call: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
         emit_tool_result: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
         emit_tool_blocked: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
@@ -1448,10 +1311,6 @@ mod tests {
             emit_tool_blocked_fn: Arc::new(emit_tool_blocked),
             emit_tool_update_fn: Arc::new(emit_tool_update),
             confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Approve),
-            dispatch_hook_fn: Arc::new(move |event| {
-                let outcome = dispatch_hook(event);
-                Box::pin(async move { outcome })
-            }),
             prepare_handoff_fn: None,
         }
     }
@@ -1493,7 +1352,6 @@ mod tests {
         let updated = Arc::clone(&events);
         let ctx = test_context_with_emitters(
             vec![provider],
-            |_| continue_hook_outcome(),
             move |call, _| {
                 started.lock().unwrap().push(RecordedToolEvent::Started(
                     call.id.clone().expect("started call ID"),
@@ -1578,49 +1436,6 @@ mod tests {
         );
     }
 
-    struct TestReplayLease(Arc<std::sync::atomic::AtomicBool>);
-
-    impl harnx_core::tool::ReplayAuthorization for TestReplayLease {
-        fn revalidate<'a, 'b>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'b>>
-        where
-            'a: 'b,
-            Self: 'b,
-        {
-            Box::pin(async move {
-                anyhow::ensure!(
-                    self.0.load(std::sync::atomic::Ordering::SeqCst),
-                    "lease replaced during approval"
-                );
-                Ok(())
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn legacy_recovery_revalidates_after_approval_before_dispatch() {
-        let held = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let lease = TestReplayLease(held.clone());
-        let mut ctx = test_context(vec![Arc::new(MockToolProvider::panic("tool_a"))], |_| {
-            HookOutcome {
-                control: HookResultControl::Ask { reason: None },
-                result: HookResult::default(),
-            }
-        });
-        ctx.confirm_tool_use_fn = Arc::new(move |_, _, _| {
-            held.store(false, std::sync::atomic::Ordering::SeqCst);
-            ToolUseConfirmation::Approve
-        });
-        let error = eval_tool_calls_with_authorization(
-            &ctx,
-            vec![test_call("tool_a")],
-            &create_abort_signal(),
-            Some(&lease),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("lease replaced during approval"));
-    }
-
     #[tokio::test]
     async fn replay_queries_retired_tools_and_normalizes_null() {
         let ctx = test_context_with_emitters(
@@ -1629,7 +1444,6 @@ mod tests {
                 Duration::ZERO,
                 Value::Null,
             ))],
-            |_| panic!("recovery must not repeat hooks"),
             |_, _| {},
             |_, value| assert!(value.is_null(), "display preserves the provider reply"),
             |_, _| {},
@@ -1663,13 +1477,10 @@ mod tests {
         delay_b: Duration,
         result_b: Value,
     ) -> ToolEvalContext {
-        test_context(
-            vec![
-                Arc::new(MockToolProvider::ok(name_a, delay_a, result_a)),
-                Arc::new(MockToolProvider::ok(name_b, delay_b, result_b)),
-            ],
-            |_| continue_hook_outcome(),
-        )
+        test_context(vec![
+            Arc::new(MockToolProvider::ok(name_a, delay_a, result_a)),
+            Arc::new(MockToolProvider::ok(name_b, delay_b, result_b)),
+        ])
     }
 
     fn test_call(name: &str) -> ToolCall {
@@ -1728,14 +1539,11 @@ mod tests {
 
     #[tokio::test]
     async fn fatal_error_propagates() {
-        let ctx = test_context(
-            vec![Arc::new(MockToolProvider::err(
-                "tool_a",
-                Duration::ZERO,
-                ToolError::Fatal(anyhow!("boom")),
-            ))],
-            |_| continue_hook_outcome(),
-        );
+        let ctx = test_context(vec![Arc::new(MockToolProvider::err(
+            "tool_a",
+            Duration::ZERO,
+            ToolError::Fatal(anyhow!("boom")),
+        ))]);
         let abort_signal = create_abort_signal();
 
         let err = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
@@ -1743,34 +1551,6 @@ mod tests {
             .expect_err("fatal error should propagate");
 
         assert!(format!("{err:#}").contains("boom"));
-    }
-
-    #[tokio::test]
-    async fn blocked_call_not_dispatched() {
-        let ctx =
-            test_context(
-                vec![Arc::new(MockToolProvider::panic("tool_a"))],
-                |event| match event {
-                    HookEvent::PreToolUse { .. } => HookOutcome {
-                        control: HookResultControl::Block {
-                            reason: "no".to_string(),
-                        },
-                        result: HookResult::default(),
-                    },
-                    _ => continue_hook_outcome(),
-                },
-            );
-        let abort_signal = create_abort_signal();
-
-        let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
-            .await
-            .expect("blocked call should still return output");
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(
-            result[0].output,
-            json!({"error": "no", "blocked_by_hook": true})
-        );
     }
 
     #[tokio::test]
@@ -1785,7 +1565,6 @@ mod tests {
                 Duration::ZERO,
                 ToolError::Recoverable(anyhow!("retry")),
             ))],
-            |_| continue_hook_outcome(),
             |_, _| {},
             move |_, result| {
                 result_emit_count_clone.fetch_add(1, Ordering::SeqCst);
@@ -1818,14 +1597,11 @@ mod tests {
             anyhow!("child failed"),
             json!({"session_id": "child-1"}),
         );
-        let ctx = test_context(
-            vec![Arc::new(MockToolProvider::err(
-                "tool_a",
-                Duration::ZERO,
-                ToolError::Recoverable(error),
-            ))],
-            |_| continue_hook_outcome(),
-        );
+        let ctx = test_context(vec![Arc::new(MockToolProvider::err(
+            "tool_a",
+            Duration::ZERO,
+            ToolError::Recoverable(error),
+        ))]);
 
         let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &create_abort_signal())
             .await
@@ -1843,7 +1619,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_provider_returns_recoverable_error() {
-        let ctx = test_context(Vec::new(), |_| continue_hook_outcome());
+        let ctx = test_context(Vec::new());
         let abort_signal = create_abort_signal();
         let result = eval_tool_calls(&ctx, vec![test_call("unknown_tool")], &abort_signal)
             .await
@@ -1863,123 +1639,6 @@ mod tests {
             .as_str()
             .expect("missing-provider error should be text")
             .contains("No tool provider configured"));
-    }
-
-    #[tokio::test]
-    async fn blocked_call_emits_blocked_event() {
-        let started_emit_count = Arc::new(AtomicUsize::new(0));
-        let started_emit_count_clone = Arc::clone(&started_emit_count);
-        let blocked_emit_count = Arc::new(AtomicUsize::new(0));
-        let blocked_emit_count_clone = Arc::clone(&blocked_emit_count);
-        let ctx = test_context_with_emitters(
-            vec![Arc::new(MockToolProvider::panic("tool_a"))],
-            |event| match event {
-                HookEvent::PreToolUse { .. } => HookOutcome {
-                    control: HookResultControl::Block {
-                        reason: "no".to_string(),
-                    },
-                    result: HookResult::default(),
-                },
-                _ => continue_hook_outcome(),
-            },
-            move |_, _| {
-                started_emit_count_clone.fetch_add(1, Ordering::SeqCst);
-            },
-            |_, _| {},
-            move |_, _| {
-                blocked_emit_count_clone.fetch_add(1, Ordering::SeqCst);
-            },
-            |_, _| {},
-        );
-        let abort_signal = create_abort_signal();
-
-        let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
-            .await
-            .expect("blocked call should still return output");
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(started_emit_count.load(Ordering::SeqCst), 0);
-        assert_eq!(blocked_emit_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn pre_tool_use_mutation_applied_to_tool() {
-        let received_arguments = Arc::new(Mutex::new(Vec::new()));
-        let received_arguments_clone = Arc::clone(&received_arguments);
-        let ctx = test_context_with_emitters(
-            vec![Arc::new(CapturingToolProvider::new(
-                "tool_a",
-                received_arguments_clone,
-                json!({"raw": true}),
-            ))],
-            |event| match event {
-                HookEvent::PreToolUse { .. } => HookOutcome {
-                    control: HookResultControl::Continue,
-                    result: HookResult {
-                        mutated_tool_input: Some(json!({"injected": true})),
-                        ..HookResult::default()
-                    },
-                },
-                _ => continue_hook_outcome(),
-            },
-            |_, _| {},
-            |_, _| {},
-            |_, _| {},
-            |_, _| {},
-        );
-        let abort_signal = create_abort_signal();
-
-        let result = eval_tool_calls(
-            &ctx,
-            vec![ToolCall::new(
-                "tool_a".to_string(),
-                json!({"original": true}),
-                None,
-                None,
-            )],
-            &abort_signal,
-        )
-        .await
-        .expect("tool call should succeed");
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(
-            received_arguments.lock().await.as_slice(),
-            &[json!({"injected": true})]
-        );
-    }
-
-    #[tokio::test]
-    async fn post_tool_use_mutation_replaces_result() {
-        let ctx = test_context_with_emitters(
-            vec![Arc::new(MockToolProvider::ok(
-                "tool_a",
-                Duration::ZERO,
-                json!({"raw": true}),
-            ))],
-            |event| match event {
-                HookEvent::PostToolUse { .. } => HookOutcome {
-                    control: HookResultControl::Continue,
-                    result: HookResult {
-                        mutated_tool_response: Some(json!({"mutated": true})),
-                        ..HookResult::default()
-                    },
-                },
-                _ => continue_hook_outcome(),
-            },
-            |_, _| {},
-            |_, _| {},
-            |_, _| {},
-            |_, _| {},
-        );
-        let abort_signal = create_abort_signal();
-
-        let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
-            .await
-            .expect("tool call should succeed");
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].output, json!({"mutated": true}));
     }
 
     #[tokio::test]
@@ -2005,7 +1664,6 @@ mod tests {
                     ]
                 }),
             ))],
-            |_| continue_hook_outcome(),
             |_, _| {},
             move |_, value| {
                 emitted_results_clone
@@ -2044,103 +1702,6 @@ mod tests {
         assert!(serialized_output.contains("<image: image/png, 4 base64 chars>"));
     }
 
-    #[tokio::test]
-    async fn pre_mutation_reflected_in_post_tool_use_event() {
-        let post_tool_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let post_tool_inputs_clone = Arc::clone(&post_tool_inputs);
-        let ctx = test_context_with_emitters(
-            vec![Arc::new(MockToolProvider::ok(
-                "tool_a",
-                Duration::ZERO,
-                json!({"raw": true}),
-            ))],
-            move |event| match event {
-                HookEvent::PreToolUse { .. } => HookOutcome {
-                    control: HookResultControl::Continue,
-                    result: HookResult {
-                        mutated_tool_input: Some(json!({"injected": true})),
-                        ..HookResult::default()
-                    },
-                },
-                HookEvent::PostToolUse { tool_input, .. } => {
-                    post_tool_inputs_clone
-                        .lock()
-                        .expect("lock post tool inputs")
-                        .push(tool_input);
-                    continue_hook_outcome()
-                }
-                _ => continue_hook_outcome(),
-            },
-            |_, _| {},
-            |_, _| {},
-            |_, _| {},
-            |_, _| {},
-        );
-        let abort_signal = create_abort_signal();
-
-        eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
-            .await
-            .expect("tool call should succeed");
-
-        assert_eq!(
-            post_tool_inputs
-                .lock()
-                .expect("lock post tool inputs")
-                .as_slice(),
-            &[json!({"injected": true})]
-        );
-    }
-
-    #[tokio::test]
-    async fn defer_returns_typed_interrupt_and_executes_no_tools() {
-        let call_count = Arc::new(tokio::sync::Mutex::new(0usize));
-        let provider = Arc::new(MockToolProvider::ok_with_call_count(
-            "tool_a",
-            Duration::ZERO,
-            json!({"ok": true}),
-            Arc::clone(&call_count),
-        ));
-        let mut ctx = test_context(vec![provider], |_| HookOutcome {
-            control: HookResultControl::Ask {
-                reason: Some("approval needed".to_string()),
-            },
-            result: HookResult::default(),
-        });
-        ctx.confirm_tool_use_fn = Arc::new(|call, _args, reason| {
-            assert_eq!(call.id.as_deref(), Some("call-1"));
-            assert_eq!(reason, Some("approval needed"));
-            ToolUseConfirmation::Defer
-        });
-        let abort_signal = create_abort_signal();
-        let err = eval_tool_calls(
-            &ctx,
-            vec![ToolCall::new(
-                "tool_a".to_string(),
-                json!({}),
-                Some("call-1".to_string()),
-                None,
-            )],
-            &abort_signal,
-        )
-        .await
-        .expect_err("defer should interrupt before dispatch");
-
-        let typed = err
-            .downcast_ref::<ToolApprovalRequiredError>()
-            .expect("typed approval interrupt");
-        assert_eq!(typed.deferred_calls().len(), 1);
-        assert_eq!(typed.deferred_calls()[0].call.id.as_deref(), Some("call-1"));
-        assert_eq!(
-            typed.deferred_calls()[0].reason.as_deref(),
-            Some("approval needed")
-        );
-        assert_eq!(
-            *call_count.lock().await,
-            0,
-            "no tool should execute when deferred"
-        );
-    }
-
     /// Build a minimal context for handoff-resolution tests with a given
     /// active-agent package, allow-listed handoff tool name, and optional
     /// package-aware decode map.
@@ -2149,7 +1710,7 @@ mod tests {
         allowed: &str,
         handoff_targets: HashMap<String, String>,
     ) -> ToolEvalContext {
-        let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+        let mut ctx = test_context(vec![]);
         ctx.current_agent_package = package.map(str::to_string);
         ctx.allowed_tool_names = HashSet::from([allowed.to_string()]);
         ctx.handoff_targets = handoff_targets;
@@ -2199,6 +1760,7 @@ mod tests {
                 "prompt": "continue work"
             }),
             Vec::new(),
+            Vec::new(),
             None,
         );
 
@@ -2228,6 +1790,7 @@ mod tests {
                 "prompt": "continue work",
                 "tool_call_id": "result-call-456"
             }),
+            Vec::new(),
             Vec::new(),
             None,
         );

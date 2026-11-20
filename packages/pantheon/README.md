@@ -200,7 +200,8 @@ The package includes ready-to-use tool server configs in `tool_servers/`. Bundle
 
 | Server | Namespace | Requires | Notes |
 |--------|-----------|----------|-------|
-| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution and the PR-stability waiter used after delivery. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Includes a native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. |
+| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution and the PR-stability waiter used after delivery. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Uses in-process tool middleware with `proxy_auth` for GitHub/Atlassian credential injection. |
+| `proxy_auth.yaml` | `proxy_auth_*` | None (bundled binary) | Long-lived GitHub/Atlassian auth proxy tool service. Provides `proxy_auth_environment` used by bash middleware. |
 | `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Opts into repository and development-tool allow batches. |
 | `plans.yaml` | `plans_*` | None (bundled binary) | NATS-backed plan/task/note management using canonical `cid:plan:` URLs. |
 | `time.yaml` | `time_*` | None (bundled binary) | Current time and wait/sleep utilities. |
@@ -208,6 +209,11 @@ The package includes ready-to-use tool server configs in `tool_servers/`. Bundle
 | `exa.yaml` | `exa_*` | None (bundled binary) | Web search via Exa. Requires `EXA_API_KEY`. |
 | `context7.yaml` | `context7_*` | Node.js / npx | Library docs lookup. No API key. |
 | `grep.yaml` | `grep_*` | None (bundled binary) | GitHub code search via grep.app. No API key. |
+| `attachments.yaml` | `attachments_*` | None (bundled binary) | NATS-backed attachment storage using canonical `cid:media:` URLs. |
+
+### Optional credential tool servers (`example_config/credential-tools/`)
+
+AWS and Kubernetes credential providers are available as opt-in templates in `example_config/credential-tools/`. To enable scoped AWS or Kubernetes access in this package without mounting host credential directories, copy `aws_creds.yaml`/`aws-creds.py` or `k8s_creds.yaml`/`k8s-creds.py` into this package's `tool_servers/` and `middleware/` directories (see `example_config/credential-tools/README.md`).
 
 Add your Exa key to `~/.local/share/harnx/.env`:
 

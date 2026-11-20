@@ -3,6 +3,11 @@
 //! These types are readers-only until durable suspension writers are deployed.
 //! Checkpoint references name private storage; they never contain execution observations.
 
+pub mod non_modal;
+pub mod response;
+pub mod surface;
+pub mod text;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};

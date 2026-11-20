@@ -282,6 +282,8 @@ async fn ids_with_separators_or_escapes_keep_their_own_rows() -> Result<()> {
     ];
     for (session, call_id, tool_call_id) in rows {
         let request = ToolRequest {
+            input_responses: None,
+            request_state: None,
             tool_call_id: Some(tool_call_id.to_string()),
             ..common::request_in_round(session, call_id, 3)
         };
@@ -371,6 +373,8 @@ async fn a_standalone_call_records_its_checkpoint_in_its_own_row() -> Result<()>
         .context("nats-server required")?;
     common::wait_for_registration(&harness.client, &harness.instance_id).await?;
     let request = ToolRequest {
+        input_responses: None,
+        request_state: None,
         parent_session_id: None,
         args: json!({"checkpoint": {"remote_job": "j-1"}}),
         ..common::request("unused", "standalone-call")

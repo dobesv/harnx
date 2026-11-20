@@ -108,6 +108,7 @@ pub(super) fn interaction_entries() -> Vec<SessionLogEntry> {
             tool_round_seq: 7,
             tool_call_id: "b".into(),
             result: ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some("b".into()),
                 name: "read".into(),
                 output: json!("done"),

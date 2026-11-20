@@ -55,7 +55,11 @@ impl Fixture {
     fn new(overrides: Value) -> Result<Self> {
         let dir = tempfile::tempdir()?;
         let script = dir.path().join("script.yaml");
-        let mut body = json!({"tools":[{"name":"mixed_tool","description":"deterministic result"}],"responses":["legacy text"]});
+        // `legacy: true` pins the mock to the pre-2026-07-28 revisions so the
+        // bridge's discover-first lifecycle falls back to `initialize` — the
+        // handshake these legacy-sequence tests assert. The modern flow has
+        // its own test that overrides this to false.
+        let mut body = json!({"tools":[{"name":"mixed_tool","description":"deterministic result"}],"responses":["legacy text"],"legacy":true});
         body.as_object_mut()
             .unwrap()
             .extend(overrides.as_object().unwrap().clone());
@@ -529,5 +533,35 @@ async fn result_limit_env_cli_precedence_and_validation() -> Result<()> {
         .output()
         .await?;
     assert!(output.status.success(), "{output:?}");
+    Ok(())
+}
+
+/// A server that speaks the 2026-07-28 revision negotiates it through
+/// `server/discover`: there is no legacy `initialize` handshake at all, and
+/// tools/call works unchanged. This is the MRTR-capable path Part B of T4.3
+/// depends on for `input_required` round trips.
+#[tokio::test]
+async fn modern_server_negotiates_discover_flow_without_initialize() -> Result<()> {
+    let expected = mixed_result(false);
+    let fixture = Fixture::new(json!({"call_result": expected, "legacy": false}))?;
+    let output = fixture
+        .run(&["--call-tool", "mixed_tool", "--tool-args", "{}"])
+        .await?;
+    assert_json_result(&output, &expected, true)?;
+    let events = fixture.requests()?;
+    let methods: Vec<&str> = events
+        .iter()
+        .map(|event| event["method"].as_str().unwrap())
+        .collect();
+    assert!(
+        !methods.contains(&"initialize"),
+        "modern flow sends no legacy handshake: {methods:?}"
+    );
+    assert!(
+        !methods.contains(&"notifications/initialized"),
+        "{methods:?}"
+    );
+    assert!(methods.contains(&"tools/list"));
+    assert!(methods.contains(&"tools/call"));
     Ok(())
 }

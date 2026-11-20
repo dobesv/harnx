@@ -301,6 +301,7 @@ pub(super) fn tool_output_from_reply(
         output,
         markdown: None,
         content: Vec::new(),
+        user_surfaces: Vec::new(),
         switch_agent: None,
     }
 }

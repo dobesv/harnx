@@ -2,7 +2,7 @@ use super::{InteractionModal, Tui};
 use crate::tool_confirmation::TOOL_CONFIRM_IDLE_GATE;
 use crate::types::ModalState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -13,6 +13,7 @@ const SCROLL_PAGE_LINES: u16 = 10;
 const NOTE_HEIGHT: u16 = 3;
 const BORDERS_HEIGHT: usize = 2;
 pub(crate) const MIN_MODAL_HEIGHT: u16 = 6;
+const A2UI_BODY_COLUMNS: u16 = 80;
 
 // qual:allow(coupling, oi) reason: "Rendering and key handling extend the shared TUI, following the existing per-concern modules."
 impl Tui {
@@ -20,10 +21,7 @@ impl Tui {
         let Some(ModalState::ConfirmInteraction(state)) = self.app.modal.as_mut() else {
             return false;
         };
-        if !state.submitting {
-            state.last_key_at = Instant::now();
-            state.note.insert_str(text);
-        }
+        insert_pasted_text(state, text);
         true
     }
 
@@ -45,6 +43,84 @@ impl Tui {
             return;
         }
         let now = Instant::now();
+        if state.a2ui.is_some() {
+            self.handle_a2ui_interaction_key(key, now);
+        } else {
+            self.handle_confirm_interaction_key(key, now);
+        }
+    }
+
+    fn handle_a2ui_interaction_key(&mut self, key: KeyEvent, now: Instant) {
+        let Some(ModalState::ConfirmInteraction(state)) = self.app.modal.as_mut() else {
+            return;
+        };
+        let Some(form) = &mut state.a2ui else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                self.submit_a2ui_interaction("deny".into());
+                return;
+            }
+            (KeyCode::Tab, KeyModifiers::NONE) => {
+                state.last_key_at = now;
+                form.focus_next();
+                return;
+            }
+            (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
+                state.last_key_at = now;
+                form.focus_prev();
+                return;
+            }
+            (KeyCode::PageUp, _) => {
+                state.scroll = state.scroll.saturating_sub(SCROLL_PAGE_LINES);
+                return;
+            }
+            (KeyCode::PageDown, _) => {
+                state.scroll = state.scroll.saturating_add(SCROLL_PAGE_LINES);
+                return;
+            }
+            _ => {}
+        }
+
+        if form.focus == super::a2ui::FocusTarget::Note {
+            self.handle_a2ui_note_key(key, now);
+            return;
+        }
+
+        state.last_key_at = now;
+        if let Some(super::a2ui::A2UIAction::Submit(name)) = form.handle_key(key) {
+            self.submit_a2ui_interaction(name);
+        }
+    }
+
+    fn handle_a2ui_note_key(&mut self, key: KeyEvent, now: Instant) {
+        let Some(ModalState::ConfirmInteraction(state)) = self.app.modal.as_mut() else {
+            return;
+        };
+        let primary = state.a2ui.as_ref().and_then(|f| f.primary_action());
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT)
+            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                state.last_key_at = now;
+                state.note.insert_newline();
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                if let Some(action) = primary {
+                    self.submit_a2ui_interaction(action);
+                }
+            }
+            _ => {
+                state.last_key_at = now;
+                state.note.input(key);
+            }
+        }
+    }
+
+    fn handle_confirm_interaction_key(&mut self, key: KeyEvent, now: Instant) {
+        let Some(ModalState::ConfirmInteraction(state)) = self.app.modal.as_mut() else {
+            return;
+        };
         match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 if now.saturating_duration_since(state.last_key_at) >= TOOL_CONFIRM_IDLE_GATE {
@@ -94,48 +170,64 @@ impl Tui {
             .borders(Borders::ALL)
             .title(if state.child.is_some() {
                 "Child confirmation"
+            } else if state.a2ui.is_some() {
+                "Interaction"
             } else {
                 "Middleware confirmation"
             })
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let footer = interaction_footer(state, self.interactions.read_error.as_deref());
-        let footer_height = Paragraph::new(footer.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(inner.width.max(1));
-        let regions = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(NOTE_HEIGHT),
-            Constraint::Length(u16::try_from(footer_height).unwrap_or(u16::MAX)),
-        ])
-        .split(inner);
-        let body = Paragraph::new(interaction_body(state)).wrap(Wrap { trim: false });
-        let max_scroll = body
-            .line_count(regions[0].width.max(1))
-            .saturating_sub(usize::from(regions[0].height));
-        state.scroll = state
-            .scroll
-            .min(u16::try_from(max_scroll).unwrap_or(u16::MAX));
-        frame.render_widget(body.scroll((state.scroll, 0)), regions[0]);
-        state.note.set_block(
-            Block::default()
-                .borders(Borders::TOP)
-                .title("Note (optional)"),
+        let note_area = super::render_modal_body(
+            frame,
+            inner,
+            super::ModalBodyParts {
+                body: interaction_body(state),
+                footer: interaction_footer(state, self.interactions.read_error.as_deref()).into(),
+                note_height: NOTE_HEIGHT,
+            },
+            &mut state.scroll,
         );
-        state.note.set_cursor_line_style(Style::default());
-        state.note.set_wrap_mode(ratatui_textarea::WrapMode::Word);
-        frame.render_widget(&state.note, regions[1]);
-        frame.render_widget(
-            Paragraph::new(footer)
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(Color::Yellow)),
-            regions[2],
+        let note_focused = state
+            .a2ui
+            .as_ref()
+            .is_some_and(|f| f.focus == super::a2ui::FocusTarget::Note);
+        super::render_note_area(
+            frame,
+            note_area,
+            &mut state.note,
+            note_focused,
+            "Note (optional)",
         );
     }
 }
 
+fn insert_pasted_text(state: &mut InteractionModal, text: &str) {
+    if state.submitting {
+        return;
+    }
+    state.last_key_at = Instant::now();
+    let pasted_into_form = state
+        .a2ui
+        .as_mut()
+        .is_some_and(|form| form.paste_text(text));
+    if !pasted_into_form {
+        state.note.insert_str(text);
+    }
+}
+
 fn interaction_body(state: &InteractionModal) -> Vec<Line<'static>> {
+    if let Some(form) = &state.a2ui {
+        let mut lines = super::a2ui_render::render_form_lines(form, A2UI_BODY_COLUMNS);
+        if state.pending.pending_count > 0 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "{} more pending; shown one at a time.",
+                state.pending.pending_count
+            )));
+        }
+        return lines;
+    }
     let mut lines = vec![Line::from(state.pending.message.clone())];
     if state.pending.kind != "confirm" {
         lines.push(Line::from(format!(
@@ -170,6 +262,8 @@ fn interaction_footer(state: &InteractionModal, read_error: Option<&str>) -> Str
     };
     let help = if state.submitting {
         format!("Submitting… · Ctrl+C {interrupt}")
+    } else if state.a2ui.is_some() {
+        super::a2ui_render::footer_help(interrupt)
     } else if state.pending.kind != "confirm" {
         format!("Ctrl+D deny · Ctrl+C {interrupt} · PgUp/PgDn scroll")
     } else {

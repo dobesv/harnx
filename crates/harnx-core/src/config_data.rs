@@ -266,7 +266,9 @@ pub struct ConfigData {
     pub sync_models_url: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<HooksConfig>,
+    // Boxed for the same reason as `AgentConfig::hooks`: `ConfigData` lives
+    // inline in `Config`, which every turn dispatch future copies by value.
+    pub hooks: Option<Box<HooksConfig>>,
 
     #[serde(
         default,
@@ -467,7 +469,7 @@ compress_threshold: 100000
 rag_top_k: 3
 highlight: false
 hooks:
-  entries: []
+  max_resume: 2
 "#;
         let got: ConfigData = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(got.model_id, "claude-sonnet-4-6");

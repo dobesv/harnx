@@ -1,12 +1,19 @@
 //! Runtime configuration → script runner → engine/provider integration.
+mod claude_hooks;
 mod confirm;
+#[cfg(unix)]
+mod credentials;
 mod diagnostics;
 mod documentation;
 mod fetch;
 mod fixture;
+mod interact;
+mod interaction_harness;
 mod model;
 mod policy;
 mod provenance;
+mod proxy_auth;
+mod proxy_auth_policy;
 mod shipped;
 mod timing;
 

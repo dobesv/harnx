@@ -1,12 +1,8 @@
 use crate::{
     config::{Config, GlobalConfig},
-    nats_hook_provider::{
-        dispatch_hook_event, HookDispatchMeta, HookEventDispatch, NatsHookProvider,
-    },
     utils::*,
 };
 use anyhow::Result;
-use harnx_hooks::HookEvent;
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -21,9 +17,8 @@ pub use harnx_core::tool::{
 };
 use harnx_engine::tool::ToolEvalRenderContext;
 pub use harnx_engine::tool::{
-    eval_tool_calls, ConfirmToolUseFn, DeferredToolCall, DispatchHookFn, PrepareHandoffFn,
-    PreparedHandoff, ToolApprovalRequiredError, ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn,
-    ToolUseConfirmation,
+    eval_tool_calls, ConfirmToolUseFn, PrepareHandoffFn, PreparedHandoff, ToolCallEmitFn,
+    ToolEvalContext, ToolUpdateEmitFn, ToolUseConfirmation,
 };
 
 /// The LLM text completion that immediately preceded a tool round.
@@ -35,33 +30,36 @@ pub struct CompletionText<'a> {
 }
 
 use crate::nats_tool_provider::NatsToolProvider;
-use crate::tool_context::{discover_nats_hook_provider_cached, discover_nats_tool_provider_cached};
+use crate::tool_context::discover_nats_tool_provider_cached;
 pub use crate::tool_context::{BuildToolEvalContextParams, ToolRoundParams};
-
-#[derive(Debug, Clone)]
-pub struct ToolApprovalInterrupt {
-    pub tool_calls: Vec<ToolCall>,
-    pub deferred_calls: Vec<DeferredToolCall>,
-}
 
 /// Whether a tool round appends its `ToolCalls` entry or resumes one the
 /// session log already holds.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ToolRoundPersistence {
     /// Append the round's `ToolCalls` entry before dispatching its calls.
     AppendCalls,
     /// The log already holds the round's `ToolCalls` entry, at `seq`.
     ExistingCalls { seq: u64 },
+    /// Old process-hook decisions are applied without invoking the retired hooks.
+    LegacyApprovals { seq: u64, denied: Vec<ToolResult> },
 }
 
 impl ToolRoundPersistence {
+    fn denied_results(self) -> Vec<ToolResult> {
+        match self {
+            Self::LegacyApprovals { denied, .. } => denied,
+            _ => Vec::new(),
+        }
+    }
+
     /// Open the round `calls` belong to and return its sequence, the one their
     /// `ToolCalls` entry has. A new round appends that entry here, before any
     /// call is dispatched. `None` when no durable entry holds the round, as in
     /// a dry run.
-    fn open_round(self, params: &ToolRoundParams<'_>, calls: &[ToolCall]) -> Result<Option<u64>> {
+    fn open_round(&self, params: &ToolRoundParams<'_>, calls: &[ToolCall]) -> Result<Option<u64>> {
         match self {
-            Self::ExistingCalls { seq } => Ok(Some(seq)),
+            Self::ExistingCalls { seq } | Self::LegacyApprovals { seq, .. } => Ok(Some(*seq)),
             Self::AppendCalls if params.config.read().dry_run => Ok(None),
             Self::AppendCalls => params.config.write().append_session_tool_calls(
                 params.input,
@@ -70,16 +68,6 @@ impl ToolRoundPersistence {
                 calls,
             ),
         }
-    }
-}
-
-impl ToolApprovalInterrupt {
-    pub fn from_error(err: &anyhow::Error) -> Option<Self> {
-        err.downcast_ref::<ToolApprovalRequiredError>()
-            .map(|typed| Self {
-                tool_calls: typed.tool_calls().to_vec(),
-                deferred_calls: typed.deferred_calls().to_vec(),
-            })
     }
 }
 
@@ -116,51 +104,34 @@ pub async fn execute_tool_round_with_persistence(
     );
     harnx_engine::tool::ensure_tool_call_ids(&mut tool_calls);
     let tool_round = persistence.open_round(&params, &tool_calls)?;
-    let ToolRoundParams {
-        config,
-        instance_id,
-        input,
-        completion: _,
-        abort_signal,
-        working_dir,
-        nats_hook_provider,
-        prepare_handoff_fn,
-        pending_async_context,
-        tool_loop_guard,
-    } = params;
+    let legacy_denied = persistence.denied_results();
+    let config = params.config;
+    let input = params.input;
+    let abort_signal = params.abort_signal;
     let dry_run = config.read().dry_run;
-    let durable =
-        crate::interaction_checkpoint::live::DurableRound::open(config, tool_round, &tool_calls)
-            .await?;
-
-    let agent_use_tools = input.agent().use_tools().map(|v| v.join(","));
-    // Derive the active agent's package (e.g. `pantheon` for `pantheon/daedalus`)
-    // so bare `_session_handoff` targets resolve to the same package (#709).
-    let current_agent_package =
-        harnx_core::package_namespace::pkg_from_qualified(input.agent().name()).map(str::to_string);
-    // Build the round context and hand it to the `bash` provider (C6). The
-    // context is wrapped in an `Arc` first: the slot stores a `Weak`, so the
-    // provider and context never form a strong cycle. `tool_round` is set
-    // before the wrap because the Arc makes the context immutable from here.
-    let eval_ctx = build_round_eval_context(
-        BuildToolEvalContextParams {
-            config,
-            instance_id,
-            agent_use_tools: agent_use_tools.as_deref(),
-            current_agent_package,
-            working_dir,
-            nats_hook_provider,
-            prepare_handoff_fn,
-            pending_async_context,
-            bash_context_slot: None,
-            command_bash: None,
-        },
-        tool_round,
-        durable.as_ref(),
+    // A call on a tool that declared `harnx:input_required` must find the
+    // durable interaction path open even when no middleware is configured;
+    // an undeclared tool's challenge degrades to an error result instead.
+    let input_declared = round_may_request_input(
+        config,
+        params.instance_id,
+        params.input.agent().name(),
+        &tool_calls,
     )
     .await;
+    let durable = crate::interaction_checkpoint::live::DurableRound::open(
+        config,
+        tool_round,
+        &tool_calls,
+        input_declared,
+    )
+    .await?;
+    let eval_ctx = build_round_eval_context(&params, tool_round, durable.as_ref()).await;
+    let tool_loop_guard = params.tool_loop_guard;
     let guard = crate::tool_loop_guard::begin_round(tool_loop_guard.as_deref(), config, input);
-    let (to_eval, refused) = screen_tool_round(guard, config, &tool_calls, &eval_ctx).await?;
+    let (to_eval, refused) =
+        screen_round_with_saved_denials(guard, config, &tool_calls, &eval_ctx, legacy_denied)
+            .await?;
     let results = evaluate_round(
         ToolFailure {
             config,
@@ -180,14 +151,76 @@ pub async fn execute_tool_round_with_persistence(
     Ok(results)
 }
 
+/// Whether any call in the round targets a NATS tool that declared
+/// `harnx:input_required` (`ToolSpec::with_input_required`), in which case
+/// the durable interaction path must be open even without middleware.
+/// Discovery is cached, so the round's later context build reuses it.
+async fn round_may_request_input(
+    config: &GlobalConfig,
+    instance_id: &harnx_core::instance::ServerScope,
+    agent_name: &str,
+    calls: &[ToolCall],
+) -> bool {
+    if calls.is_empty() || !crate::tool_context::has_broker_address() {
+        return false;
+    }
+    let package = harnx_core::package_namespace::pkg_from_qualified(agent_name).map(str::to_string);
+    let config = config.read().clone();
+    let Some(provider) =
+        discover_nats_tool_provider_cached(&config, instance_id, package.as_deref()).await
+    else {
+        return false;
+    };
+    calls
+        .iter()
+        .any(|call| provider.may_request_input(&call.name))
+}
+
+async fn screen_round_with_saved_denials(
+    guard: Option<&parking_lot::Mutex<harnx_core::loop_guard::ToolRepeatGuard>>,
+    config: &GlobalConfig,
+    calls: &[ToolCall],
+    eval: &ToolEvalContext,
+    mut denied: Vec<ToolResult>,
+) -> Result<(Vec<ToolCall>, Vec<ToolResult>)> {
+    for result in &denied {
+        (eval.emit_tool_blocked_fn)(&result.call, &result.output);
+    }
+    let candidates: Vec<_> = calls
+        .iter()
+        .filter(|call| !denied.iter().any(|result| result.call == **call))
+        .cloned()
+        .collect();
+    let (to_eval, mut refused) = screen_tool_round(guard, config, &candidates, eval).await?;
+    refused.append(&mut denied);
+    Ok((to_eval, refused))
+}
+
 async fn build_round_eval_context(
-    mut params: BuildToolEvalContextParams<'_>,
+    params: &ToolRoundParams<'_>,
     tool_round: Option<u64>,
     durable: Option<&crate::interaction_checkpoint::live::DurableRound>,
 ) -> Arc<ToolEvalContext> {
+    let agent_use_tools = params.input.agent().use_tools().map(|v| v.join(","));
+    // Bare handoff targets resolve to the active agent's package (#709).
+    let current_agent_package =
+        harnx_core::package_namespace::pkg_from_qualified(params.input.agent().name())
+            .map(str::to_string);
+    // The slot holds a Weak, so installing the completed context cannot form
+    // a provider/context cycle. Set the round before the Arc makes it immutable.
     let slot = crate::bash_provider::BashEvalContextSlot::new();
-    params.bash_context_slot = Some(slot.clone());
-    let mut ctx = build_tool_eval_context(params).await;
+    let mut ctx = build_tool_eval_context(BuildToolEvalContextParams {
+        config: params.config,
+        instance_id: params.instance_id,
+        agent_use_tools: agent_use_tools.as_deref(),
+        current_agent_package,
+        working_dir: params.working_dir,
+        prepare_handoff_fn: params.prepare_handoff_fn.clone(),
+        pending_async_context: params.pending_async_context.clone(),
+        bash_context_slot: Some(slot.clone()),
+        command_bash: None,
+    })
+    .await;
     ctx.tool_round = tool_round;
     if let Some(round) = durable {
         round.install(&mut ctx);
@@ -279,9 +312,7 @@ fn terminal_tool_interruption(
     abort: &harnx_core::abort::AbortSignal,
     error: &anyhow::Error,
 ) -> bool {
-    abort.aborted()
-        || ToolApprovalInterrupt::from_error(error).is_some()
-        || error.is::<harnx_engine::tool::ToolInputRequiredError>()
+    abort.aborted() || error.is::<harnx_engine::tool::ToolInputRequiredError>()
 }
 
 async fn persist_failed_tool_results(
@@ -371,45 +402,6 @@ async fn persist_stopped_tool_results(
     Ok(())
 }
 
-fn build_dispatch_hook_fn(
-    session: (&GlobalConfig, Option<&str>),
-    working_dir: Option<&std::path::Path>,
-    nats_hook_provider: Option<Arc<NatsHookProvider>>,
-    pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
-) -> Arc<DispatchHookFn> {
-    let (config, session_name) = session;
-    let abort = config.read().maintenance_abort.clone();
-    let session_id = session_name.unwrap_or("cmd").to_string();
-    let cwd = working_dir
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    Arc::new(move |event: HookEvent| {
-        let session_id = session_id.clone();
-        let abort = abort.clone();
-        let cwd = cwd.clone();
-        let nats_hook_provider = nats_hook_provider.clone();
-        let pending_async_context = pending_async_context.clone();
-        Box::pin(async move {
-            // Ask is returned unchanged. eval_tool_calls turns a deferred
-            // confirmation into ToolApprovalRequiredError. Headless workers
-            // cannot prompt, so their confirmation callback decides whether
-            // the error is surfaced or the call is denied.
-            dispatch_hook_event(HookEventDispatch {
-                event,
-                provider: nats_hook_provider.as_deref(),
-                meta: HookDispatchMeta {
-                    abort,
-                    session_id,
-                    cwd,
-                    resume_count: 0,
-                },
-                pending_async_context,
-            })
-            .await
-        })
-    })
-}
-
 /// Build tool lifecycle emit closures over a shared declaration map.
 fn build_emit_fns(
     decl_map: &Arc<HashMap<String, ToolDeclaration>>,
@@ -476,32 +468,23 @@ fn emit_tool_update(
     }
 }
 
-async fn resolve_nats_providers(
+async fn resolve_nats_provider(
     config: &Config,
     instance_id: &harnx_core::instance::ServerScope,
     active_package: Option<&str>,
-    injected: (Option<Arc<NatsToolProvider>>, Option<Arc<NatsHookProvider>>),
-) -> (Option<Arc<NatsToolProvider>>, Option<Arc<NatsHookProvider>>) {
-    let (injected_tool_provider, injected_hook_provider) = injected;
-    if let Some(provider) = injected_tool_provider {
-        return (Some(provider), injected_hook_provider);
+    injected: Option<Arc<NatsToolProvider>>,
+) -> Option<Arc<NatsToolProvider>> {
+    if injected.is_some() {
+        return injected;
     }
-    // Same gate as the declaration refresh. Tests that run the agent loop
-    // in-process have no broker address, and their tool calls would otherwise
-    // start or join the developer's shared broker.
+    // In-process tests without a broker must not start the developer's broker.
     if !crate::tool_context::has_broker_address() {
-        return (None, injected_hook_provider);
+        return None;
     }
-    let tool_provider =
-        discover_nats_tool_provider_cached(config, instance_id, active_package).await;
-    let hook_provider = match injected_hook_provider {
-        Some(provider) => Some(provider),
-        None => discover_nats_hook_provider_cached(config, instance_id).await,
-    };
-    (tool_provider, hook_provider)
+    discover_nats_tool_provider_cached(config, instance_id, active_package).await
 }
 
-/// Build tool providers, hook dispatch, and rendering state for one tool round.
+/// Build tool providers, middleware, and rendering state for one tool round.
 pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> ToolEvalContext {
     build_tool_eval_context_inner(params, None).await
 }
@@ -515,7 +498,7 @@ pub async fn build_tool_eval_context_with_provider(
 }
 
 async fn build_tool_eval_context_inner(
-    mut params: BuildToolEvalContextParams<'_>,
+    params: BuildToolEvalContextParams<'_>,
     provider: Option<Arc<NatsToolProvider>>,
 ) -> ToolEvalContext {
     let snapshot = snapshot_tool_round(
@@ -523,21 +506,20 @@ async fn build_tool_eval_context_inner(
         params.agent_use_tools,
         params.current_agent_package.as_deref(),
     );
-    let (provider, hooks) = resolve_nats_providers(
+    let provider = resolve_nats_provider(
         &snapshot.config,
         params.instance_id,
         params.current_agent_package.as_deref(),
-        (provider, params.nats_hook_provider.take()),
+        provider,
     )
     .await;
-    assemble_tool_eval_context(params, snapshot, provider, hooks)
+    assemble_tool_eval_context(params, snapshot, provider)
 }
 
 fn assemble_tool_eval_context(
     params: BuildToolEvalContextParams<'_>,
     snapshot: ToolRoundSnapshot,
     provider: Option<Arc<NatsToolProvider>>,
-    hooks: Option<Arc<NatsHookProvider>>,
 ) -> ToolEvalContext {
     let decl_map = Arc::new(build_context_decl_map(
         snapshot.declarations,
@@ -571,12 +553,6 @@ fn assemble_tool_eval_context(
         emit_tool_blocked_fn,
         emit_tool_update_fn,
         confirm_tool_use_fn: snapshot.confirmation,
-        dispatch_hook_fn: build_dispatch_hook_fn(
-            (params.config, snapshot.session_name.as_deref()),
-            params.working_dir,
-            hooks,
-            params.pending_async_context,
-        ),
         prepare_handoff_fn: params.prepare_handoff_fn,
     };
     crate::middleware::install(&mut ctx, &snapshot.config);
@@ -586,7 +562,6 @@ fn assemble_tool_eval_context(
 struct ToolRoundSnapshot {
     declarations: Vec<ToolDeclaration>,
     handoff_targets: HashMap<String, String>,
-    session_name: Option<String>,
     confirmation: Arc<ConfirmToolUseFn>,
     config: Config,
 }
@@ -601,10 +576,6 @@ fn snapshot_tool_round(
     ToolRoundSnapshot {
         declarations,
         handoff_targets,
-        session_name: guard
-            .session
-            .as_ref()
-            .map(|session| session.id().to_string()),
         confirmation: build_confirm_tool_use_fn(&guard),
         config: guard.clone(),
     }
@@ -642,24 +613,19 @@ fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
 }
 
 /// Assemble normal providers, with an optional command-scoped Bash catalog.
-/// An override keeps Bash active even for pure shell and limits inner consent
-/// to that command. Base providers never contain Bash, preventing recursion.
+/// An override keeps Bash active even for pure shell and limits the inner
+/// catalog to that command. Base providers never contain Bash, preventing recursion.
 fn build_tool_providers(
     config: &GlobalConfig,
     nats_provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
     bash_context_slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
     command_bash: Option<crate::bash_provider::CommandBashInputs>,
 ) -> Vec<Arc<dyn ToolProvider>> {
-    let (bash_active, bash_inner_declarations, operator_inner_consent) = match command_bash {
-        Some(inputs) => (
-            true,
-            inputs.inner_declarations,
-            inputs.operator_inner_consent,
-        ),
+    let (bash_active, bash_inner_declarations) = match command_bash {
+        Some(inputs) => (true, inputs.inner_declarations),
         None => (
             config.read().bash_tools_active(),
             config.read().bash_inner_tool_declarations(),
-            false,
         ),
     };
     let mut base_providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
@@ -697,7 +663,6 @@ fn build_tool_providers(
             base_providers: base_providers.clone(),
             slot: bash_context_slot,
             payload_limit,
-            operator_inner_consent,
         })
         .with_attachment_fetcher(attachment_fetcher)
         .with_media_store(media_store),
@@ -917,12 +882,33 @@ fn print_tool_result_fallback(
     println!("{}", dimmed_text(&truncated));
 }
 
+fn prompt_tool_confirmation(tool_name: &str, input: &Value, reason: Option<&str>) -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    const MAX_CONFIRMATION_PREVIEW_CHARS: usize = 500;
+    let preview: String = serde_json::to_string_pretty(input)
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_CONFIRMATION_PREVIEW_CHARS)
+        .collect();
+    let message = format!(
+        "Confirm tool '{tool_name}'\n{}\nInput: {preview}\nAllow this tool call?",
+        reason.unwrap_or_default()
+    );
+    inquire::Confirm::new(&message)
+        .with_default(false)
+        .prompt()
+        .unwrap_or_default()
+}
+
 fn default_confirm_tool_use(
     call: &ToolCall,
     arguments: &Value,
     reason: Option<&str>,
 ) -> ToolUseConfirmation {
-    if harnx_hooks::prompt::confirm_tool_use(&call.name, arguments, reason) {
+    if prompt_tool_confirmation(&call.name, arguments, reason) {
         ToolUseConfirmation::Approve
     } else {
         ToolUseConfirmation::Deny {
@@ -1002,7 +988,6 @@ mod tests {
             None,
             Some(crate::bash_provider::CommandBashInputs {
                 inner_declarations: Vec::new(),
-                operator_inner_consent: true,
             }),
         );
         assert_eq!(providers[0].name(), "bash-script");
@@ -1030,7 +1015,6 @@ mod tests {
             BuildToolEvalContextParams::new(&config, &instance_id).with_command_bash(
                 crate::bash_provider::CommandBashInputs {
                     inner_declarations: vec![make_decl_with_templates("fs_read", None, None)],
-                    operator_inner_consent: true,
                 },
             ),
         )
@@ -1546,14 +1530,6 @@ mod tests {
             emit_tool_blocked_fn: Arc::new(|_, _| {}),
             emit_tool_update_fn: Arc::new(|_, _| {}),
             confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Approve),
-            dispatch_hook_fn: Arc::new(|_| {
-                Box::pin(async {
-                    harnx_core::hooks::HookOutcome {
-                        control: harnx_core::hooks::HookResultControl::Continue,
-                        result: harnx_core::hooks::HookResult::default(),
-                    }
-                })
-            }),
             prepare_handoff_fn: None,
         };
 

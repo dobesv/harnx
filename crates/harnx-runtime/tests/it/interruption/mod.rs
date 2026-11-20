@@ -86,6 +86,7 @@ fn tool_results(id: &str, output: serde_json::Value) -> Entry {
     Entry::ToolResults {
         handoff_selection: None,
         results: vec![ToolOutput {
+            user_surfaces: Vec::new(),
             id: Some(id.into()),
             name: "slow_tool".into(),
             output,
@@ -218,6 +219,8 @@ async fn await_wind_up(log: &NatsSessionLog, call_id: &str) -> Result<Vec<(u64, 
 /// transcript call to its row.
 fn journal_request(session_key: &str, call_id: &str, round: u64) -> ToolRequest {
     ToolRequest {
+        input_responses: None,
+        request_state: None,
         run_context: None,
         replay: None,
         operation_id: format!("op-{}", wire_id(call_id)),
@@ -250,6 +253,7 @@ async fn complete_in_journal(
         .complete(
             request,
             ToolReply {
+                input_required: None,
                 call_id: request.call_id.clone(),
                 result: Ok(result),
                 final_progress: None,

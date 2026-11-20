@@ -41,8 +41,7 @@ use harnx_core::sink::{current_agent_event_sink, with_agent_event_sink};
 use harnx_core::tool::{ToolCall, ToolProvider, ToolResult, ToolUpdatePatch};
 use harnx_engine::tool::{
     eval_inner_tool_call, EvaluatedInnerCall, InnerToolCallStatus, InnerToolEvalOptions,
-    ToolApprovalRequiredError, ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn,
-    ToolUseConfirmation, WorkBoundary,
+    ToolCallEmitFn, ToolEvalContext, ToolUpdateEmitFn, WorkBoundary,
 };
 // Share MCP domain-error classification with the command layer so both
 // layers report the same failure and keep text from every error block.
@@ -173,10 +172,6 @@ pub struct InnerCallExecutorConfig {
     pub max_calls: usize,
     /// NATS payload pre-flight; `None` skips the check (tests, non-NATS setups).
     pub payload_limit: Option<PayloadLimit>,
-    /// Operator script runs (#2630): auto-approve this run's inner calls
-    /// after the normal fork. Ordinary agent rounds leave this false and
-    /// keep the fork's Defer.
-    pub operator_inner_consent: bool,
 }
 
 impl InnerCallExecutorConfig {
@@ -188,7 +183,6 @@ impl InnerCallExecutorConfig {
             max_concurrent: DEFAULT_MAX_CONCURRENT_INNER_CALLS,
             max_calls: DEFAULT_MAX_INNER_CALLS_PER_SCRIPT,
             payload_limit: None,
-            operator_inner_consent: false,
         }
     }
 
@@ -202,13 +196,6 @@ impl InnerCallExecutorConfig {
         self.payload_limit = Some(payload_limit);
         self
     }
-
-    /// Operator script runs (#2630): auto-approve this run's inner calls
-    /// after the normal fork.
-    pub fn with_operator_inner_consent(mut self, operator_inner_consent: bool) -> Self {
-        self.operator_inner_consent = operator_inner_consent;
-        self
-    }
 }
 
 /// Runtime-owned gate for script-originated tool calls. Cheap to share via
@@ -219,8 +206,6 @@ pub struct InnerCallExecutor {
     max_concurrent: usize,
     max_calls: usize,
     payload_limit: Option<Arc<PayloadLimit>>,
-    /// #2630 operator script runs only; ordinary rounds never set this.
-    operator_inner_consent: bool,
 }
 
 impl InnerCallExecutor {
@@ -231,7 +216,6 @@ impl InnerCallExecutor {
             max_concurrent: config.max_concurrent.max(1),
             max_calls: config.max_calls,
             payload_limit: config.payload_limit.map(Arc::new),
-            operator_inner_consent: config.operator_inner_consent,
         }
     }
 
@@ -291,15 +275,6 @@ impl InnerCallExecutor {
         });
         if let Some(limit) = &self.payload_limit {
             limit.guard_dispatch(&mut ctx);
-        }
-        if self.operator_inner_consent {
-            // Operator script runs (#2630): the operator already consented to
-            // this script's inner calls. The normal fork resets confirmation
-            // to Defer — restore approval only on this runtime-owned fork.
-            // Hook Block/Deny still stops the call before any confirmation,
-            // and any further fork (child agents, nested scripts) resets to
-            // Defer again, so the consent never escapes this run.
-            ctx.confirm_tool_use_fn = Arc::new(|_, _, _| ToolUseConfirmation::Approve);
         }
 
         InnerCallRun {
@@ -483,9 +458,9 @@ impl InnerCallRun {
     }
 
     /// Execute one inner call through the full admission pipeline
-    /// (PreToolUse hooks, dispatch, PostToolUse), enforcing the allowlist,
+    /// (middleware, dispatch), enforcing the allowlist,
     /// call budget, and concurrency cap first. Payload limits apply before
-    /// admission and again after hook mutations. The parent abort signal
+    /// admission and again after mutations. The parent abort signal
     /// propagates: an aborted signal yields [`InnerOutcome::Fatal`].
     pub async fn call(&self, tool: &str, args: Value, abort_signal: &AbortSignal) -> InnerOutcome {
         // Poll the abort before any admission gate, so a rejection-only
@@ -550,7 +525,7 @@ impl InnerCallRun {
         // Keep the concurrency permit and cancellation guard until durable
         // media writes finish, so a completed command can read its path at once.
         let evaluated = self.prepare_media(evaluated).await;
-        let (outcome, status, bytes) = classify_evaluation(tool, evaluated);
+        let (outcome, status, bytes) = classify_evaluation(evaluated);
 
         // Normal completion: disarm the guard, then record the final row.
         let start = cancel_guard
@@ -795,7 +770,6 @@ impl std::fmt::Display for CallRejection {
 impl std::error::Error for CallRejection {}
 
 fn classify_evaluation(
-    tool: &str,
     evaluated: anyhow::Result<EvaluatedInnerCall>,
 ) -> (InnerOutcome, InnerTraceStatus, u64) {
     match evaluated {
@@ -814,7 +788,7 @@ fn classify_evaluation(
                     rejection.bytes,
                 );
             }
-            let (outcome, status) = classify_error(tool, error);
+            let (outcome, status) = classify_error(error);
             (outcome, status, 0)
         }
     }
@@ -870,20 +844,7 @@ fn classify_output(
     }
 }
 
-fn classify_error(tool: &str, error: anyhow::Error) -> (InnerOutcome, InnerTraceStatus) {
-    if let Some(approval) = error.downcast_ref::<ToolApprovalRequiredError>() {
-        let reason = approval
-            .deferred_calls()
-            .first()
-            .and_then(|deferred| deferred.reason.clone());
-        return (
-            InnerOutcome::ApprovalRequired {
-                tool: tool.to_string(),
-                reason,
-            },
-            InnerTraceStatus::ApprovalRequired,
-        );
-    }
+fn classify_error(error: anyhow::Error) -> (InnerOutcome, InnerTraceStatus) {
     (
         InnerOutcome::Fatal {
             message: format!("{error:#}"),
@@ -899,7 +860,6 @@ mod tests {
     use super::*;
     use harnx_core::abort::create_abort_signal;
     use harnx_core::event::{AgentEvent, NoticeEvent};
-    use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
     use harnx_core::instance::ServerScope;
     use harnx_core::partial_result::error_with_partial_result;
     use harnx_core::tool::{ToolCallOrigin, ToolError, ToolProgress, ToolProviderOutput};
@@ -907,34 +867,11 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
-    type HookEvents = Arc<Mutex<Vec<HookEvent>>>;
-
-    fn continue_outcome() -> HookOutcome {
-        HookOutcome {
-            control: HookResultControl::Continue,
-            result: HookResult::default(),
-        }
-    }
-
-    #[derive(Clone)]
-    enum HookControl {
-        Continue,
-        Block(&'static str),
-        Ask(Option<&'static str>),
-        Mutate(Value),
-    }
-
     /// Outer context with panicking emitters and confirmation: the fork must
     /// replace all of them, and any inner-call leak through the outer
     /// callbacks fails the test instead of silently creating child UI rows.
-    fn outer_context(
-        providers: Vec<Arc<dyn ToolProvider>>,
-        control: HookControl,
-    ) -> (ToolEvalContext, HookEvents) {
-        let events: HookEvents = Arc::default();
-        let captured = Arc::clone(&events);
-        let control = Arc::new(control);
-        let ctx = ToolEvalContext {
+    fn outer_context(providers: Vec<Arc<dyn ToolProvider>>) -> ToolEvalContext {
+        ToolEvalContext {
             on_tool_call_completed: None,
             on_interaction: None,
             middleware_fn: None,
@@ -961,35 +898,19 @@ mod tests {
             confirm_tool_use_fn: Arc::new(|_, _, _| {
                 panic!("outer confirmation fired for an inner call")
             }),
-            dispatch_hook_fn: Arc::new(move |event| {
-                let outcome = match &*control {
-                    HookControl::Continue => continue_outcome(),
-                    HookControl::Mutate(arguments) => HookOutcome {
-                        control: HookResultControl::Continue,
-                        result: HookResult {
-                            mutated_tool_input: Some(arguments.clone()),
-                            ..HookResult::default()
-                        },
-                    },
-                    HookControl::Block(reason) => HookOutcome {
-                        control: HookResultControl::Block {
-                            reason: reason.to_string(),
-                        },
-                        result: HookResult::default(),
-                    },
-                    HookControl::Ask(reason) => HookOutcome {
-                        control: HookResultControl::Ask {
-                            reason: reason.map(str::to_string),
-                        },
-                        result: HookResult::default(),
-                    },
-                };
-                captured.lock().expect("hook events lock").push(event);
-                Box::pin(async move { outcome })
-            }),
             prepare_handoff_fn: None,
-        };
-        (ctx, events)
+        }
+    }
+
+    fn test_executor_run(
+        provider: &Arc<FakeToolProvider>,
+        tools: &[&str],
+    ) -> (InnerCallRun, AbortSignal) {
+        let ctx = outer_context(shared(provider));
+        let executor = executor_with(tools, shared(provider), (8, 100));
+        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
+        let abort = create_abort_signal();
+        (run, abort)
     }
 
     #[derive(Debug)]
@@ -1190,7 +1111,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::DelayedOk(Duration::from_millis(40), json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(&["tool_a"], shared(&provider), (2, 100));
         let run = Arc::new(executor.begin_run(&ctx, PARENT_ROUND, None));
         let abort = create_abort_signal();
@@ -1232,8 +1153,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::DelayedOk(Duration::from_millis(5), json!("fast")),
         });
-        let (ctx, _hooks) =
-            outer_context(vec![as_dyn(&slow), as_dyn(&fast)], HookControl::Continue);
+        let ctx = outer_context(vec![as_dyn(&slow), as_dyn(&fast)]);
         let executor = executor_with(
             &["slow_tool", "fast_tool"],
             vec![as_dyn(&slow), as_dyn(&fast)],
@@ -1281,7 +1201,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Panic,
         });
-        let (ctx, hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(
             &["fs_read", "fs_write", "grep_search"],
             shared(&provider),
@@ -1313,10 +1233,6 @@ mod tests {
         }
 
         assert_eq!(log.count(), 0, "provider must not be dispatched");
-        assert!(
-            hooks.lock().expect("hook events lock").is_empty(),
-            "rejection happens before admission, so no hooks may fire"
-        );
         let trace = run.trace();
         assert_eq!(trace.len(), 2);
         assert_eq!(trace[0].status, InnerTraceStatus::Rejected);
@@ -1332,7 +1248,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Panic,
         });
-        let (ctx, hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(
             &["bash", "switch_agent", "ask_user", "atlas_session_handoff"],
             shared(&provider),
@@ -1354,7 +1270,6 @@ mod tests {
         }
 
         assert_eq!(log.count(), 0, "control tools must never dispatch");
-        assert!(hooks.lock().expect("hook events lock").is_empty());
     }
 
     #[derive(Default)]
@@ -1387,8 +1302,8 @@ mod tests {
             progress_title: None,
             behavior: Behavior::NoticeThenOk("notice-b".into(), json!("b")),
         });
-        let (ctx_a, _hooks_a) = outer_context(shared(&provider_a), HookControl::Continue);
-        let (ctx_b, _hooks_b) = outer_context(shared(&provider_b), HookControl::Continue);
+        let ctx_a = outer_context(shared(&provider_a));
+        let ctx_b = outer_context(shared(&provider_b));
         let executor = executor_with(
             &["tool_a", "tool_b"],
             vec![as_dyn(&provider_a), as_dyn(&provider_b)],
@@ -1434,36 +1349,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_approval_maps_to_approval_required_without_dispatch() {
-        let log = Arc::new(DispatchLog::default());
-        let provider = Arc::new(FakeToolProvider {
-            log: Arc::clone(&log),
-            handles: None,
-            progress_title: None,
-            behavior: Behavior::Panic,
-        });
-        let (ctx, hooks) = outer_context(shared(&provider), HookControl::Ask(Some("needs review")));
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
-
-        match run.call("tool_a", json!({"x": 1}), &abort).await {
-            InnerOutcome::ApprovalRequired { tool, reason } => {
-                assert_eq!(tool, "tool_a");
-                assert_eq!(reason.as_deref(), Some("needs review"));
-            }
-            other => panic!("expected approval_required, got {other:?}"),
-        }
-
-        assert_eq!(log.count(), 0, "deferred calls must not dispatch");
-        let hooks = hooks.lock().expect("hook events lock");
-        assert_eq!(hooks.len(), 1, "only the PreToolUse hook fires");
-        assert!(matches!(hooks[0], HookEvent::PreToolUse { .. }));
-        drop(hooks);
-        assert_eq!(run.trace()[0].status, InnerTraceStatus::ApprovalRequired);
-    }
-
-    #[tokio::test]
     async fn blocked_hook_maps_to_blocked() {
         let log = Arc::new(DispatchLog::default());
         let provider = Arc::new(FakeToolProvider {
@@ -1472,8 +1357,20 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Panic,
         });
-        let (ctx, _hooks) =
-            outer_context(shared(&provider), HookControl::Block("denied by policy"));
+        let mut ctx = outer_context(shared(&provider));
+        ctx.middleware_fn = Some(Arc::new(|prep, _, _| {
+            Box::pin(async move {
+                Ok(harnx_engine::tool::ToolMiddlewareOutcome::Completed(
+                    harnx_engine::tool::MaterializedToolResult::new(
+                        harnx_core::tool::ToolResult::new(
+                            prep.call.clone(),
+                            json!({"error": "denied by policy"}),
+                        ),
+                        harnx_engine::tool::InnerToolCallStatus::Blocked,
+                    ),
+                ))
+            })
+        }));
         let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
         let run = executor.begin_run(&ctx, PARENT_ROUND, None);
         let abort = create_abort_signal();
@@ -1498,7 +1395,7 @@ mod tests {
                 partial: Some(json!({"steps": 3})),
             },
         });
-        let (ctx, hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
         let run = executor.begin_run(&ctx, PARENT_ROUND, None);
         let abort = create_abort_signal();
@@ -1515,11 +1412,6 @@ mod tests {
         }
 
         assert_eq!(log.count(), 1);
-        let hooks = hooks.lock().expect("hook events lock");
-        assert!(hooks
-            .iter()
-            .any(|event| matches!(event, HookEvent::PostToolUseFailure { .. })));
-        drop(hooks);
         assert_eq!(run.trace()[0].status, InnerTraceStatus::ToolError);
     }
 
@@ -1532,10 +1424,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Ok(json!("late")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
+        let (run, abort) = test_executor_run(&provider, &["tool_a"]);
         abort.set_ctrlc();
 
         match run.call("tool_a", json!({}), &abort).await {
@@ -1562,7 +1451,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Ok(json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(&["tool_a"], shared(&provider), (8, 3));
         let run = executor.begin_run(&ctx, PARENT_ROUND, None);
         let abort = create_abort_signal();
@@ -1599,7 +1488,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Ok(json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         // Probe mirrors the runtime wiring: full serialized request size.
         let request_size: RequestSizeProbe = Arc::new(|_tool, args| {
             serde_json::to_vec(args)
@@ -1652,10 +1541,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Null,
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
+        let (run, abort) = test_executor_run(&provider, &["tool_a"]);
 
         match run.call("tool_a", json!({}), &abort).await {
             InnerOutcome::Ok { result } => assert_eq!(result.output, Value::Null),
@@ -1680,10 +1566,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Ok(json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
+        let (run, abort) = test_executor_run(&provider, &["tool_a"]);
 
         let first = run.call("tool_a", json!({}), &abort).await;
         let second = run.call("tool_a", json!({}), &abort).await;
@@ -1720,10 +1603,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Ok(json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
+        let (run, abort) = test_executor_run(&provider, &["tool_a"]);
 
         // Value-free summaries stay short for long values, so truncation
         // needs many keys.
@@ -1751,10 +1631,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Ok(json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
+        let (run, abort) = test_executor_run(&provider, &["tool_a"]);
 
         let secret = "sk-synthetic-piped-secret-0123456789";
         let args = json!({"text": secret, "count": 7, "flag": true, "list": [1, 2, 3]});
@@ -1820,7 +1697,7 @@ mod tests {
             progress_title: Some("working".into()),
             behavior: Behavior::Ok(json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
         let observer = Arc::new(RecordingObserver::default());
         let run = executor.begin_run(&ctx, PARENT_ROUND, Some(observer.clone()));
@@ -1854,7 +1731,24 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Panic,
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Block("nope"));
+        let mut ctx = outer_context(shared(&provider));
+        ctx.middleware_fn = Some(Arc::new(|prep, _origin, _next| {
+            Box::pin(async move {
+                (prep.context.evaluation.emit_tool_blocked_fn)(
+                    &prep.call,
+                    &json!({"error": "nope"}),
+                );
+                Ok(harnx_engine::tool::ToolMiddlewareOutcome::Completed(
+                    harnx_engine::tool::MaterializedToolResult::new(
+                        harnx_core::tool::ToolResult::new(
+                            prep.call.clone(),
+                            json!({"error": "nope"}),
+                        ),
+                        harnx_engine::tool::InnerToolCallStatus::Blocked,
+                    ),
+                ))
+            })
+        }));
         let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
         let observer = Arc::new(RecordingObserver::default());
         let run = executor.begin_run(&ctx, PARENT_ROUND, Some(observer.clone()));
@@ -1868,6 +1762,7 @@ mod tests {
             observer.blocked.lock().expect("lock").as_slice(),
             ["tool_a: nope"]
         );
+        assert_eq!(run.trace()[0].status, InnerTraceStatus::Blocked);
     }
 
     #[test]
@@ -1910,10 +1805,7 @@ mod tests {
                 "isError": true,
             })),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
+        let (run, abort) = test_executor_run(&provider, &["tool_a"]);
 
         let outcome = run.call("tool_a", json!({}), &abort).await;
         match outcome {
@@ -2114,7 +2006,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::DelayedOk(Duration::from_millis(25), json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(&["tool_a"], shared(&provider), (2, 100));
         let progress = Arc::new(RecordingProgress::default());
         let aggregator = Arc::new(InnerProgressAggregator::new(
@@ -2190,7 +2082,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::DelayedOk(Duration::from_millis(200), json!("late")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
         let observer = Arc::new(StatusRecordingObserver::default());
         let run = Arc::new(executor.begin_run(&ctx, PARENT_ROUND, Some(observer.clone())));
@@ -2234,7 +2126,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Fatal("provider exploded"),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
         let run = executor.begin_run(&ctx, PARENT_ROUND, None);
 
@@ -2261,7 +2153,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::DelayedOk(Duration::from_millis(30), json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(&["tool_a"], shared(&provider), (8, 3));
         let run = Arc::new(executor.begin_run(&ctx, PARENT_ROUND, None));
         let abort = create_abort_signal();
@@ -2302,10 +2194,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Panic,
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
+        let (run, abort) = test_executor_run(&provider, &["tool_a"]);
         abort.set_ctrlc();
 
         let outcome = run.call("tool_a", json!({}), &abort).await;
@@ -2329,7 +2218,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Ok(json!("done")),
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
+        let ctx = outer_context(shared(&provider));
         let executor = executor_with(&["tool_a"], shared(&provider), (8, 1000));
         let run = executor.begin_run(&ctx, PARENT_ROUND, None);
         let abort = create_abort_signal();
@@ -2387,7 +2276,7 @@ mod tests {
         });
         let providers: Vec<Arc<dyn ToolProvider>> =
             vec![slow_provider.clone(), fast_provider.clone()];
-        let (ctx, _hooks) = outer_context(providers.clone(), HookControl::Continue);
+        let ctx = outer_context(providers.clone());
         let executor = executor_with(&["slow_fail", "fast_fail"], providers, (8, 100));
         let run = Arc::new(executor.begin_run(&ctx, PARENT_ROUND, None));
         let abort = create_abort_signal();
@@ -2445,10 +2334,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Panic,
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
+        let (run, abort) = test_executor_run(&provider, &["tool_a"]);
 
         let mut fatal = None;
         for _ in 0..MAX_INNER_CALL_ATTEMPTS_PER_SCRIPT + 1 {
@@ -2529,42 +2415,10 @@ mod tests {
         );
     }
 
-    // --- #2630: operator-script inner consent -------------------------------
-
-    fn consenting_executor(providers: Vec<Arc<dyn ToolProvider>>) -> InnerCallExecutor {
-        InnerCallExecutor::new(
-            InnerCallExecutorConfig::new(vec!["tool_a".to_string()], providers)
-                .with_operator_inner_consent(true),
-        )
-    }
+    // --- Inner call allowlist -----------------------------------------------
 
     #[tokio::test]
-    async fn operator_consent_approves_inner_ask_and_dispatches() {
-        let log = Arc::new(DispatchLog::default());
-        let provider = Arc::new(FakeToolProvider {
-            log: Arc::clone(&log),
-            handles: None,
-            progress_title: None,
-            behavior: Behavior::Ok(json!({"done": true})),
-        });
-        let (ctx, hooks) = outer_context(shared(&provider), HookControl::Ask(Some("needs review")));
-        let executor = consenting_executor(shared(&provider));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
-
-        match run.call("tool_a", json!({"x": 1}), &abort).await {
-            InnerOutcome::Ok { result } => assert_eq!(result.output, json!({"done": true})),
-            other => panic!("expected dispatch, got {other:?}"),
-        }
-        assert_eq!(log.count(), 1, "consent approves the ask and dispatches");
-        assert_eq!(run.trace()[0].status, InnerTraceStatus::Ok);
-        let hooks = hooks.lock().expect("hook events lock");
-        assert!(matches!(hooks[0], HookEvent::PreToolUse { .. }));
-        assert!(matches!(hooks[1], HookEvent::PostToolUse { .. }));
-    }
-
-    #[tokio::test]
-    async fn operator_consent_does_not_bypass_the_allowlist() {
+    async fn inner_call_does_not_bypass_the_allowlist() {
         let log = Arc::new(DispatchLog::default());
         let provider = Arc::new(FakeToolProvider {
             log: Arc::clone(&log),
@@ -2572,10 +2426,7 @@ mod tests {
             progress_title: None,
             behavior: Behavior::Panic,
         });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = consenting_executor(shared(&provider));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
+        let (run, abort) = test_executor_run(&provider, &["tool_a"]);
 
         match run.call("tool_b", json!({}), &abort).await {
             InnerOutcome::Rejected { reason } => {
@@ -2584,140 +2435,5 @@ mod tests {
             other => panic!("expected rejection, got {other:?}"),
         }
         assert_eq!(log.count(), 0, "denied names must never dispatch");
-    }
-
-    #[tokio::test]
-    async fn operator_consent_still_blocks_on_hook_block() {
-        let log = Arc::new(DispatchLog::default());
-        let provider = Arc::new(FakeToolProvider {
-            log: Arc::clone(&log),
-            handles: None,
-            progress_title: None,
-            behavior: Behavior::Panic,
-        });
-        let (ctx, _hooks) =
-            outer_context(shared(&provider), HookControl::Block("denied by policy"));
-        let executor = consenting_executor(shared(&provider));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
-
-        match run.call("tool_a", json!({}), &abort).await {
-            InnerOutcome::Blocked { reason } => assert_eq!(reason, "denied by policy"),
-            other => panic!("expected blocked, got {other:?}"),
-        }
-        assert_eq!(log.count(), 0);
-        assert_eq!(run.trace()[0].status, InnerTraceStatus::Blocked);
-    }
-
-    #[tokio::test]
-    async fn ordinary_run_defers_approval_even_when_parent_context_approves() {
-        let log = Arc::new(DispatchLog::default());
-        let provider = Arc::new(FakeToolProvider {
-            log: Arc::clone(&log),
-            handles: None,
-            progress_title: None,
-            behavior: Behavior::Panic,
-        });
-        let (mut ctx, _hooks) = outer_context(shared(&provider), HookControl::Ask(None));
-        // The parent (root operator) callback approves everything; the inner
-        // fork must still defer without command-scoped consent (#2630).
-        ctx.confirm_tool_use_fn = Arc::new(|_, _, _| ToolUseConfirmation::Approve);
-        let executor = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
-
-        match run.call("tool_a", json!({}), &abort).await {
-            InnerOutcome::ApprovalRequired { tool, .. } => assert_eq!(tool, "tool_a"),
-            other => panic!("expected approval_required, got {other:?}"),
-        }
-        assert_eq!(log.count(), 0, "deferred calls must not dispatch");
-    }
-
-    #[tokio::test]
-    async fn operator_consent_does_not_leak_into_child_forks() {
-        let log = Arc::new(DispatchLog::default());
-        let provider = Arc::new(FakeToolProvider {
-            log: Arc::clone(&log),
-            handles: None,
-            progress_title: None,
-            behavior: Behavior::Panic,
-        });
-        let (ctx, _hooks) = outer_context(shared(&provider), HookControl::Continue);
-        let executor = consenting_executor(shared(&provider));
-        let run = executor.begin_run(&ctx, PARENT_ROUND, None);
-
-        let call = started_call("tool_a", "call-1");
-        // The consented fork approves …
-        assert_eq!(
-            (run.ctx.confirm_tool_use_fn)(&call, &json!({}), None),
-            ToolUseConfirmation::Approve
-        );
-        assert!(
-            !Arc::ptr_eq(&run.ctx.confirm_tool_use_fn, &ctx.confirm_tool_use_fn),
-            "the outer context keeps its own confirmation"
-        );
-        // … but any child fork of it resets to Defer, so child agents and
-        // nested scripts keep their normal policies (#2630).
-        let child = run.ctx.fork_for_inner_calls(InnerToolEvalOptions {
-            providers: Vec::new(),
-            tool_round: None,
-            emit_tool_call_fn: Arc::new(|_, _| {}),
-            emit_tool_result_fn: Arc::new(|_, _| {}),
-            emit_tool_blocked_fn: Arc::new(|_, _| {}),
-            emit_tool_update_fn: Arc::new(|_, _| {}),
-        });
-        assert_eq!(
-            (child.confirm_tool_use_fn)(&call, &json!({}), None),
-            ToolUseConfirmation::Defer
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_and_subsequent_ordinary_runs_stay_unaffected() {
-        let log = Arc::new(DispatchLog::default());
-        let provider = Arc::new(FakeToolProvider {
-            log: Arc::clone(&log),
-            handles: None,
-            progress_title: None,
-            behavior: Behavior::Ok(json!({"done": true})),
-        });
-        let ask = HookControl::Ask(Some("needs review"));
-        let (consent_ctx, _hooks_a) = outer_context(shared(&provider), ask.clone());
-        let (ordinary_ctx, _hooks_b) = outer_context(shared(&provider), ask);
-        let consenting = consenting_executor(shared(&provider));
-        let ordinary = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let consent_run = Arc::new(consenting.begin_run(&consent_ctx, PARENT_ROUND, None));
-        let ordinary_run = Arc::new(ordinary.begin_run(&ordinary_ctx, PARENT_ROUND, None));
-        let abort = create_abort_signal();
-
-        let a = {
-            let run = Arc::clone(&consent_run);
-            let abort = abort.clone();
-            tokio::spawn(async move { run.call("tool_a", json!({}), &abort).await })
-        };
-        let b = {
-            let run = Arc::clone(&ordinary_run);
-            let abort = abort.clone();
-            tokio::spawn(async move { run.call("tool_a", json!({}), &abort).await })
-        };
-        assert!(matches!(
-            a.await.expect("consent call"),
-            InnerOutcome::Ok { .. }
-        ));
-        assert!(matches!(
-            b.await.expect("ordinary call"),
-            InnerOutcome::ApprovalRequired { .. }
-        ));
-        assert_eq!(log.count(), 1, "only the consented run dispatched");
-
-        // A later ordinary run from a fresh executor still defers.
-        let subsequent = executor_with(&["tool_a"], shared(&provider), (8, 100));
-        let run = subsequent.begin_run(&ordinary_ctx, PARENT_ROUND, None);
-        let abort = create_abort_signal();
-        assert!(matches!(
-            run.call("tool_a", json!({}), &abort).await,
-            InnerOutcome::ApprovalRequired { .. }
-        ));
-        assert_eq!(log.count(), 1);
     }
 }

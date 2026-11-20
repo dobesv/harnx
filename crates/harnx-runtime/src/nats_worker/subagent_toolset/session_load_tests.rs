@@ -73,6 +73,8 @@ impl LoadFixture {
     /// admission and a logged original for prompt-scoped loads.
     async fn dispatch_prompt(&self) -> anyhow::Result<(String, u64)> {
         let request = ToolRequest {
+            input_responses: None,
+            request_state: None,
             operation_id: "operation".into(),
             call_id: "original-prompt".into(),
             tool: "session_send".into(),

@@ -158,7 +158,7 @@ patches:
 
 ## Tool Servers (`tool_servers/`)
 
-Tool servers provide external tools to Harnx. Native toolset servers (such as `harnx-attachment-tools`, `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, and `harnx-grep-tools`) run directly without a bridge wrapper, while external stdio MCP servers run via `harnx-mcp-bridge`. Each server is defined in a file under `tool_servers/` (such as `tool_servers/fs.yaml` or `tool_servers/exa.yaml`).
+Tool servers provide external tools to Harnx. Native toolset servers (such as `harnx-attachment-tools`, `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, and `harnx-claude-hook-tools`) run directly without a bridge wrapper, while external stdio MCP servers run via `harnx-mcp-bridge`. Each server is defined in a file under `tool_servers/` (such as `tool_servers/fs.yaml` or `tool_servers/exa.yaml`).
 
 The **filename** (without `.yaml`) is used as the server name.
 
@@ -208,6 +208,12 @@ env:
 >   ```
 >
 >   Set the actual secret (`EXA_API_KEY=…`) in `~/.local/share/harnx/.env`.
+
+> **Tools that ask for input.** A bridged MCP server that speaks the MCP
+> 2026-07-28 protocol revision (MRTR) can suspend a tool call asking the user
+> for input; the answer resumes the call automatically. Nothing to configure:
+> servers that do not offer it keep working over the legacy handshake. See
+> [Tool-produced interactions](middleware-guide.md#tool-produced-interactions-input_required).
 
 ### Running Multiple Instances (`--name`)
 

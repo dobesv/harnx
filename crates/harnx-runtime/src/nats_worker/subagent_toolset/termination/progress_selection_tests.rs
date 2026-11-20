@@ -75,6 +75,7 @@ fn thinking_only_tool_round(thought: &str) -> Vec<(u64, SessionLogEntry)> {
             SessionLogEntry::ToolResults {
                 handoff_selection: None,
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("call".into()),
                     name: "noop".into(),
                     output: serde_json::Value::Null,

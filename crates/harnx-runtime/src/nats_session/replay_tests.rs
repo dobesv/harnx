@@ -82,6 +82,7 @@ fn replay_emits_messages_and_tool_events_in_order() {
             SessionLogEntry::ToolResults {
                 handoff_selection: None,
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("read-call".into()),
                     name: "read".into(),
                     output: json!({"text": "# Harnx\n"}),
@@ -147,6 +148,7 @@ fn replay_with_declarations_renders_tool_call_and_result_templates() {
             SessionLogEntry::ToolResults {
                 handoff_selection: None,
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("read-call".into()),
                     name: "read".into(),
                     output: json!({"text": "# Harnx"}),

@@ -146,6 +146,8 @@ impl InterruptedTurn {
     /// the same string.
     fn request(&self, call_id: &str) -> ToolRequest {
         ToolRequest {
+            input_responses: None,
+            request_state: None,
             run_context: None,
             replay: None,
             operation_id: format!("op-{}", wire_id(call_id)),
@@ -173,6 +175,7 @@ impl InterruptedTurn {
     /// Record the reply a tool wrote to the journal before anyone read it back.
     async fn answered(&self, request: &ToolRequest, output: serde_json::Value) {
         let reply = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(output),
             final_progress: None,
@@ -187,6 +190,8 @@ impl InterruptedTurn {
     /// `c3`, and the retry is the one that answers it.
     async fn seed_dispatch_and_replies(&self) {
         let c3_retry = ToolRequest {
+            input_responses: None,
+            request_state: None,
             run_context: None,
             operation_id: "op-retry-c3".into(),
             call_id: "retry-c3".into(),
@@ -452,6 +457,8 @@ async fn the_newest_unanswered_attempt_is_the_one_cancelled() {
     };
     let turn = InterruptedTurn::seed(server.url(), &["twice"]).await;
     let newest = ToolRequest {
+        input_responses: None,
+        request_state: None,
         run_context: None,
         operation_id: "op-second-twice".into(),
         call_id: "second-twice".into(),
