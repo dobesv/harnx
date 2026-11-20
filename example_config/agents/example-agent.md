@@ -14,6 +14,8 @@ use_tools:                       # Which MCP tools to allow
   - fs_grep
   - fs_find
   - harnx_agent_session_history_read
+# patches:                       # jaq filters applied at session activation with $user bound
+#   - 'if ($user.groups | index("developers")) then . else .use_tools |= map(select(. != "fs_write" and . != "fs_edit")) end'
 description: ""                  # Short description of the agent
 version: ""                      # Agent version string
 compaction_agent: example-compaction-agent  # Agent to use for context compression (uses its model/system prompt)
@@ -45,3 +47,4 @@ documents:                       # RAG document paths (relative to config dir)
 ---
 
 You are a helpful AI assistant. Your task is to help the user with their questions and tasks.
+{% if "developers" in __user__.groups %}You may use filesystem write and edit tools to modify files.{% endif %}

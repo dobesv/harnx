@@ -145,17 +145,7 @@ async fn session_gc_refuses_live_work_then_removes_global_identity_events_and_sc
 async fn gc_refuses_unallocated_first_identity_after_lease_loss_then_recovery_closes_it(
 ) -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut pause =
-        t.a.backend
-            .runner
-            .fault_hooks()
-            .pause(Boundary::FirstReservation, 1);
-    let send = tokio::spawn({
-        let app = t.a.app.clone();
-        async move { rpc(app, "alice", "SendMessage", first_message()).await }
-    });
-    pause.reached().await;
-    let first = reservation(&t).await?;
+    let (pause, send, first) = supervision::pause_first_reservation(&t).await?;
     remove_owner_lease(&t, &first.allocation.storage_key).await?;
     let config = t.h.config.read().clone();
     let error =

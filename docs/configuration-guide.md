@@ -269,6 +269,59 @@ tls_key: "/path/to/key"      # Optional client key
 
 See the [NATS HA Guide](nats-ha.md) for more details.
 
+## Agents (`agents/`)
+
+Agents are Markdown files with YAML front-matter in `<config-dir>/agents/<name>.md`. See the [Agent Guide](agent-guide.md) for complete agent configuration, built-in variables, tools, and handoffs.
+
+### Customizing Agents by Caller (`patches` and `__user__`)
+
+Agents can adapt their tools and system prompts based on the caller who created the session:
+
+- **`patches` front-matter field**: One jaq filter string or a YAML list of jaq filter strings that rewrites the agent's configuration at session activation, with the caller's principals bound as `$user`.
+- **`__user__` prompt variable**: A dynamic variable in prompt templates containing the creator's principals (`user_id`, `users`, `groups`, `roles`).
+
+#### `patches` Evaluation Semantics
+
+- **Input**: The agent configuration serialized as JSON (`use_tools`, `bash_tools`, `instructions`, `model`, etc.).
+- **Bound variable (`$user`)**: JSON object containing:
+  - `user_id`: Raw caller identity string or `null`.
+  - `users`: Expanded user aliases from `users.yaml` (includes `user_id`), or empty.
+  - `groups`: Resolved groups from headers and `users.yaml`, or empty.
+  - `roles`: Resolved roles from headers and `users.yaml`, or empty.
+- **Timing and frequency**: Evaluated once per session activation on the worker. Reconciled scratch installs also evaluate patches so MCP server demand reflects patched tool selectors.
+- **Evaluation order**:
+  1. Base agent configuration (including package patches)
+  2. Persisted session overrides (e.g. `.set use_tools`)
+  3. Agent `patches` (with `$user` bound)
+  4. Runtime resolution (re-resolving the model if changed, middleware validation, server selection, run limits)
+
+Because `patches` runs after session overrides, overrides cannot re-add tools removed by a patch. But removing tools by name does not block `*` or glob selectors (such as `fs_*`) in `use_tools` or `bash_tools`. A branch that needs a real restriction must set an explicit allowlist without wildcards.
+
+- **Invariants**: Serde-skipped runtime state (variables, agent-owned tools, unchanged model, middleware origin, hook package directories) is preserved. The baseline agent in memory and on disk is never modified.
+- **Strict single output**: The filter must output exactly one JSON object. Empty, multiple, or non-object outputs fail activation.
+- **Name preservation**: A patch must not modify the agent `name`.
+- **Fail closed**: Filter syntax is validated when the agent is loaded. At session activation, any compile error, runtime evaluation error, invalid output, changed name, or deserialization failure terminates the activation with an error naming the agent and filter. On upgraded workers, the session never runs unpatched.
+
+#### Example
+
+```yaml
+use_tools: [jira, confluence, coder, fs]
+patches:
+  - 'if ($user.groups | index("developers")) then . else .use_tools |= map(select(. != "coder" and . != "fs")) end'
+```
+
+Callers with `groups: [developers]` retain all four tools. Callers without that group see only `jira` and `confluence`.
+
+#### Caveats and Boundaries
+
+- **Fixed at creation**: Caller principals are captured once when the session is created. Subsequent callers prompting an existing session receive the creator's tailoring.
+- **Membership changes**: Updates to group or role memberships take effect in new sessions only.
+- **Inheritance**: Sub-agents and handoff sessions inherit the parent session's snapshot verbatim.
+- **Not an access-control boundary**: `use_tools` and `bash_tools` are independent selectors. If a tool is in both, removing it from `use_tools` does not remove it from script mode (`bash_tools`); a patch must update both selectors. Tool dispatch also does not yet reject model calls to undeclared tools ([issue #2770](https://github.com/dobesv/harnx/issues/2770)). Do not rely on `patches` for security authorization.
+- **Authorization uses live memberships**: Access control (`access.yaml` and A2A owner binding) always evaluates live request memberships, never the session customization snapshot.
+- **Rolling upgrade order**: Upgrade workers before `harnx-serve`, `harnx-a2a-server`, and other frontends. Deploy `patches` in agent definitions and expand user access last. Older workers do not recognize `patches` and run the unpatched configuration. Rollback requires removing `patches` before rolling back workers.
+- **Filter termination and determinism**: Patches must terminate; jaq filters have no execution timeout. Filters run more than once per activation (server reconciliation and turn install), so avoid non-deterministic built-ins like `now` or `env`. Avoid copying `$user` fields into config values that could be rejected and logged in server error diagnostics.
+
 ## Example Configuration
 
 A comprehensive reference for the new folder structure and common provider/server examples can be found in the repository at:
@@ -628,6 +681,24 @@ Nonblank explicit or inherited identities (for example, A2A caller identities, s
 
 Once metadata is written at session creation, the identity is immutable, including on handoff into an existing session. For concurrent creators, the first successful metadata creation wins. Promptless subscriptions and control commands don't bind session ownership.
 
+#### Caller Principals Snapshot (`user_principals`)
+
+When a session is created, Harnx snapshots the creator's resolved caller principals into the read-only session property `user_principals` in addition to `user_id`. This snapshot customizes prompt templates (`__user__`) and agent configuration (`patches`):
+
+- **Snapshot shape**:
+  - `user_id`: Raw caller identity string, or `null`.
+  - `users`: List of expanded user identities from `users.yaml` aliases (includes `user_id`), or empty.
+  - `groups`: List of group memberships resolved from request headers and `users.yaml`, or empty.
+  - `roles`: List of role memberships resolved from request headers and `users.yaml`, or empty.
+- **Sources**:
+  - `harnx-serve`: Resolved from `serve_user_id_sources`, `serve_group_headers`, `serve_role_headers`, and `users.yaml`.
+  - `harnx-a2a-server`: Resolved from `--user-id-header`, `--group-header`, `--role-header`, and `users.yaml`. The snapshot is stored with the initial message reservation and retained during recovery.
+  - Local CLI, TUI, and ACP: Sessions run without request headers and receive `user_id`-only or anonymous principals (`user_id: null`, empty lists).
+  - Legacy sessions: Existing sessions without a stored snapshot fall back to `user_id`-only principals (or anonymous).
+- **Inheritance**: Sub-agent and handoff sessions inherit the parent session's `user_principals` property verbatim.
+- **Fixed for session life**: Principals are captured once at session creation. If another caller prompts the session, the session keeps the creator's tailoring. Group membership updates apply to new sessions only.
+- **Customization, not access control**: `user_principals` customizes prompts and tools. It is not an authorization boundary: tool dispatch does not yet reject calls outside the completion's declared tools ([issue #2770](https://github.com/dobesv/harnx/issues/2770)). Authorization checks (`access.yaml` and A2A owner binding) continue to use live request memberships.
+
 Example `config.yaml`:
 
 ```yaml
@@ -701,7 +772,7 @@ Header and membership rules:
 - **Fail closed on malformed values**: If any configured membership header contains invalid bytes that fail UTF-8 header value conversion, the request is rejected immediately with HTTP 401 Unauthorized without echoing header contents.
 - **Distinct namespaces**: Users, groups, and roles occupy completely distinct namespaces. The same string value in different namespaces never matches across categories.
 - **OR within rules, union across rules**: A rule matches when its `agents` pattern matches AND at least one selector category (`users`, `groups`, or `roles`) matches the caller's request. Scopes are unioned across all matching rules.
-- **Request-local and non-persistent**: Groups and roles are evaluated per request and are never persisted in session metadata, task KV, or NATS properties. Revoking or changing a membership takes effect on the caller's next HTTP request.
+- **Request-local authorization**: Groups and roles are evaluated fresh per request for access control, and live authorization never relies on persisted memberships. Revoking or changing a membership takes effect on the caller's next HTTP request. For agent customization, the caller's resolved principals at session creation are snapshotted into the read-only `user_principals` session property (`__user__` in templates, `$user` in agent `patches`); access rules never consult that snapshot for authorization.
 - **User ownership unchanged**: Groups and roles grant access scopes, but they never satisfy session ownership. Sessions are owned solely by immutable user IDs. Callers with `prompt` scope can only access sessions where `user_id == caller.user_id`. Callers with `admin` scope (granted by any user, group, or role rule) can access sessions across all users.
 - **User identity required**: Memberships do not satisfy required caller authentication. When access rules are enabled, protected routes still require a valid user identity.
 - **Reverse proxy trust**: Upstream proxies must authenticate callers and replace or strip all configured user, group, and role headers before forwarding requests.
@@ -879,7 +950,7 @@ When an authenticated caller makes a request, the server expands the caller's id
 
 #### Caller expansion only, stored ownership preserved
 Alias expansion applies **only** to the incoming caller during request authorization:
-- In `harnx-serve`, new sessions created via `POST /v1/agents/{agent}/sessions` record the caller's raw incoming identity (`user_id`) in session metadata, not an alias entry name or other identities in the group.
+- In `harnx-serve`, new sessions created via `POST /v1/agents/{agent}/sessions` record the caller's raw incoming identity (`user_id`) in session metadata, not an alias entry name or other identities in the group. The session's read-only `user_principals` property records the caller's principals snapshot (`user_id`, expanded `users`, `groups`, `roles`) for prompt and tool customization.
 - In `harnx-a2a-server`, new contexts and tasks record the caller's raw incoming identity as the stored owner in the A2A binding. Stored owner identities are never expanded.
 - When an authorized caller later accesses or resumes a session, their expanded caller identities are checked against the stored session owner. Configured groups and roles never grant session or context ownership.
 
@@ -894,4 +965,4 @@ In both `harnx-serve` and `harnx-a2a-server`, configured `groups` and `roles` on
 - **Applies without membership headers**: If no membership headers are configured on the server (or none are supplied in the request), matching an alias entry still assigns its configured groups and roles to the caller.
 - **Header failures fail closed**: Malformed membership headers (such as non-UTF-8 bytes) fail closed immediately with HTTP 401 Unauthorized (or JSON-RPC `-32000`). Configured groups and roles do not bypass or mask header validation failures.
 - **Matched against access rules**: Effective groups and roles match `groups:` and `roles:` selectors in `access.yaml`. The user, group, and role namespaces remain completely distinct.
-- **No ownership or persistence**: Configured memberships grant access scopes (such as `prompt` or `admin`), but they never grant session ownership and are never stored in session metadata or NATS task KV. Anonymous and unmatched callers get no configured memberships.
+- **Access control evaluation and customization snapshot**: Configured memberships grant access scopes (such as `prompt` or `admin`), but they never grant session ownership and are evaluated live per request. At session creation, resolved identity and memberships are snapshotted into the read-only `user_principals` session property for prompt and tool tailoring (`__user__` and `patches`); access rules never consult that snapshot for authorization. Anonymous and unmatched callers get no configured memberships.

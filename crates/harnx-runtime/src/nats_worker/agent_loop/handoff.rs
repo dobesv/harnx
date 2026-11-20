@@ -138,7 +138,7 @@ async fn handoff_initializer(
         .context("handoff source metadata missing")?;
     let inherited_identity =
         crate::nats_session_metadata::session_properties(&source_metadata.metadata)?
-            .inherited_user_id();
+            .inherited_identity();
     Ok(
         crate::SessionInitializer::named(destination.agent.clone(), Default::default())
             .with_properties(inherited_identity)

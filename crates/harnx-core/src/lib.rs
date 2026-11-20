@@ -54,6 +54,7 @@ pub mod timing_identity;
 pub mod tool;
 pub mod transcript_view;
 pub mod user_aliases;
+pub mod user_principals;
 pub mod working_mode;
 
 pub mod jaq;

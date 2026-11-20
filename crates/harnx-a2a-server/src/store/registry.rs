@@ -24,7 +24,8 @@ impl A2aStore {
         first: Option<FirstMessageReservation>,
     ) -> Result<()> {
         // An admin may admit a follow-up, but recovery must resume as the original
-        // owner, not as that request's caller. Memberships never enter this record.
+        // owner, not as that request's caller. The customization snapshot travels
+        // inside `first` when one exists; authorization never consults it.
         let owner = self.recovery_owner(export, owner, allocation).await?;
         let record = RecoveryRegistration {
             agent: export.agent.clone(),

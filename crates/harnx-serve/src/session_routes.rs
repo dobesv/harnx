@@ -34,6 +34,9 @@ pub(crate) struct SessionsRouteContext<'a> {
     pub(crate) scoped: &'a harnx_runtime::config::GlobalConfig,
     pub(crate) query: Option<&'a str>,
     user_id: Option<&'a str>,
+    /// Caller principals from this request's identity, stamped read-only
+    /// when the request creates a session.
+    user_principals: Option<&'a harnx_core::user_principals::UserPrincipals>,
     access: Option<(&'a AccessRules, CallerView<'a>)>,
 }
 
@@ -48,6 +51,7 @@ impl<'a> SessionsRouteContext<'a> {
             scoped,
             query,
             user_id: None,
+            user_principals: None,
             access: None,
         }
     }
@@ -57,8 +61,15 @@ impl<'a> SessionsRouteContext<'a> {
         self
     }
 
-    pub(crate) fn with_user_id(mut self, user_id: Option<&'a str>) -> Self {
+    /// The request's resolved identity: owner id plus caller principals,
+    /// stamped read-only when the request creates a session.
+    pub(crate) fn with_identity(
+        mut self,
+        user_id: Option<&'a str>,
+        user_principals: Option<&'a harnx_core::user_principals::UserPrincipals>,
+    ) -> Self {
         self.user_id = user_id;
+        self.user_principals = user_principals;
         self
     }
 }
@@ -172,6 +183,7 @@ impl Server {
                     context.target,
                     context.scoped,
                     context.user_id.map(str::to_string),
+                    context.user_principals.cloned(),
                 )
                 .await
             }
@@ -208,11 +220,15 @@ impl Server {
         target: &crate::session_actor::ResolvedAgentTarget,
         scoped: &harnx_runtime::config::GlobalConfig,
         user_id: Option<String>,
+        user_principals: Option<harnx_core::user_principals::UserPrincipals>,
     ) -> Result<AppResponse> {
         ensure_frontend_nats_owner(target.cluster()).await?;
         let mut initializer = harnx_runtime::SessionInitializer::from_config(&scoped.read())?;
         if let Some(user_id) = user_id {
             initializer = initializer.with_user_id(user_id);
+        }
+        if let Some(principals) = user_principals {
+            initializer = initializer.with_user_principals(&principals);
         }
         let session_id =
             Config::reserve_new_session_id_with_initializer(scoped, initializer).await?;
@@ -564,7 +580,7 @@ mod tests {
             .expect("resolve session creator");
 
         let response = server
-            .create_session_json(&target, &scoped, None)
+            .create_session_json(&target, &scoped, None, None)
             .await
             .expect("create session response");
 

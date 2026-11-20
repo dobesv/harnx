@@ -62,6 +62,7 @@ pub enum EventHookOnError {
 /// A file's ordered event-hook declarations for one event. Origin is attached
 /// by the file/package loader.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct EventHooksList {
     pub entries: Vec<EventHookEntry>,
 }
@@ -373,6 +374,27 @@ StopFailure:
         };
         assert_eq!(policy.timeout, std::time::Duration::from_secs(5));
         assert_eq!(policy.on_error, EventHookOnError::Allow);
+    }
+
+    #[test]
+    fn hooks_config_round_trips_every_event_as_a_list() {
+        let mut value = serde_json::json!({"max_resume": 2});
+        for event in HookEventKind::ALL {
+            value[event.key()] = serde_json::json!([
+                {"name": "shell", "bash": "event_input", "timeout": "5s"},
+                {"name": "python", "python": "event_input()"},
+                {"name": "file", "script": "hooks/audit.py"},
+                {"name": "disabled", "enabled": false}
+            ]);
+        }
+        let config: HooksConfig = serde_json::from_value(value).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        for event in HookEventKind::ALL {
+            assert!(json[event.key()].is_array(), "{}: {json}", event.key());
+        }
+        assert_eq!(serde_json::from_value::<HooksConfig>(json).unwrap(), config);
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert_eq!(serde_yaml::from_str::<HooksConfig>(&yaml).unwrap(), config);
     }
 
     #[test]

@@ -3,17 +3,7 @@ use super::*;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registry_restart_recovers_first_reservation_without_http_or_prompt_replay() -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut pause =
-        t.a.backend
-            .runner
-            .fault_hooks()
-            .pause(Boundary::FirstReservation, 1);
-    let send = tokio::spawn({
-        let app = t.a.app.clone();
-        async move { rpc(app, "alice", "SendMessage", first_message()).await }
-    });
-    pause.reached().await;
-    let saved = reservation(&t).await?;
+    let (pause, send, saved) = paused_first_message(&t, Boundary::FirstReservation, 1).await?;
     remove_owner_lease(&t, &saved.allocation.storage_key).await?;
     let restarted_store = Arc::new(A2aStore::new(t.h.metadata.clone()));
     let restarted = Replica::new(&t.h, restarted_store.clone(), Runner::new(restarted_store))?;
@@ -43,14 +33,7 @@ async fn registry_restart_recovers_first_reservation_without_http_or_prompt_repl
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_takeover_ignores_renewing_worker_lease_and_fences_local_waiter() -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut output =
-        t.a.backend
-            .runner
-            .fault_hooks()
-            .pause(Boundary::Publication, 2);
-    let first = t.a.rpc("alice", "SendMessage", first_message()).await?;
-    output.reached().await;
-    let saved = reservation(&t).await?;
+    let (output, first, saved) = paused_publication_first_call(&t).await?;
     let leases = t.h.jetstream.get_key_value("harnx_leases").await?;
     assert!(harnx_nats_common::leader_reads::get(
         &leases,
@@ -87,14 +70,7 @@ async fn background_takeover_ignores_renewing_worker_lease_and_fences_local_wait
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_completion_wins_cancel_before_terminal_publication() -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut pause =
-        t.a.backend
-            .runner
-            .fault_hooks()
-            .pause(Boundary::Publication, 2);
-    let first = t.a.rpc("alice", "SendMessage", first_message()).await?;
-    pause.reached().await;
-    let saved = reservation(&t).await?;
+    let (pause, first, saved) = paused_publication_first_call(&t).await?;
     t.h.llm.release.notify_one();
     let session = session_for(&t.b, &t.h, &saved.allocation.local_id).await?;
     let ticket = harnx_runtime::nats_session::fixed_admission::FixedAdmissionTicket::from_parts(
@@ -148,17 +124,7 @@ async fn bounded_registry_pages_reach_abandoned_work_with_two_concurrent_sweeper
             .register_recovery(&t.h.export, &alice(), &allocation, None)
             .await?;
     }
-    let mut pause =
-        t.a.backend
-            .runner
-            .fault_hooks()
-            .pause(Boundary::FirstReservation, 1);
-    let send = tokio::spawn({
-        let app = t.a.app.clone();
-        async move { rpc(app, "alice", "SendMessage", first_message()).await }
-    });
-    pause.reached().await;
-    let saved = reservation(&t).await?;
+    let (pause, send, saved) = paused_first_message(&t, Boundary::FirstReservation, 1).await?;
     remove_owner_lease(&t, &saved.allocation.storage_key).await?;
     let store = Arc::new(A2aStore::new(t.h.metadata.clone()));
     let restarted = Replica::new(&t.h, store.clone(), Runner::new(store))?;
@@ -184,14 +150,7 @@ async fn bounded_registry_pages_reach_abandoned_work_with_two_concurrent_sweeper
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn takeover_terminal_wakes_local_waiter_before_former_owner_resumes() -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut output =
-        t.a.backend
-            .runner
-            .fault_hooks()
-            .pause(Boundary::Publication, 2);
-    t.a.rpc("alice", "SendMessage", first_message()).await?;
-    output.reached().await;
-    let saved = reservation(&t).await?;
+    let (output, _first, saved) = paused_publication_first_call(&t).await?;
     let handler = HarnxHandler::new(
         t.h.export.clone(),
         harnx_a2a_server::identity::Identity::default(),
@@ -227,18 +186,10 @@ async fn registry_recovers_claimed_context_before_task_allocation_without_replay
     let t = TwoBackends::start().await?;
     let hooks = t.a.backend.store.context_fault_hooks();
     let mut claim = hooks.pause(Boundary::ContextCas, 1);
-    let send = tokio::spawn({
-        let app = t.a.app.clone();
-        async move { rpc(app, "alice", "SendMessage", first_message()).await }
-    });
-    claim.reached().await;
-    let saved = reservation(&t).await?;
+    let send = send_first_message(&t);
+    let saved = reached_reservation(&mut claim, &t).await?;
     let empty =
-        t.b.backend
-            .store
-            .read_context(&saved.allocation.storage_key)
-            .await?
-            .context("claimed empty context")?;
+        replica_b_context(&t, &saved.allocation.storage_key, "claimed empty context").await?;
     assert!(empty.document.state.active.is_none());
     assert_eq!(empty.document.epoch, 1);
     remove_owner_lease(&t, &saved.allocation.storage_key).await?;

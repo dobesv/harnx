@@ -361,3 +361,67 @@ fn event_hooks_resolution_survives_default_config() {
     let _: Option<Box<HooksConfig>> = config.hooks.clone();
     let _: Option<ToolServerConfig> = None;
 }
+
+#[test]
+fn event_hooks_patched_scripts_keep_loader_origins_for_every_event() {
+    let _lock = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", root);
+    let config_file = write(root, "config.yaml", "{}\n");
+    for (name, script_dir) in [("tailored", "external"), ("pkg/tailored", "packages/pkg")] {
+        write(
+            root,
+            &format!("{script_dir}/scripts/baseline.sh"),
+            "event_input",
+        );
+        write(
+            root,
+            &format!("{script_dir}/scripts/patched.py"),
+            "event_input()",
+        );
+        let mut hooks = serde_json::json!({"max_resume": 2});
+        for event in HookEventKind::ALL {
+            hooks[event.key()] = serde_json::json!([
+                {"name": event.key(), "script": "scripts/baseline.sh"}
+            ]);
+        }
+        let frontmatter = serde_json::json!({
+            "hooks": hooks,
+            "patches": ".hooks |= with_entries(if .key == \"max_resume\" then . else .value |= map(.script = \"scripts/patched.py\") end)"
+        });
+        // The local agent lives outside agents/, so fallback origins cannot
+        // accidentally make a lost loader origin pass this test.
+        let agent_file = write(
+            root,
+            "external/tailored.md",
+            &agent_md(&serde_yaml::to_string(&frontmatter).unwrap()),
+        );
+        let agent = agent::load_with_qualified_name(&agent_file, name).unwrap();
+        let origin = agent.hooks().unwrap().origin.clone().unwrap();
+        let mut config = Config::load_from_file(&config_file).unwrap();
+        config.use_agent_obj(agent).unwrap();
+
+        config
+            .apply_session_agent_patches(
+                &harnx_core::user_principals::anonymous(),
+                &harnx_core::agent_config::AgentVariables::default(),
+            )
+            .unwrap();
+
+        let agent = config.extract_agent();
+        let hooks = agent.hooks().unwrap();
+        assert_eq!(hooks.origin.as_ref(), Some(&origin), "{name}");
+        assert_eq!(hooks.max_resume, Some(2));
+        let resolved = config.resolved_event_hooks().unwrap();
+        for event in HookEventKind::ALL {
+            let entries = resolved.list(event);
+            assert_eq!(entries.len(), 1, "{name}: {}", event.key());
+            assert_eq!(entries[0].name, event.key());
+            assert_eq!(
+                entries[0].source,
+                MiddlewareSource::Python("event_input()".into())
+            );
+        }
+    }
+}

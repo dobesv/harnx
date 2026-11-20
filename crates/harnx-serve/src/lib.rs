@@ -874,8 +874,32 @@ impl Server {
             persistence: PersistenceKind::Nats,
             web_base_url: web_url::inferred_base_url(req.headers(), req.uri()),
             user_id: RequestIdentity::user_id(&req),
+            user_principals: RequestIdentity::of(&req).stampable_principals(),
         };
         handle_ag_ui_rpc(req, target, session, context).await
+    }
+
+    /// The `/agents/<agent>/sessions` routes: the request's resolved identity
+    /// is stamped read-only when a route creates a session.
+    async fn handle_agents_sessions_route(
+        &self,
+        method: &Method,
+        req: &hyper::Request<Incoming>,
+        target: &crate::session_actor::ResolvedAgentTarget,
+        scoped: &harnx_runtime::config::GlobalConfig,
+        access: Option<(&AccessRules, CallerView<'_>)>,
+    ) -> Result<AppResponse> {
+        self.handle_sessions_route(
+            method,
+            req.headers(),
+            SessionsRouteContext::new(target, scoped, req.uri().query())
+                .with_identity(
+                    RequestIdentity::user_id(req).as_deref(),
+                    RequestIdentity::of(req).stampable_principals().as_ref(),
+                )
+                .with_access(access),
+        )
+        .await
     }
 
     async fn handle_agent_tree(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
@@ -910,14 +934,8 @@ impl Server {
                 }
             }
             AgentsRoute::Sessions => {
-                self.handle_sessions_route(
-                    &method,
-                    req.headers(),
-                    SessionsRouteContext::new(&target, &scoped, req.uri().query())
-                        .with_user_id(RequestIdentity::user_id(&req).as_deref())
-                        .with_access(access),
-                )
-                .await
+                self.handle_agents_sessions_route(&method, &req, &target, &scoped, access)
+                    .await
             }
             AgentsRoute::Session => {
                 self.handle_agent_session(
@@ -1185,6 +1203,7 @@ impl Server {
         session: &str,
     ) -> Result<AppResponse> {
         let user_id = RequestIdentity::user_id(&req);
+        let user_principals = RequestIdentity::of(&req).stampable_principals();
         let web_base_url = web_url::inferred_base_url(req.headers(), req.uri());
         let body = req.collect().await?.to_bytes();
         let request = ag_ui::AgUiRunRequest {
@@ -1193,6 +1212,7 @@ impl Server {
             body: &body,
             web_base_url,
             user_id,
+            user_principals,
         };
         ag_ui::ag_ui_run_for_target(
             &self.config,

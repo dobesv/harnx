@@ -77,6 +77,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | `conversation_starters` | `list` | `[]` | Suggested prompts shown when starting the agent in TUI mode. |
 | `documents` | `list` | `[]` | Document paths for RAG integration. See [Documents](#documents-rag). |
 | `instructions` | `string` | none | If set, overrides the Markdown body as the system prompt. |
+| `patches` | `string` or `list` | none | jaq filters that rewrite the agent config at session activation with caller principals bound as `$user`. See [Agent Patches (`patches`)](#agent-patches-patches). |
 | `middleware` | `list` | `[]` | In-process tool-call scripts, including durable confirmations. See [Tool middleware and confirmation](#tool-middleware-and-confirmation). |
 | `hooks` | `object` | none | Per-agent lifecycle event hooks. See [Hooks](#hooks). |
 
@@ -144,8 +145,9 @@ Harnx provides built-in variables that are always available, without needing to 
 | `{{__locale__}}` | System locale | `en-US`, `ja-JP` |
 | `{{__now__}}` | Current date and time | `2025-01-15 14:30:00` |
 | `{{__cwd__}}` | Current working directory | `/home/user/project` |
+| `{{__user__}}` | Caller principals snapshot | `{user_id: "alice", users: ["alice"], groups: ["developers"], roles: ["admin"]}` |
 
-Built-in variables are interpolated after custom variables, so they work everywhere custom variables do.
+Built-in variables are interpolated after custom variables, so they work everywhere custom variables do. Agent and session variables cannot override `__user__`. See [Dynamic Variables in Prompts](#dynamic-variables-in-prompts) for conditional prompt examples with `__user__`.
 
 ## Prompt Body
 
@@ -441,7 +443,8 @@ Each property holds a value and an `inherit` flag. A sub-agent session started f
 
 | Property | Value | Copied to sub-agent sessions |
 |---|---|---|
-| `user_id` | The user the session acts for. Read-only for agents; Harnx doesn't record one yet. | by default |
+| `user_id` | The user the session acts for. Read-only for agents. | by default |
+| `user_principals` | Caller principals snapshot (`user_id`, `users`, `groups`, `roles`). Read-only for agents. | by default |
 | `github_owner_repo` | GitHub repository as `owner/repo` | by default |
 | `git_branch` | Git branch | by default |
 | `github_issue` | Issue number in `github_owner_repo` | by default |
@@ -465,6 +468,109 @@ Any other name that starts with a lowercase letter and uses only lowercase lette
 ```
 
 A blank value, `0` for a number, or an empty list removes a property. When `inherit` is omitted an existing property keeps its flag and a new one takes the default above; asking to copy `web_session_url` is an error. Writing a property only records it: it doesn't check out a branch, change directory or contact GitHub.
+
+## Agent Patches (`patches`)
+
+The `patches` front-matter field lets an agent rewrite its own configuration at session activation based on the caller who created the session. For example, an agent can offer developer tools to engineering staff while presenting a restricted tool set to others.
+
+### Configuration
+
+`patches` accepts a single jaq filter string or a YAML list of jaq filter strings:
+
+```yaml
+patches:
+  - 'if ($user.groups | index("developers")) then . else .use_tools |= map(select(. != "coder" and . != "fs")) end'
+```
+
+### How Patches Run
+
+- **Input**: The filter receives the agent's serialized configuration as a JSON object (including `use_tools`, `bash_tools`, `instructions`, `model`, and other front-matter fields).
+- **Bound variable (`$user`)**: The session creator's caller principals are bound to `$user` as a JSON object with four keys:
+  - `user_id`: The raw resolved user identity string, or `null`.
+  - `users`: List of expanded user identities from `users.yaml` aliases (includes `user_id`), or empty.
+  - `groups`: List of group memberships resolved from request headers and `users.yaml`, or empty.
+  - `roles`: List of role memberships resolved from request headers and `users.yaml`, or empty.
+- **Evaluation timing**: The worker evaluates `patches` once per session activation when installing the effective agent. Scratch installs for MCP server reconciliation also evaluate it so server demand matches the patched selectors.
+- **Evaluation order**:
+  1. Base agent configuration (including package patches)
+  2. Persisted session overrides (such as `.set use_tools`)
+  3. Agent `patches` (with `$user` bound)
+  4. Runtime resolution (re-resolving the model if `model` changed, re-validating middleware, server selection, and run limits)
+
+Because `patches` runs after session overrides, a session override cannot re-add tools that the patch removes. But removing tools by name does not block `*` or glob selectors (such as `fs_*`) in `use_tools` or `bash_tools`. A branch that needs a real restriction must set an explicit allowlist without wildcards.
+
+### Invariants and Runtime State
+
+- **State preservation**: Serde-skipped runtime state (agent-owned tools, shared and session variables, resolved model when the model ID is unchanged, middleware package origin, hook package directories, and the stamped principal snapshot) is preserved across the patch round-trip. If a patch changes the `model` ID, the worker re-resolves the new model from its client catalog.
+- **Base agent immutable**: The baseline agent definition in memory and on disk is never modified. Each activation derives its effective configuration fresh from the baseline agent and that session's stored snapshot.
+- **Single object output**: Each filter must produce exactly one JSON object. Empty output, multiple outputs, or non-object output are errors.
+- **Name preservation**: A patch must not modify the agent `name`.
+
+### Validation and Fail-Closed Behavior
+
+Harnx compiles and validates `patches` filters at agent load time, catching syntax errors and references to undeclared variables before a session runs.
+
+At session activation, patch execution fails closed:
+- Compilation or runtime filter errors
+- Empty or multiple filter outputs
+- Non-object output
+- Modifying the agent `name`
+- Output that fails AgentConfig deserialization
+
+Any of these conditions terminates the activation with an error naming the agent and filter. On upgraded workers, the session never falls back to the unpatched (more permissive) configuration.
+
+### Filter Termination and Determinism
+
+- **Filter termination**: jaq filters run synchronously on worker threads without a timeout or step limit. Filters must terminate; a non-terminating filter (such as `repeat(1) | select(false)`) will hang worker activation indefinitely.
+- **Multiple evaluations**: The worker evaluates `patches` more than once per activation: first during scratch installation for MCP server reconciliation (to determine server demand), and again during real installation before turn execution. Authors should avoid non-deterministic jaq built-ins such as `now` or `env`, which could cause those evaluations to diverge.
+- **Diagnostics and sensitive data**: When a patch produces invalid configuration or fails to deserialize, error diagnostics log the failing fields. Avoid copying sensitive `$user` values into configuration fields that could fail validation or be exposed in error sinks.
+
+### Example: Role-Based Tool Tailoring
+
+This agent gives coding tools and delegation instructions only to callers in the `developers` group:
+
+```markdown
+---
+model: openai:gpt-4o
+use_tools:
+  - jira
+  - confluence
+  - coder
+  - fs
+patches:
+  - 'if ($user.groups | index("developers")) then . else .use_tools |= map(select(. != "coder" and . != "fs")) end'
+---
+You are a Jira assistant.
+{% if "developers" in __user__.groups %}You may delegate coding work to coder.{% endif %}
+```
+
+- When a caller in the `developers` group starts a session, the filter leaves `use_tools` untouched. The model receives all four tools, and the prompt includes the delegation instruction.
+- When a caller outside `developers` starts a session, the filter removes `coder` and `fs` from `use_tools`. The prompt omits the delegation instruction.
+- For local CLI and TUI sessions, `__user__.groups` is empty, so the prompt renders the non-developer branch. But local sessions do not run `patches`, so `use_tools` keeps its full declared set. Only NATS worker sessions apply `patches`.
+
+### Where Caller Principals Come From
+
+- **HTTP (`harnx-serve`)**: Resolved from configured identity headers/cookies (`serve_user_id_sources`), group headers (`serve_group_headers`), and role headers (`serve_role_headers`), merged with alias identities and configured groups/roles from `users.yaml`.
+- **A2A (`harnx-a2a-server`)**: Resolved from `--user-id-header`, `--group-header`, and `--role-header`, merged with `users.yaml`. The snapshot is stored with the initial message reservation and retained during crash recovery.
+- **CLI / TUI / ACP**: Local sessions run without request membership headers. They receive `user_id`-only or anonymous principals (`user_id: null`, empty lists).
+- **Legacy sessions**: Sessions created before principal snapshots were introduced fall back to `user_id`-only principals (or anonymous).
+
+### Caveats and Boundaries
+
+- **Fixed at creation**: Caller principals are captured once when the session is created. If another user prompts an existing session, the session retains the creator's tailoring.
+- **Membership changes**: Updates to group or role memberships apply to new sessions only.
+- **Inheritance**: Sub-agents (`*_session_new`, `*_session_prompt`, `*_session_send`) and handoffs inherit the parent session's snapshot verbatim.
+- **Not an access-control boundary**: `use_tools` and `bash_tools` are independent selectors. If a tool is in both, removing it from `use_tools` does not remove it from script mode (`bash_tools`); a patch must update both selectors. Tool dispatch also does not yet reject model calls to undeclared tools ([issue #2770](https://github.com/dobesv/harnx/issues/2770)). Do not treat `patches` as an authorization boundary.
+- **Authorization uses live memberships**: Access control (`access.yaml` rules and A2A context owner bindings) continues to evaluate live request memberships on every call, never the session's customization snapshot.
+
+### Rolling Upgrades and Fleet Deployment
+
+When deploying `patches` across an existing cluster:
+
+1. **Upgrade workers first**: Older worker binaries do not recognize the `patches` front-matter field and run the unpatched, more permissive configuration. They also treat `user_principals` as an unknown custom property rather than a read-only system property.
+2. **Upgrade servers and frontends**: Update `harnx-serve`, `harnx-a2a-server`, and other property-writing replicas so they capture caller principals at session creation. Sessions created by replicas that were not upgraded have no principal snapshot and keep the `user_id`-only fallback after rollout. Recreate those sessions once every property-writing replica is upgraded to get membership-based tailoring.
+3. **Enable `patches` and widen access last**: Add `patches` to agent definitions and grant broader access only after all cluster workers run the new release.
+4. **Rollback sequence**: If rolling back, remove or revert `patches` from agent definitions before rolling back workers.
 
 ## Documents (RAG)
 
@@ -1069,6 +1175,13 @@ Agent prompts are rendered using [MiniJinja](https://github.com/mitsuhiko/miniji
 - `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-4o`). This updates automatically if the agent falls back to a different model.
 - `{{ tools }}`: A list of available tools. You can iterate over them: `{% for t in tools %}- {{ t.name }}: {{ t.description }}{% endfor %}`.
 - `{{ __os__ }}`, `{{ __arch__ }}`, `{{ __shell__ }}`, `{{ __cwd__ }}`, `{{ __now__ }}`, `{{ __locale__ }}`: Environment and system information.
+- `__user__`: The session creator's caller-principals snapshot, with exactly four fields: `user_id`, `users` (expanded user aliases), `groups`, and `roles`. When a session has no stored snapshot but does have a `user_id` (such as a legacy session), Harnx returns user-id-only principals (`user_id` set, `users: [user_id]`, empty `groups` and `roles`). Only an anonymous session gets a null `user_id` (`none`) and empty lists. Agent and session variables cannot override `__user__`. The snapshot stays fixed for the session and is inherited by subagents and handoffs; it customizes prompts, not access checks. See [Agent Patches (`patches`)](#agent-patches-patches) for tool tailoring and caveats.
+
+Use group membership to conditionally include instructions:
+
+```jinja
+{% if "developers" in __user__.groups %}You may delegate coding work to coder.{% endif %}
+```
 
 ### Detecting Environment-Specific Tooling
 

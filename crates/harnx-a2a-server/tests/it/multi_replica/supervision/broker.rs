@@ -44,12 +44,7 @@ async fn broker_partition_preserves_cancel_intent_and_slot_until_background_reco
         "partition must not report cancel success"
     );
     t.h._broker.signal("-CONT")?;
-    let after =
-        t.b.backend
-            .store
-            .read_context(&saved.allocation.storage_key)
-            .await?
-            .context("after partition")?;
+    let after = replica_b_context(&t, &saved.allocation.storage_key, "after partition").await?;
     let active = after
         .document
         .state

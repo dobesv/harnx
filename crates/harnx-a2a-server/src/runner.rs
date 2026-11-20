@@ -236,7 +236,12 @@ impl Runner {
         } = request;
         self.verify_existing_context(export, owner, local_id)
             .await?;
-        let initializer = session_initializer(export, &owner.principal, local_id)?;
+        let initializer = session_initializer(
+            export,
+            &owner.principal,
+            owner.stampable_principals().as_ref(),
+            local_id,
+        )?;
         let session = Box::pin(NatsSession::from_global_config(
             NatsSessionConfig {
                 cluster: export.cluster.clone().unwrap_or_else(|| "__local__".into()),
@@ -429,18 +434,22 @@ impl Runner {
 fn session_initializer(
     export: &Export,
     owner: &Principal,
+    principals: Option<&harnx_core::user_principals::UserPrincipals>,
     local_id: Option<&str>,
 ) -> Result<SessionInitializer> {
     let initializer = SessionInitializer::named(export.agent.clone(), Default::default());
     if local_id.is_some() {
+        // Existing sessions keep the identity stamped at their creation.
         return Ok(initializer);
     }
-    let Some(user_id) = owner.user_id() else {
-        return Ok(initializer);
+    let mut initializer = match owner.user_id() {
+        Some(user_id) => initializer.with_user_id(user_id),
+        None => initializer,
     };
-    Ok(initializer.with_properties(serde_json::from_value(
-        serde_json::json!({"user_id": {"value": user_id, "inherit": true}}),
-    )?))
+    if let Some(principals) = principals {
+        initializer = initializer.with_user_principals(principals);
+    }
+    Ok(initializer)
 }
 
 async fn shutdown_turn(handle: &RunnerHandle) {
@@ -569,4 +578,83 @@ fn turn_outcome(
 struct AdmissionOwnership {
     guard: OwnedMutexGuard<Option<Arc<RunnerHandle>>>,
     authority: OwnedTask,
+}
+
+#[cfg(test)]
+mod session_initializer_tests {
+    use super::*;
+    use crate::{
+        exports::AgentCardMeta,
+        identity::Identity,
+        store::{DedupeKey, FirstMessageReservation, TaskAllocation},
+    };
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    #[test]
+    fn group_only_a2a_reservation_recovery_stamps_principals_without_user_id() -> Result<()> {
+        let identity = Identity::with_memberships(&[], &["x-groups".into()], &["x-roles".into()])?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-groups"),
+            HeaderValue::from_static("engineering"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-roles"),
+            HeaderValue::from_static("reviewer"),
+        );
+        let owner = identity.resolve_request(&headers)?;
+        assert_eq!(owner.principal, Principal::Anonymous);
+
+        let reservation = FirstMessageReservation {
+            identity: DedupeKey {
+                cluster: "__local__".into(),
+                export: "agent".into(),
+                owner: None,
+                message_id: "first-message".into(),
+            },
+            fingerprint: "fingerprint".into(),
+            message: serde_json::from_value(serde_json::json!({
+                "messageId": "first-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "Hello"}]
+            }))?,
+            allocation: TaskAllocation::new("agent", "session".into()),
+            principals: owner.stampable_principals(),
+        };
+        let recovered: FirstMessageReservation =
+            serde_json::from_slice(&serde_json::to_vec(&reservation)?)?;
+        let export = Export {
+            agent: "agent".into(),
+            public_name: "agent".into(),
+            cluster: None,
+            card_meta: AgentCardMeta {
+                name: "agent".into(),
+                description: String::new(),
+                version: "1".into(),
+                conversation_starters: Vec::new(),
+            },
+            lookup_keys: Vec::new(),
+        };
+        let initializer = session_initializer(
+            &export,
+            &owner.principal,
+            recovered.principals.as_ref(),
+            None,
+        )?;
+
+        let metadata =
+            harnx_runtime::nats_session_metadata::SessionMetadata::new("session", initializer);
+        let properties = harnx_runtime::nats_session_metadata::session_properties(&metadata)?;
+        assert!(properties.get("user_id").is_none());
+        assert_eq!(
+            properties.get("user_principals").unwrap().value,
+            serde_json::json!({
+                "user_id": null,
+                "users": [],
+                "groups": ["engineering"],
+                "roles": ["reviewer"]
+            })
+        );
+        Ok(())
+    }
 }

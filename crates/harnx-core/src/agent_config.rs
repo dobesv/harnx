@@ -9,8 +9,9 @@ use crate::model::Model;
 use crate::retry_config::RetryConfig;
 use crate::system_vars::render_template;
 use crate::tool::{ToolDeclaration, Tools};
+use crate::user_principals::UserPrincipals;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fancy_regex::Regex;
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -102,6 +103,35 @@ where
     Ok(value.map(normalize_toolset_value))
 }
 
+/// `patches:` accepts one jaq filter string or a list of them, mirroring the
+/// package patch `agents:` shape. A whitespace-only string and `null` read as
+/// no patches.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PatchesValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+// qual:api — referenced only through serde's `deserialize_with` string attribute, which rustqual cannot see as a call site
+pub fn deserialize_patches<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<PatchesValue>::deserialize(deserializer)?;
+    Ok(match value {
+        None => Vec::new(),
+        Some(PatchesValue::One(filter)) => {
+            if filter.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![filter]
+            }
+        }
+        Some(PatchesValue::Many(filters)) => filters,
+    })
+}
+
 // --- AgentConfig --------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -168,6 +198,17 @@ pub struct AgentConfig {
     /// Per-agent run limits override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_limits: Option<RunLimitsOverride>,
+    /// jaq filters that rewrite this agent's own config at session activation,
+    /// with the session's caller-principals snapshot bound as `$user`. One
+    /// filter string or a list — the same shape as a package patch `agents:`
+    /// entry, but scoped to the declaring agent (no `.name` filtering needed).
+    /// Fail-closed at activation; see [`AgentConfig::apply_user_patches`].
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_patches"
+    )]
+    patches: Vec<String>,
     #[serde(default)]
     pub role: AgentRole,
     #[serde(default)]
@@ -181,6 +222,31 @@ pub struct AgentConfig {
     tools: Tools,
     #[serde(skip, default)]
     model: Model,
+    /// The caller principals this activation was tailored for, stamped onto
+    /// the effective agent a worker installs. Read by template rendering (the
+    /// `__user__` variable). Never serialized: it is per-activation runtime
+    /// state, not part of the agent file.
+    #[serde(skip, default)]
+    user_principals: Option<UserPrincipals>,
+}
+
+/// The jaq global names (with their `$` prefix) available to `patches`
+/// filters, paired with values in [`AgentConfig::patch_globals`]. Adding a
+/// global means adding its name here, its value in `patch_globals`, and
+/// keeping the declaration list passed at validation sites in sync.
+pub const PATCH_GLOBAL_NAMES: &[&str] = &["$user"];
+
+/// Serde-skipped runtime state carried across a `patches` round trip
+/// (invariant I3); see [`AgentConfig::take_runtime_state`].
+struct PatchRuntimeState {
+    before_model_id: Option<String>,
+    shared_variables: AgentVariables,
+    session_variables: Option<AgentVariables>,
+    tools: Tools,
+    resolved_model: Model,
+    user_principals: Option<UserPrincipals>,
+    middleware_origin: Option<crate::middleware::MiddlewareOrigin>,
+    hook_origin: Option<crate::middleware::MiddlewareOrigin>,
 }
 
 impl AgentConfig {
@@ -200,6 +266,14 @@ impl AgentConfig {
             serde_yaml::from_str::<AgentFrontMatter>(metadata)
                 .map_err(|e| anyhow::anyhow!("Invalid front-matter in agent '{}': {}", name, e))?
         };
+        if !frontmatter.patches.is_empty() {
+            crate::jaq::validate_filters_with_globals(&frontmatter.patches, PATCH_GLOBAL_NAMES)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Invalid front-matter in agent '{name}': invalid `patches` filters: {e}"
+                    )
+                })?;
+        }
         Ok(Self {
             name: name.to_string(),
             model_id: frontmatter.model_id,
@@ -224,6 +298,7 @@ impl AgentConfig {
             title_agent: frontmatter.title_agent,
             loop_detection: frontmatter.loop_detection,
             run_limits: frontmatter.run_limits,
+            patches: frontmatter.patches,
             role: frontmatter.role,
             prompt,
             ..Default::default()
@@ -401,6 +476,135 @@ impl AgentConfig {
     /// Returns this agent's run limits override.
     pub fn run_limits(&self) -> Option<&RunLimitsOverride> {
         self.run_limits.as_ref()
+    }
+
+    /// This agent's `patches` filters, applied at worker activation with the
+    /// session's caller principals bound as `$user`.
+    // qual:allow(dry, boilerplate) reason: "accessor mirrors the surrounding AgentConfig getter style; the field stays private so serialized front-matter cannot diverge from parsing"
+    pub fn patches(&self) -> &[String] {
+        &self.patches
+    }
+
+    /// The caller principals this activation was tailored for, stamped by the
+    /// worker when it installs the session's effective agent. `None` outside a
+    /// session (CLI, tests, frontends).
+    pub fn user_principals(&self) -> Option<&UserPrincipals> {
+        self.user_principals.as_ref()
+    }
+
+    /// Stamp the caller principals onto this effective agent.
+    // qual:allow(dry, boilerplate) reason: "setter mirrors the surrounding AgentConfig setter style; the field stays private to keep stamping a worker-side decision"
+    pub fn set_user_principals(&mut self, user_principals: Option<UserPrincipals>) {
+        self.user_principals = user_principals;
+    }
+
+    /// Values for [`PATCH_GLOBAL_NAMES`], bound while `patches` run.
+    fn patch_globals(user: &UserPrincipals) -> Vec<(&'static str, serde_json::Value)> {
+        vec![(
+            "$user",
+            serde_json::to_value(user).expect("UserPrincipals are JSON-serializable"),
+        )]
+    }
+
+    /// Apply this agent's `patches` filters with `$user` bound to `user`,
+    /// turning this config into the session's effective agent config.
+    ///
+    /// Fail-closed: a compile or runtime error, empty or multiple filter
+    /// outputs, a non-object output, a changed agent `name`, or a config that
+    /// no longer deserializes all fail with an error naming this agent, and
+    /// the caller must fail the activation rather than run the unpatched
+    /// config.
+    ///
+    /// Runtime state that serde does not carry is restored from the
+    /// pre-patch config via [`PatchRuntimeState`], so the effective agent
+    /// behaves as if the patched values had been in the agent file
+    /// (invariant I3). A changed `model` id is left unresolved for the
+    /// caller, which owns the client catalog.
+    // qual:allow(iosp) — one fail-closed pipeline: serialize, filter, validate, restore; each step's error names the agent, and splitting it would spread that context across helpers
+    pub fn apply_user_patches(&mut self, user: &UserPrincipals) -> Result<()> {
+        if self.patches.is_empty() {
+            return Ok(());
+        }
+        let agent_name = self.name.clone();
+        let mut output = serde_json::to_value(&*self)
+            .with_context(|| format!("serialize agent '{agent_name}' for `patches`"))?;
+        let globals = Self::patch_globals(user);
+        for (index, filter) in self.patches.iter().enumerate() {
+            output = crate::jaq::eval_filters_single_with_globals(
+                std::slice::from_ref(filter),
+                output,
+                &globals,
+            )
+            .with_context(|| {
+                format!(
+                    "agent '{agent_name}': `patches` filter {} failed",
+                    index + 1
+                )
+            })?;
+            anyhow::ensure!(
+                output.is_object(),
+                "agent '{agent_name}': `patches` filter {} {filter:?} must output a JSON object, got {}",
+                index + 1,
+                json_kind(&output)
+            );
+        }
+        let patched = serde_json::from_value::<AgentConfig>(output).with_context(|| {
+            format!("agent '{agent_name}': `patches` produced an invalid agent config")
+        })?;
+        anyhow::ensure!(
+            patched.name == agent_name,
+            "agent '{agent_name}': `patches` must not change the agent `name` (saw '{}')",
+            patched.name
+        );
+        let runtime = self.take_runtime_state();
+        *self = patched;
+        self.restore_runtime_state(runtime);
+        Ok(())
+    }
+
+    /// Capture the serde-skipped runtime state a `patches` round trip must
+    /// preserve (invariant I3): variables, agent-owned tools, the resolved
+    /// model while its id is unchanged, middleware and lifecycle hook origins,
+    /// and the stamped principals.
+    fn take_runtime_state(&mut self) -> PatchRuntimeState {
+        let hook_origin = self.hooks.as_mut().and_then(|hooks| hooks.origin.take());
+        PatchRuntimeState {
+            before_model_id: self.model_id.clone(),
+            shared_variables: std::mem::take(&mut self.shared_variables),
+            session_variables: self.session_variables.take(),
+            tools: std::mem::take(&mut self.tools),
+            resolved_model: std::mem::take(&mut self.model),
+            user_principals: self.user_principals.take(),
+            middleware_origin: self.middleware.origin.take(),
+            hook_origin,
+        }
+    }
+
+    /// Restore the state [`AgentConfig::take_runtime_state`] captured onto
+    /// the patched config. A `model` id the patch changed stays unresolved;
+    /// the worker resolves it from its client catalog.
+    fn restore_runtime_state(&mut self, runtime: PatchRuntimeState) {
+        let PatchRuntimeState {
+            before_model_id,
+            shared_variables,
+            session_variables,
+            tools,
+            resolved_model,
+            user_principals,
+            middleware_origin,
+            hook_origin,
+        } = runtime;
+        self.shared_variables = shared_variables;
+        self.session_variables = session_variables;
+        self.tools = tools;
+        if self.model_id == before_model_id {
+            self.model = resolved_model;
+        }
+        self.user_principals = user_principals;
+        self.middleware.origin = middleware_origin;
+        if let Some(hooks) = &mut self.hooks {
+            hooks.origin = hook_origin;
+        }
     }
 
     pub fn compaction_agent(&self) -> Option<&str> {
@@ -641,6 +845,12 @@ struct AgentFrontMatter {
     /// Per-agent run limits override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     run_limits: Option<RunLimitsOverride>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_patches"
+    )]
+    patches: Vec<String>,
     #[serde(default)]
     role: AgentRole,
 }
@@ -670,6 +880,7 @@ impl AgentFrontMatter {
             title_agent: config.title_agent.clone(),
             loop_detection: config.loop_detection,
             run_limits: config.run_limits,
+            patches: config.patches.clone(),
             role: config.role,
         }
     }
@@ -698,6 +909,7 @@ impl AgentFrontMatter {
             && self.instructions.is_none()
             && self.hooks.is_none()
             && self.middleware.is_empty()
+            && self.patches.is_empty()
     }
 
     fn compaction_is_empty(&self) -> bool {
@@ -737,6 +949,17 @@ fn serialize_frontmatter(frontmatter: &AgentFrontMatter) -> Result<String> {
         .unwrap_or(&output)
         .trim()
         .to_string())
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 // --- AgentVariable -----------------------------------------------------------
@@ -1152,6 +1375,505 @@ You are a compaction agent.\n";
                 "{value}"
             );
         }
+    }
+
+    // --- `patches` ----------------------------------------------------------------
+
+    fn developers_group_principals() -> UserPrincipals {
+        UserPrincipals {
+            user_id: Some("alice".to_string()),
+            users: vec!["alice".to_string()],
+            groups: vec!["developers".to_string()],
+            roles: vec![],
+        }
+    }
+
+    /// Render the full anyhow error chain; `patches` failures assert on the
+    /// agent-naming context, not just the top-level message.
+    fn anyhow_chain(error: anyhow::Error) -> String {
+        format!("{error:#}")
+    }
+
+    fn non_developer_principals() -> UserPrincipals {
+        UserPrincipals {
+            user_id: Some("mallory".to_string()),
+            users: vec!["mallory".to_string()],
+            groups: vec!["finance".to_string()],
+            roles: vec![],
+        }
+    }
+
+    /// The example agent from the plan: coding tools only for developers.
+    fn patchable_agent_config() -> AgentConfig {
+        AgentConfig::from_markdown(
+            "jira-assistant",
+            "---\n\
+             model: openai:gpt-4o\n\
+             use_tools: [jira, confluence, coder, fs]\n\
+             patches:\n\
+             - 'if ($user.groups | index(\"developers\")) then . else .use_tools |= map(select(. != \"coder\" and . != \"fs\")) end'\n\
+             ---\n\
+             You are a Jira assistant.\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn patches_parse_from_frontmatter_string_and_list() {
+        let single =
+            AgentConfig::from_markdown("single", "---\npatches: '.use_tools = []'\n---\nBody\n")
+                .unwrap();
+        assert_eq!(single.patches(), &[".use_tools = []".to_string()]);
+
+        let list = AgentConfig::from_markdown(
+            "list",
+            "---\npatches:\n  - '.use_tools = []'\n  - '.model = \"openai:gpt-4o\"'\n---\nBody\n",
+        )
+        .unwrap();
+        assert_eq!(
+            list.patches(),
+            &[
+                ".use_tools = []".to_string(),
+                ".model = \"openai:gpt-4o\"".to_string()
+            ]
+        );
+
+        // Absent, null, and whitespace-only all read as no patches.
+        for (name, frontmatter) in [
+            ("absent", "model: openai:gpt-4o\n"),
+            ("null", "model: openai:gpt-4o\npatches: null\n"),
+            ("blank", "model: openai:gpt-4o\npatches: \"  \"\n"),
+        ] {
+            let agent = AgentConfig::from_markdown(name, &format!("---\n{frontmatter}---\nBody\n"))
+                .unwrap();
+            assert!(agent.patches().is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn patches_survive_export_and_reparse() {
+        let agent = patchable_agent_config();
+        let exported = agent.export().unwrap();
+        let reparsed = AgentConfig::from_markdown("jira-assistant", &exported).unwrap();
+        assert_eq!(reparsed.patches(), agent.patches());
+    }
+
+    #[test]
+    fn broken_patches_filter_fails_agent_load() {
+        // A compile error must surface at load time, not at the first session.
+        let result = AgentConfig::from_markdown(
+            "broken",
+            "---\npatches:\n  - '$missing as $x | .'\n---\nBody\n",
+        );
+        let error = anyhow_chain(result.unwrap_err());
+        assert!(
+            error.contains("broken") && error.contains("patches"),
+            "load error must name the agent and the `patches` field: {error}"
+        );
+
+        // A filter that is fine syntactically but references an undeclared
+        // global also fails compile.
+        assert!(AgentConfig::from_markdown(
+            "undeclared",
+            "---\npatches: '.x = $undeclared'\n---\nBody\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn apply_user_patches_trims_use_tools_for_non_developers() {
+        // Developer keeps everything.
+        let mut developer = patchable_agent_config();
+        developer
+            .apply_user_patches(&developers_group_principals())
+            .unwrap();
+        assert_eq!(
+            developer.use_tools(),
+            Some(vec![
+                "jira".to_string(),
+                "confluence".to_string(),
+                "coder".to_string(),
+                "fs".to_string(),
+            ])
+        );
+
+        // Non-developer loses the coding tools; everything else stays.
+        let mut outsider = patchable_agent_config();
+        outsider
+            .apply_user_patches(&non_developer_principals())
+            .unwrap();
+        assert_eq!(
+            outsider.use_tools(),
+            Some(vec!["jira".to_string(), "confluence".to_string()])
+        );
+        assert_eq!(outsider.model_id(), Some("openai:gpt-4o"));
+        assert_eq!(outsider.name(), "jira-assistant");
+    }
+
+    #[test]
+    fn apply_user_patches_is_noop_without_patches() {
+        let mut agent =
+            AgentConfig::from_markdown("plain", "---\nmodel: openai:gpt-4o\n---\nBody\n").unwrap();
+        agent
+            .apply_user_patches(&non_developer_principals())
+            .unwrap();
+        assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
+        assert_eq!(agent.name(), "plain");
+    }
+
+    #[test]
+    fn apply_user_patches_preserves_runtime_state() {
+        use crate::middleware::MiddlewareOrigin;
+        use crate::model::Model;
+        use crate::tool::{ToolDeclaration, Tools};
+        use std::path::PathBuf;
+
+        let mut agent = AgentConfig::from_markdown(
+            "stateful",
+            "---\n\
+             model: openai:gpt-4o\n\
+             use_tools: [fs]\n\
+             patches: '.use_tools = []'\n\
+             hooks:\n\
+             \x20 max_resume: 2\n\
+             \x20 SessionStart: [{name: greet, script: hooks/start.sh}]\n\
+             \x20 UserPromptSubmit: [{name: gate, python: pass}]\n\
+             \x20 Stop: [{name: resume, bash: next}]\n\
+             \x20 StopFailure: [{name: audit, script: hooks/failure.py}]\n\
+             ---\n\
+             Body\n",
+        )
+        .unwrap();
+        let mut shared = AgentVariables::new();
+        shared.insert("shared_key".to_string(), "shared".to_string());
+        let mut session = AgentVariables::new();
+        session.insert("session_key".to_string(), "session".to_string());
+        agent.set_shared_variables(shared);
+        agent.set_session_variables(session);
+        let tools = Tools::init_from_mcp(Some(vec![ToolDeclaration {
+            name: "agent_owned".to_string(),
+            description: "Owned by this agent".to_string(),
+            parameters: Default::default(),
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+            kind: None,
+        }]));
+        agent.set_tools(tools.clone());
+        agent.set_model(Model::new("openai", "gpt-4o"));
+        agent.middleware.origin = Some(MiddlewareOrigin {
+            file: PathBuf::from("/etc/harnx/agents/stateful.md"),
+            base_dir: PathBuf::from("/etc/harnx"),
+        });
+        agent.hooks.as_mut().unwrap().origin = Some(MiddlewareOrigin {
+            file: PathBuf::from("/packages/demo/agents/stateful.md"),
+            base_dir: PathBuf::from("/packages/demo"),
+        });
+        let hooks_before = agent.hooks.clone();
+        agent.set_user_principals(Some(developers_group_principals()));
+
+        agent
+            .apply_user_patches(&non_developer_principals())
+            .expect("identity filter with $user binds");
+
+        // Patched value took effect.
+        assert_eq!(agent.use_tools(), Some(Vec::new()));
+        // Serde-skipped runtime state survived the round trip.
+        assert_eq!(
+            agent
+                .shared_variables()
+                .get("shared_key")
+                .map(String::as_str),
+            Some("shared")
+        );
+        assert_eq!(
+            agent.variables().get("session_key").map(String::as_str),
+            Some("session"),
+            "session variables must win over shared after restore"
+        );
+        assert_eq!(
+            agent.tools().declarations()[0].name,
+            "agent_owned",
+            "agent-owned tool declarations must survive"
+        );
+        assert_eq!(
+            agent.model().id(),
+            "openai:gpt-4o",
+            "unchanged model id keeps the resolved model"
+        );
+        assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
+        assert_eq!(
+            agent.middleware.origin.as_ref().map(|origin| &origin.file),
+            Some(&PathBuf::from("/etc/harnx/agents/stateful.md")),
+            "middleware origin must survive"
+        );
+        assert_eq!(
+            agent.hooks, hooks_before,
+            "all lifecycle hook entries and their shared file/base-dir origin must survive"
+        );
+        assert_eq!(
+            agent.user_principals(),
+            Some(&developers_group_principals()),
+            "the stamped snapshot must survive"
+        );
+    }
+
+    #[test]
+    fn apply_user_patches_replaced_lifecycle_hooks_keep_their_origin() {
+        use crate::hooks::HookEventKind;
+        use crate::middleware::{MiddlewareOrigin, MiddlewareSourceConfig};
+
+        let origin = MiddlewareOrigin {
+            file: "/packages/demo/agents/stateful.md".into(),
+            base_dir: "/packages/demo".into(),
+        };
+        for event in HookEventKind::ALL {
+            let mut agent =
+                AgentConfig::from_markdown("stateful", "---\nhooks: {max_resume: 1}\n---\nBody\n")
+                    .unwrap();
+            agent.hooks.as_mut().unwrap().origin = Some(origin.clone());
+            agent.patches = vec![format!(
+                r#".hooks = {{"{}": [{{"name": "patched", "script": "hooks/patched.py"}}], "max_resume": 4}}"#,
+                event.key()
+            )];
+
+            agent
+                .apply_user_patches(&non_developer_principals())
+                .unwrap();
+
+            let hooks = agent.hooks().unwrap();
+            assert_eq!(hooks.origin.as_ref(), Some(&origin), "{}", event.key());
+            assert_eq!(hooks.max_resume, Some(4));
+            let crate::hooks::EventHookEntry::Full(entry) = &hooks.list(event).entries[0] else {
+                panic!("expected patched hook for {}", event.key());
+            };
+            assert_eq!(entry.name, "patched");
+            assert_eq!(
+                entry.source,
+                MiddlewareSourceConfig::Script {
+                    script: "hooks/patched.py".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn apply_user_patches_removed_hooks_are_not_restored_with_their_origin() {
+        for filter in ["del(.hooks)", ".hooks = null"] {
+            let mut agent = AgentConfig::from_markdown(
+                "stateful",
+                "---\nhooks:\n  Stop: [{name: audit, bash: event_input}]\n---\nBody\n",
+            )
+            .unwrap();
+            agent.hooks.as_mut().unwrap().origin = Some(crate::middleware::MiddlewareOrigin {
+                file: "/packages/demo/agents/stateful.md".into(),
+                base_dir: "/packages/demo".into(),
+            });
+            agent.patches = vec![filter.into()];
+
+            agent
+                .apply_user_patches(&non_developer_principals())
+                .unwrap();
+
+            assert!(agent.hooks().is_none(), "{filter}");
+        }
+    }
+
+    #[test]
+    fn apply_user_patches_changed_model_id_leaves_the_model_for_the_caller() {
+        use crate::model::Model;
+
+        let mut agent = AgentConfig::from_markdown(
+            "remodeled",
+            "---\n\
+             model: openai:gpt-4o\n\
+             patches: '.model = \"openai:gpt-4o-mini\"'\n\
+             ---\n\
+             Body\n",
+        )
+        .unwrap();
+        agent.set_model(Model::new("openai", "gpt-4o"));
+
+        agent
+            .apply_user_patches(&non_developer_principals())
+            .unwrap();
+
+        assert_eq!(agent.model_id(), Some("openai:gpt-4o-mini"));
+        assert_eq!(
+            agent.model().id(),
+            Model::default().id(),
+            "a changed model id must reset the resolved model"
+        );
+        assert_eq!(
+            serde_json::to_value(agent.model().data()).unwrap(),
+            serde_json::to_value(Model::default().data()).unwrap(),
+            "resolved model metadata must reset too"
+        );
+    }
+
+    #[test]
+    fn apply_user_patches_late_errors_preserve_runtime_state() {
+        use crate::middleware::MiddlewareOrigin;
+        use crate::model::Model;
+        use std::path::PathBuf;
+
+        for filter in [".use_tools = 5", ".name = \"other\""] {
+            let mut agent = AgentConfig::from_markdown(
+                "stateful",
+                "---\nhooks:\n  StopFailure:\n    - name: audit\n      python: pass\n---\nBody\n",
+            )
+            .unwrap();
+            agent.patches = vec![filter.to_string()];
+            agent.set_shared_variables(AgentVariables::from_iter([(
+                "shared".into(),
+                "value".into(),
+            )]));
+            agent.set_session_variables(AgentVariables::from_iter([(
+                "session".into(),
+                "value".into(),
+            )]));
+            agent.set_model(Model::new("openai", "gpt-4o"));
+            agent.set_user_principals(Some(developers_group_principals()));
+            agent.middleware.origin = Some(MiddlewareOrigin {
+                file: PathBuf::from("/packages/demo/agents/stateful.md"),
+                base_dir: PathBuf::from("/packages/demo"),
+            });
+            agent.hooks.as_mut().unwrap().origin = agent.middleware.origin.clone();
+            let before = format!("{agent:?}");
+
+            agent
+                .apply_user_patches(&non_developer_principals())
+                .unwrap_err();
+
+            assert_eq!(
+                format!("{agent:?}"),
+                before,
+                "late error from {filter:?} must preserve serde-skipped state too"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_user_patches_rejects_non_object_intermediate_outputs() {
+        for (projection, kind) in [
+            (".use_tools", "array"),
+            (".name", "string"),
+            ("42", "number"),
+            ("false", "bool"),
+            ("null", "null"),
+        ] {
+            let mut agent =
+                AgentConfig::from_markdown("tailored", "---\nuse_tools: [fs_read]\n---\nBody\n")
+                    .unwrap();
+            agent.patches = vec![
+                ".".into(),
+                projection.into(),
+                r#"{"name":"tailored","instructions":"reconstructed"}"#.into(),
+            ];
+            let before = format!("{agent:?}");
+
+            let error = anyhow_chain(
+                agent
+                    .apply_user_patches(&non_developer_principals())
+                    .unwrap_err(),
+            );
+
+            assert!(
+                error.contains("tailored") && error.contains("patches"),
+                "{error}"
+            );
+            assert!(
+                error.contains("filter 2") && error.contains(projection),
+                "{error}"
+            );
+            assert!(
+                error.contains("JSON object") && error.contains(kind),
+                "{error}"
+            );
+            assert_eq!(format!("{agent:?}"), before);
+        }
+    }
+
+    #[test]
+    fn apply_user_patches_chains_object_outputs() {
+        let mut agent = patchable_agent_config();
+        agent.patches = vec![
+            ".use_tools = []".into(),
+            ".instructions = $user.user_id".into(),
+        ];
+
+        agent
+            .apply_user_patches(&non_developer_principals())
+            .unwrap();
+
+        assert_eq!(agent.use_tools(), Some(Vec::new()));
+        assert_eq!(agent.interpolated_instructions().unwrap(), "mallory");
+    }
+
+    #[test]
+    fn apply_user_patches_fails_closed() {
+        fn filter_case(filter: &str) -> String {
+            let mut agent = AgentConfig::from_markdown(
+                "failing",
+                &format!("---\npatches: {filter}\n---\nBody\n"),
+            )
+            .unwrap();
+            let error = anyhow_chain(
+                agent
+                    .apply_user_patches(&non_developer_principals())
+                    .unwrap_err(),
+            );
+            assert!(
+                error.contains("failing"),
+                "filter {filter:?}: error must name the agent: {error}"
+            );
+            error
+        }
+
+        // Runtime error inside the filter.
+        let error = filter_case("'.use_tools |= map(.missing)'");
+        assert!(
+            error.contains("patches"),
+            "runtime error must name `patches`: {error}"
+        );
+        // No output.
+        let error = filter_case("'select(false)'");
+        assert!(error.contains("no output"), "{error}");
+        // More than one output.
+        let error = filter_case("'. , .'");
+        assert!(error.contains("multiple outputs"), "{error}");
+        // Output that is not an object.
+        let error = filter_case("'.name'");
+        assert!(error.contains("JSON object"), "{error}");
+        // Renaming the agent.
+        let error = filter_case("'.name = \"other\"'");
+        assert!(
+            error.contains("must not change the agent `name`"),
+            "{error}"
+        );
+        // Output that no longer deserializes as an agent config.
+        let error = filter_case("'.use_tools = 5'");
+        assert!(
+            error.contains("invalid agent config"),
+            "deserialize failure must be reported: {error}"
+        );
+
+        // The same filters never mutated the config they failed on.
+        let mut agent =
+            AgentConfig::from_markdown("failing", "---\npatches: '.name = \"other\"'\n---\nBody\n")
+                .unwrap();
+        agent
+            .apply_user_patches(&non_developer_principals())
+            .unwrap_err();
+        assert_eq!(agent.name(), "failing");
+        assert_eq!(
+            agent.use_tools(),
+            None,
+            "a failed patch must leave the config unchanged"
+        );
     }
 }
 

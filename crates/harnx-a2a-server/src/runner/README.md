@@ -129,10 +129,14 @@ interruption of already admitted work. Missing active bindings aren't recreated;
 only a verified winning first reservation can initialize missing metadata.
 
 Recovery registrations keep the binding's original owner when an admin admits a
-follow-up, not that admin's current identity. Only owner/export/allocation facts are
-persisted, never request groups, roles, headers or credentials. `multi_replica/auth/`
-tests this split with revoked rules, paused first initialization and prompt append,
-stale owners, role-admin follow-ups and independent replica retries.
+follow-up, not that admin's current identity. Authorization decisions rely strictly
+on persisted owner/export/allocation facts and live request memberships, never
+persisted groups, roles, headers or credentials. (For prompt and tool customization,
+the initial caller's resolved principals snapshot is carried in recovery records and
+the session's read-only `user_principals` property, but authorization never consults
+that snapshot). `multi_replica/auth/` tests this split with revoked rules, paused
+first initialization and prompt append, stale owners, role-admin follow-ups and
+independent replica retries.
 
 ## Recovery never admits missing work
 

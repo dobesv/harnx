@@ -22,6 +22,7 @@ fn fixture() -> (Export, RecoveryRegistration) {
         fingerprint: String::new(),
         message: serde_json::from_value(serde_json::json!({"messageId":"message","role":"ROLE_USER","parts":[{"text":"Hello"}]})).unwrap(),
         allocation: allocation.clone(),
+        principals: None,
     };
     let record = RecoveryRegistration {
         agent: export.agent.clone(),

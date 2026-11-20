@@ -54,9 +54,10 @@ pub(super) struct PreparedTarget {
 }
 
 /// One turn's callback state, retained beside LoopResult until actor dispatch.
+/// The config is shared because its size inflates every retained preparation future.
 #[derive(Clone)]
 pub(super) struct HandoffPreparation {
-    config: Config,
+    config: Arc<Config>,
     registry: SessionMap,
     targets: Arc<Mutex<HashMap<String, PreparedTarget>>>,
     failure: Arc<Mutex<Option<String>>>,
@@ -65,7 +66,7 @@ pub(super) struct HandoffPreparation {
 impl HandoffPreparation {
     pub(super) fn new(config: Config, registry: SessionMap) -> Self {
         Self {
-            config,
+            config: Arc::new(config),
             registry,
             targets: Default::default(),
             failure: Default::default(),
@@ -151,7 +152,7 @@ impl HandoffPreparation {
         session_id: Option<String>,
     ) -> Result<HandoffSessionId> {
         let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) else {
-            return Config::reserve_new_session_id(scoped)
+            return Box::pin(Config::reserve_new_session_id(scoped))
                 .await
                 .map(HandoffSessionId::Reserved);
         };
@@ -179,6 +180,21 @@ impl HandoffPreparation {
     }
 }
 
+mod identity;
+
+use identity::InheritedIdentity;
+
+pub(crate) async fn lookup_identity_for_tests(
+    config: &Config,
+    key: &SessionKey,
+) -> anyhow::Result<(
+    Option<String>,
+    Option<harnx_core::user_principals::UserPrincipals>,
+)> {
+    let identity = identity::lookup_handoff_identity(config, key).await?;
+    Ok((identity.user_id, identity.user_principals))
+}
+
 pub(super) struct HandoffRequest {
     pub(super) prepared: PreparedTarget,
     pub(super) prompt: String,
@@ -200,14 +216,21 @@ impl SessionActor {
             prompt,
             handoff_tool_call_id,
         } = request;
+        let identity = match self.handoff_identity().await {
+            Ok(identity) => identity,
+            Err(_) => return self.fail_handoff(done, self.handoff_identity_error()),
+        };
         let PreparedTarget { target, session_id } = prepared;
         // Requested IDs were validated during preparation. Reserved IDs must never
         // enter caller ownership validation, even if another agent uses the same ID.
         let target_session_id = session_id.into_string();
         let target_key = SessionKey::new(target.clone(), target_session_id.clone());
         if target_key == self.key {
-            self.queue_self_handoff(prompt, parent);
-        } else if let Err(error) = self.send_handoff_prompt(&target_key, prompt, parent).await {
+            self.queue_self_handoff(prompt, parent, identity);
+        } else if let Err(error) = self
+            .send_handoff_prompt(&target_key, prompt, parent, identity)
+            .await
+        {
             self.fail_handoff(done, error);
             return;
         }
@@ -224,13 +247,11 @@ impl SessionActor {
         &mut self,
         prompt: String,
         parent: harnx_runtime::nats_session_metadata::RunLimitsRecord,
+        identity: InheritedIdentity,
     ) {
         self.pending.push_back(PendingPrompt {
             text: prompt,
-            options: SessionPromptOptions {
-                runtime_parent: Some(Box::new(parent)),
-                ..Default::default()
-            },
+            options: identity.into_prompt_options(parent, self.web_address.inferred_base()),
         });
     }
 
@@ -239,6 +260,7 @@ impl SessionActor {
         target_key: &SessionKey,
         prompt: String,
         parent: harnx_runtime::nats_session_metadata::RunLimitsRecord,
+        identity: InheritedIdentity,
     ) -> Result<()> {
         let target_handle = self.get_or_spawn_target_session_actor(target_key.clone());
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -246,11 +268,7 @@ impl SessionActor {
             .tx
             .send(SessionCommand::Prompt {
                 text: prompt,
-                options: SessionPromptOptions {
-                    runtime_parent: Some(Box::new(parent)),
-                    web_base_url: self.web_address.inferred_base().map(str::to_string),
-                    ..Default::default()
-                },
+                options: identity.into_prompt_options(parent, self.web_address.inferred_base()),
                 reply: reply_tx,
             })
             .await
