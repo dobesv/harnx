@@ -1598,8 +1598,7 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    observation; `SubagentToolset::cancel` interrupts children only for
    `session_new`/`session_prompt`. Ancestor checks
    (`TurnWorker::refuse_resume_under_interrupted_parent`,
-   `nats_worker/daemon_turn_input.rs`; `nats_worker/ancestor_check.rs` is its
-   `#[cfg(test)]` twin) stop at a detached admission,
+   `nats_worker/daemon_turn_input.rs`) stop at a detached admission,
    after checking that invocation's own terminal state for synchronous
    descendants. Explicit `session_cancel` and inherited deadlines still stop
    detached work. The default-false field preserves old admission JSON without

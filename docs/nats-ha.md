@@ -1089,8 +1089,7 @@ wind-up has cancelled them. Two guards make the order irrelevant.
 tool_call_id }` in its metadata at creation. Before rolling an
 `InFlightResumable` turn forward — and before each later turn of the same
 session — the worker runs `refuse_resume_under_interrupted_parent`
-(`nats_worker/daemon_turn_input.rs`; `nats_worker/ancestor_check.rs` is a
-cfg(test) re-implementation of the same verdict): if a parent delegation
+(`nats_worker/daemon_turn_input.rs`): if a parent delegation
 invocation ended in `Cancel` or `Error`, nothing is waiting for the child's
 answer, so it does not resume — it interrupts itself with a `parent-stop:`
 cancellation and winds up instead. The walk follows admission links upward,
