@@ -7,6 +7,7 @@ use crate::common;
 
 use futures_util::{StreamExt, TryStreamExt};
 use harnx_core::event::{AgentEvent, AgentEventSink};
+use harnx_core::middleware::{MiddlewareDefinition, MiddlewareEntry, MiddlewareSourceConfig};
 use harnx_runtime::config::ConfigLock;
 use harnx_runtime::config::{
     Config, GlobalConfig, ToolServerConfig, HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV,
@@ -449,6 +450,126 @@ async fn a_session_only_starts_the_servers_its_agent_uses() -> anyhow::Result<()
         "starting a second session must not disturb the first session's servers"
     );
 
+    Ok(())
+}
+
+/// Linger window for the middleware-only-server test: long enough that both
+/// servers stay registered across the moment the session's turn completes,
+/// short enough that the reservation handler's periodic sweep tears them
+/// down well inside the 20s polling deadline. Existing reconciler tests
+/// watch teardown at a zero linger; this test needs the linger itself
+/// observable, because the session ends as soon as its turn does.
+const MIDDLEWARE_ONLY_LINGER: Duration = Duration::from_secs(3);
+
+/// #2796: a server the session's agent never selects must still start when
+/// middleware needs one of its tools. Here `plans` is demanded only by a
+/// middleware entry declared inside its own server config — the aws-creds
+/// shape — with `tools: [plans_list_plans]`, while the agent's
+/// `use_tools: time_*` matches the `time` server alone. The turn is driven
+/// through the real activation path, so a missing middleware union at
+/// selection time leaves `plans` unstarted and the middleware's tool
+/// unallowlisted. After the turn ends, the middleware-only server must
+/// linger and stop exactly like the agent-selected one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_starts_servers_that_only_its_middleware_needs() -> anyhow::Result<()> {
+    harnx_core::require_nextest();
+    let Some(nats) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(E2E_TOKEN.to_string()),
+    })
+    .await?
+    else {
+        eprintln!("skipping: nats-server binary not available");
+        return Ok(());
+    };
+
+    const AGENT_TIME_ONLY: AgentFixture = AgentFixture {
+        name: "agent-time-only",
+        use_tools: "time_*",
+    };
+
+    let config_root = tempfile::tempdir()?;
+    let agents_dir = config_root.path().join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+    write_agent(&agents_dir, &AGENT_TIME_ONLY)?;
+    let _env = EnvGuard::install(&[
+        (HARNX_NATS_URL_ENV, nats.url()),
+        (HARNX_NATS_TOKEN_ENV, E2E_TOKEN),
+        ("HARNX_CONFIG_DIR", &config_root.path().to_string_lossy()),
+    ]);
+
+    let config = e2e_worker_config(
+        resolve_binary("harnx-time-tools")?,
+        resolve_binary("harnx-plans-tools")?,
+    );
+    {
+        let mut config = config.write();
+        let plans = config
+            .tool_servers
+            .iter_mut()
+            .find(|server| server.name == "plans")
+            .expect("e2e_worker_config includes the plans server");
+        plans
+            .middleware
+            .entries
+            .push(MiddlewareEntry::Full(MiddlewareDefinition {
+                name: "plans-helper".to_string(),
+                // Selection ignores match patterns on purpose — the session
+                // may call a matching tool at any time — so `.*` keeps the
+                // fixture minimal. The inline `bash: next` script exists
+                // only so resolution succeeds; the stub agent never calls
+                // a tool, so it never runs.
+                matcher: ".*".to_string(),
+                source: MiddlewareSourceConfig::Bash {
+                    bash: "next".to_string(),
+                },
+                // A concrete tool name, the way `aws_creds_environment`
+                // names a tool of the `aws_creds` server.
+                tools: vec!["plans_list_plans".to_string()],
+                fetch: Vec::new(),
+                timeout: Duration::from_secs(30),
+                on_error: Default::default(),
+            }));
+    }
+
+    let daemon = WorkerDaemonConfig::managing(LOCAL_CLUSTER_KEY, "middleware-reconciler-e2e")
+        .with_tool_reservation_timing_for_test(Duration::from_secs(10), MIDDLEWARE_ONLY_LINGER);
+    let worker_config = config.clone();
+    let worker = tokio::spawn(async move {
+        run_worker_daemon(worker_config, daemon, Some(stub_call_fn()), None).await
+    });
+
+    let client = async_nats::ConnectOptions::new()
+        .token(E2E_TOKEN.to_string())
+        .connect(nats.url())
+        .await?;
+    // Wait for readiness so the activation cannot beat the worker's
+    // subscriptions, the same way `spawn_capturing_worker` does.
+    let mut readiness = client
+        .subscribe(harnx_runtime::nats_worker::worker_ready_subject(
+            LOCAL_CLUSTER_KEY,
+        ))
+        .await?;
+    client.flush().await?;
+    tokio::time::timeout(Duration::from_secs(5), readiness.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("worker readiness subscription closed"))?;
+
+    // A full turn exercises the real activation path: claim, server start,
+    // execution, then session end — which releases both servers' user.
+    run_agent_turn(&client, "middleware-only", AGENT_TIME_ONLY.name, "stub").await?;
+
+    await_registered(&client, "time").await?;
+    await_registered(&client, "plans").await?;
+
+    // Both servers linger after the session ends — refcounting treats the
+    // middleware-only server like the agent-selected one — and the
+    // reservation handler's periodic sweep stops them once the linger
+    // window passes.
+    await_deregistered(&client, "time").await?;
+    await_deregistered(&client, "plans").await?;
+
+    worker.abort();
+    let _ = worker.await;
     Ok(())
 }
 

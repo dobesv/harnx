@@ -11,7 +11,7 @@ Copy the provider YAML and Python script into your active package, preserving th
 | AWS | `tool_servers/aws_creds.yaml` | `middleware/aws-creds.py` |
 | Kubernetes | `tool_servers/k8s_creds.yaml` | `middleware/k8s-creds.py` |
 
-Keep your package's existing `bash.yaml`. Each provider YAML declares its own middleware matching `^bash_(exec|spawn)$`; no legacy hooks are needed.
+Keep your package's existing `bash.yaml`. Each provider YAML declares its own middleware matching `^bash_(exec|spawn)$`; no legacy hooks are needed. Under local worker management, the provider's tool server starts automatically for sessions using the middleware without listing credential tools in the agent's `use_tools`.
 
 AWS works independently. Add `--profile <name>` to `aws_creds.yaml` if needed; otherwise it uses the host AWS SDK credential chain.
 
@@ -34,7 +34,7 @@ The environment tools return endpoint capabilities and file locations, not sourc
 
 AWS and bash need the same loopback network namespace. Kubernetes also needs its generated kubeconfig readable by bash at the same absolute path, and `curl` on the child `PATH`. The worker executing middleware may be remote.
 
-The supplied native services start on one host under the local managed supervisor. For remote bash, separate containers or Kubernetes sandboxes, arrange shared namespaces/mounts yourself; NATS alone doesn't provide them.
+The supplied native services start on one host under the local managed supervisor when session middleware requires them, without listing credential tools in `use_tools`. For remote bash, separate containers or Kubernetes sandboxes, arrange shared namespaces/mounts yourself; NATS alone doesn't provide them.
 
 Unmanaged services use the worker's `HARNX_NATS_URL`, `HARNX_NATS_TOKEN` and `HARNX_SERVER_SCOPE`. Set `HARNX_SERVER_PACKAGE=credential-tools`, `HARNX_SERVER_CONFIG` and `--name` to each service's YAML basename (`aws_creds`, `k8s_creds` or `bash`), and `HARNX_PACKAGE_DIR` to this package's absolute path on that host. For a copied configuration, substitute its package name/path.
 

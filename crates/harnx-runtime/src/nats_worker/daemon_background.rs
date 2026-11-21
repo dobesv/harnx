@@ -240,6 +240,18 @@ pub(super) struct BackgroundServices {
     _subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
 }
 
+/// Tool servers this worker should run for the config it is holding.
+///
+/// Selection follows the active agent's `use_tools` (falling back to the
+/// global `use_tools`), its `bash_tools`, and the `tools:`
+/// selectors of every middleware entry active for that agent, so a server
+/// that only hosts middleware helper tools starts too. Middleware selectors
+/// go through `tool_servers_for_view` with the same agent package the
+/// middleware itself resolves tools with, and matching ignores middleware
+/// `match` patterns: the session can call a matching tool at any time, and
+/// the server should already be running when it does. A middleware
+/// resolution error warns and continues with the agent-derived servers; the
+/// failing turn still reports the middleware error through its own path.
 pub(super) fn configured_worker_services(config: &GlobalConfig) -> Vec<ToolServerConfig> {
     let config = config.read();
     let agent_package = config
@@ -258,6 +270,20 @@ pub(super) fn configured_worker_services(config: &GlobalConfig) -> Vec<ToolServe
     // inner set resolves to nothing on the worker.
     if let Some(bash_tools) = config.agent.as_ref().and_then(|agent| agent.bash_tools()) {
         selectors.extend(bash_tools);
+    }
+    // #2796: middleware helper tools resolve with the same package context as
+    // the agent's own selectors (see middleware/wiring.rs), so their servers
+    // join the same selection instead of failing as not allowlisted.
+    match config.resolved_middleware() {
+        Ok(chain) => selectors.extend(
+            chain
+                .entries
+                .iter()
+                .flat_map(|entry| entry.tools.iter().cloned()),
+        ),
+        Err(error) => {
+            log::warn!("could not resolve middleware for tool-server selection: {error:#}")
+        }
     }
     tool_servers_for_view(&config, agent_package, &selectors)
 }
@@ -450,6 +476,7 @@ mod tests {
         tool_servers_for_view, tool_servers_matching_use_tools,
     };
     use crate::config::{Agent, AgentConfig, Config, ToolServerConfig};
+    use harnx_core::middleware::{MiddlewareDefinition, MiddlewareEntry, MiddlewareSourceConfig};
 
     fn tool_server(name: &str) -> ToolServerConfig {
         ToolServerConfig {
@@ -463,6 +490,51 @@ mod tests {
             package: None,
             hooks: None,
         }
+    }
+
+    fn middleware_with_tools(name: &str, tools: &[&str]) -> MiddlewareEntry {
+        MiddlewareEntry::Full(MiddlewareDefinition {
+            name: name.to_string(),
+            matcher: ".*".to_string(),
+            source: MiddlewareSourceConfig::Bash {
+                bash: "next".to_string(),
+            },
+            tools: tools.iter().map(|tool| tool.to_string()).collect(),
+            fetch: Vec::new(),
+            timeout: std::time::Duration::from_secs(30),
+            on_error: Default::default(),
+        })
+    }
+
+    fn disabled_middleware(name: &str) -> MiddlewareEntry {
+        MiddlewareEntry::Disable {
+            name: name.to_string(),
+            enabled: false,
+        }
+    }
+
+    fn worker_config_with_global_middleware(
+        agent_markdown: &str,
+        middleware: MiddlewareEntry,
+        tool_servers: Vec<ToolServerConfig>,
+    ) -> crate::config::GlobalConfig {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.middleware.entries.push(middleware);
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", agent_markdown).unwrap(),
+            ));
+            config.tool_servers = tool_servers;
+        }
+        config
+    }
+
+    fn configured_server_names(config: &crate::config::GlobalConfig) -> Vec<String> {
+        configured_worker_services(config)
+            .into_iter()
+            .map(|server| server.name)
+            .collect()
     }
 
     #[test]
@@ -638,6 +710,130 @@ mod tests {
             AgentConfig::from_markdown("coding/worker", "---\nuse_tools: []\n---\n").unwrap(),
         ));
         assert!(configured_worker_services(&config).is_empty());
+    }
+
+    #[test]
+    fn configured_worker_services_starts_servers_only_middleware_needs() {
+        // #2796: `plans` and `weather` are excluded from the agent's
+        // use_tools, but agent-front-matter and global middleware declare
+        // their tools, so both servers must start alongside `fs`.
+        let config = worker_config_with_global_middleware(
+            "---\nuse_tools: [fs_*]\nmiddleware: [{name: agent-helper, match: '.*', bash: next, tools: [plans_list]}]\n---\n",
+            middleware_with_tools("global-helper", &["weather_get_forecast"]),
+            vec![
+                tool_server("fs"),
+                tool_server("plans"),
+                tool_server("weather"),
+            ],
+        );
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "plans", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_starts_a_server_declaring_its_own_middleware() {
+        // aws-creds shape (#2796): the middleware lives in the tool
+        // server's own file, so the server is needed only by middleware
+        // declared within it.
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            let mut weather = tool_server("weather");
+            weather.middleware.entries.push(middleware_with_tools(
+                "weather-auth",
+                &["weather_get_forecast"],
+            ));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", "---\nuse_tools: [fs_*]\n---\n").unwrap(),
+            ));
+            config.tool_servers = vec![tool_server("fs"), weather];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_ignores_middleware_removed_by_a_later_disable() {
+        // The agent disables the global entry, so it never reaches the
+        // resolved chain and its tools create no server demand.
+        let config = worker_config_with_global_middleware(
+            "---\nuse_tools: [fs_*]\nmiddleware: [{name: helper, enabled: false}]\n---\n",
+            middleware_with_tools("helper", &["weather_get_forecast"]),
+            vec![tool_server("fs"), tool_server("weather")],
+        );
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs"]);
+    }
+
+    #[test]
+    fn configured_worker_services_ignores_middleware_in_a_disabled_server_file() {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            let mut weather = tool_server("weather");
+            weather.enabled = false;
+            weather.middleware.entries.push(middleware_with_tools(
+                "weather-auth",
+                &["weather_get_forecast"],
+            ));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", "---\nuse_tools: [fs_*]\n---\n").unwrap(),
+            ));
+            config.tool_servers = vec![tool_server("fs"), weather];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs"]);
+    }
+
+    #[test]
+    fn configured_worker_services_does_not_duplicate_middleware_selected_servers() {
+        // Agent and middleware selectors overlap on both servers; each
+        // configured server still appears at most once.
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.middleware.entries.push(middleware_with_tools(
+                "helper",
+                &["weather_get_forecast", "fs_*"],
+            ));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", "---\nuse_tools: [weather_*]\n---\n").unwrap(),
+            ));
+            config.tool_servers = vec![tool_server("fs"), tool_server("weather")];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_keeps_agent_servers_when_middleware_resolution_fails() {
+        // Script paths are validated at config load, so the error is induced
+        // with a Disable naming an entry no earlier level declared —
+        // `apply_level` rejects it at resolution time. Selection must warn
+        // and fall back to the agent's servers instead of aborting.
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.middleware.entries.push(disabled_middleware("ghost"));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", "---\nuse_tools: [fs_*]\n---\n").unwrap(),
+            ));
+            config.tool_servers = vec![tool_server("fs"), tool_server("weather")];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs"]);
     }
 
     #[test]

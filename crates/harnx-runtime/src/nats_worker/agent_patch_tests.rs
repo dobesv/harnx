@@ -543,6 +543,29 @@ fn tool_servers_for_activation_demands_servers_for_the_patched_agent() {
     );
 }
 
+/// #2796: middleware helper tools demand their servers at activation, not
+/// just the agent's use_tools. The `fs` server is selected only by the
+/// agent-declared middleware's `tools:`.
+#[test]
+fn tool_servers_for_activation_starts_middleware_only_servers() {
+    require_nextest();
+    let fixture = AgentFixture::open(
+        "---\nmodel: openai:test-model\nuse_tools: [jira_search]\nmiddleware:\n  - name: helper\n    match: '^bash_exec$'\n    bash: echo helper\n    tools: [fs_read]\n---\nTailored agent.\n",
+    );
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", fixture._temp.path());
+
+    let mut config = fixture.config.clone();
+    config.tool_servers = vec![tool_server("fs"), tool_server("jira")];
+    let global = Arc::new(ConfigLock::new(config));
+
+    let demand: Vec<String> =
+        tool_servers_for_activation(&global, &fixture.metadata(&developer_principals()))
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+    assert_eq!(demand, vec!["fs".to_string(), "jira".to_string()]);
+}
+
 #[test]
 fn rebuilt_and_regenerated_inputs_keep_patched_config_and_principals() {
     use crate::config::{input, session};
