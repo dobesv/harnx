@@ -425,6 +425,12 @@ impl Config {
             compacted_msgs.clone(),
             params.tool_output_max_chars,
             session.compaction_summary.as_deref(),
+        )
+        .with_kept(
+            keep_plan
+                .kept_indices(session.messages.len())
+                .into_iter()
+                .map(|index| &session.messages[index]),
         );
         let from = compacted_msgs.clone().filter_map(|m| m.log_seq).min();
         let to = compacted_msgs.filter_map(|m| m.log_seq).max();
@@ -496,9 +502,19 @@ mod tests {
                 plan.prompt_idx, expected_prompt,
                 "limit={limit:?}, configured={configured:?}"
             );
+            let rendered = transcript.fit(usize::MAX);
+            let (summarized, kept) = rendered.split_once("</transcript>").unwrap();
             assert_eq!(
-                transcript.fit(usize::MAX).contains("word word"),
-                expected_prompt.is_none()
+                summarized.contains("word word"),
+                expected_prompt.is_none(),
+                "{rendered}"
+            );
+            // A kept prompt is replayed after the summary, so the summarizer
+            // is shown it as context instead of as material to summarize.
+            assert_eq!(
+                kept.contains("<kept_after_summary>\n<user>\nword word"),
+                expected_prompt.is_some(),
+                "{rendered}"
             );
         }
     }

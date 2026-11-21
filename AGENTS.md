@@ -172,6 +172,13 @@ rustqual treats only an exact `#[cfg(test)]` as test code. A module gated with
 `unwrap`s and test-only calls are reported. Write that gate as two attributes,
 `#[cfg(test)]` and `#[cfg(unix)]`, which compile the same.
 
+A finding in a file the change never touched can still come from the change.
+The repeated-match check (DRY-005, `repeated_match`) groups `match` expressions
+by the shape of their arms, whatever the enum and the values, and reports every
+member once a group reaches three. A new `A => 0, B => 2, _ => 1` match on one
+enum joined two such matches on unrelated enums in test files, and all three
+were reported.
+
 The `Code quality` CI job runs the gate on pull requests and annotates the diff
 with what it finds. It is advisory: `.mergify.yml` doesn't require it.
 
