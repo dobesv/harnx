@@ -3,8 +3,10 @@
 Middleware wraps tool calls with in-process BashKit Bash or Monty Python scripts.
 Use it to rewrite arguments, deny a call, transform its result, or call trusted
 helper tools. It runs in the worker, including cloud/unmanaged workers without
-`manage_servers`; it doesn't launch a hook-server process. Helper tool servers
-still need to be available to that worker.
+`manage_servers`; it doesn't launch a hook-server process. When the worker
+manages tool servers locally, servers hosting helper tools start automatically on
+session activation without listing them in the agent's `use_tools`. On unmanaged
+workers, helper servers must run externally and be available to the worker.
 
 Lifecycle `hooks:` are in-process event scripts now; see the [Hooks Guide](hooks-guide.md).
 To call an existing Claude hook command from middleware, use the
@@ -36,7 +38,7 @@ middleware:
 | `bash` | Inline BashKit source. |
 | `python` | Inline Monty Python source. |
 | `script` | Script file with `.sh`, `.bash`, or `.py` extension. |
-| `tools` | Helper tool selectors, same syntax as `bash_tools`; empty by default. |
+| `tools` | Helper tool selectors, same syntax as `bash_tools`; empty by default. Starts required servers under local worker management. |
 | `fetch` | Exact HTTP(S) host allowlist for this entry, e.g. `[policy.example.com]`. Empty or omitted denies all fetches. See controlled fetch below. |
 | `timeout` | Positive duration string, default `30s`. Includes downstream execution time. |
 | `on_error` | `deny` (default) or `allow`; see error policy below. |
@@ -753,6 +755,35 @@ Operator root calls auto-approve `confirm` under scoped operator consent;
 operator calls — `interact` names the reason and points at `harnx interact
 answer` for sessions, where a pending interaction can be answered from the
 CLI.
+
+### Helper tool servers and startup
+
+When the worker daemon manages tool servers locally, servers hosting middleware
+helper tools start automatically on session activation. You do not need to list
+helper tools in the agent's `use_tools` (or the global `use_tools` fallback) just
+to start their servers.
+
+- **Active middleware sources:** The worker collects `tools:` selectors from
+  every middleware entry active for the session: global `middleware:`,
+  middleware declared in enabled tool-server files, and agent front matter.
+  Entries removed by a later disable entry (`enabled: false`) and middleware in
+  disabled tool-server files do not contribute selectors.
+- **Selector matching:** Selectors follow standard `use_tools` matching rules,
+  including concrete tool names, toolsets, package-qualified names, and
+  wildcards (`*`). For example, `tools: ["*"]` starts every configured server.
+  Matching uses the active agent's package context, identical to execution-time
+  tool resolution.
+- **Match patterns ignored for startup:** Tool-server selection ignores
+  middleware `match` regexes. Sessions may call matching tools at any point, so
+  required servers start on session activation and stay ready.
+- **Server lifecycle:** Servers started for middleware are reference-counted
+  and linger after turns and sessions exactly like servers started for agent
+  `use_tools`.
+- **Unmanaged workers:** Automatic startup applies only when the worker daemon
+  manages tool servers locally. On unmanaged or cloud workers where tool servers
+  run externally, helper servers must run independently and be available over NATS.
+- **Lifecycle hooks:** In-process event hooks (`hooks:`) are separate and do not
+  declare or start tool servers (#2798).
 
 ## Deployment and crash limits
 
