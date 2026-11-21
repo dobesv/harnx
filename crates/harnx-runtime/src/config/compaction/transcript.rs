@@ -1,8 +1,16 @@
 //! Sanitized transcript pieces, kept separate until the summarizer budget is known.
+//!
+//! The summarizer reads the transcript as XML-style elements: the dropped
+//! messages inside `<transcript>`, then `<kept_after_summary>` listing what is
+//! replayed verbatim after the summary. Each speaker has its own element, so
+//! the summarizer can attribute text: an agent's instructions to a delegate
+//! sit inside `<tool_call>` and the delegate's echo of them inside
+//! `<tool_result>`, never inside `<user>`.
 
-use super::{is_turn_prompt, render_tool_output};
-use fancy_regex::Regex;
+use super::{is_turn_prompt, render_tool_output, truncate_middle};
+use fancy_regex::{Captures, Regex};
 use harnx_core::message::{Message, MessageContent, MessageContentPart, MessageRole};
+use harnx_core::runtime_note::is_reserved_message_id;
 use harnx_core::session::ToolOutput;
 use harnx_core::text::estimate_token_length;
 use std::borrow::Cow;
@@ -31,6 +39,32 @@ pub(super) fn strip_data_urls(text: &str) -> Cow<'_, str> {
     })
 }
 
+/// Our own element names, wherever they appear in message or tool text. Text
+/// such as a file of this module, or a tool result quoting `</tool_result>`,
+/// must not be able to close an element or open a forged `<user>`. A new
+/// element name belongs in this list too.
+static ELEMENT_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"<(/?)(transcript|earlier_summary|kept_after_summary|system|user|assistant|runtime_note|tool_call|tool_result)\b",
+    )
+    .unwrap()
+});
+
+fn escape_element_tags(text: &str) -> Cow<'_, str> {
+    ELEMENT_TAG.replace_all(text, |captures: &Captures<'_, str>| {
+        format!("&lt;{}{}", &captures[1], &captures[2])
+    })
+}
+
+fn attribute(name: &str, value: &str) -> String {
+    let value = strip_data_urls(value)
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace(['\r', '\n'], " ");
+    format!(" {name}=\"{value}\"")
+}
+
 fn render_parts(parts: &[MessageContentPart]) -> String {
     parts
         .iter()
@@ -55,26 +89,45 @@ enum Kind {
 
 #[derive(Clone)]
 struct Section {
-    heading: String,
+    open: String,
     body: String,
+    close: String,
     stub: Option<String>,
 }
 
 impl Section {
-    fn new(heading: impl Into<String>, body: &str) -> Self {
-        Self::from_sanitized(heading, strip_data_urls(body).into_owned())
+    /// An element whose body is message or tool text: strips inline data and
+    /// escapes our own tag names so the body cannot end the element early.
+    fn element(tag: &str, attributes: &str, body: &str) -> Self {
+        Self::from_sanitized(tag, attributes, &strip_data_urls(body))
     }
 
-    fn from_sanitized(heading: impl Into<String>, body: String) -> Self {
+    /// Like `element`, for a body whose data URLs were already stripped.
+    fn from_sanitized(tag: &str, attributes: &str, body: &str) -> Self {
         Self {
-            heading: heading.into(),
-            body,
+            open: format!("<{tag}{attributes}>\n"),
+            body: escape_element_tags(body).into_owned(),
+            close: format!("\n</{tag}>"),
+            stub: None,
+        }
+    }
+
+    /// A self-closing element that stands in for content left out.
+    fn empty(tag: &str, attributes: &str) -> Self {
+        Self {
+            open: format!("<{tag}{attributes}/>"),
+            body: String::new(),
+            close: String::new(),
             stub: None,
         }
     }
 
     fn render(&self) -> String {
-        format!("{}{}", self.heading, self.body)
+        format!("{}{}{}", self.open, self.body, self.close)
+    }
+
+    fn frame_tokens(&self) -> usize {
+        estimate_token_length(&self.open) + estimate_token_length(&self.close)
     }
 
     fn shrink_to_stub(&mut self) -> bool {
@@ -84,8 +137,9 @@ impl Section {
         if estimate_token_length(&stub) >= estimate_token_length(&self.render()) {
             return false;
         }
-        self.heading.clear();
-        self.body = stub;
+        self.open = stub;
+        self.body.clear();
+        self.close.clear();
         true
     }
 }
@@ -103,23 +157,23 @@ impl RenderedMessage {
         if let MessageContent::ToolCalls(calls) = &message.content {
             return Self::new(Kind::Tool, tool_sections(calls, max_tool_chars));
         }
-        let (kind, label) = message_kind_and_label(message);
+        let (kind, tag) = message_kind_and_tag(message);
         let body = render_content(&message.content);
-        let mut section = Section::new(format!("── {label} ──\n"), &body);
+        let mut section = Section::element(tag, "", &body);
         if kind == Kind::Tool {
-            section.stub = Some("[tool: completed; output omitted]".into());
+            section.stub = Some(format!(
+                "<tool_result{}{}/>",
+                attribute("status", "completed"),
+                attribute("output", "omitted")
+            ));
         }
         Self::new(kind, vec![section])
     }
 
     fn prior_summary(summary: &str) -> Self {
-        let heading = format!(
-            "{}Earlier compaction summary:\n",
-            crate::config::session::RUNTIME_NOTE_PREFIX
-        );
         Self::new(
             Kind::Context,
-            vec![Section::new(heading, &format!("{summary}\n\n---"))],
+            vec![Section::element("earlier_summary", "", summary)],
         )
     }
 
@@ -135,11 +189,7 @@ impl RenderedMessage {
     }
 
     fn render(&self) -> String {
-        self.sections
-            .iter()
-            .map(Section::render)
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        render_sections(&self.sections)
     }
 
     fn recount(&mut self) {
@@ -147,13 +197,28 @@ impl RenderedMessage {
     }
 }
 
-fn message_kind_and_label(message: &Message) -> (Kind, &'static str) {
+fn render_sections(sections: &[Section]) -> String {
+    sections
+        .iter()
+        .map(Section::render)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Runtime notes, hook context and timing notices are user-role rows the
+/// harness wrote. Only the structured id or the timing receipt identifies
+/// them; the `[Runtime note]` text prefix is not trusted.
+fn is_runtime_context(message: &Message) -> bool {
+    !is_turn_prompt(message) || message.id.as_deref().is_some_and(is_reserved_message_id)
+}
+
+fn message_kind_and_tag(message: &Message) -> (Kind, &'static str) {
     match message.role {
         MessageRole::System => (Kind::Context, "system"),
-        MessageRole::User if is_turn_prompt(message) => (Kind::User, "user"),
-        MessageRole::User => (Kind::Context, "user"),
+        MessageRole::User if is_runtime_context(message) => (Kind::Context, "runtime_note"),
+        MessageRole::User => (Kind::User, "user"),
         MessageRole::Assistant => (Kind::Assistant, "assistant"),
-        MessageRole::Tool => (Kind::Tool, "tool result"),
+        MessageRole::Tool => (Kind::Tool, "tool_result"),
     }
 }
 
@@ -178,15 +243,26 @@ fn mark_turn_replies(messages: &mut [RenderedMessage]) {
     }
 }
 
+fn tool_status(output: &serde_json::Value) -> &'static str {
+    let failed = ["isError", "is_error"]
+        .iter()
+        .any(|key| output.get(key).and_then(|v| v.as_bool()) == Some(true));
+    if failed {
+        "error"
+    } else {
+        "completed"
+    }
+}
+
 fn tool_sections(calls: &harnx_core::message::MessageContentToolCalls, cap: usize) -> Vec<Section> {
     let mut sections = Vec::new();
     if !calls.text.is_empty() {
-        sections.push(Section::new("── assistant ──\n", &calls.text));
+        sections.push(Section::element("assistant", "", &calls.text));
     }
     for result in &calls.tool_results {
-        let name = strip_data_urls(&result.call.name).replace(['\r', '\n'], " ");
+        let name = attribute("name", &result.call.name);
         let args = serde_json::to_string(&result.call.arguments).unwrap_or_default();
-        sections.push(Section::new(format!("── tool call: {name} ──\n"), &args));
+        sections.push(Section::element("tool_call", &name, &args));
         let output = ToolOutput {
             id: result.call.id.clone(),
             name: result.call.name.clone(),
@@ -196,23 +272,144 @@ fn tool_sections(calls: &harnx_core::message::MessageContentToolCalls, cap: usiz
             user_surfaces: result.user_surfaces.clone(),
             switch_agent: result.switch_agent.clone(),
         };
-        let failed = ["isError", "is_error"]
-            .iter()
-            .any(|key| result.output.get(key).and_then(|v| v.as_bool()) == Some(true));
-        let status = if failed { "error" } else { "completed" };
+        let status = attribute("status", tool_status(&result.output));
         // The three-tier renderer already sanitizes before applying its cap.
-        let mut section =
-            Section::from_sanitized("── tool result ──\n", render_tool_output(&output, cap));
-        section.stub = Some(format!("[{name}: {status}; output omitted]"));
+        let mut section = Section::from_sanitized(
+            "tool_result",
+            &format!("{name}{status}"),
+            &render_tool_output(&output, cap),
+        );
+        section.stub = Some(format!(
+            "<tool_result{name}{status}{}/>",
+            attribute("output", "omitted")
+        ));
         sections.push(section);
     }
     sections
+}
+
+/// What the summarizer sees of a message replayed after its summary: who
+/// spoke and what they said, with tool arguments and results left out.
+fn kept_sections(message: &Message, cap: usize) -> Vec<(Kind, Section)> {
+    let excerpt = |text: &str| truncate_middle(&strip_data_urls(text), cap);
+    if let MessageContent::ToolCalls(calls) = &message.content {
+        let mut sections = Vec::new();
+        if !calls.text.is_empty() {
+            sections.push((
+                Kind::Assistant,
+                Section::from_sanitized("assistant", "", &excerpt(&calls.text)),
+            ));
+        }
+        sections.extend(calls.tool_results.iter().map(|result| {
+            let name = attribute("name", &result.call.name);
+            (Kind::Tool, Section::empty("tool_call", &name))
+        }));
+        return sections;
+    }
+    match message_kind_and_tag(message) {
+        (Kind::Tool, tag) => vec![(Kind::Tool, Section::empty(tag, ""))],
+        (kind, tag) => {
+            let body = excerpt(&render_content(&message.content));
+            vec![(kind, Section::from_sanitized(tag, "", &body))]
+        }
+    }
+}
+
+const KEPT_OPEN: &str = "<kept_after_summary>\n";
+const KEPT_CLOSE: &str = "\n</kept_after_summary>";
+
+/// Render the replayed messages within `limit` tokens. Excerpting bodies can't
+/// shrink element tags, so a round of many tool calls can overflow `limit` by
+/// itself; the fewest elements that make the block fit are then left out.
+fn render_kept(sections: &[(Kind, Section)], limit: usize) -> String {
+    if sections.is_empty() {
+        return "<kept_after_summary/>".into();
+    }
+    let order = kept_omission_order(sections);
+    let render = |omitted: usize| {
+        let mut shown = vec![true; sections.len()];
+        order[..omitted]
+            .iter()
+            .for_each(|&index| shown[index] = false);
+        let shown: Vec<&Section> = sections
+            .iter()
+            .zip(shown)
+            .filter_map(|((_, section), show)| show.then_some(section))
+            .collect();
+        let full = wrap_kept(&shown, omitted, None);
+        if estimate_token_length(&full) <= limit {
+            full
+        } else {
+            wrap_kept(&shown, omitted, Some(limit))
+        }
+    };
+    let all = render(0);
+    if estimate_token_length(&all) <= limit {
+        return all;
+    }
+    // Search for the fewest omissions that fit. Each candidate is measured,
+    // so the result stays within `limit` unless even the bare marker doesn't.
+    let (mut low, mut high) = (1, sections.len());
+    let mut best = render(high);
+    while low < high {
+        let omitted = low + (high - low) / 2;
+        let candidate = render(omitted);
+        if estimate_token_length(&candidate) <= limit {
+            best = candidate;
+            high = omitted;
+        } else {
+            low = omitted + 1;
+        }
+    }
+    best
+}
+
+/// The order elements are left out of the kept block in: tool calls first,
+/// then other messages, then user prompts, each oldest first. The user's
+/// prompt is what the summarizer most needs.
+fn kept_omission_order(sections: &[(Kind, Section)]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..sections.len()).collect();
+    // The sort is stable, so each group stays oldest first.
+    order.sort_by_key(|&index| {
+        let kind = sections[index].0;
+        (kind != Kind::Tool, kind == Kind::User)
+    });
+    order
+}
+
+/// The kept block with `omitted` elements noted as left out. Under a `limit`,
+/// every shown body gets an equal share, excerpted from both ends.
+fn wrap_kept(sections: &[&Section], omitted: usize, limit: Option<usize>) -> String {
+    let marker = (omitted > 0).then(|| format!("[{omitted} replayed elements not listed]"));
+    let share = limit.map(|limit| {
+        let fixed = estimate_token_length(&format!("{KEPT_OPEN}{KEPT_CLOSE}"))
+            + marker.as_deref().map_or(0, estimate_token_length);
+        limit.saturating_sub(fixed) / sections.len().max(1)
+    });
+    let bodies = sections.iter().map(|section| {
+        let mut section = (*section).clone();
+        if let Some(share) = share {
+            section.body =
+                excerpt_text(&section.body, share.saturating_sub(section.frame_tokens()));
+        }
+        section.render()
+    });
+    format!(
+        "{KEPT_OPEN}{}{KEPT_CLOSE}",
+        marker
+            .into_iter()
+            .chain(bodies)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    )
 }
 
 /// Rendering is independent of the session split and can be reused across model fallbacks.
 #[derive(Clone)]
 pub(crate) struct Transcript {
     messages: Vec<RenderedMessage>,
+    kept: Vec<(Kind, Section)>,
+    max_tool_chars: usize,
 }
 
 impl Transcript {
@@ -233,7 +430,22 @@ impl Transcript {
                 .map(|message| RenderedMessage::from_message(message, max_tool_chars)),
         );
         mark_turn_replies(&mut rendered);
-        Self { messages: rendered }
+        Self {
+            messages: rendered,
+            kept: Vec::new(),
+            max_tool_chars,
+        }
+    }
+
+    /// The messages compaction keeps verbatim after the summary. The
+    /// summarizer sees them as context, so it can attribute requests and
+    /// avoid repeating what will be replayed anyway.
+    pub(crate) fn with_kept<'a>(mut self, kept: impl IntoIterator<Item = &'a Message>) -> Self {
+        self.kept = kept
+            .into_iter()
+            .flat_map(|message| kept_sections(message, self.max_tool_chars))
+            .collect();
+        self
     }
 
     /// Apply lossy stages only as needed. The source remains intact for a retry
@@ -281,8 +493,16 @@ pub fn render_transcript(messages: &[Message], max_tool_chars: usize) -> String 
     FittingTranscript::new(Transcript::new(messages, max_tool_chars, None), usize::MAX).render()
 }
 
+const TRANSCRIPT_OPEN: &str = "<transcript>\n";
+const TRANSCRIPT_CLOSE: &str = "\n</transcript>\n\n";
+
 struct FittingTranscript {
     transcript: Transcript,
+    /// The rendered `<kept_after_summary>` block. It takes at most half the
+    /// budget and stays fixed while the stages shrink the dropped messages.
+    kept: String,
+    /// Tokens of the transcript wrapper and the kept block.
+    frame_tokens: usize,
     budget: usize,
     cached_budget: usize,
     tokens: usize,
@@ -295,7 +515,12 @@ struct FittingTranscript {
 impl FittingTranscript {
     fn new(transcript: Transcript, budget: usize) -> Self {
         let latest = |kind| transcript.messages.iter().rposition(|m| m.kind == kind);
+        let kept = render_kept(&transcript.kept, budget / 2);
         Self {
+            frame_tokens: estimate_token_length(&format!(
+                "{TRANSCRIPT_OPEN}{TRANSCRIPT_CLOSE}{kept}"
+            )),
+            kept,
             budget,
             cached_budget: budget,
             tokens: transcript.messages.iter().map(|m| m.tokens).sum(),
@@ -327,13 +552,18 @@ impl FittingTranscript {
                 .filter(|message| !message.omitted)
                 .map(RenderedMessage::render),
         );
-        sections.join("\n\n")
+        format!(
+            "{TRANSCRIPT_OPEN}{}{TRANSCRIPT_CLOSE}{}",
+            sections.join("\n\n"),
+            self.kept
+        )
     }
 
     fn fits(&self) -> bool {
         // Reduction loops must not render the whole transcript on each mutation.
         // Transcript::fit checks the joined estimator at stage boundaries.
-        self.tokens + estimate_token_length(&self.markers()) <= self.cached_budget
+        self.tokens + estimate_token_length(&self.markers()) + self.frame_tokens
+            <= self.cached_budget
     }
 
     fn recount(&mut self, index: usize) {
@@ -395,15 +625,15 @@ impl FittingTranscript {
     }
 
     fn excerpt(&mut self, index: usize) {
-        let marker_tokens = estimate_token_length(&self.markers());
+        let fixed_tokens = estimate_token_length(&self.markers()) + self.frame_tokens;
         let message = &mut self.transcript.messages[index];
         let allowance = self
             .cached_budget
-            .saturating_sub(self.tokens - message.tokens + marker_tokens);
+            .saturating_sub(self.tokens - message.tokens + fixed_tokens);
         // Tool rounds have been removed by stage (b); user/reply/context each
-        // have one section, so labels and omission counts remain intact.
+        // have one section, so their tags and omission counts remain intact.
         for section in &mut message.sections {
-            let body_budget = allowance.saturating_sub(estimate_token_length(&section.heading));
+            let body_budget = allowance.saturating_sub(section.frame_tokens());
             section.body = excerpt_text(&section.body, body_budget);
         }
         self.recount(index);
@@ -438,7 +668,7 @@ impl FittingTranscript {
             kept.insert(0, markers);
         }
         // Only render the protected pair, not a clone of all the discarded history.
-        estimate_token_length(&kept.join("\n\n")) <= self.budget
+        estimate_token_length(&kept.join("\n\n")) + self.frame_tokens <= self.budget
     }
 
     fn excerpt_latest(&mut self) {

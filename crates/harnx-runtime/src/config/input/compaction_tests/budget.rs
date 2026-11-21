@@ -1,7 +1,7 @@
 use super::*;
 
 const DATA_URL: &str = "data:image/png;base64,AQIDBA==";
-const OMITTED_OUTPUT: &str = "[edit: completed; output omitted]";
+const OMITTED_OUTPUT: &str = r#"<tool_result name="edit" status="completed" output="omitted"/>"#;
 
 fn budgeted_session(stream: bool) -> (GlobalConfig, Arc<CaptureLog>, Vec<Message>) {
     let output = format!(
@@ -40,22 +40,38 @@ fn summary_client(limit: usize) -> Arc<MockClient> {
 }
 
 fn assert_dropped_complement(transcript: &str) {
+    let (summarized, kept_block) = transcript.split_once("</transcript>").unwrap();
     for kept in ["remove hex", "hex removed and verified", "\"ok\":true"] {
         assert!(
-            !transcript.contains(kept),
+            !summarized.contains(kept),
             "kept content leaked: {transcript}"
         );
     }
     for dropped in [
         "archived question",
         "archived answer",
-        "── tool call: edit ──",
+        "<tool_call name=\"edit\">",
     ] {
         assert!(
-            transcript.contains(dropped),
+            summarized.contains(dropped),
             "dropped content missing: {transcript}"
         );
     }
+    // The summarizer sees what is replayed, without tool arguments or results.
+    for replayed in [
+        "remove hex",
+        "<tool_call name=\"edit\"/>",
+        "hex removed and verified",
+    ] {
+        assert!(
+            kept_block.contains(replayed),
+            "replayed context missing: {transcript}"
+        );
+    }
+    assert!(
+        !kept_block.contains("\"ok\":true"),
+        "kept tool results leaked: {transcript}"
+    );
 }
 
 fn assert_sanitized_request(client: &MockClient) -> String {
