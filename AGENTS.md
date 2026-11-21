@@ -1609,7 +1609,22 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    not synthetic conversion tests — strict-mode clients send `null` for
    omitted nested objects (see "Tool parameter schemas").
 
-6. **Dispatched prompts report progress from a parent-side watcher, not from
+6. **Async admissions are detached from parent interruption** (issue #2779) —
+   `session_send` sets `InvocationAdmission.detached` before durable append for
+   new invocations. Joined messages keep the existing invocation's admission.
+   Parent `Cancel`/`Error`, including restart recovery's prompt-scoped stop,
+   cannot refuse the child's next turn or worker resume. An inline soft wait
+   doesn't change this. Cancelling `session_send` or `session_wait` stops only
+   observation; `SubagentToolset::cancel` interrupts children only for
+   `session_new`/`session_prompt`. Ancestor checks
+   (`TurnWorker::refuse_resume_under_interrupted_parent`,
+   `nats_worker/daemon_turn_input.rs`) stop at a detached admission,
+   after checking that invocation's own terminal state for synchronous
+   descendants. Explicit `session_cancel` and inherited deadlines still stop
+   detached work. The default-false field preserves old admission JSON without
+   adding an `InvocationEdgeKind` variant that older readers would reject.
+
+7. **Dispatched prompts report progress from a parent-side watcher, not from
    the child's turn** (issue #2664) — successful dispatch and an authorized
    `session_wait` start (`async_session/progress.rs`) a
    `SubagentProgressReporter` watcher, deduplicated per prompt in-process.

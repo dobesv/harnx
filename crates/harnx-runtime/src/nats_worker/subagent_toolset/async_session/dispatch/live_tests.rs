@@ -37,7 +37,7 @@ async fn dispatched_child_runs_after_sender_drop_with_inherited_configured_hard_
     )?;
     let admitted_at = chrono::Utc::now();
     let args = json!({"message": "continue after sender is gone", "session_id": "live-dispatch", "timeout_secs": -1});
-    let context = journaled_context(&js, &parent, admitted_at, &args).await?;
+    let context = journaled_context(&js, &parent, admitted_at, &args, "trusted-parent").await?;
     let cancel = CancellationToken::new();
     let (receipt, _) = dispatch_send(&toolset, args, cancel.clone(), context).await?;
     let handle = receipt.handle;
@@ -86,10 +86,11 @@ async fn journaled_context(
     parent: &RunLimitsRecord,
     admitted_at: chrono::DateTime<chrono::Utc>,
     args: &Value,
+    parent_key: &str,
 ) -> Result<ToolInvocationContext> {
     let context = ToolInvocationContext {
         call_id: "durable-dispatch".into(),
-        invoking_session_id: Some("trusted-parent".into()),
+        invoking_session_id: Some(parent_key.into()),
         run_context: Some(harnx_toolset::AutonomousRunContext {
             snapshot: serde_json::to_value(parent)?,
             started_at_ms: admitted_at.timestamp_millis().try_into()?,
@@ -164,3 +165,6 @@ async fn terminal_entries(
     .await
     .context("worker never completed durable dispatched prompt")?
 }
+
+#[path = "parent_stop_tests.rs"]
+mod parent_stop_tests;

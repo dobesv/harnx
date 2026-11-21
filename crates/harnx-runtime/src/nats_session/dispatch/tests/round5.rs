@@ -90,6 +90,7 @@ async fn freeze_candidate_before_recontent(
     // A busy reserve leaves candidate P/X while its caller holds the frozen X snapshot.
     let entries = session.load_durable_entries().await?;
     let authority = AdmissionAuthority::Inherited {
+        detached: false,
         parent: f.parent.clone(),
         edge: InvocationEdgeKind::Delegation,
         admitted_at: f.parent.admitted_at,

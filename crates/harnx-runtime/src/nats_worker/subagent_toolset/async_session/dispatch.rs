@@ -70,15 +70,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
     check_cancel(&cancel)?;
     let session = checkpointed_session(toolset, &args, &inherited.parent_key, &context).await?;
     ensure_receipt_fits(session.session_id(), &context.call_id, budget)?;
-    let session = session
-        .with_inherited_admission(
-            inherited.parent.clone(),
-            context.call_id.clone(),
-            inherited.admitted_at,
-            InvocationEdgeKind::Delegation,
-            args.timeout_secs,
-        )
-        .with_execution_parent(inherited.parent_key.clone(), context.call_id.clone());
+    let session = inherited.admit_detached(session, &context, args.timeout_secs);
     // Replayed delivery never re-fetches attachments or replaces original
     // content, even if the referenced resource disappeared after admission.
     // A joined-dispatch record is authoritative here, including over a
@@ -111,8 +103,8 @@ pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
     };
     check_cancel(&cancel)?;
     record_child(toolset, &context, session.session_id()).await?;
-    // Parent observer cancellation is deliberately not installed on the child.
-    // Explicit parent cancellation and hard deadlines retain worker authority.
+    // Parent interruption and observer cancellation do not stop detached work.
+    // Explicit session_cancel and inherited hard deadlines still stop the child.
     let prompt = session
         .append_dispatch_content(content)
         .await
@@ -145,6 +137,26 @@ struct InheritedDispatch {
     parent_key: String,
     parent: RunLimitsRecord,
     admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl InheritedDispatch {
+    fn admit_detached(
+        &self,
+        session: NatsSession,
+        context: &ToolInvocationContext,
+        timeout_secs: Option<u64>,
+    ) -> NatsSession {
+        session
+            .with_inherited_admission(
+                self.parent.clone(),
+                context.call_id.clone(),
+                self.admitted_at,
+                InvocationEdgeKind::Delegation,
+                timeout_secs,
+            )
+            .with_detached_admission()
+            .with_execution_parent(self.parent_key.clone(), context.call_id.clone())
+    }
 }
 
 /// A joined-dispatch record is the caller's immutable dispatch identity. The

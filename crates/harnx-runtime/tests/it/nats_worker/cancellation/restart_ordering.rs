@@ -90,6 +90,7 @@ async fn seed(js: &async_nats::jetstream::Context) -> Result<(String, String)> {
     let child_time = chrono::Utc::now();
     let mut admission = harnx_runtime::nats_session_metadata::InvocationAdmission::new(
         &harnx_runtime::nats_session_metadata::AdmissionAuthority::Inherited {
+            detached: false,
             parent: root_limits.clone(),
             edge: harnx_runtime::nats_session_metadata::InvocationEdgeKind::Delegation,
             admitted_at: child_time,

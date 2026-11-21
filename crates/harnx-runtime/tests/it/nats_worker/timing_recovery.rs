@@ -120,6 +120,7 @@ async fn setup_recovery_authority_and_limits(
             CallTimeoutOverride::from_optional(Some(5400)),
         )?;
         AdmissionAuthority::Inherited {
+            detached: false,
             parent,
             edge: InvocationEdgeKind::Delegation,
             admitted_at,

@@ -172,9 +172,9 @@ impl TurnWorker {
         Ok((input, seed_cursor))
     }
 
-    /// A child session may only resume while the parent tool call that
-    /// created it is still open. When it is not, interrupt this session so the
-    /// log records why it stopped, and run nothing.
+    /// Refuse delegated work under a cancelled or failed parent invocation.
+    /// Detached admissions stop ancestry traversal: they survive parent stops,
+    /// but their own interruption still stops synchronous descendants.
     pub(super) async fn refuse_resume_under_interrupted_parent(
         &self,
         backend: &NatsSessionLogBackend,
@@ -188,19 +188,18 @@ impl TurnWorker {
         if current.parent_invocation.is_none() {
             return Ok(false);
         }
-        let admission = self
+        let mut ancestor = self
             .session_metadata
             .admission(backend.session_id(), current.invocation_id.as_str())
             .await?
             .context("resuming invocation has no admission")?;
-        if admission.edge != Some(crate::nats_session_metadata::InvocationEdgeKind::Delegation) {
-            return Ok(false);
-        }
-        let mut ancestor = admission.clone();
         let mut stopped_parent = None;
         let mut seen = std::collections::HashSet::new();
         for _ in 0..32 {
-            if ancestor.edge != Some(crate::nats_session_metadata::InvocationEdgeKind::Delegation) {
+            if ancestor.detached
+                || ancestor.edge
+                    != Some(crate::nats_session_metadata::InvocationEdgeKind::Delegation)
+            {
                 break;
             }
             let Some(parent_key) = ancestor.parent_storage_key.as_deref() else {
