@@ -176,8 +176,8 @@ async fn test_compact_session_with_compaction_agent_sends_rendered_transcript() 
         "the rendered transcript must include the conversation content; transcript: {transcript:?}"
     );
     assert!(
-        transcript.contains("── user ──"),
-        "the user message is a rendered transcript with role labels; transcript: {transcript:?}"
+        transcript.contains("<user>"),
+        "the user message is a rendered transcript with role tags; transcript: {transcript:?}"
     );
     assert!(
         system_prompt_contains(messages, "specialized compaction agent"),
@@ -290,14 +290,19 @@ async fn test_compact_session_honors_compaction_keep_recent_turns() {
 
     // Exactly three user turns compacted (default keep of 3 would compact one),
     // and turn 4 stays out of the transcript because it is kept verbatim.
-    let compacted_turns = transcript.matches("── user ──").count();
+    let (summarized, kept) = transcript.split_once("</transcript>").unwrap();
+    let compacted_turns = summarized.matches("<user>").count();
     assert_eq!(
         compacted_turns, 3,
         "keep_recent_turns=1 must compact 3 of 4 turns; transcript: {transcript:?}"
     );
     assert!(
-        !transcript.contains("user turn 4"),
+        !summarized.contains("user turn 4"),
         "the last turn must be kept verbatim, not compacted; transcript: {transcript:?}"
+    );
+    assert!(
+        kept.contains("<user>\nuser turn 4\n</user>"),
+        "the summarizer must see the kept turn as replayed context; transcript: {transcript:?}"
     );
 
     // The kept-verbatim suffix lands back as [U4, A4]; summary stays on runtime field.

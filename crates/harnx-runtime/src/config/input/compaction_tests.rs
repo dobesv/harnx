@@ -345,20 +345,23 @@ fn assert_cumulative_requests(client: &MockClient, first_summary: &str) {
     assert_eq!(history.conversation_history.len(), 2);
     let first = &history.conversation_history[0].messages;
     assert_eq!(first.len(), 2);
-    assert!(!first[1].content.to_text().contains("recent question"));
+    let first_transcript = first[1].content.to_text();
+    let (first_summarized, first_kept) = first_transcript.split_once("</transcript>").unwrap();
+    assert!(!first_summarized.contains("recent question"));
+    assert!(first_kept.contains("<user>\nrecent question\n</user>"));
     let second = &history.conversation_history[1].messages;
     assert_eq!(second.len(), 2);
     let transcript = second[1].content.to_text();
-    let prior = format!(
-        "{}Earlier compaction summary:\n{}\n\n---\n\n",
-        session::RUNTIME_NOTE_PREFIX,
-        first_summary
-    );
+    let prior = format!("<transcript>\n<earlier_summary>\n{first_summary}\n</earlier_summary>\n\n");
     assert!(transcript.starts_with(&prior), "{transcript}");
     assert_eq!(transcript.matches(first_summary).count(), 1);
-    assert!(transcript[prior.len()..].contains("recent question"));
-    assert!(transcript[prior.len()..].contains("recent answer"));
-    assert!(!transcript[prior.len()..].contains("new question"));
+    let (summarized, kept) = transcript[prior.len()..]
+        .split_once("</transcript>")
+        .unwrap();
+    assert!(summarized.contains("recent question"));
+    assert!(summarized.contains("recent answer"));
+    assert!(!summarized.contains("new question"));
+    assert!(kept.contains("<user>\nnew question\n</user>"));
 }
 
 fn stored_summary(config: &GlobalConfig) -> String {
@@ -632,11 +635,17 @@ async fn compaction_summarizer_receives_only_complement_of_prompt_and_tail() {
         .unwrap()
         .content
         .to_text();
-    assert!(transcript.contains("archived question"));
-    assert!(transcript.contains("word word"));
-    assert!(!transcript.contains("remove hex"));
-    assert!(!transcript.contains("hex removed and verified"));
+    let (summarized, kept_block) = transcript.split_once("</transcript>").unwrap();
+    assert!(summarized.contains("archived question"));
+    assert!(summarized.contains("word word"));
+    assert!(!summarized.contains("remove hex"));
+    assert!(!summarized.contains("hex removed and verified"));
     assert!(!transcript.contains("\"ok\":true"));
+    assert!(kept_block.contains("<user>\nremove hex"), "{transcript}");
+    assert!(
+        kept_block.contains("hex removed and verified"),
+        "{transcript}"
+    );
     let kept = view(&config.read().session.as_ref().unwrap().messages);
     assert_eq!(kept.len(), 3);
     reload(&config, &log);
