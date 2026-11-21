@@ -169,7 +169,7 @@ Agent Cards are public when access rules are disabled. With access rules enabled
 
 - **Server-allocated contexts**: `contextId` is identical to the durable harnx session ID. Contexts are strictly allocated by the server. Incoming requests containing an unknown or unauthorized `contextId` are rejected with `TaskNotFoundError` (`-32001`). Clients cannot invent context IDs. With access rules enabled, `admin` can operate another user's context on the same export; creating a context still requires `prompt`.
 - **Task ID format**: Task IDs are opaque strings formatted as `{contextId}.{uuid}`. Because harnx session IDs are base64url strings without dots, the dot cleanly delimits the context ID from the task UUID.
-- **One active task per context**: A context can execute only one task at a time. If a client sends a new prompt to a context while a task is still running, the server rejects the request with code `-32000` ("context has an active task; retry later").
+- **One active task per context**: A context can execute only one task at a time. A new prompt for a context whose task is still running is steered into that task's turn and answered on the same task (issue #2774). Only a context whose steered work has not settled yet — including a parked `INPUT_REQUIRED` reply wait or a legacy context without a steerable invocation — rejects a fresh prompt with the retryable busy code `-32000` ("context already has an active task; retry later").
 - **Message deduplication**: Requests are deduped by `messageId`.
   - Retrying an identical `messageId` and content returns the existing task record—even if the task has already reached a terminal state.
   - Sending an existing `messageId` with different content returns `InvalidParams` (`-32602`).
@@ -255,7 +255,7 @@ The server emits JSON-RPC 2.0 error responses with structured `google.rpc.ErrorI
 
 | Code | Reason | Description |
 |---|---|---|
-| `-32000` | Server-specific | Missing or empty user identity header (HTTP 401), or busy context (active task in progress). |
+| `-32000` | Server-specific | Missing or empty user identity header (HTTP 401), or busy context (parked `INPUT_REQUIRED` task or legacy context; a running task steers new input into its turn instead, issue #2774). |
 | `-32001` | `TASK_NOT_FOUND` | Task or server-allocated context does not exist, or the caller can't access its agent, owner or export. |
 | `-32002` | `TASK_NOT_CANCELABLE` | Task is already in a terminal state (`COMPLETED`, `FAILED`, `CANCELED`). |
 | `-32003` | `PUSH_NOT_SUPPORTED` | Push notification configuration requested (push notifications unsupported). |

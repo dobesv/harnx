@@ -17,7 +17,7 @@ pub(super) struct Frames {
     pub(super) comments: usize,
 }
 impl Frames {
-    async fn open(http: &Http, method: &str, params: Value) -> Result<Self> {
+    pub(super) async fn open(http: &Http, method: &str, params: Value) -> Result<Self> {
         Self::open_version(http, method, params, Some("1.0")).await
     }
     async fn open_version(
@@ -448,13 +448,25 @@ async fn assert_invalid_streaming_admissions(http: &Http, task: &Value) -> Resul
         (message("unknown", Some(&json!("unknown"))), -32001),
         (mismatch, -32602),
         (changed, -32602),
-        (message("busy", Some(&task["contextId"])), -32000),
     ] {
         let error = http
             .rpc("SendStreamingMessage", json!({"message": request}))
             .await?;
         assert_eq!(error["error"]["code"], expected, "{error}");
     }
+    // A new message to the running context steers into its live turn and
+    // streams the same task instead of the old -32000 busy rejection.
+    let mut steered = Frames::open(
+        http,
+        "SendStreamingMessage",
+        json!({"message": message("busy", Some(&task["contextId"]))}),
+    )
+    .await?;
+    assert_eq!(
+        steered.event().await?.context("steering snapshot")?["task"]["id"],
+        task["id"]
+    );
+    drop(steered);
     let foreign = http
         .rpc_call(HttpRpcCall::new(
             &http.url,

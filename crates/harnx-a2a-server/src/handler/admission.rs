@@ -11,10 +11,12 @@ use crate::{
     input_map::message_to_input,
     runner::{RunnerError, TurnRequest},
     store::{
-        message_fingerprint, parse_task_id, ContextAccess, DedupeKey, MessageIdentity, TaskRecord,
+        message_fingerprint, parse_task_id, ContextAccess, DedupeKey, DedupeMappingKind,
+        DedupeMappingTarget, MessageIdentity, TaskRecord,
     },
 };
-use a2a_lf::{A2AError, Message, Role, SendMessageRequest};
+use a2a_lf::{A2AError, Message, Role, SendMessageRequest, TaskState};
+use harnx_runtime::nats_session::SteeringTargetEnded;
 use harnx_runtime::NatsSession;
 
 struct MessageAdmission {
@@ -63,6 +65,18 @@ impl MessageAdmission {
     }
 }
 
+/// What `reconcile_context` found for an existing conversation.
+enum BusyContext {
+    /// No non-terminal task holds the context.
+    Idle,
+    /// The coordinated authority's active task is still running; its snapshot
+    /// is reconciled and its runtime invocation is a steering target.
+    Active(Box<TaskRecord>),
+    /// Non-terminal legacy entries without an authority document. No runtime
+    /// invocation can be steered into; callers keep the busy rejection.
+    Legacy,
+}
+
 impl HarnxHandler {
     async fn admit_existing(
         &self,
@@ -89,10 +103,96 @@ impl HarnxHandler {
             .await?;
         self.reject_terminal_target(owner, target).await?;
         self.check_running()?;
-        if busy {
-            return Err(map_error(RunnerError::Busy.into()));
+        match busy {
+            // A running coordinated task steers new input into its live turn
+            // and answers on the same task (issue #2774). Parked
+            // INPUT_REQUIRED work keeps the dedicated reply path and the
+            // busy error; legacy entries have no steerable invocation.
+            BusyContext::Active(record) if record.task.status.state != TaskState::InputRequired => {
+                self.admit_steering_message(owner, request, *record).await
+            }
+            BusyContext::Active(_) | BusyContext::Legacy => {
+                Err(map_error(RunnerError::Busy.into()))
+            }
+            BusyContext::Idle => self.admit_new_message(owner, request).await,
         }
-        self.admit_new_message(owner, request).await
+    }
+
+    // qual:allow(iosp) reason: "Validate, join the live invocation and register dedupe in one ordered sequence; the typed end-of-turn race falls back to fresh admission, and splitting that ordering scatters the invariants."
+    /// Deliver a message into a running task's turn as steering input
+    /// (issue #2774) and answer on the same task. The message keeps its
+    /// `messageId` dedupe mapping, so retries are idempotent and changed
+    /// parts still fail the fingerprint check.
+    async fn admit_steering_message(
+        &self,
+        owner: &RequestIdentity,
+        request: MessageAdmission,
+        active: TaskRecord,
+    ) -> Result<Admission, A2AError> {
+        // Steering appends into a live turn, so invalid parts must be
+        // rejected before any transcript row exists, exactly like new
+        // admissions that must not allocate a session.
+        let input = message_to_input(&request.message, self.limits)
+            .map_err(|error| map_error(error.into()))?;
+        let invocation = active.execution_id.clone();
+        if invocation.is_empty() {
+            return Err(map_error(anyhow::anyhow!(
+                "active task has no runtime invocation"
+            )));
+        }
+        let session = self.session(owner, request.context.as_deref()).await?;
+        let message_id = request.message.message_id.clone();
+        // Fault seam (issue #2774 review): pausing here keeps the busy
+        // decision stale, so tests can end the live turn before the join
+        // and exercise the SteeringTargetEnded fallback.
+        #[cfg(feature = "fault-injection")]
+        self.backend
+            .runner
+            .fault_hooks()
+            .checkpoint(crate::fault_injection::Boundary::SteeringJoin)
+            .await;
+        let steered = session
+            .clone()
+            .with_external_admission()
+            .with_admission_id(message_id.clone())
+            .admit_input_steered(&input, &invocation)
+            .await;
+        match steered {
+            // The turn ended between the busy check and the join; the runtime
+            // left no row or activation (a bind-then-append race may leave a
+            // stale admission binding that resolves to nothing once the
+            // invocation is terminal). Admit a fresh task normally, which
+            // settles the finished one first.
+            // qual:allow(coupling, deh) reason: "The runtime join reports the end-of-turn race as a typed error inside anyhow; matching it by downcast is the house pattern."
+            Err(error) if error.downcast_ref::<SteeringTargetEnded>().is_some() => {
+                self.admit_new_message(owner, request).await
+            }
+            Err(error) => Err(map_error(error)),
+            Ok(_) => {
+                self.backend
+                    .store
+                    .put_dedupe_mapping(
+                        DedupeMappingKind::Message,
+                        session.storage_key(),
+                        DedupeMappingTarget::new(
+                            MessageIdentity {
+                                message_id: &message_id,
+                                fingerprint: &request.fingerprint,
+                            },
+                            &active.task.id,
+                        ),
+                    )
+                    .await
+                    .map_err(map_error)?;
+                Ok(Admission {
+                    snapshot: active,
+                    deduped: false,
+                    response_after: None,
+                    direct: false,
+                    events: None,
+                })
+            }
+        }
     }
 
     pub(super) async fn admit(
@@ -217,9 +317,9 @@ impl HarnxHandler {
         &self,
         owner: &RequestIdentity,
         context: Option<&str>,
-    ) -> Result<bool, A2AError> {
+    ) -> Result<BusyContext, A2AError> {
         let Some(context) = context else {
-            return Ok(false);
+            return Ok(BusyContext::Idle);
         };
 
         // Fast path: check index for non-terminal tasks
@@ -239,20 +339,25 @@ impl HarnxHandler {
             .map_err(map_error)?
         {
             return match context.document.state.active {
-                Some(active) => Ok(!self
-                    .reconcile(owner, active.snapshot)
-                    .await?
-                    .task
-                    .status
-                    .state
-                    .is_terminal()),
-                None => Ok(false),
+                Some(active) => {
+                    let record = self.reconcile(owner, active.snapshot).await?;
+                    if record.task.status.state.is_terminal() {
+                        Ok(BusyContext::Idle)
+                    } else {
+                        Ok(BusyContext::Active(Box::new(record)))
+                    }
+                }
+                None => Ok(BusyContext::Idle),
             };
         }
         self.reconcile_index(owner, &key).await
     }
 
-    async fn reconcile_index(&self, owner: &RequestIdentity, key: &str) -> Result<bool, A2AError> {
+    async fn reconcile_index(
+        &self,
+        owner: &RequestIdentity,
+        key: &str,
+    ) -> Result<BusyContext, A2AError> {
         let non_terminal_entries = self
             .backend
             .store
@@ -262,7 +367,7 @@ impl HarnxHandler {
 
         if non_terminal_entries.is_empty() {
             // No active tasks
-            return Ok(false);
+            return Ok(BusyContext::Idle);
         }
 
         // Load and reconcile only non-terminal tasks
@@ -294,7 +399,11 @@ impl HarnxHandler {
                 .state
                 .is_terminal();
         }
-        Ok(busy)
+        Ok(if busy {
+            BusyContext::Legacy
+        } else {
+            BusyContext::Idle
+        })
     }
 
     async fn reject_terminal_target(

@@ -169,9 +169,11 @@ async fn assert_working_validation_precedence(http: &Http, invalid: &Value) -> R
                 .await?,
             -32001,
         );
+        // A running context steers valid input into its live turn; invalid
+        // parts are rejected by content validation before any row exists.
         code(
             &http.rpc(method, json!({"message": invalid})).await?,
-            -32000,
+            -32005,
         );
         let mut mismatch = invalid.clone();
         mismatch["messageId"] = json!("validation-order");
@@ -198,7 +200,7 @@ async fn assert_terminal_validation_precedence(http: &Http, invalid: &Value) -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn invalid_parts_do_not_override_owner_busy_or_terminal_errors() -> Result<()> {
+async fn invalid_parts_do_not_override_owner_or_terminal_errors() -> Result<()> {
     let http = Http::start().await?;
     let first = http.working(message("validation-order", None)).await?;
     let mut invalid = message("invalid-new", Some(&first["contextId"]));

@@ -115,6 +115,43 @@ pub enum RunnerError {
     Busy,
     Terminal,
 }
+
+impl Runner {
+    /// Bounded hold for a task's outstanding steered drain (issue #2774):
+    /// recovery waits for a live worker to finish answering the steered rows
+    /// before settling, but after [`HEAD_DRAIN_TIMEOUT`] the sweep falls
+    /// through to the ordinary owner-loss interrupt+settle path instead of
+    /// wedging the task and its context.
+    pub(super) fn hold_steered_drain(&self, task_id: &str) -> bool {
+        let mut holds = self.steered_drain_holds.lock();
+        // An expired hold is the owning task's fall-through proof: purging
+        // it here (an earlier purge removed any expired entry on every
+        // call) would let another task's sweep reset the owner's window —
+        // its next call would insert a fresh timestamp and defer its
+        // recovery again. Keep other tasks' expired holds until their own
+        // expiry check removes them, and bound the map by count instead;
+        // the cap only trims state for tasks whose recovery never came
+        // back, which have no live hold to lose.
+        if holds.len() >= STEERED_DRAIN_HOLDS_CAP {
+            holds.retain(|id, seen| id == task_id || seen.elapsed() < HEAD_DRAIN_TIMEOUT);
+        }
+        match holds.get(task_id) {
+            Some(seen) if seen.elapsed() < HEAD_DRAIN_TIMEOUT => true,
+            Some(_) => {
+                holds.remove(task_id);
+                false
+            }
+            None => {
+                holds.insert(task_id.to_owned(), std::time::Instant::now());
+                true
+            }
+        }
+    }
+
+    pub(super) fn clear_steered_drain_hold(&self, task_id: &str) {
+        self.steered_drain_holds.lock().remove(task_id);
+    }
+}
 impl std::fmt::Display for RunnerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -139,12 +176,29 @@ struct ContextSlot {
     active: Arc<Mutex<Option<Arc<RunnerHandle>>>>,
 }
 
+/// How long a fresh admission waits for the previous invocation's runtime
+/// admission head to drain steered continuation rounds (issue #2774) before
+/// capturing the fixed predecessor, and how long recovery holds an outstanding
+/// steered drain for a live worker before falling through to the ordinary
+/// owner-loss interrupt+settle. The candidate lease is held for the whole
+/// wait, so no other admission can interleave; the bound keeps a wedged
+/// predecessor or a dead worker from pinning the context forever.
+pub(super) const HEAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on the steered-drain hold map. Expired holds are removed only by
+/// their owning task's own expiry check (see [`Runner::hold_steered_drain`]),
+/// so the map is bounded by count, not by time-based purging.
+const STEERED_DRAIN_HOLDS_CAP: usize = 1024;
+
 /// One runner per cluster/store. Do not share a store between different brokers.
 pub struct Runner {
     store: Arc<A2aStore>,
     contexts: parking_lot::Mutex<HashMap<ContextKey, Arc<ContextSlot>>>,
     shutting_down: AtomicBool,
     boot_id: String,
+    /// First observation of each task's outstanding steered drain
+    /// (issue #2774); bounds recovery's hold, see [`HEAD_DRAIN_TIMEOUT`].
+    steered_drain_holds: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
     #[cfg(feature = "fault-injection")]
     lease_config_override: parking_lot::Mutex<Option<harnx_runtime::nats_lease::NatsLeaseConfig>>,
     #[cfg(feature = "fault-injection")]
@@ -170,6 +224,7 @@ impl Runner {
         Arc::new(Self {
             store,
             contexts: Default::default(),
+            steered_drain_holds: Default::default(),
             shutting_down: AtomicBool::new(false),
             boot_id: uuid::Uuid::new_v4().to_string(),
             #[cfg(feature = "fault-injection")]

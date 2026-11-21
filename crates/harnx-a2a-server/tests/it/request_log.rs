@@ -62,26 +62,33 @@ async fn request_log_unary_success_and_mapped_errors() -> Result<()> {
     assert_eq!(records[0]["message_id"], "logged-send");
     assert_eq!(records[0]["state"], "Working");
     assert!(records[0]["duration_ms"].as_f64().unwrap() >= 0.0);
-    let mut busy = message("logged-busy");
-    busy["contextId"] = task["contextId"].clone();
-    let response = http
+    let mut follow_up = message("logged-busy");
+    follow_up["contextId"] = task["contextId"].clone();
+    // Steering (issue #2774) delivers a same-context message to the running
+    // turn instead of rejecting it as busy: the follow-up returns the same
+    // task and the request log records a second success.
+    let steered = http
         .rpc_call(HttpRpcCall::new(
             &http.url,
             CALLER,
             "SendMessage",
-            json!({"message":busy}),
+            json!({"message":follow_up, "configuration":{"returnImmediately":true}}),
         ))
         .await?;
-    assert_eq!(response["error"]["code"], -32000);
+    assert_eq!(steered["result"]["task"]["id"], task["id"], "{steered}");
+    assert_eq!(
+        steered["result"]["task"]["status"]["state"], "TASK_STATE_WORKING",
+        "{steered}"
+    );
     let unknown = http.rpc("GetTask", json!({"id":"missing-task"})).await?;
     assert_eq!(unknown["error"]["code"], -32001);
     let records = events(&http.h.logs);
     assert_eq!(records.len(), 3);
-    assert_eq!(records[1]["error_code"], -32000);
-    assert_eq!(
-        records[1]["error_message"],
-        "context already has an active task, retry later"
-    );
+    assert_eq!(records[1]["method"], "SendMessage");
+    assert_eq!(records[1]["task_id"], task["id"]);
+    assert_eq!(records[1]["context_id"], task["contextId"]);
+    assert_eq!(records[1]["message_id"], "logged-busy");
+    assert_eq!(records[1]["state"], "Working");
     assert_eq!(records[2]["method"], "GetTask");
     assert_eq!(records[2]["task_id"], "missing-task");
     assert_eq!(records[2]["error_code"], -32001);

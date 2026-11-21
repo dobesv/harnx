@@ -24,6 +24,47 @@ struct HitlApprovalIntent<'a> {
 }
 
 impl NatsSession {
+    /// Decide an exact middleware interaction request (a confirmation
+    /// challenge), waking the owning worker first. A parked round that
+    /// answered a steered row (issue #2774) ends its owning execution, so
+    /// no live control listener remains: only a freshly activated worker
+    /// can lease-fence the response onto the log. The extra activation is
+    /// harmless when the original execution is still parked with its
+    /// listener up: that worker applies the decision directly.
+    // qual:allow(iosp) reason: "Wake-target selection reads the interaction root and the outstanding steered row before deciding; which wake is correct depends on both reads in sequence."
+    pub async fn decide_interaction_with_wake(
+        &self,
+        reference: &ApprovalRef,
+        interaction_id: &str,
+        response: &harnx_core::interaction::InteractionResponse,
+    ) -> Result<crate::interactions::InteractionDecisionOutcome> {
+        let entries = self.load_durable_entries().await?;
+        if let Some((prompt_seq, _)) = self.hitl_invocation_root(reference, &entries).await? {
+            // While the root round is still parked mid-round, its prompt is
+            // uncovered and wakes the worker directly. After the root round
+            // ended and a steered continuation round (issue #2774) is the
+            // parked one, the covered root prompt would settle the
+            // activation's preflight without a claim, so wake on the
+            // outstanding steered row: that is the row the resumed round
+            // answers.
+            let wake_seq = super::steered_covered_through(&entries, prompt_seq).map_or(
+                prompt_seq,
+                |through| {
+                    entries
+                        .iter()
+                        .find(|(seq, entry)| {
+                            *seq > through
+                                && crate::nats_worker::executable_user_message_id(entry).is_some()
+                        })
+                        .map_or(prompt_seq, |(seq, _)| *seq)
+                },
+            );
+            self.publish_activation(wake_seq, None, None).await?;
+        }
+        self.decide_interaction(interaction_id, reference.request_seq, response)
+            .await
+    }
+
     /// Decide one exact approval generation, never a newer request with a reused ID.
     /// Already-applied answers preserve the original note; only the boolean answer
     /// determines a conflict. A terminal invocation or superseded request is stale.
@@ -56,7 +97,7 @@ impl NatsSession {
         target: &HitlDecisionTarget<'_>,
         entries: &[(u64, SessionLogEntry)],
     ) -> Result<Option<HitlDecisionOutcome>> {
-        let Some(outcome) = self.hitl_decision_state(target, entries)? else {
+        let Some(outcome) = self.hitl_decision_state(target, entries).await? else {
             return Ok(None);
         };
         if matches!(outcome, HitlDecisionOutcome::AlreadyApplied { .. }) {
@@ -119,7 +160,7 @@ impl NatsSession {
                 HitlDecisionOutcome::Conflicting
             }));
         }
-        self.hitl_decision_state(target, &entries)
+        self.hitl_decision_state(target, &entries).await
     }
 
     /// Tool-ID compatibility API for interactive frontends. Select the current
@@ -196,7 +237,7 @@ impl NatsSession {
 
     /// None means still pending. Every resolved state is scoped to the root and
     /// latest approval, rather than merely the tool ID or physical request tail.
-    fn hitl_decision_state(
+    async fn hitl_decision_state(
         &self,
         target: &HitlDecisionTarget<'_>,
         entries: &[(u64, SessionLogEntry)],
@@ -207,7 +248,8 @@ impl NatsSession {
             prompt_sequence: target.prompt_seq,
             session_id: &self.session_id,
         };
-        let progress = Self::invocation_progress_from_entries(&scope, entries)?;
+        let steered_live = self.steered_live_head(scope.invocation_id).await?;
+        let progress = Self::invocation_progress_from_entries(&scope, entries, steered_live)?;
         match progress {
             PromptProgress::InputRequired(pending)
                 if pending.interaction_id.is_none() && is_matching_pending(&pending, target) =>

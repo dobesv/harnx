@@ -27,7 +27,12 @@ pub(super) async fn completion(
         first
     };
     llm.requested.notify_one();
-    if llm.script == Script::Fail {
+    // Script::Fail rejects every request; Script::SteeringFail lets the root
+    // round through and fails exactly the steered continuation round, so a
+    // later fresh task completes normally.
+    if llm.script == Script::Fail
+        || (llm.script == Script::SteeringFail && llm.requests.lock().len() == 2)
+    {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"secret-token /srv/private https://private.invalid", "type":"invalid_request_error"}}))).into_response();
     }
     assert_eq!(body["stream"], true, "worker must call streaming LLM");

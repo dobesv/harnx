@@ -28,6 +28,44 @@ context, repairs a settled predecessor if needed, captures one runtime predecess
 and CAS-reserves all task identities before prompt append. Contending candidates
 follow the same identity or return the existing Busy error for distinct work.
 
+A follow-up for a context whose task is still running steers into that task's live
+turn instead of returning Busy (issue #2774): the handler binds the message to the
+running invocation and appends it as a user row the worker folds in at its next
+tool-round seam, or answers in a continuation round under the same invocation when
+the turn has no seam. The reply is the same task, and streaming requests subscribe
+to that task's events. Retries dedupe by messageId on the same task; a different
+fingerprint under the same id still fails the fingerprint check. Parked
+`INPUT_REQUIRED` tasks keep their dedicated reply path and the Busy error, and so
+do legacy contexts without a steerable invocation.
+
+Dedupe ordering accepts one crash window, by design: the steered row is appended
+first and the messageId-to-task mapping is written after. Committing the mapping
+first would let a retry dedupe-hit a task whose steered row never landed (silent
+loss); the reverse order can only duplicate, never drop. While the task is live a
+same-id retry is still idempotent — the runtime replays the committed row by id and
+refuses a same-id retry with different content, even before the mapping lands —
+so the window only matters if the server dies between append and mapping and the
+task settles before the retry: the retried messageId then admits fresh work and
+answers the same content again on a new task. This matches the at-least-once
+behaviour of first-message reservations.
+
+Because steered rows can keep draining after a task's follow observed its boundary,
+the context can be idle at the authority while the runtime admission head is still
+active. A fresh admission waits that head out (bounded, with the candidate lease
+held) before capturing its runtime predecessor, and the detached publisher retries
+the head CAS while the drain finishes, so a steered continuation can neither fence
+out the next task nor leave the context wedged.
+
+Owner loss during that drain is accepted failover behavior, not a wedge: the
+recovery sweep holds the settlement for a bounded 30 s drain window so a live
+worker can still answer the outstanding steered rows, and if the window expires
+— the owner is gone and the continuation is slow or held — the sweep falls
+through to the ordinary owner-loss interrupt and settles the task `FAILED`
+(rather than `CANCELED`, which is reserved for an actual cancel intent). A
+slow-but-alive continuation is therefore cut at roughly 30 s plus one sweep
+batch after its owner disappears; ordinary live tasks are never subject to this
+budget.
+
 Local gates, LRUs and live handles aren't authority. Live presentation and local
 completion handles require a matching owner fence; a stale cached snapshot can't
 replace a recovered task. Active task mutations use `OwnedTask::update`, which

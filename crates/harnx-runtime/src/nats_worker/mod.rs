@@ -89,6 +89,7 @@ mod wind_up_tests;
 // Re-export test-only items for integration tests
 pub use agent_loop::derive_attention_seq;
 pub(crate) use agent_loop::derive_pending_hitl_approvals;
+pub(crate) use agent_loop::executable_user_message_id;
 pub use agent_loop::{run_agent_loop_with_nats, run_agent_loop_with_nats_inner, RunAgentLoopArgs};
 pub use backend::{FencedSessionLogSink, NatsSessionLogBackend};
 pub use control::{

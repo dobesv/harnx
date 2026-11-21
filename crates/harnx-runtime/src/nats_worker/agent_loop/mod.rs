@@ -347,7 +347,7 @@ pub(crate) fn last_fed_user_log_seq(_input: &Input) -> Option<u64> {
 pub(crate) use selected_input::fold_new_user_messages_since;
 
 // Some(None) is an executable row missing its required admission identity.
-pub(super) fn executable_user_message_id(entry: &SessionLogEntry) -> Option<Option<&str>> {
+pub(crate) fn executable_user_message_id(entry: &SessionLogEntry) -> Option<Option<&str>> {
     match entry {
         SessionLogEntry::Message {
             id, role, content, ..
