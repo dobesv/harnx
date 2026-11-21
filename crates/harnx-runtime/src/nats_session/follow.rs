@@ -105,7 +105,7 @@ impl NatsSession {
         })
     }
 
-    pub(super) fn observe_follow_boundary(
+    pub(super) async fn observe_follow_boundary(
         &self,
         entries: &[(u64, SessionLogEntry)],
         target: &FollowTarget<'_>,
@@ -117,8 +117,13 @@ impl NatsSession {
             prompt_sequence: target.prompt_seq,
             session_id: &self.session_id,
         };
+        let steered_live = self.steered_live_head(scope.invocation_id).await?;
         Ok(
-            match Self::invocation_progress_from_entries(&scope, entries)? {
+            match Self::invocation_progress_from_entries(&scope, entries, steered_live)? {
+                // Steered continuation rounds (issue #2774) hold the
+                // invocation in Running and its approval in InputRequired
+                // until every steered row drains, so Terminal here is the
+                // settled invocation, extracted through its last terminator.
                 PromptProgress::Terminal(result) => Some(result.into()),
                 PromptProgress::InputRequired(pending) => {
                     if options
@@ -293,7 +298,7 @@ impl NatsSession {
         }
     }
 
-    fn check_initial_follow_boundary(
+    async fn check_initial_follow_boundary(
         &self,
         entries: &[(u64, SessionLogEntry)],
         target: &FollowTarget<'_>,
@@ -307,6 +312,7 @@ impl NatsSession {
             "boundary follow has no invocation identity"
         );
         self.observe_follow_boundary(entries, target, boundary_options)
+            .await
     }
 
     async fn evaluate_initial_follow_boundary(
@@ -317,11 +323,9 @@ impl NatsSession {
         let initial_entries = self
             .load_initial_follow_entries(event_stream, config.boundary_options.is_some())
             .await?;
-        let initial_boundary = self.check_initial_follow_boundary(
-            &initial_entries,
-            config.target,
-            config.boundary_options,
-        )?;
+        let initial_boundary = self
+            .check_initial_follow_boundary(&initial_entries, config.target, config.boundary_options)
+            .await?;
         if initial_boundary.is_none() {
             self.publish_activation(
                 config.target.prompt_seq,

@@ -214,12 +214,20 @@ fn assert_consumers(case: &Case) {
             "{context}: terminal"
         );
         assert_eq!(
-            NatsSession::extract_final_response(&case.entries, expected.prompt),
+            NatsSession::extract_final_response(
+                &case.entries,
+                expected.prompt,
+                expected.terminal.unwrap_or(u64::MAX)
+            ),
             expected.response,
             "{context}: response"
         );
         assert_eq!(
-            NatsSession::extract_turn_error(&case.entries, expected.prompt),
+            NatsSession::extract_turn_error(
+                &case.entries,
+                expected.prompt,
+                expected.terminal.unwrap_or(u64::MAX)
+            ),
             expected.error,
             "{context}: error"
         );

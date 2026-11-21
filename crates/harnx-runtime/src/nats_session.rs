@@ -73,6 +73,8 @@ mod steering;
 mod surface_action;
 pub use compaction_request::{request_compaction_session, CompactSubmit, CompactionRequest};
 pub use completion::completed_subagent_progress;
+pub use steering::SteeredContentMismatch;
+pub use steering::SteeringTargetEnded;
 pub mod fixed_admission;
 #[cfg(feature = "fault-injection")]
 pub mod fixed_admission_faults;
@@ -404,6 +406,114 @@ pub(crate) fn requested_seq_status_with_effective(
     }
 }
 
+/// Whether user rows that strict steering (issue #2774) appended into
+/// `prompt_seq`'s invocation are still owed answers. Steered rows land past
+/// the prompt's own terminator and continuation rounds answer them, so a
+/// boundary or recovery observer must not treat the prompt as settled while
+/// they remain. Log-only by design: a steered row can only exist before the
+/// task settles and releases its context, so no admission metadata is needed.
+///
+/// The check runs on the effective log view (retractions applied) and skips
+/// later copies of already-seen user rows: compaction re-logs kept rows under
+/// their original ids, and a copy is history, never new work, so an ordinary
+/// compacted conversation never looks outstanding. Coverage is
+/// terminator-aware: a TurnEnd covers rows through its `through_seq`, and a
+/// Cancel or Error that ends the invocation after the last covering TurnEnd
+/// covers everything before it. Callers pass the live invocation's root
+/// prompt; A2A admits no second invocation before the first task settles, so
+/// rows of a later invocation cannot be misread as this one's outstanding work.
+pub fn steered_rows_outstanding(
+    entries: &[(u64, SessionLogEntry)],
+    prompt_seq: u64,
+) -> anyhow::Result<bool> {
+    // Terminators only exist on the raw log: the mutation resolver drops
+    // TurnEnd rows from the effective view, so coverage is computed from the
+    // raw entries while row-level retractions and compaction copies are
+    // read from the effective view.
+    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)?;
+    let Some(through) = steered_covered_through(entries, prompt_seq) else {
+        return Ok(false);
+    };
+    let mut seen_ids = std::collections::HashSet::new();
+    for (seq, entry) in &effective {
+        if *seq <= through {
+            if let Some(Some(id)) = crate::nats_worker::executable_user_message_id(entry) {
+                seen_ids.insert(id);
+            }
+        }
+    }
+    Ok(effective.iter().any(|(seq, entry)| {
+        if *seq <= through {
+            return false;
+        }
+        match crate::nats_worker::executable_user_message_id(entry) {
+            // A later copy of an already-covered row is compaction history.
+            Some(Some(id)) => seen_ids.insert(id),
+            Some(None) => true,
+            None => false,
+        }
+    }))
+}
+
+/// The furthest coverage of `prompt_seq`'s invocation on the raw log:
+/// the largest `through_seq` among the TurnEnds proving the prompt
+/// terminal, or the Cancel/Error that ended the invocation after the last
+/// covering TurnEnd. Continuation rounds that answer steered rows extend
+/// TurnEnd coverage past the prompt's own terminator; an abnormal terminator
+/// ends the invocation, covering everything before it.
+fn steered_covered_through(effective: &[(u64, SessionLogEntry)], prompt_seq: u64) -> Option<u64> {
+    let mut through = None;
+    let mut last_turn_end = None;
+    let mut abnormal = None;
+    for (seq, entry) in effective.iter().filter(|(seq, _)| *seq > prompt_seq) {
+        match entry {
+            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= prompt_seq => {
+                through = Some(through.map_or(*through_seq, |t: u64| t.max(*through_seq)));
+                last_turn_end = Some(last_turn_end.map_or(*seq, |te: u64| te.max(*seq)));
+            }
+            // The first abnormal terminator past the last covering TurnEnd
+            // ends the invocation: steered rows before it are interrupted,
+            // never answered, and rows after it belong to another invocation
+            // (see the invariant on steered_rows_outstanding).
+            SessionLogEntry::Cancel { .. } | SessionLogEntry::Error { .. }
+                if abnormal.is_none() && last_turn_end.is_none_or(|te| *seq > te) =>
+            {
+                abnormal = Some(*seq);
+            }
+            _ => {}
+        }
+    }
+    abnormal.or(through)
+}
+
+/// Seq of the terminator that ends `prompt_seq`'s invocation when strict
+/// steering (issue #2774) extended it past the prompt's own first terminator:
+/// the last covering TurnEnd, or the Cancel/Error that ended the invocation
+/// after it. None when the first terminator is the whole story. Callers pass
+/// the live invocation's root prompt, so a later invocation's terminators
+/// cannot be misread (A2A admits no second invocation before the first task
+/// settles).
+pub fn steered_terminal_seq(entries: &[(u64, SessionLogEntry)], prompt_seq: u64) -> Option<u64> {
+    let first = invocation_terminal_seq(entries, prompt_seq)?;
+    let mut last_turn_end = None;
+    let mut abnormal = None;
+    for (seq, entry) in entries.iter().filter(|(seq, _)| *seq > prompt_seq) {
+        match entry {
+            SessionLogEntry::TurnEnd { through_seq, .. } if *through_seq >= prompt_seq => {
+                last_turn_end = Some(last_turn_end.map_or(*seq, |te: u64| te.max(*seq)));
+            }
+            SessionLogEntry::Cancel { .. } | SessionLogEntry::Error { .. }
+                if abnormal.is_none() && last_turn_end.is_none_or(|te| *seq > te) =>
+            {
+                abnormal = Some(*seq);
+            }
+            _ => {}
+        }
+    }
+    let end = abnormal.or(last_turn_end)?;
+    (end > first).then_some(end)
+}
+
 /// First durable terminator of this prompt, never a later turn's terminal row.
 ///
 /// Historical result extraction (extract_final_response, extract_turn_error,
@@ -496,6 +606,12 @@ impl DurableTextEnqueue {
         Ok(self.user_msg_seq)
     }
 }
+
+/// Initial and maximum intervals for
+/// [`NatsSession::wait_admission_head_drain`]'s poll. The interval doubles up
+/// to the cap so a long steered drain does not hammer the log forever.
+const ADMISSION_HEAD_PROBE: std::time::Duration = std::time::Duration::from_millis(50);
+const ADMISSION_HEAD_PROBE_CAP: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct AppendedPrompt {
@@ -1031,6 +1147,20 @@ impl NatsSession {
         content: MessageContent,
         user_msg_id: String,
     ) -> Result<AppendedPrompt> {
+        self.append_user_content_entry(content, user_msg_id, false)
+            .await
+    }
+
+    /// Append one admitted user row. `steered` marks a steering row that is
+    /// bound to a fixed-admission invocation's live turn (A2A, issue #2774);
+    /// the invocation's own fixed prompt row still requires the fixed-ticket
+    /// append path.
+    async fn append_user_content_entry(
+        &self,
+        content: MessageContent,
+        user_msg_id: String,
+        steered: bool,
+    ) -> Result<AppendedPrompt> {
         let log = NatsSessionLog::new_with_replicas(
             self.jetstream.clone(),
             self.storage_key.clone(),
@@ -1044,7 +1174,7 @@ impl NatsSession {
             fence_token: None,
         };
         let user_msg_seq = self
-            .append_prompt_entry(&log, &user_entry, &user_msg_id)
+            .append_prompt_entry(&log, &user_entry, &user_msg_id, steered)
             .await
             .context("failed to append user message to session log")?;
 
@@ -1099,6 +1229,37 @@ impl NatsSession {
             events: None,
             live: None,
         }))
+    }
+
+    /// Replay variant for coordinated steering (A2A, issue #2774): the
+    /// committed row replays only when its content matches this attempt's
+    /// content. The frontend's changed-parts check is its dedupe mapping,
+    /// which is written after the row and can be missing after a failed
+    /// write or a crash; without this comparison a changed retry under the
+    /// same id would be answered with — and dedupe-recorded against — a row
+    /// the caller never sent.
+    async fn existing_prompt_matching_content(
+        &self,
+        message_id: &str,
+        content: &harnx_core::message::MessageContent,
+    ) -> Result<Option<AppendedPrompt>> {
+        let entries = self.load_durable_entries().await?;
+        let committed = entries.iter().find_map(|(_, entry)| match entry {
+            SessionLogEntry::Message {
+                id: Some(id),
+                role,
+                content,
+                ..
+            } if role.is_user() && id == message_id => Some(content.clone()),
+            _ => None,
+        });
+        match committed {
+            None => Ok(None),
+            Some(committed) if committed != *content => {
+                Err(steering::SteeredContentMismatch.into())
+            }
+            Some(_) => self.existing_prompt_with_message_id(message_id).await,
+        }
     }
 
     /// Recover a completed invocation before applying its original deadline.
@@ -1411,6 +1572,76 @@ impl NatsSession {
             .await
     }
 
+    /// Admit interactive input that must join the named invocation's running
+    /// turn (coordinated steering, A2A issue #2774). The caller's
+    /// [`Self::with_admission_id`] becomes the durable row id, so same-id retries
+    /// replay the committed row instead of appending twice.
+    ///
+    /// Unlike [`Self::admit_input`] with [`Self::with_steering_admission`],
+    /// this never falls through to a fresh reservation when the target
+    /// invocation ended: the typed [`SteeringTargetEnded`] error leaves no
+    /// row or activation, so the caller can re-decide admission (for example
+    /// fall back to a new task). The prompt binding can remain from the
+    /// bind-then-append race, naming the now-ended invocation; it resolves
+    /// to nothing once that invocation is terminal, so fresh admissions for
+    /// the same message id proceed. Requires explicit frontend admission
+    /// authority.
+    pub async fn admit_input_steered(
+        &self,
+        input: &crate::config::Input,
+        target_invocation: &str,
+    ) -> Result<AppendedPrompt> {
+        anyhow::ensure!(
+            self.admission_authority.is_some(),
+            "steering requires explicit frontend admission authority"
+        );
+        self.steer_admitted_content(input.message_content(), target_invocation)
+            .await
+    }
+
+    /// Wait until the session's admission head names a provably terminal
+    /// invocation (or no invocation at all), so a fixed admission's predecessor
+    /// capture and its fenced append land against a stable tail. Steering
+    /// (A2A, issue #2774) answers steered rows in continuation rounds under
+    /// the previous invocation after that task's A2A follow already observed a
+    /// boundary, so a context can be idle at the authority while the runtime
+    /// head is still draining; a fresh admission must wait that drain out
+    /// instead of capturing a predecessor the drain then overwrites.
+    pub async fn wait_admission_head_drain(&self, timeout: std::time::Duration) -> Result<()> {
+        // Cheap head-key read first: a session with no invocation at all must
+        // not pay a transcript fetch, and only a named head needs the log to
+        // prove its invocation terminal. The poll escalates so a long drain
+        // does not hammer the log at the initial interval forever.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut probe = ADMISSION_HEAD_PROBE;
+        loop {
+            if self
+                .metadata_store
+                .admission_head(&self.storage_key)
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
+            let entries = self.load_durable_entries().await?;
+            if self
+                .metadata_store
+                .active_admission(&self.storage_key, &entries)
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "session busy: admission head still draining steered work after {timeout:?}"
+                );
+            }
+            tokio::time::sleep(probe).await;
+            probe = (probe * 2).min(ADMISSION_HEAD_PROBE_CAP);
+        }
+    }
+
     async fn admit_input_routed(
         &self,
         input: &crate::config::Input,
@@ -1667,15 +1898,31 @@ impl NatsSession {
         entries: &[(u64, SessionLogEntry)],
         user_msg_seq: u64,
     ) -> (Option<String>, Option<String>) {
+        let end = invocation_terminal_seq(entries, user_msg_seq).unwrap_or(u64::MAX);
+        Self::extract_turn_outcome_bounded(entries, user_msg_seq, end)
+    }
+
+    /// Turn extraction with an explicit terminal bound, used when steered
+    /// rows extended the invocation past its first terminator: the boundary
+    /// result is then the invocation's last answer, through the latest
+    /// TurnEnd covering the prompt.
+    pub(crate) fn extract_turn_outcome_bounded(
+        entries: &[(u64, SessionLogEntry)],
+        user_msg_seq: u64,
+        end: u64,
+    ) -> (Option<String>, Option<String>) {
         (
-            Self::extract_final_response(entries, user_msg_seq),
-            Self::extract_turn_error(entries, user_msg_seq),
+            Self::extract_final_response(entries, user_msg_seq, end),
+            Self::extract_turn_error(entries, user_msg_seq, end),
         )
     }
 
     /// Worker-reported failure for the current turn, if the turn ended in one.
-    fn extract_turn_error(entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> Option<String> {
-        let end = invocation_terminal_seq(entries, user_msg_seq).unwrap_or(u64::MAX);
+    fn extract_turn_error(
+        entries: &[(u64, SessionLogEntry)],
+        user_msg_seq: u64,
+        end: u64,
+    ) -> Option<String> {
         entries
             .iter()
             .rev()
@@ -1694,8 +1941,8 @@ impl NatsSession {
     fn extract_final_response(
         entries: &[(u64, SessionLogEntry)],
         user_msg_seq: u64,
+        end: u64,
     ) -> Option<String> {
-        let end = invocation_terminal_seq(entries, user_msg_seq).unwrap_or(u64::MAX);
         let turn_entries: Vec<_> = entries
             .iter()
             .filter(|(seq, _)| *seq > user_msg_seq && *seq <= end)
@@ -2867,7 +3114,11 @@ mod tests {
         ]);
 
         assert_eq!(
-            NatsSession::extract_final_response(&entries, 3),
+            NatsSession::extract_final_response(
+                &entries,
+                3,
+                invocation_terminal_seq(&entries, 3).unwrap_or(u64::MAX)
+            ),
             Some("new".to_string())
         );
     }
@@ -2880,7 +3131,14 @@ mod tests {
             (3, MessageRole::User, "new prompt"),
         ]);
 
-        assert_eq!(NatsSession::extract_final_response(&entries, 3), None);
+        assert_eq!(
+            NatsSession::extract_final_response(
+                &entries,
+                3,
+                invocation_terminal_seq(&entries, 3).unwrap_or(u64::MAX)
+            ),
+            None
+        );
     }
 }
 
@@ -2895,3 +3153,7 @@ mod interrupt_tests;
 #[cfg(test)]
 #[path = "nats_session/invocation_terminal_seq_tests.rs"]
 pub(crate) mod invocation_terminal_seq_tests;
+
+#[cfg(test)]
+#[path = "nats_session/steered_rows_tests.rs"]
+mod steered_rows_tests;

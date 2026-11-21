@@ -12,7 +12,9 @@ pub(super) fn agent(script: Script, dir: &std::path::Path) -> Result<Option<Stri
         return shipped_daedalus(dir).map(Some);
     }
     let (tool, body) = match script {
-        Script::ConfirmTool | Script::ConfirmHeld => ("bash_exec", "if confirm --id first 'Run counted command?'; then next; else deny 'Denied by user'; fi"),
+        Script::ConfirmTool | Script::ConfirmHeld | Script::SteeringApproval => {
+            ("bash_exec", "if confirm --id first 'Run counted command?'; then next; else deny 'Denied by user'; fi")
+        }
         Script::ConfirmSerial => ("bash_exec", "if confirm --id first 'First confirmation?' && confirm --id second 'Second confirmation?'; then next; else deny 'Denied by user'; fi"),
         Script::ConfirmSameRound => {
             write_same_round_tools_agent(dir)?;

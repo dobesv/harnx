@@ -8,6 +8,7 @@ use crate::nats_worker::{
 use anyhow::{Context, Result};
 use harnx_core::session::SessionLogEntry;
 use harnx_core::session_reconstruct::{current_turn_entries, last_terminator_is_cancel};
+use std::future::Future;
 use std::time::Duration;
 
 /// How often [`await_prompt_interrupt`] re-reads the log while a turn runs.
@@ -73,6 +74,18 @@ impl NatsSession {
         prompt_seq: u64,
         reason: &str,
     ) -> Result<InterruptOutcome> {
+        // Only the invocation currently holding the admission head can own
+        // rows appended past this prompt's own terminator (strict steering,
+        // issue #2774): a stale stop for a superseded prompt must not reach
+        // a later live invocation's rows, and reports idle exactly as
+        // before. The gate below decides the initial ownership; the stop
+        // carries the owning invocation id so the append loop re-derives
+        // ownership from the admission head on every CAS attempt. The log
+        // alone cannot close that window: once a successor invocation's
+        // prompt row is appended, `steered_rows_outstanding` cannot tell
+        // its rows from this prompt's steered ones, so head ownership is
+        // what keeps a stale owner's Cancel off the successor's work.
+        let drain_owner = self.prompt_drain_owner(prompt_seq).await?;
         let request = InterruptRequest {
             session_id: self.storage_key.clone(),
             cluster: self.config.cluster.clone(),
@@ -83,16 +96,59 @@ impl NatsSession {
         };
         tokio::time::timeout(
             INTERRUPT_APPEND_TIMEOUT,
-            interrupt_invocation(
+            interrupt_invocation_stop_steered(
                 &self.jetstream,
                 &self.client,
                 &self.config.activation_route,
                 request,
-                prompt_seq,
+                InvocationStop {
+                    prompt_seq,
+                    owning_head: drain_owner,
+                },
             ),
         )
         .await
         .context("invocation cancellation unconfirmed; external cleanup unknown")?
+    }
+
+    /// The invocation whose steered drain `prompt_seq`'s stop may reach: the
+    /// prompt's binding's invocation, when that invocation still holds the
+    /// admission head. A prompt whose invocation no longer holds the head
+    /// has no live drain of its own to stop. The check resolves the
+    /// prompt's own binding and compares it to the head — the head
+    /// invocation's newest bound row would be a steered row, not this
+    /// prompt. The gate loads the durable log once and the append loop
+    /// loads it again on purpose: the loop reads through its own log
+    /// handle whose replica configuration serves the plain interrupt
+    /// path too, so reusing the gate's entries would couple the two read
+    /// configurations for a load that is already on the stop's bounded
+    /// path (issue #2774 review F3).
+    pub(super) async fn prompt_drain_owner(&self, prompt_seq: u64) -> Result<Option<String>> {
+        bound_ownership_read(async {
+            let Some(prompt_id) =
+                prompt_message_id(&self.load_durable_entries().await?, prompt_seq)
+            else {
+                // Id-less row: nothing was ever admitted for it, so no
+                // invocation can own a drain past it.
+                return Ok(None);
+            };
+            let Some(invocation) = self
+                .metadata_store
+                .prompt_admission_binding(&self.storage_key, &prompt_id)
+                .await?
+            else {
+                // Unbound row: it never joined an invocation's drain.
+                return Ok(None);
+            };
+            let owns = self
+                .metadata_store()
+                .admission_head(&self.storage_key)
+                .await?
+                .as_deref()
+                == Some(invocation.as_str());
+            Ok(owns.then_some(invocation))
+        })
+        .await
     }
 
     pub async fn interrupt_admitted_invocation(&self, reason: &str) -> Result<InterruptOutcome> {
@@ -108,6 +164,20 @@ impl NatsSession {
         else {
             return Ok(InterruptOutcome::Idle);
         };
+        // Only the invocation currently holding the admission head can own
+        // rows appended past its own terminator (strict steering, issue
+        // #2774): those are its steered drain, and stopping the invocation
+        // must append a Cancel past the covering TurnEnd. A superseded
+        // historical invocation is reported idle exactly as before, so a
+        // later live invocation in the same session cannot be cancelled by
+        // a stale stop. The stop carries the invocation id so the append
+        // loop re-derives head ownership on every CAS attempt. The head
+        // read is bounded like every other ownership-gate read: a stalled
+        // broker fails the stop as an unconfirmed error instead of
+        // hanging it (issue #2774 review F1).
+        let head =
+            bound_ownership_read(self.metadata_store().admission_head(&self.storage_key)).await?;
+        let owns_head = head.as_deref() == Some(id.as_str());
         let request = InterruptRequest {
             session_id: self.storage_key.clone(),
             cluster: self.config.cluster.clone(),
@@ -118,12 +188,15 @@ impl NatsSession {
         };
         tokio::time::timeout(
             INTERRUPT_APPEND_TIMEOUT,
-            interrupt_invocation(
+            interrupt_invocation_stop_steered(
                 &self.jetstream,
                 &self.client,
                 &self.config.activation_route,
                 request,
-                prompt_seq,
+                InvocationStop {
+                    prompt_seq,
+                    owning_head: owns_head.then(|| id.to_string()),
+                },
             ),
         )
         .await
@@ -389,7 +462,137 @@ pub async fn interrupt_invocation(
     request: InterruptRequest,
     prompt_seq: u64,
 ) -> Result<InterruptOutcome> {
-    interrupt_target(js, client, route, request, Some(prompt_seq)).await
+    interrupt_target(
+        js,
+        client,
+        route,
+        request,
+        Some(InvocationStop {
+            prompt_seq,
+            owning_head: None,
+        }),
+    )
+    .await
+}
+
+/// [`interrupt_invocation`] for callers that own the invocation's live
+/// admission: the stop also lands when strict steering (issue #2774) has
+/// extended the invocation past its first terminator with an outstanding
+/// drain. Worker deadline callbacks pass the expired invocation's id in
+/// `owning_head`; the append loop re-derives ownership from the admission
+/// head on every CAS attempt, so once a successor takes the head the stop
+/// is scoped to the prompt's own turn and the successor's rows are never
+/// cancelled.
+pub async fn interrupt_invocation_stop_steered(
+    js: &async_nats::jetstream::Context,
+    client: &async_nats::Client,
+    route: &SessionActivationRoute,
+    request: InterruptRequest,
+    stop: InvocationStop,
+) -> Result<InterruptOutcome> {
+    interrupt_target(js, client, route, request, Some(stop)).await
+}
+
+/// Bound an admission-ownership read: a stalled broker must surface as an
+/// unconfirmed error instead of hanging the cancel or silently guessing
+/// ownership (issue #2774, review F1/F3).
+pub(super) async fn bound_ownership_read<T>(read: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(INTERRUPT_APPEND_TIMEOUT, read)
+        .await
+        .context("steered-drain ownership check unconfirmed; external cleanup unknown")?
+}
+
+/// Invocation-fence targeting for a stop: the admitted prompt the stop is
+/// bound to, and the invocation that must still hold the admission head for
+/// the stop to reach rows past the prompt's own terminator (its steered
+/// drain, issue #2774). Ownership is re-derived from the head on every CAS
+/// attempt, so a successor invocation admitted mid-loop cannot have its
+/// rows cancelled by a stale owner. `owning_head: None` means the stop is
+/// scoped to the prompt's own turn and never touches a steered drain.
+pub struct InvocationStop {
+    pub prompt_seq: u64,
+    pub owning_head: Option<String>,
+}
+
+/// The per-attempt view of a [`InvocationStop`]: which prompt the stop is
+/// bound to, and whether that prompt's invocation still owns the steered
+/// drain in this attempt's admission-head view.
+#[derive(Clone, Copy)]
+struct ScopedStop {
+    pub prompt_seq: u64,
+    pub stop_steered_drain: bool,
+}
+
+/// The message id of the user row at `prompt_seq`, if the log still has
+/// one there.
+fn prompt_message_id(entries: &[(u64, SessionLogEntry)], prompt_seq: u64) -> Option<String> {
+    entries
+        .iter()
+        .find(|(seq, _)| *seq == prompt_seq)
+        .and_then(|(_, entry)| match entry {
+            SessionLogEntry::Message {
+                id: Some(id), role, ..
+            } if role.is_user() => Some(id.clone()),
+            _ => None,
+        })
+}
+
+/// The `Cancel` at `seq`, when the log really has one there.
+fn cancel_at(entries: &[(u64, SessionLogEntry)], seq: u64) -> bool {
+    entries.iter().any(|(entry_seq, entry)| {
+        *entry_seq == seq && matches!(entry, SessionLogEntry::Cancel { .. })
+    })
+}
+
+/// The invocation fence verdict for the current log view: `Some` when the
+/// target's state already answers the stop without another append, `None`
+/// when the stop should append its `Cancel`. `stop` is this CAS attempt's
+/// scoped view — its drain ownership already reflects the current
+/// admission head.
+fn fenced_outcome(
+    entries: &[(u64, SessionLogEntry)],
+    stop: ScopedStop,
+) -> Result<Option<InterruptOutcome>> {
+    let Some(terminal) = super::invocation_terminal_seq(entries, stop.prompt_seq) else {
+        return Ok(None);
+    };
+    // Strict steering (issue #2774) can extend the invocation past this first
+    // terminator while steered rows are outstanding. Only a caller that owns
+    // the live admission may stop that extended invocation: its rows belong
+    // to it. Otherwise the historical prompt is reported idle exactly as
+    // before, so a stale stop can never cancel later work.
+    let steered_live =
+        stop.stop_steered_drain && super::steered_rows_outstanding(entries, stop.prompt_seq)?;
+    if !steered_live {
+        return Ok(Some(if cancel_at(entries, terminal) {
+            InterruptOutcome::AlreadyInterrupted {
+                cancel_seq: terminal,
+            }
+        } else {
+            InterruptOutcome::Idle
+        }));
+    }
+    // The drain keeps the invocation live: the stop appends below, unless the
+    // extended end is already a Cancel.
+    let boundary = super::steered_terminal_seq(entries, stop.prompt_seq).unwrap_or(terminal);
+    if cancel_at(entries, boundary) {
+        return Ok(Some(InterruptOutcome::AlreadyInterrupted {
+            cancel_seq: boundary,
+        }));
+    }
+    Ok(None)
+}
+
+/// The `Cancel` carrying our own cancellation id among a conflict's newer
+/// entries: our append landed before, and the lost ack is its confirmation.
+fn own_cancel_seq(entries: &[(u64, SessionLogEntry)], cancellation_id: &str) -> Option<u64> {
+    entries.iter().find_map(|(seq, entry)| match entry {
+        SessionLogEntry::Cancel {
+            cancellation_id: Some(id),
+            ..
+        } if id == cancellation_id => Some(*seq),
+        _ => None,
+    })
 }
 
 async fn interrupt_target(
@@ -397,37 +600,36 @@ async fn interrupt_target(
     client: &async_nats::Client,
     route: &SessionActivationRoute,
     request: InterruptRequest,
-    prompt_seq: Option<u64>,
+    stop: Option<InvocationStop>,
 ) -> Result<InterruptOutcome> {
     let log = NatsSessionLog::new(js.clone(), request.session_id.clone());
-    let mut entries: Vec<_> = match prompt_seq {
+    // Steered-drain ownership is re-derived from the admission head on every
+    // CAS attempt: the log alone cannot tell a successor invocation's rows
+    // from this prompt's steered ones once the successor's prompt row is
+    // appended, so the head is the authority that keeps a stale owner's
+    // Cancel off the successor's work.
+    let head_store = steered_stop_store(js, stop.as_ref(), request.replicas).await?;
+    let mut entries: Vec<_> = match &stop {
         Some(_) => log.load_events_latest_async().await?,
         None => log.last_entry_async().await?.into_iter().collect(),
     };
     for _ in 0..MAX_CAS_ATTEMPTS {
-        if let Some(prompt) = prompt_seq {
-            if let Some(terminal) = super::invocation_terminal_seq(&entries, prompt) {
-                return Ok(
-                    if entries.iter().any(|(seq, entry)| {
-                        *seq == terminal && matches!(entry, SessionLogEntry::Cancel { .. })
-                    }) {
-                        InterruptOutcome::AlreadyInterrupted {
-                            cancel_seq: terminal,
-                        }
-                    } else {
-                        InterruptOutcome::Idle
-                    },
-                );
-            }
-        }
-        if prompt_seq.is_none() {
-            if let Some(outcome) = decide(&entries) {
-                return Ok(outcome);
-            }
+        let scoped = match stop.as_ref() {
+            Some(stop) => Some(scoped_stop(stop, head_store.as_ref(), &request.session_id).await?),
+            None => None,
+        };
+        let settled = match scoped {
+            Some(scoped) => fenced_outcome(&entries, scoped)?,
+            None => decide(&entries),
+        };
+        if let Some(outcome) = settled {
+            return Ok(outcome);
         }
         let tail = entries
             .last()
-            .map_or(prompt_seq.unwrap_or(0), |(seq, _)| *seq);
+            .map_or(scoped.map_or(0, |scoped| scoped.prompt_seq), |(seq, _)| {
+                *seq
+            });
         let entry = SessionLogEntry::cancel_request(
             request.cancellation_id.clone(),
             request.requested_by.clone(),
@@ -449,26 +651,19 @@ async fn interrupt_target(
                     client,
                     route,
                     Accepted::new(&request, cancel_seq),
-                    prompt_seq.is_none(),
+                    stop.is_none(),
                 );
                 return Ok(InterruptOutcome::Accepted { cancel_seq });
             }
             FencedAppend::Conflict { entries: newer } => {
                 // Our own lost ack shows up as a Cancel carrying our id.
-                if let Some((seq, _)) = newer.iter().find(|(_, e)| {
-                    matches!(
-                        e,
-                        SessionLogEntry::Cancel { cancellation_id: Some(id), .. }
-                            if *id == request.cancellation_id
-                    )
-                }) {
-                    let cancel_seq = *seq;
+                if let Some(cancel_seq) = own_cancel_seq(&newer, &request.cancellation_id) {
                     announce(
                         js,
                         client,
                         route,
                         Accepted::new(&request, cancel_seq),
-                        prompt_seq.is_none(),
+                        stop.is_none(),
                     );
                     return Ok(InterruptOutcome::Accepted { cancel_seq });
                 }
@@ -479,6 +674,47 @@ async fn interrupt_target(
     anyhow::bail!(
         "session log tail kept moving; interrupt not appended after {MAX_CAS_ATTEMPTS} attempts"
     )
+}
+
+/// The metadata store for re-deriving steered-drain ownership in the stop
+/// loop, created only when the stop claims an owning invocation at all
+/// (issue #2774).
+async fn steered_stop_store(
+    js: &async_nats::jetstream::Context,
+    stop: Option<&InvocationStop>,
+    replicas: usize,
+) -> Result<Option<crate::nats_session_metadata::SessionMetadataStore>> {
+    match stop.filter(|stop| stop.owning_head.is_some()) {
+        Some(_) => Ok(Some(
+            crate::nats_session_metadata::SessionMetadataStore::ensure(js, replicas).await?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// This CAS attempt's scoped stop: the recorded owning invocation re-derived
+/// against the current admission head, so a stale owner — a successor
+/// admitted mid-loop — cannot reach the steered rows. No store means no
+/// owning invocation was recorded, and the stop stays scoped to the
+/// prompt's own turn.
+async fn scoped_stop(
+    stop: &InvocationStop,
+    store: Option<&crate::nats_session_metadata::SessionMetadataStore>,
+    session_id: &str,
+) -> Result<ScopedStop> {
+    let stop_steered_drain = match store {
+        Some(store) => {
+            let head = store.admission_head(session_id).await?;
+            stop.owning_head
+                .as_deref()
+                .is_some_and(|owning| head.as_deref() == Some(owning))
+        }
+        None => false,
+    };
+    Ok(ScopedStop {
+        prompt_seq: stop.prompt_seq,
+        stop_steered_drain,
+    })
 }
 
 /// `None` means "append a Cancel now".

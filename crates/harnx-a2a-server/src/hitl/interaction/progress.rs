@@ -6,6 +6,7 @@ use harnx_runtime::{
     NatsSession, PendingHitlApproval, PromptProgress,
 };
 
+// qual:allow(iosp) reason: "One ordered probe sequence decides a parked prompt's progress; extracting steps hides which re-read races which decision."
 pub(crate) async fn fixed_progress(
     session: &NatsSession,
     ticket: &FixedAdmissionTicket,

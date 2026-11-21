@@ -256,6 +256,12 @@ them with "interrupted by server restart" on startup or foreground access.
 
 Before rolling back to a version without interactive tool approval:
 - Drain parked approvals: answer or cancel tasks in `TASK_STATE_INPUT_REQUIRED`.
+- Drain steered continuations before rollback. Follow-ups to a running task are
+  steered into its turn (issue #2774) and are answered in continuation rounds that
+  can still run after the task's root answer already streamed. A follow-up sent to
+  a task whose steered work has not settled blocks new work on that context, so
+  let running tasks settle first instead of assuming `CancelTask` alone is enough
+  while the drain is still in flight.
 - Query active sessions via `ListTasks` with `status="TASK_STATE_INPUT_REQUIRED"`
   (or `"input-required"`) per context. ListTasks is paginated: check `nextPageToken`
   on each response and pass it as `pageToken` (with optional `pageSize`) until

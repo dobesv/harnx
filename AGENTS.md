@@ -1515,13 +1515,26 @@ Operational properties:
 
 ### Run-deadline cancellation is invocation-fenced
 
-Worker deadline timeouts use `interrupt_invocation` (in `nats_session/interrupt.rs`),
-binding the cancellation to the specific admission's prompt sequence. Unlike
+Worker deadline timeouts use `interrupt_invocation_stop_steered` (in
+`nats_session/interrupt.rs`), binding the cancellation to the specific
+admission's prompt sequence. Unlike
 session-level `interrupt_session`, which targets the current turn, invocation-fenced
 cancellation checks the terminal boundary before appending a `Cancel`. If the
 invocation already completed or an earlier cancellation won, the fenced call
 returns without appending. Late timer callbacks cannot cancel a subsequent
 independent run in the same session.
+
+A first `TurnEnd` is not proof the invocation settled: steering (issue #2774) can
+extend an invocation past its first terminator while steered rows are still
+outstanding. Only a stop naming the invocation that currently holds the session's
+admission head may end that extended drain — deadline callbacks pass the expired
+invocation, `interrupt_prompt` and `interrupt_admitted_invocation` pass their own
+binding — while a headless stop (`interrupt_invocation`, `owning_head: None`) stays
+scoped to the prompt's own turn and reports `Idle` at its terminator. Ownership is
+re-derived from the head on every CAS attempt — once a successor's prompt row is
+appended, the log's `steered_rows_outstanding` view cannot attribute rows to an
+invocation, so the head is the only authority that keeps a stale owner's `Cancel`
+off a successor's work.
 
 This fencing is distinct from lease loss or worker failover, which set a
 nonterminal abort flag without publishing a cancellation.

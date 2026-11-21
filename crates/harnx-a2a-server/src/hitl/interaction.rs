@@ -183,9 +183,9 @@ async fn deliver_interaction(
     response: &InteractionResponse,
 ) -> Result<HitlDecisionOutcome> {
     let outcome = session
-        .decide_interaction(&request.interaction_id, target.request_seq, response)
+        .decide_interaction_with_wake(target, &request.interaction_id, response)
         .await?;
-    decision_outcome(outcome, response.action != "deny", response.note.clone())
+    decision_outcome(outcome, approves(response), response.note.clone())
 }
 
 fn decision_outcome(

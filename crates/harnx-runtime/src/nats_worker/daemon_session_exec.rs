@@ -219,6 +219,43 @@ fn ensure_named_agent_has_model(
     );
     Ok(())
 }
+
+/// The interrupt stop a deadline expiry issues, named for the expired
+/// invocation so it also ends that invocation's outstanding steered drain
+/// (issue #2774). The interrupt append loop re-derives head ownership on
+/// every CAS attempt, so a successor invocation's rows are never cancelled.
+fn deadline_stop(
+    prompt_seq: u64,
+    record: &crate::nats_session_metadata::RunLimitsRecord,
+) -> crate::nats_session::interrupt::InvocationStop {
+    crate::nats_session::interrupt::InvocationStop {
+        prompt_seq,
+        owning_head: Some(record.invocation_id.as_str().to_owned()),
+    }
+}
+
+/// The interrupt request shared by every deadline expiry path: immediate
+/// expiry, the detached timer, and the recorded DeadlineExpired error.
+fn deadline_interrupt_request(
+    storage: String,
+    cluster: String,
+    replicas: usize,
+    record: &crate::nats_session_metadata::RunLimitsRecord,
+) -> crate::nats_session::InterruptRequest {
+    crate::nats_session::InterruptRequest {
+        session_id: storage,
+        cluster,
+        replicas,
+        cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
+        reason: "autonomous invocation deadline expired".into(),
+        // Every caller invokes this on a record with a finite deadline, so
+        // from_record is Some; the fallback only guards a corrupt record.
+        requested_by: crate::TimeoutTerminal::from_record(record)
+            .map(|terminal| terminal.message())
+            .unwrap_or_else(|| "autonomous invocation deadline expired".into()),
+    }
+}
+
 impl WorkerRuntime {
     pub(super) async fn count_activation_failure(
         &self,
@@ -634,18 +671,13 @@ impl WorkerRuntime {
                 .invocation_prompt_seq(&storage, record.invocation_id.as_str(), &entries)
                 .await?
                 .context("expired admission has no prompt binding")?;
-            let request = crate::nats_session::InterruptRequest {
-                session_id: storage,
-                cluster,
-                replicas,
-                cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
-                reason: "autonomous invocation deadline expired".into(),
-                requested_by: crate::TimeoutTerminal::from_record(&record)
-                    .expect("finite worker deadline")
-                    .message(),
-            };
-            let outcome = crate::nats_session::interrupt::interrupt_invocation(
-                &js, &client, &route, request, prompt,
+            let request = deadline_interrupt_request(storage, cluster, replicas, &record);
+            let outcome = crate::nats_session::interrupt::interrupt_invocation_stop_steered(
+                &js,
+                &client,
+                &route,
+                request,
+                deadline_stop(prompt, &record),
             )
             .await?;
             if outcome.cancel_seq().is_some() {
@@ -688,18 +720,13 @@ impl WorkerRuntime {
                     return;
                 }
             };
-            let request = crate::nats_session::InterruptRequest {
-                session_id: storage.clone(),
-                cluster,
-                replicas,
-                cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
-                reason: "autonomous invocation deadline expired".into(),
-                requested_by: crate::TimeoutTerminal::from_record(&record)
-                    .expect("finite worker deadline")
-                    .message(),
-            };
-            match crate::nats_session::interrupt::interrupt_invocation(
-                &js, &client, &route, request, prompt,
+            let request = deadline_interrupt_request(storage.clone(), cluster, replicas, &record);
+            match crate::nats_session::interrupt::interrupt_invocation_stop_steered(
+                &js,
+                &client,
+                &route,
+                request,
+                deadline_stop(prompt, &record),
             )
             .await
             {
@@ -848,22 +875,18 @@ impl WorkerRuntime {
                         )
                         .await
                     {
-                        let request = crate::nats_session::InterruptRequest {
-                            session_id: running.activation.session_id.clone(),
-                            cluster: self.cluster.clone(),
-                            replicas: self.lease.replicas,
-                            cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
-                            reason: "autonomous invocation deadline expired".into(),
-                            requested_by: crate::TimeoutTerminal::from_record(&record)
-                                .expect("finite worker deadline")
-                                .message(),
-                        };
-                        match crate::nats_session::interrupt::interrupt_invocation(
+                        let request = deadline_interrupt_request(
+                            running.activation.session_id.clone(),
+                            self.cluster.clone(),
+                            self.lease.replicas,
+                            &record,
+                        );
+                        match crate::nats_session::interrupt::interrupt_invocation_stop_steered(
                             &self.jetstream,
                             &self.client,
                             &self.activation_route,
                             request,
-                            prompt,
+                            deadline_stop(prompt, &record),
                         )
                         .await
                         {

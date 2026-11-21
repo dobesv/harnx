@@ -711,7 +711,7 @@ impl NatsSession {
         };
         #[cfg(test)]
         fail_at(_attempt.fault, DispatchFault::BeforeAppend)?;
-        let appended = self.append_prompt_entry(&log, &entry, id).await;
+        let appended = self.append_prompt_entry(&log, &entry, id, false).await;
         // A lost PubAck is not proof that append failed. Resolve the exact raw
         // identity before returning an error; never pick a later prompt.
         #[cfg(test)]

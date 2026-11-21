@@ -40,6 +40,16 @@ async fn alternating_process_routes_dedupe_exact_stream_busy_and_scoped_cancel()
 
     let streams = four_readers(&mut routes, &request, &id).await?;
     active_reads_and_rejections(&mut routes, &context, &id, &request).await?;
+    // Release the held follow-up request. The root turn finishes, but the
+    // steered row is still owed a continuation round: the steered message
+    // streams a counted-tool call (request 3) and then holds its own
+    // follow-up (request 4) until the next release, matching how the mock
+    // holds every non-counted round of the CountedTool script.
+    pair.a.h.llm.release.notify_one();
+    pair.a.requested(4).await?;
+    assert_eq!(tool_count(&pair.a.h)?, 2);
+    // The task stays working until the steered row is answered, so the same
+    // task streams the continuation round and settles with its response.
     pair.a.h.llm.release.notify_one();
     for (mut frames, mut answer) in streams {
         finish(&mut frames, &mut answer).await?;
@@ -61,8 +71,8 @@ async fn alternating_process_routes_dedupe_exact_stream_busy_and_scoped_cancel()
             id
         );
     }
-    assert_eq!(tool_count(&pair.a.h)?, 1);
-    assert_eq!(pair.a.h.llm.requests.lock().len(), 2);
+    assert_eq!(tool_count(&pair.a.h)?, 2);
+    assert_eq!(pair.a.h.llm.requests.lock().len(), 4);
 
     follow_and_cancel(&mut routes, &context, &id).await?;
     routes.assert_routes(&[
@@ -148,8 +158,8 @@ async fn follow_and_cancel(
     )?;
     assert_eq!(next["id"], retry["id"]);
     assert_ne!(next["id"], *id);
-    routes.pair.a.requested(4).await?;
-    assert_eq!(tool_count(&routes.pair.a.h)?, 2);
+    routes.pair.a.requested(6).await?;
+    assert_eq!(tool_count(&routes.pair.a.h)?, 3);
     for _ in 0..2 {
         let old_cancel = routes
             .rpc(RpcCall::new(
@@ -187,8 +197,8 @@ async fn follow_and_cancel(
         .await?;
     assert_eq!(canceled["result"]["status"]["state"], "TASK_STATE_CANCELED");
     terminal_frames(&mut subscription, "TASK_STATE_CANCELED").await?;
-    assert_eq!(tool_count(&routes.pair.a.h)?, 2);
-    assert_eq!(routes.pair.a.h.llm.requests.lock().len(), 4);
+    assert_eq!(tool_count(&routes.pair.a.h)?, 3);
+    assert_eq!(routes.pair.a.h.llm.requests.lock().len(), 6);
     Ok(())
 }
 
@@ -242,7 +252,9 @@ async fn active_reads_and_rejections(
         assert_eq!(list["result"]["tasks"][0]["id"], *id);
     }
     for _ in 0..2 {
-        let busy = routes
+        // Distinct work on the still-running context steers into the live turn
+        // and answers on the same task (issue #2774) instead of the old -32000.
+        let steered = routes
             .rpc(RpcCall::new(
                 "runner",
                 "alice",
@@ -250,7 +262,7 @@ async fn active_reads_and_rejections(
                 immediate(chat("distinct-busy", Some(context))),
             ))
             .await?;
-        assert_eq!(busy["error"]["code"], -32000, "{busy}");
+        assert_eq!(task(&steered)?["id"], *id, "{steered}");
     }
     let mut changed = request.clone();
     changed["message"]["parts"][0]["text"] = json!("changed payload");

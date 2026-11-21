@@ -3,6 +3,7 @@ pub(crate) mod context;
 pub(crate) mod fixtures;
 pub(crate) mod hitl;
 pub(crate) mod lifecycle;
+pub(crate) mod steering;
 pub(crate) mod validation;
 
 pub(crate) use fixtures::*;

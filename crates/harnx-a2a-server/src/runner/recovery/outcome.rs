@@ -67,6 +67,7 @@ struct RecoveryContext<'a> {
     output_limit: usize,
 }
 
+// qual:allow(iosp) reason: "The closure's admission arm must probe progress, bail on parked/HITL work and only then interrupt; the order is the protocol."
 async fn handle_admitted_closure(
     cx: &RecoveryContext<'_>,
     prompt_sequence: u64,
@@ -97,6 +98,7 @@ async fn handle_admitted_closure(
     Ok(completed_outcome(result, canceled, cx.output_limit))
 }
 
+// qual:allow(iosp) reason: "The steered-extended completion proof outranks the closure arms; keeping the probe above the match keeps that precedence visible."
 pub(super) async fn recovery_outcome(
     session: &NatsSession,
     ticket: &FixedAdmissionTicket,

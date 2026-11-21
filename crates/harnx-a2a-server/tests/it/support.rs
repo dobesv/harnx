@@ -32,6 +32,24 @@ mod completion;
 use completion::completion;
 
 pub const DEADLINE: Duration = Duration::from_secs(120);
+
+/// Wait until the fake LLM has recorded `count` requests. Each request
+/// notifies [`Llm::requested`], so this is deterministic even while rounds
+/// are held at the model seam: it is the way to release one held round and
+/// prove the next round's request registered before releasing it again (a
+/// `notify_one` permit does not stack, so back-to-back releases can be
+/// consumed by the wrong round).
+pub async fn llm_requested_count(h: &Harness, count: usize) -> anyhow::Result<()> {
+    loop {
+        if h.llm.requests.lock().len() >= count {
+            return Ok(());
+        }
+        tokio::time::timeout(DEADLINE, h.llm.requested.notified())
+            .await
+            .map_err(|_| anyhow::anyhow!("model round {count} never started"))?;
+    }
+}
+
 pub fn alice() -> Principal {
     Principal::User("alice".into())
 }
@@ -192,7 +210,32 @@ pub enum Script {
     Tool,
     SerialTool,
     SameRoundTools,
+    /// Counted bash_exec rounds with every non-counted round held at the model
+    /// seam. Only the unix-gated e2e replica tests construct it, so the other
+    /// platforms would otherwise flag the variant as never constructed.
+    #[cfg_attr(not(unix), allow(dead_code))]
     CountedTool,
+    Steering,
+    /// Steering with the root answer round and the steered continuation
+    /// round both held at the model seam: the root round's TurnEnd lands
+    /// while the steered row is still owed, so tests can place owner loss,
+    /// cancel intent or takeover inside the steered drain window. The
+    /// continuation answers with distinct text so recovery can be proven to
+    /// extract the steered answer, not the root round's. Only the
+    /// fault-injection multi-replica supervision tests construct it.
+    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
+    SteeringHeld,
+    /// Steering whose steered continuation round fails at the provider: the
+    /// root round answers plain text and holds, then the continuation
+    /// request answers HTTP 400 so the steered drain ends in a durable
+    /// Error.
+    SteeringFail,
+    /// Steering whose steered continuation round asks for HITL approval:
+    /// the root round answers plain text and holds while the test steers,
+    /// the continuation round issues a bash_exec call the confirmation
+    /// middleware parks, and the round after the approval answers plain
+    /// text so the steered drain completes with a distinguishable answer.
+    SteeringApproval,
     ReadOnlyTool,
     A2uiTool,
     A2uiSerial,
@@ -245,7 +288,6 @@ fn test_logs() -> Logs {
         .expect("test tracing subscriber");
     logs
 }
-
 async fn start_llm(
     script: Script,
 ) -> Result<(Arc<Llm>, std::net::SocketAddr, AbortOnDropHandle<()>)> {
@@ -332,6 +374,8 @@ fn write_fixture_support_configs(
     if matches!(
         script,
         Script::CountedTool
+            | Script::Steering
+            | Script::SteeringApproval
             | Script::ConfirmTool
             | Script::ConfirmHeld
             | Script::ConfirmSerial
@@ -386,7 +430,7 @@ fn fixture_agent_content(script: Script, dir: &std::path::Path) -> Result<String
     if let Some(agent) = interaction::agent(script, dir)? {
         return Ok(agent);
     }
-    if script == Script::CountedTool {
+    if matches!(script, Script::CountedTool | Script::Steering) {
         return Ok(
             "---\nmodel: mock:test\nuse_tools: [bash_exec]\n---\nTest counted tool agent\n".into(),
         );
