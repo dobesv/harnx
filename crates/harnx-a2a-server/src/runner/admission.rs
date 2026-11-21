@@ -241,14 +241,27 @@ impl Runner {
         }
         let predecessor = match admission.fixed_predecessor {
             Some(tail) => tail,
-            None => session
-                .prepare_fixed_admission(
-                    admission.allocation.invocation_id.clone(),
-                    admission.allocation.prompt_id.clone(),
-                    admission.allocation.closure_id.clone(),
-                )
-                .await?
-                .expected_predecessor(),
+            None => {
+                // A fresh admission captures the fixed predecessor against the
+                // tail, so the previous invocation's steered continuation
+                // rounds (issue #2774) must have drained first: an appends-
+                // after-capture continuation would fence this admission out.
+                if let Err(error) = session.wait_admission_head_drain(HEAD_DRAIN_TIMEOUT).await {
+                    // The previous invocation's steered drain did not finish
+                    // in time: the context is still busy with live work, so
+                    // surface the retryable busy error, not a generic failure.
+                    tracing::warn!(%error, "admission head drain timed out");
+                    return Err(RunnerError::Busy.into());
+                }
+                session
+                    .prepare_fixed_admission(
+                        admission.allocation.invocation_id.clone(),
+                        admission.allocation.prompt_id.clone(),
+                        admission.allocation.closure_id.clone(),
+                    )
+                    .await?
+                    .expected_predecessor()
+            }
         };
         // Construct once; future recovery restores these fields, never a later tail.
         FixedAdmissionTicket::from_parts(

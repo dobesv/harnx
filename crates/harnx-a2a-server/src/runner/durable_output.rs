@@ -28,13 +28,30 @@ fn invocation_end_seq(
     prompt: u64,
     through: Option<u64>,
 ) -> u64 {
+    let cap = through.unwrap_or(u64::MAX);
+    // A live steered drain (issue #2774): rows past the prompt's first
+    // terminator belong to this invocation and are owed continuation-round
+    // answers, so the bound is the caller's own reconciliation point (the
+    // approval challenge sequence), not the first terminator — otherwise an
+    // InputRequired reconciliation would drop the continuation's assistant
+    // text before the challenge. While the drain is live no later
+    // invocation can exist (see the invariant on steered_rows_outstanding),
+    // so the caller's bound cannot leak another invocation's rows. A read
+    // failure falls back to the conservative first-terminator bound.
+    if harnx_runtime::nats_session::steered_rows_outstanding(entries, prompt).unwrap_or(false) {
+        return cap;
+    }
     let end = entries
         .iter()
         .find_map(|(seq, entry)| {
             (*seq > prompt && is_raw_terminator(entry, prompt)).then_some(*seq)
         })
         .unwrap_or(u64::MAX);
-    end.min(through.unwrap_or(u64::MAX))
+    // Steered continuation rounds (issue #2774) extend the invocation past
+    // its first terminator; durable output reconciles through the extended
+    // bound so the recovered text includes the steered answers.
+    let end = harnx_runtime::nats_session::steered_terminal_seq(entries, prompt).unwrap_or(end);
+    end.min(cap)
 }
 
 fn extract_assistant_text(entry: &SessionLogEntry) -> Option<String> {
@@ -115,6 +132,68 @@ mod tests {
             timestamp: None,
             fence_token: None,
         }
+    }
+
+    fn steered_user(id: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: Some(id.into()),
+            role: MessageRole::User,
+            content: MessageContent::Text("steered".into()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn turn_end(through_seq: u64) -> SessionLogEntry {
+        SessionLogEntry::TurnEnd {
+            through_seq,
+            fence_token: 1,
+            timestamp: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn live_drain_reconcile_includes_continuation_text_up_to_challenge() -> Result<()> {
+        harnx_core::require_nextest();
+        // The continuation round raises its approval challenge before any
+        // TurnEnd covers the steered row: the drain is live, so the bound is
+        // the challenge sequence, not the root round's first terminator.
+        let entries = vec![
+            (1, assistant("old")),
+            (3, assistant("root answer")),
+            (4, turn_end(2)),
+            (5, steered_user("steered")),
+            (6, assistant("continuation text")),
+        ];
+        assert_eq!(
+            invocation_text(&entries, 2, Some(6))?,
+            "root answercontinuation text"
+        );
+        // Once a covering TurnEnd settles the drain, the extended bound
+        // still includes the steered answer, and rows after the abnormal
+        // terminator — the next invocation's — stay excluded.
+        let mut drained = entries.clone();
+        drained.push((7, turn_end(5)));
+        drained.push((
+            9,
+            SessionLogEntry::Cancel {
+                fence_token: 0,
+                cancellation_id: None,
+                requested_by: None,
+                timestamp: None,
+            },
+        ));
+        drained.push((10, assistant("after")));
+        assert_eq!(
+            invocation_text(&drained, 2, None)?,
+            "root answercontinuation text"
+        );
+        assert_eq!(
+            invocation_text(&entries, 2, None)?,
+            "root answercontinuation text"
+        );
+        Ok(())
     }
 
     #[test]

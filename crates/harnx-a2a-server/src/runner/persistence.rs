@@ -56,6 +56,7 @@ impl Publisher {
         self.publish_snapshot();
         Ok(())
     }
+    // qual:allow(iosp) reason: "One closure resolution plus the steered-extended completion proof decides whether the stop really landed."
     pub(super) async fn confirm_stop(&mut self, session: &NatsSession) -> Result<()> {
         let ticket = self.authority.ticket(&self.storage_key)?;
         let stopped = match session.resolve_fixed_admission(&ticket).await? {
@@ -69,6 +70,7 @@ impl Publisher {
         self.stop_observed = true;
         Ok(())
     }
+    // qual:allow(iosp) reason: "The closure outcome dictates exactly one follow-up per branch, including the interrupt that releases a steered drain; a split hides which branch owes the interrupt."
     pub(super) async fn stop_failed_admission(&mut self, session: &NatsSession) -> Result<()> {
         let ticket = self.authority.ticket(&self.storage_key)?;
         match session.close_fixed_admission(&ticket).await? {

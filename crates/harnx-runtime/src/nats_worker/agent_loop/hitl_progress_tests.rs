@@ -19,12 +19,17 @@ fn ticket(predecessor: u64) -> FixedAdmissionTicket {
     .unwrap()
 }
 
+/// Historical mode: the prompt is not being followed live, so rows past its
+/// terminator belong to later invocations and the first terminator's proof
+/// wins. Live mode (steered drains, issue #2774) is covered by the runtime's
+/// steered_rows_tests.
 fn progress(entries: &[(u64, SessionLogEntry)], predecessor: u64) -> PromptProgress {
     NatsSession::fixed_prompt_progress_from_entries(
         &ticket(predecessor),
         predecessor + 1,
         "session",
         entries,
+        false,
     )
     .unwrap()
 }

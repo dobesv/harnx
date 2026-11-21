@@ -36,6 +36,7 @@ impl NatsSession {
         log: &NatsSessionLog,
         entry: &SessionLogEntry,
         message_id: &str,
+        steered: bool,
     ) -> Result<u64> {
         let mut entries = log.load_events_latest_async().await?;
         let mut tail = entries.last().map_or(0, |(seq, _)| *seq);
@@ -46,7 +47,7 @@ impl NatsSession {
                 .await?
                 .context("prompt has no admission")?;
             anyhow::ensure!(
-                admission.fixed_ticket.is_none(),
+                steered || admission.fixed_ticket.is_none(),
                 "fixed admission requires fixed-ticket append"
             );
             anyhow::ensure!(

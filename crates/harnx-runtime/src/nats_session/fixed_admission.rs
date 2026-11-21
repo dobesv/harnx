@@ -334,11 +334,18 @@ impl NatsSession {
         let FixedAdmissionOutcome::Admitted { prompt_sequence } = outcome else {
             anyhow::bail!("fixed prompt is not admitted: {outcome:?}");
         };
+        // While this ticket's invocation still holds the admission head,
+        // rows past its own terminator are its steered drain and decide
+        // progress (issue #2774); once a later invocation takes the head,
+        // its rows are that invocation's work and the first terminator's
+        // proof wins.
+        let steered_live = self.steered_live_head(ticket.invocation_id()).await?;
         let progress = Self::fixed_prompt_progress_from_entries(
             ticket,
             prompt_sequence,
             &self.session_id,
             &entries,
+            steered_live,
         )?;
         self.guard_fixed_progress(prompt_sequence, &entries, progress)
             .await
@@ -370,6 +377,7 @@ impl NatsSession {
 
     /// Observe the original fixed invocation's durable completion without
     /// activation or append. Recovery must check this before deciding to stop it.
+    // qual:allow(iosp) reason: "The completion proof resolves the admission, then extends the extraction bound through the steered terminator; the bound is only meaningful for the resolved prompt, so the reads stay together."
     pub async fn fixed_prompt_completion(
         &self,
         ticket: &FixedAdmissionTicket,
@@ -385,16 +393,25 @@ impl NatsSession {
         let Some(terminal) = super::invocation_terminal_seq(&entries, prompt_sequence) else {
             return Ok(None);
         };
-        let (response, error) = Self::extract_turn_outcome(&entries, prompt_sequence);
+        // Strict steering (issue #2774) appends rows past the prompt's own
+        // terminator that continuation rounds answer: while they are still
+        // outstanding the invocation is not durably complete, and once they
+        // drain the completion is the invocation's last answer through the
+        // extended terminator, not the root round's.
+        if super::steered_rows_outstanding(&entries, prompt_sequence)? {
+            return Ok(None);
+        }
+        let end = super::steered_terminal_seq(&entries, prompt_sequence).unwrap_or(terminal);
+        let (response, error) = Self::extract_turn_outcome_bounded(&entries, prompt_sequence, end);
         Ok(Some(super::NatsTurnResult {
             response,
             error,
             session_id: self.session_id.clone(),
             user_msg_id: ticket.prompt_id().into(),
             user_msg_seq: prompt_sequence,
-            was_cancelled: entries.iter().any(|(seq, entry)| {
-                *seq == terminal && matches!(entry, SessionLogEntry::Cancel { .. })
-            }),
+            was_cancelled: entries
+                .iter()
+                .any(|(seq, entry)| *seq == end && matches!(entry, SessionLogEntry::Cancel { .. })),
         }))
     }
 }
