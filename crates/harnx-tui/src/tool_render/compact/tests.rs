@@ -123,3 +123,36 @@ fn compact_wait_result_keeps_full_output_in_detail_view() {
     assert_eq!(text, "completed");
     assert!(full_detail.as_ref().unwrap().contains("child output"));
 }
+
+#[test]
+fn compact_send_dispatch_result_keeps_full_output_in_detail_view() {
+    // The session_send result template renders a dispatch-only result as one
+    // line ("dispatched <session_id>"); the whole envelope stays in full_detail.
+    let output = serde_json::json!({
+        "session_id": "ab12cd",
+        "prompt_id": "long-prompt-id",
+        "invocation_id": "long-prompt-id",
+        "dispatch": "confirmed",
+        "status": "pending",
+        "terminal": false,
+        "wait_expired": false,
+        "elapsed_ms": 4,
+        "output": {"observation": {"observed_at_ms": 1, "running_ms": 1,
+            "complete": false, "error": null}},
+    });
+    let items = crate::tool_transcript::tool_completed_to_transcript_items(
+        &output,
+        Some("dispatched ab12cd"),
+    );
+    let [crate::types::TranscriptItem::ToolResultMarkdown {
+        text, full_detail, ..
+    }] = items.as_slice()
+    else {
+        panic!("expected one result row");
+    };
+    assert_eq!(text, "dispatched ab12cd");
+    let detail = full_detail.as_ref().unwrap();
+    assert!(detail.contains("session_id"), "{detail}");
+    assert!(detail.contains("long-prompt-id"), "{detail}");
+    assert!(detail.contains("confirmed"), "{detail}");
+}

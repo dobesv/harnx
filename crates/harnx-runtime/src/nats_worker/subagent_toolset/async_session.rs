@@ -13,7 +13,7 @@ pub(super) mod observation;
 mod progress;
 mod specs;
 
-pub(crate) use specs::{session_send_spec, session_wait_spec};
+pub(crate) use specs::{session_result_template, session_send_spec, session_wait_spec};
 
 use super::session_read::{ReadOptions, ResolvedRead};
 use crate::nats_session_metadata::{CallTimeoutOverride, EffectiveDeadline};

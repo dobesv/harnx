@@ -7,11 +7,23 @@ use harnx_toolset::{
 };
 use serde_json::{json, Value};
 
-// Keep repeated observations compact without changing the model-facing result.
-// Errors have no status/output envelope, so retain their diagnostic instead.
-const WAIT_RESULT_TEMPLATE: &str = concat!(
-    "{% if result.is_error %}",
+// Keep repeated observations compact without changing the model-facing
+// result. Errors have no status/output envelope, so retain their diagnostic
+// instead. The three arms below compose into the `session_send` and
+// `session_wait` result templates; `session_send` only adds its dispatch-only
+// line ahead of the shared wait summary.
+
+/// Leading `is_error` arm shared by result templates. Callers append the
+/// optional `session_send` dispatch arm, then an `else` summary arm that closes
+/// the conditional.
+const RESULT_ERROR_ARM: &str = concat!(
+    "{% if result.is_error or result.error %}",
     "{{ result.error | default(raw(), true) | replace('\r', ' ') | replace('\n', ' ') | truncate(100) }}",
+);
+
+/// One-line status summary for every wait-shaped observation. Closes the
+/// `is_error` conditional opened by [`RESULT_ERROR_ARM`].
+const WAIT_SUMMARY_ARM: &str = concat!(
     "{% else %}{{ result.status | default('unknown', true) }}",
     "{% if result.wait_expired %} (wait expired){% endif %}",
     "{% if result.stopped_by %} ({{ result.stopped_by }}){% endif %}",
@@ -22,6 +34,30 @@ const WAIT_RESULT_TEMPLATE: &str = concat!(
     "{% if diagnostic.text %} — {{ diagnostic.text | replace('\r', ' ') | replace('\n', ' ') | truncate(100) }}{% endif %}",
     "{% endif %}{% endif %}",
 );
+
+/// Dispatch-only `session_send` (no `wait`) never rendered a page: no events,
+/// not terminal, no expiry or stop, and no observation error. Everything else
+/// is a wait-shaped observation and falls through to the shared summary.
+const SEND_DISPATCH_ARM: &str = concat!(
+    "{% elif not result.terminal and not result.wait_expired and not result.stopped_by",
+    " and not result.output.observation.error and result.output.events is not defined",
+    " and result.status != 'blocked' %}",
+    "dispatched{% if result.session_id %} {{ result.session_id }}{% endif %}",
+    "{% if result.dispatch == 'unconfirmed' %} (unconfirmed){% endif %}",
+);
+
+/// Result template for `session_send`: a dispatch-only call renders the
+/// durable handle's session ID; a soft wait renders the same one-line status
+/// summary as `session_wait`.
+fn send_result_template() -> String {
+    format!("{RESULT_ERROR_ARM}{SEND_DISPATCH_ARM}{WAIT_SUMMARY_ARM}")
+}
+
+/// Wrap a summary body in the shared `is_error` arm so other
+/// `<agent>_session_*` result templates keep the same error rendering.
+pub(crate) fn session_result_template(summary_arm: &str) -> String {
+    format!("{RESULT_ERROR_ARM}{{% else %}}{summary_arm}{{% endif %}}")
+}
 
 /// Wait properties shared by `session_send.wait` and the top level of
 /// `session_wait`.
@@ -124,6 +160,7 @@ files by including cid: attachment URLs in their reply. {}",
         "@ {agent}{{% if args.session_id %}} [{}]{{% endif %}}\n{{{{ args.message }}}}",
         super::super::SHORT_SESSION_ID
     ))
+    .with_result_template(&send_result_template())
     .with_kind(ToolProgressKind::Execute)
     .with_stop_on_new_message()
 }
@@ -181,7 +218,7 @@ deadline. To check status without waiting, use session_load with prompt_id."
         "@ {agent} [{}] wait {{{{ args.prompt_id | truncate(8, '') }}}}",
         super::super::SHORT_SESSION_ID
     ))
-    .with_result_template(WAIT_RESULT_TEMPLATE)
+    .with_result_template(&format!("{RESULT_ERROR_ARM}{WAIT_SUMMARY_ARM}"))
     .with_kind(ToolProgressKind::Read)
     .with_stop_on_new_message()
 }
