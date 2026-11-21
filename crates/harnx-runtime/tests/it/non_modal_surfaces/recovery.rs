@@ -40,7 +40,10 @@ async fn non_modal_turn_action_delivered_after_lost_reply() -> Result<()> {
         .publish_with_reply(subject, dead_inbox, command.to_bytes()?.into())
         .await?;
     wait_slow_started(&fixture).await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // No fixed sleep before the release: the reply is lost structurally
+    // (nobody reads the dead inbox), and the record's durability is the
+    // barrier below — releasing as soon as the tool has started cannot
+    // shorten what the retry observes.
     fixture.slow_release.store(true, Ordering::SeqCst);
     // The record is durable but its reply is gone.
     let deadline = std::time::Instant::now() + CI_SAFE_TIMEOUT;

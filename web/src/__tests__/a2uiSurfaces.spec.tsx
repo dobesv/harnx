@@ -408,7 +408,9 @@ describe('Non-modal A2UI Surfaces', () => {
       ['invalid_data', 'The submitted form data is invalid.'],
       ['unauthorized_tool', 'You do not have permission to execute this tool action.'],
       ['tool_failed', 'The action failed during execution.'],
-      ['lease_lost', 'Session ownership changed while processing this action. Please retry.'],
+      ['lease_lost', 'Session ownership changed while processing this action. A direct tool may have run; check the session before retrying.'],
+      ['append_failed', 'The action record could not be confirmed. A direct tool may have run, and the record may already be durable; check the session before retrying.'],
+      ['pending', 'The worker is still processing this action. Check the session for its outcome before trying again.'],
     ])('displays humanized rejection error (%s) without crashing, preserving form inputs', async (outcome, expectedMsg) => {
       vi.mocked(submitSurfaceAction).mockRejectedValueOnce(
         new SurfaceActionError('surface action rejected', -32004, outcome, { outcome })

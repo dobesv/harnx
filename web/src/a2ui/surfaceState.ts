@@ -119,7 +119,11 @@ export function humanizeRejectionOutcome(outcome: string): string {
     case 'tool_failed':
       return 'The action failed during execution.';
     case 'lease_lost':
-      return 'Session ownership changed while processing this action. Please retry.';
+      return 'Session ownership changed while processing this action. A direct tool may have run; check the session before retrying.';
+    case 'append_failed':
+      return 'The action record could not be confirmed. A direct tool may have run, and the record may already be durable; check the session before retrying.';
+    case 'pending':
+      return 'The worker is still processing this action. Check the session for its outcome before trying again.';
     default:
       return `Action rejected: ${outcome.replace(/_/g, ' ')}.`;
   }

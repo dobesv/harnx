@@ -471,15 +471,20 @@ fn surface_decision_error(result: &Result<SurfaceActionOutcome, String>) -> Opti
         Ok(SurfaceActionOutcome::ToolFailed) => {
             Some("tool_failed: the declared target tool failed".into())
         }
-        Ok(SurfaceActionOutcome::LeaseLost) => {
-            Some("lease_lost: worker ownership changed; retry the action".into())
-        }
-        Ok(SurfaceActionOutcome::AppendFailed) => {
-            Some("append_failed: the action could not be recorded; nothing is durable".into())
-        }
-        Ok(SurfaceActionOutcome::Pending) => {
-            Some("pending: the action is still being processed".into())
-        }
+        Ok(SurfaceActionOutcome::LeaseLost) => Some(
+            "lease_lost: the action outcome is uncertain; a direct tool may have run. \
+             Check the session before retrying."
+                .into(),
+        ),
+        Ok(SurfaceActionOutcome::AppendFailed) => Some(
+            "append_failed: a handler panic or record failure left the action outcome \
+             uncertain; a direct tool may have run. Check the session before retrying."
+                .into(),
+        ),
+        Ok(SurfaceActionOutcome::Pending) => Some(
+            "pending: the action is still being processed; check its outcome before retrying."
+                .into(),
+        ),
         Err(error) => Some(error.clone()),
     }
 }

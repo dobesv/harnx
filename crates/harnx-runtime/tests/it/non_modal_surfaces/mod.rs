@@ -12,6 +12,7 @@ mod stub;
 
 mod at_most_once;
 mod basics;
+mod client_ack;
 mod direct_tool;
 mod lease;
 mod recovery;
