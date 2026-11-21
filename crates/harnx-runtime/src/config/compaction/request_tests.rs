@@ -114,7 +114,7 @@ fn oversized_system_prompt_is_unchanged_and_transcript_minimized_without_size_er
     assert_eq!(data.messages[0].content.to_text(), prompt);
     let text = data.messages[1].content.to_text();
     assert!(text.contains("[1 earlier user prompts omitted]"));
-    assert!(text.contains("── user ──"));
+    assert!(text.contains("<user>"));
     assert!(estimate_token_length(&text) < 60);
     assert!(
         model.guard_max_input_tokens(&data.messages).is_err(),

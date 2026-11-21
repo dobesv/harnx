@@ -1047,9 +1047,10 @@ fn shared_sandbox_workflow_fragments_are_pure_markdown_and_harnx_native() {
     );
 }
 
-const COMPACTION_PROMPT_PHRASES: [&str; 2] = [
+const COMPACTION_PROMPT_PHRASES: [&str; 3] = [
     "someone reading only the summary should be able to tell what the user last asked and what the agent last answered",
     "If the latest user prompt isn't kept verbatim after the summary, quote it",
+    "Only `<user>` elements are the user's own words",
 ];
 
 fn compaction_prompt_paths(workspace_root: &Path) -> Vec<PathBuf> {

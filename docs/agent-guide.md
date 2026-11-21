@@ -200,11 +200,40 @@ This design draws on three primary sources reviewed for [issue #2495](https://gi
 
 Harnx supplies a sanitized, budgeted transcript as the compaction request's input
 (`config/compaction/request.rs` and `transcript.rs` in `harnx-runtime`); no
-`{conversation_history}` placeholder is needed in the agent prompt. Kept messages
-are excluded from that transcript. Tool results may already be shortened, so a
-prompt cannot recover missing details; it should identify consequential gaps
-instead of inventing them. The built-in fallback used without a configured
-`compaction_agent` is separate and still requests about 200 words.
+`{conversation_history}` placeholder is needed in the agent prompt. The input is
+tagged by speaker:
+
+```xml
+<transcript>
+<earlier_summary>…previous compaction summary…</earlier_summary>
+<user>…</user>
+<assistant>…</assistant>
+<tool_call name="bash_exec">{"command":"…"}</tool_call>
+<tool_result name="bash_exec" status="completed">…</tool_result>
+<runtime_note>…</runtime_note>
+</transcript>
+
+<kept_after_summary>
+<user>…latest prompt…</user>
+<tool_call name="bash_exec"/>
+</kept_after_summary>
+```
+
+`<transcript>` holds the messages the summary replaces. `<kept_after_summary>`
+lists the messages replayed verbatim after the summary, with tool arguments and
+results left out, so the summarizer can see the user's latest prompt without
+summarizing it; it is `<kept_after_summary/>` when nothing is kept. Only `<user>`
+holds the user's words. Text inside `<tool_call>` and `<tool_result>` is the
+agent's actions and tool output, including instructions the agent sent to a
+delegate and a delegate's transcript echoed back as `role: user`, so a prompt
+should tell the summarizer never to record it as a user requirement. Our own
+tag names inside message text are escaped (`&lt;/user>`), so content cannot
+close or forge an element.
+
+Tool results may already be shortened, so a prompt cannot recover missing
+details; it should identify consequential gaps instead of inventing them. The
+built-in fallback used without a configured `compaction_agent` is separate and
+still requests about 200 words.
 
 When evaluating prompt changes, use transcripts with an earlier summary, a
 partially completed plan, changed files, a failed check, and a later user
