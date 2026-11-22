@@ -285,6 +285,12 @@ pub(super) fn configured_worker_services(config: &GlobalConfig) -> Vec<ToolServe
             log::warn!("could not resolve middleware for tool-server selection: {error:#}")
         }
     }
+    match config.resolved_event_hooks() {
+        Ok(hooks) => selectors.extend(hooks.tool_selectors().map(str::to_owned)),
+        Err(error) => {
+            log::warn!("could not resolve event hooks for tool-server selection: {error:#}")
+        }
+    }
     tool_servers_for_view(&config, agent_package, &selectors)
 }
 
@@ -476,6 +482,7 @@ mod tests {
         tool_servers_for_view, tool_servers_matching_use_tools,
     };
     use crate::config::{Agent, AgentConfig, Config, ToolServerConfig};
+    use harnx_core::hooks::HooksConfig;
     use harnx_core::middleware::{MiddlewareDefinition, MiddlewareEntry, MiddlewareSourceConfig};
 
     fn tool_server(name: &str) -> ToolServerConfig {
@@ -730,6 +737,110 @@ mod tests {
         let names = configured_server_names(&config);
 
         assert_eq!(names, ["fs", "plans", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_starts_servers_needed_only_by_hooks_for_every_event() {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown(
+                    "worker",
+                    r#"---
+hooks:
+  SessionStart:
+    - {name: start, bash: next, tools: [fs_read]}
+  UserPromptSubmit:
+    - {name: prompt, bash: next, tools: [time_get_current_time]}
+  Stop:
+    - {name: stop, bash: next, tools: [plans_list]}
+  StopFailure:
+    - {name: failure, bash: next, tools: [weather_get_forecast]}
+---
+"#,
+                )
+                .unwrap(),
+            ));
+            config.tool_servers = vec![
+                tool_server("fs"),
+                tool_server("time"),
+                tool_server("plans"),
+                tool_server("weather"),
+                tool_server("unused"),
+            ];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "time", "plans", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_ignores_disabled_hook_tool_selectors() {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.hooks = Some(Box::new(
+                serde_yaml::from_str::<HooksConfig>(
+                    r#"Stop:
+  - {name: helper, bash: next, tools: [weather_get_forecast]}
+"#,
+                )
+                .unwrap(),
+            ));
+            config
+                .middleware
+                .entries
+                .push(middleware_with_tools("helper-middleware", &["plans_list"]));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown(
+                    "worker",
+                    r#"---
+use_tools: [fs_*]
+hooks:
+  Stop:
+    - {name: helper, enabled: false}
+---
+"#,
+                )
+                .unwrap(),
+            ));
+            config.tool_servers = vec![
+                tool_server("fs"),
+                tool_server("plans"),
+                tool_server("weather"),
+            ];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "plans"]);
+    }
+
+    #[test]
+    fn configured_worker_services_keeps_agent_and_middleware_servers_when_hook_resolution_fails() {
+        // A disable for an unknown hook makes hook resolution fail. The warning
+        // must not discard servers selected by the agent or middleware.
+        let config = worker_config_with_global_middleware(
+            r#"---
+use_tools: [fs_*]
+hooks:
+  Stop:
+    - {name: ghost, enabled: false}
+---
+"#,
+            middleware_with_tools("helper", &["weather_get_forecast"]),
+            vec![
+                tool_server("fs"),
+                tool_server("weather"),
+                tool_server("plans"),
+            ],
+        );
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "weather"]);
     }
 
     #[test]

@@ -92,6 +92,7 @@ fn session_start_event_config(
                     source: harnx_core::middleware::MiddlewareSourceConfig::Bash {
                         bash: bash.to_string(),
                     },
+                    tools: vec![],
                     fetch: vec![],
                     timeout: std::time::Duration::from_secs(30),
                     on_error,
@@ -127,6 +128,7 @@ async fn dispatch_test_session_start(
         },
         &config,
         &crate::utils::create_abort_signal(),
+        || async { panic!("hooks without tools must not build a tool context") },
     )
     .await;
     (result, pending)

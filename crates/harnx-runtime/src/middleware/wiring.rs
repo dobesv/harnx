@@ -33,11 +33,7 @@ fn resolve(config: &Config, package: Option<&str>) -> Result<Chain> {
         .entries
         .into_iter()
         .map(|definition| {
-            let tools = config
-                .select_tools_for_package(&definition.tools, package)
-                .into_iter()
-                .filter(|tool| crate::config::is_bash_inner_tool_allowed(&tool.name))
-                .collect();
+            let tools = config.select_script_tools_for_package(&definition.tools, package);
             Arc::new(Entry { definition, tools })
         })
         .collect();

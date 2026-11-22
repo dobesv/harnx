@@ -23,6 +23,7 @@ fn session_start_context_hook() -> HooksConfig {
                 source: MiddlewareSourceConfig::Bash {
                     bash: "add_context \"context from session start hook\"".to_string(),
                 },
+                tools: vec![],
                 fetch: vec![],
                 timeout: Duration::from_secs(30),
                 on_error: EventHookOnError::Allow,

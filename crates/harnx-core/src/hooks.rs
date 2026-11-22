@@ -85,12 +85,14 @@ impl EventHookEntry {
 }
 
 /// Full replacement, never a partial overlay of an earlier declaration.
-/// Middleware fields minus `match`, `tools` and the interaction operations.
+/// Middleware fields minus `match` and the interaction operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EventHookDefinition {
     pub name: String,
     #[serde(flatten)]
     pub source: MiddlewareSourceConfig,
+    /// Helper tool selectors, resolved after discovery; empty exposes no tools.
+    pub tools: Vec<String>,
     /// Exact HTTP(S) hosts; empty denies all fetch requests.
     pub fetch: Vec<String>,
     #[serde(serialize_with = "serialize_event_hook_timeout")]
@@ -105,6 +107,7 @@ struct RawEventHookEntry {
     bash: Option<String>,
     python: Option<String>,
     script: Option<PathBuf>,
+    tools: Option<Vec<String>>,
     fetch: Option<Vec<String>>,
     timeout: Option<String>,
     on_error: Option<EventHookOnError>,
@@ -172,6 +175,7 @@ fn parse_event_hook_entry(value: &serde_json::Value) -> Result<EventHookEntry, S
     Ok(EventHookEntry::Full(EventHookDefinition {
         name: raw.name,
         source,
+        tools: raw.tools.unwrap_or_default(),
         fetch: crate::middleware::parse_fetch_hosts(raw.fetch.unwrap_or_default())?,
         timeout,
         on_error: raw.on_error.unwrap_or_default(),
@@ -409,6 +413,81 @@ StopFailure:
     }
 
     #[test]
+    fn event_hook_tools_parse_and_round_trip_for_every_event_and_source() {
+        let selectors = [" fs_* ", "pkg/tool", "fs_{read,write}", "readers", "fs_*"];
+        for event in HookEventKind::ALL {
+            for source in [
+                "bash: event_input",
+                "python: event_input()",
+                "script: hook.py",
+            ] {
+                let yaml = format!(
+                    "{}:\n  - name: helper\n    {source}\n    tools: {}\n",
+                    event.key(),
+                    serde_json::to_string(&selectors).unwrap()
+                );
+                let config: HooksConfig = serde_yaml::from_str(&yaml).unwrap();
+                let EventHookEntry::Full(definition) = &config.list(event).entries[0] else {
+                    panic!("expected a full entry");
+                };
+                assert_eq!(definition.tools, selectors);
+                let serialized = serde_yaml::to_string(&config).unwrap();
+                assert_eq!(
+                    serde_yaml::from_str::<HooksConfig>(&serialized).unwrap(),
+                    config
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn event_hook_tools_default_to_empty_for_every_event() {
+        for event in HookEventKind::ALL {
+            for tools in ["", "    tools: []\n"] {
+                let yaml = format!(
+                    "{}:\n  - name: helper\n    bash: event_input\n{tools}",
+                    event.key()
+                );
+                let config: HooksConfig = serde_yaml::from_str(&yaml).unwrap();
+                let EventHookEntry::Full(definition) = &config.list(event).entries[0] else {
+                    panic!("expected a full entry");
+                };
+                assert!(definition.tools.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn event_hook_tools_keep_strict_fields_and_disable_entries() {
+        for event in HookEventKind::ALL {
+            for fields in [
+                "bash: event_input, tool: [fs_read]",
+                "bash: event_input, tools: fs_read",
+                "bash: event_input, tools: [1]",
+                "bash: event_input, tools: null",
+                "enabled: false, tools: [fs_read]",
+                "enabled: false, tools: []",
+            ] {
+                let yaml = format!("{}:\n  - {{name: helper, {fields}}}\n", event.key());
+                let error = serde_yaml::from_str::<HooksConfig>(&yaml).unwrap_err();
+                assert!(error.to_string().contains("helper"), "{fields}: {error}");
+                if fields.contains("tool:") {
+                    assert!(
+                        error.to_string().contains("unknown field `tool`"),
+                        "{error}"
+                    );
+                }
+            }
+            let yaml = format!("{}:\n  - {{name: helper, enabled: false}}\n", event.key());
+            let config: HooksConfig = serde_yaml::from_str(&yaml).unwrap();
+            assert!(matches!(
+                config.list(event).entries[0],
+                EventHookEntry::Disable { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn hooks_config_merges_max_resume_agent_first() {
         let global: HooksConfig = serde_yaml::from_str("max_resume: 5\n").unwrap();
         let agent: HooksConfig = serde_yaml::from_str("max_resume: 3\n").unwrap();
@@ -515,6 +594,7 @@ UserPromptSubmit:
                 source: crate::middleware::MiddlewareSourceConfig::Bash {
                     bash: "resume \"continue\"".into(),
                 },
+                tools: vec![],
                 fetch: vec![],
                 timeout: std::time::Duration::from_millis(1500),
                 on_error: super::EventHookOnError::Allow,

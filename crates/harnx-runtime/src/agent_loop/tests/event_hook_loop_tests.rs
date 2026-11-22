@@ -2,6 +2,8 @@
 //! resume bounds, and hook-context delivery to the model and the transcript
 //! (issue #2198).
 
+mod tools;
+
 use super::*;
 use crate::config::session::SessionAppendSink;
 use harnx_core::hooks::{
@@ -18,6 +20,7 @@ fn bash_hook(name: &str, bash: &str) -> EventHookEntry {
         source: MiddlewareSourceConfig::Bash {
             bash: bash.to_string(),
         },
+        tools: vec![],
         fetch: vec![],
         timeout: std::time::Duration::from_secs(30),
         on_error: EventHookOnError::Allow,

@@ -1,12 +1,14 @@
-// qual:allow(srp, file_length=391) reason: "Input types, effect application and the shared script runner form one cohesive in-process event-hook unit; splitting it would leak partial state across modules."
-//! In-process lifecycle event hooks (plan D7).
+//! In-process lifecycle event hooks.
 //!
 //! Runs the resolved per-event hook chains from
 //! `Config::resolved_event_hooks` through the same BashKit/Monty script
 //! runtime the tool middleware uses. Scripts see `event_input`, may `fetch`
 //! allowlisted URLs, and record effects with the event's operations:
 //! `add_context` (SessionStart, UserPromptSubmit), `block`/`rewrite_prompt`
-//! (UserPromptSubmit), and `resume` (Stop). Interaction operations
+//! (UserPromptSubmit), and `resume` (Stop). Entries that declare `tools:`
+//! also get those tools as script commands and `call_tool`, through the
+//! shared bridge in `middleware::tools` (see "Calling tools" in
+//! `docs/hooks-guide.md`). Interaction operations
 //! (`confirm`, `save`, `next`, …) are intentionally not registered: an event
 //! hook that tries one fails, which the hook's `on_error` policy handles.
 //!
@@ -18,14 +20,18 @@
 //! allow` warns and continues, `deny` (SessionStart/UserPromptSubmit only)
 //! fails the event.
 
+mod operations;
+mod tools;
+
+use tools::{EventTools, HookTools};
+
 use crate::config::{GlobalConfig, ResolvedEventHook};
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, Result};
 use harnx_core::abort::wait_abort_signal;
 use harnx_core::hooks::{EventHookOnError, HookEventKind};
+use harnx_engine::tool::ToolEvalContext;
 use harnx_script::{
-    BashKitBackend, CancellationToken, ExcType, ExtFunctionResult, MontyException, MontyObject,
-    ScriptBackend, ScriptCommand, ScriptCommandContext, ScriptCommandOutput, ScriptHostContext,
-    ScriptLimits, ScriptPythonFunctions, ScriptPythonHandler, ScriptRequest, ScriptStatus,
+    BashKitBackend, CancellationToken, ScriptBackend, ScriptLimits, ScriptRequest, ScriptStatus,
 };
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -33,23 +39,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::utils::AbortSignal;
-
-/// Operations registered for each event. Everything else is unknown and fails
-/// the run — that is how interactions stay unavailable here.
-fn operations(event: HookEventKind) -> &'static [&'static str] {
-    match event {
-        HookEventKind::SessionStart => &["event_input", "fetch", "add_context"],
-        HookEventKind::UserPromptSubmit => &[
-            "event_input",
-            "fetch",
-            "add_context",
-            "block",
-            "rewrite_prompt",
-        ],
-        HookEventKind::Stop => &["event_input", "fetch", "resume"],
-        HookEventKind::StopFailure => &["event_input", "fetch"],
-    }
-}
 
 /// The payload each hook's script reads through `event_input`.
 #[derive(Debug, Clone)]
@@ -141,18 +130,48 @@ struct RunState {
 }
 
 /// Run one event's hooks in-process.
+///
+/// `tool_context` is called once, only if an entry for this event declares tools.
+/// It must refresh discovered declarations in `config` before returning the base
+/// context. Use a factory returning a boxed future to keep the large context
+/// builder off the agent loop's stack, without allocating for tool-free hooks.
+/// An eagerly constructed (unboxed) future here overflowed Tokio's default
+/// stack in existing worker middleware tests even with no hooks configured —
+/// new dispatch sites must keep the `|| Box::pin(...)` pattern.
+/// Shared context construction observes turn abort but is outside per-hook
+/// script timeouts.
 // qual:allow(complexity, max_cognitive=18) reason: "The per-hook loop folds four policies (first-resume-wins, block discards, per-hook on_error, deny wins) that belong to one chain walk; extracting them would hide the ordering contract."
 // qual:allow(iosp) — chain state (blocks, rewrite, resume) accumulates per hook in declaration order; a helper per policy would re-thread the same mutable outcome.
-pub async fn run_event_hooks(
+pub async fn run_event_hooks<F>(
     config: &GlobalConfig,
     input: &EventHookInput,
     abort_signal: &AbortSignal,
-) -> Result<EventHookOutcome> {
+    tool_context: impl FnOnce() -> F,
+) -> Result<EventHookOutcome>
+where
+    F: std::future::Future<Output = ToolEvalContext>,
+{
     let event = input.event;
     let hooks = config.read().resolved_event_hooks()?.list(event).to_vec();
     if hooks.is_empty() {
         return Ok(EventHookOutcome::default());
     }
+    let tools = if hooks.iter().any(|hook| !hook.tools.is_empty()) {
+        let evaluation = tokio::select! {
+            biased;
+            () = wait_abort_signal(abort_signal) => None,
+            evaluation = tool_context() => Some(evaluation),
+        };
+        evaluation.map(|evaluation| {
+            Box::new(EventTools {
+                evaluation: Arc::new(evaluation),
+                config: config.read().clone(),
+                abort: abort_signal.clone(),
+            })
+        })
+    } else {
+        None
+    };
     let mut outcome = EventHookOutcome::default();
     let mut prompt = input.prompt.clone();
     for hook in &hooks {
@@ -160,7 +179,7 @@ pub async fn run_event_hooks(
         if let (Some(prompt), Some(object)) = (&prompt, input_json.as_object_mut()) {
             object.insert("prompt".to_string(), json!(prompt));
         }
-        match run_one(hook, event, &input_json, abort_signal).await {
+        match run_one(hook, event, &input_json, abort_signal, tools.as_deref()).await {
             Ok(state) => {
                 outcome.context.extend(state.context);
                 if let Some(reason) = state.block {
@@ -194,42 +213,26 @@ pub async fn run_event_hooks(
     Ok(outcome)
 }
 
-// qual:allow(complexity, max_function_lines=73) reason: "One hook run = script setup, admission, op dispatch and error policy in one place; splitting separates each op from the error semantics it belongs to."
 // qual:allow(iosp) — mirrors the middleware script runner setup so the two stay recognizably aligned; the admitted interpreter session is constructed, driven and dropped in one scope.
 async fn run_one(
     hook: &ResolvedEventHook,
     event: HookEventKind,
     input_json: &Value,
     abort_signal: &AbortSignal,
+    tools: Option<&EventTools>,
 ) -> std::result::Result<RunState, String> {
+    // Also covers abort while the shared tool context was being built.
+    if abort_signal.aborted() {
+        return Err(format!("hook '{}' interrupted", hook.name));
+    }
+    let tools = match tools.filter(|_| !hook.tools.is_empty()) {
+        Some(context) => context.for_hook(hook, event),
+        None => Ok(HookTools::default()),
+    }
+    .map_err(|error| format!("{error:#}"))?;
     let state = Arc::new(Mutex::new(RunState::default()));
-    let commands: Vec<Arc<Operation>> = operations(event)
-        .iter()
-        .map(|name| {
-            Arc::new(Operation {
-                name,
-                state: state.clone(),
-                input: input_json.clone(),
-                fetch: hook.fetch.clone(),
-            })
-        })
-        .collect();
-    let script_commands: Vec<Arc<dyn ScriptCommand>> = commands
-        .iter()
-        .map(|operation| {
-            let operation = operation.clone();
-            Arc::new(BashOperation(operation)) as Arc<dyn ScriptCommand>
-        })
-        .collect();
-    let python_functions = ScriptPythonFunctions {
-        names: operations(event)
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect(),
-        handler: Arc::new(PythonOperation {
-            operations: commands.clone(),
-        }),
-    };
+    let (script_commands, python_functions) =
+        operations::register(hook, event, input_json, state.clone(), tools);
     let cancel = CancellationToken::new();
     let _cancel_on_drop = cancel.clone().drop_guard();
     let script = source(&hook.source);
@@ -285,177 +288,4 @@ fn source(source: &harnx_core::middleware::MiddlewareSource) -> String {
             format!("python3 <<'{delimiter}'\n{source}\n{delimiter}\n")
         }
     }
-}
-
-/// One registered operation. The Bash command and Python function paths share
-/// `execute_value`; only the value↔text conversion differs.
-struct Operation {
-    name: &'static str,
-    state: Arc<Mutex<RunState>>,
-    input: Value,
-    fetch: Vec<String>,
-}
-
-struct BashOperation(Arc<Operation>);
-
-#[async_trait::async_trait]
-impl ScriptCommand for BashOperation {
-    fn name(&self) -> &str {
-        self.0.name
-    }
-
-    async fn run(
-        &self,
-        args: &[String],
-        _stdin: Option<&[u8]>,
-        ctx: ScriptCommandContext<'_>,
-    ) -> std::result::Result<ScriptCommandOutput, String> {
-        let host = ScriptHostContext {
-            cancel: ctx.cancel,
-            control: ctx.control,
-        };
-        match self.0.execute(args, &host).await {
-            Ok(Some(value)) => Ok(ScriptCommandOutput {
-                stdout: format!("{value}\n"),
-                ..Default::default()
-            }),
-            Ok(None) => Ok(ScriptCommandOutput::default()),
-            Err(error) => {
-                host.control.stop();
-                Err(format!("{error:#}"))
-            }
-        }
-    }
-}
-
-impl Operation {
-    async fn execute(&self, args: &[String], host: &ScriptHostContext) -> Result<Option<Value>> {
-        match self.name {
-            "event_input" => {
-                ensure!(args.is_empty(), "event_input takes no arguments");
-                Ok(Some(self.input.clone()))
-            }
-            "fetch" => {
-                ensure!(args.len() == 1, "fetch requires one HTTP(S) URL");
-                crate::middleware::fetch::fetch_url(&args[0], &self.fetch, &host.cancel)
-                    .await
-                    .map(Some)
-            }
-            "add_context" => {
-                let message = args.join(" ");
-                ensure!(!message.trim().is_empty(), "add_context requires a message");
-                self.state.lock().context.push(message);
-                Ok(None)
-            }
-            "block" => {
-                let reason = args.join(" ");
-                ensure!(!reason.trim().is_empty(), "block requires a reason");
-                self.state.lock().block = Some(reason);
-                Ok(None)
-            }
-            "rewrite_prompt" => {
-                let prompt = args.join(" ");
-                ensure!(
-                    !prompt.trim().is_empty(),
-                    "rewrite_prompt requires a prompt"
-                );
-                self.state.lock().rewrite = Some(prompt);
-                Ok(None)
-            }
-            "resume" => {
-                // The message is optional: an empty resume keeps the loop's
-                // default continuation text.
-                self.state.lock().resume = Some(args.join(" "));
-                Ok(None)
-            }
-            _ => Err(anyhow!("unknown event-hook operation")),
-        }
-    }
-
-    fn parameters(&self) -> &'static [&'static str] {
-        match self.name {
-            "event_input" => &[],
-            "fetch" => &["url"],
-            "add_context" => &["message"],
-            "block" => &["reason"],
-            "rewrite_prompt" => &["prompt"],
-            "resume" => &["message"],
-            _ => &[],
-        }
-    }
-}
-
-struct PythonOperation {
-    operations: Vec<Arc<Operation>>,
-}
-
-#[async_trait::async_trait]
-impl ScriptPythonHandler for PythonOperation {
-    async fn call(
-        &self,
-        name: String,
-        args: Vec<MontyObject>,
-        kwargs: Vec<(MontyObject, MontyObject)>,
-        host: ScriptHostContext,
-    ) -> ExtFunctionResult {
-        let result = async {
-            let operation = self
-                .operations
-                .iter()
-                .find(|operation| operation.name == name)
-                .ok_or_else(|| anyhow!("unknown event-hook function '{name}'"))?;
-            let values = bind(operation.parameters(), args, kwargs)?;
-            let args = values.iter().map(|value| match value {
-                Value::String(text) => text.clone(),
-                _ => String::new(),
-            });
-            operation.execute(&args.collect::<Vec<_>>(), &host).await
-        }
-        .await;
-        match result.and_then(|value| {
-            value
-                .map(crate::middleware::conversion::to_python)
-                .transpose()
-        }) {
-            Ok(object) => ExtFunctionResult::Return(object.unwrap_or(MontyObject::None)),
-            Err(error) => {
-                host.control.stop();
-                ExtFunctionResult::Error(MontyException::new(
-                    ExcType::RuntimeError,
-                    Some(format!("{error:#}")),
-                ))
-            }
-        }
-    }
-}
-
-/// Bind positional and keyword arguments to the operation's parameters,
-/// mirroring the middleware Python bridge.
-fn bind(
-    parameters: &[&str],
-    args: Vec<MontyObject>,
-    kwargs: Vec<(MontyObject, MontyObject)>,
-) -> Result<Vec<Value>> {
-    ensure!(
-        args.len() <= parameters.len(),
-        "too many positional event-hook arguments"
-    );
-    let mut values = parameters
-        .iter()
-        .zip(args)
-        .map(|(_, value)| crate::middleware::conversion::from_python(value))
-        .collect::<Result<Vec<_>>>()?;
-    values.resize_with(parameters.len(), || Value::Null);
-    for (key, value) in kwargs {
-        let name = match crate::middleware::conversion::from_python(key)? {
-            Value::String(name) => name,
-            _ => anyhow::bail!("event-hook keyword names must be strings"),
-        };
-        let index = parameters
-            .iter()
-            .position(|parameter| *parameter == name)
-            .ok_or_else(|| anyhow!("unknown event-hook argument '{name}'"))?;
-        values[index] = crate::middleware::conversion::from_python(value)?;
-    }
-    Ok(values)
 }

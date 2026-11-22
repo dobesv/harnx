@@ -1,28 +1,18 @@
+mod inner;
+pub(crate) use inner::{tool_commands, ScriptTools};
+
 use super::{effects::DispatchGuard, frame::Frame};
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, Result};
 use harnx_core::tool::{ToolCall, ToolError};
-use harnx_engine::tool::{eval_inner_tool_call, InnerToolEvalOptions};
 use harnx_script::{
-    commands::{CallOutcome, InnerExecutor, ToolSpec},
+    commands::{CallOutcome, InnerExecutor},
     CancellationToken, ScriptCommand,
 };
 use serde_json::Value;
 use std::sync::Arc;
 
 pub(super) fn commands(frame: &Arc<Frame>) -> Result<Vec<Arc<dyn ScriptCommand>>> {
-    let specs = frame
-        .tools
-        .iter()
-        .map(|tool| ToolSpec {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            schema: tool.parameters.as_value().clone(),
-        })
-        .collect();
-    Ok(harnx_script::commands::tool_commands(
-        specs,
-        Arc::new(FrameTools(frame.clone())),
-    )?)
+    tool_commands(&frame.tools, Arc::new(FrameTools(frame.clone())))
 }
 
 pub(super) struct FrameTools(pub Arc<Frame>);
@@ -46,43 +36,21 @@ impl FrameTools {
         cancel: CancellationToken,
     ) -> Result<Value> {
         let _operation = self.0.begin()?;
-        ensure!(
-            self.0.tools.iter().any(|tool| tool.name == name),
-            "middleware tool '{name}' is not allowlisted"
+        let tools = ScriptTools::middleware(
+            self.0.prepared.context.clone(),
+            self.0.tools.iter().map(|tool| tool.name.clone()).collect(),
         );
-        ensure!(
-            arguments.is_object(),
-            "tool arguments must be a JSON object"
-        );
-        let context = &self.0.prepared.context;
-        let mut ctx = context
-            .evaluation
-            .fork_for_inner_calls(InnerToolEvalOptions {
-                providers: context.evaluation.providers.clone(),
-                tool_round: context.evaluation.tool_round,
-                emit_tool_call_fn: Arc::new(|_, _| {}),
-                emit_tool_result_fn: Arc::new(|_, _| {}),
-                emit_tool_blocked_fn: Arc::new(|_, _| {}),
-                emit_tool_update_fn: Arc::new(|_, _| {}),
-            });
-        ctx.middleware_fn = None;
-        ctx.allowed_tool_names = self.0.tools.iter().map(|tool| tool.name.clone()).collect();
-        let call = ToolCall::new(
-            name.to_string(),
-            arguments,
-            Some(uuid::Uuid::new_v4().to_string()),
-            None,
-        );
-        self.dispatch(ctx, call, cancel).await
+        let (ctx, call) = tools.prepare(name, arguments)?;
+        self.dispatch(&tools, ctx, call, cancel).await
     }
 
     async fn dispatch(
         &self,
+        tools: &ScriptTools,
         ctx: harnx_engine::tool::ToolEvalContext,
         call: ToolCall,
         cancel: CancellationToken,
     ) -> Result<Value> {
-        let context = &self.0.prepared.context;
         let dispatch = DispatchGuard::begin(self.0.ancestors.clone());
         let physical = match &self.0.attempt {
             Some(attempt) => Some(
@@ -104,11 +72,11 @@ impl FrameTools {
                     crate::nats_tool_provider::with_physical_invocation(
                         id.clone(),
                         call.id.clone().unwrap_or_default(),
-                        eval_inner_tool_call(&ctx, call, &context.abort),
+                        tools.evaluate(&ctx, call),
                     )
                     .await
                 }
-                None => eval_inner_tool_call(&ctx, call, &context.abort).await,
+                None => tools.evaluate(&ctx, call).await,
             }
         };
         let evaluated = tokio::select! {

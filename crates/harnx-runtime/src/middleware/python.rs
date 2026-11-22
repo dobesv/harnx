@@ -65,6 +65,12 @@ impl Handler {
         kwargs: Vec<(MontyObject, MontyObject)>,
         host: &ScriptHostContext,
     ) -> Result<Value> {
+        if name == "call_tool" {
+            let (name, arguments) = tool_arguments(args, kwargs)?;
+            return FrameTools(self.0.clone())
+                .execute(&name, arguments, host.cancel.clone())
+                .await;
+        }
         let mut values = bind(parameters(name)?, args, kwargs)?;
         match name {
             "tool_input" => Ok(self.0.input.clone()),
@@ -114,13 +120,6 @@ impl Handler {
             }
             "respond" => self.0.respond(required(&mut values, "result")?),
             "deny" => self.0.deny(string(required(&mut values, "reason")?)?),
-            "call_tool" => {
-                let name = string(required(&mut values, "name")?)?;
-                let arguments = required(&mut values, "args")?;
-                FrameTools(self.0.clone())
-                    .execute(&name, arguments, host.cancel.clone())
-                    .await
-            }
             _ => bail!("unknown middleware function"),
         }
     }
@@ -181,4 +180,15 @@ fn string(value: Value) -> Result<String> {
         Value::String(value) => Ok(value),
         _ => bail!("middleware argument must be a string"),
     }
+}
+
+/// Keep the hook and middleware `call_tool(name, args)` contracts identical.
+pub(crate) fn tool_arguments(
+    args: Vec<MontyObject>,
+    kwargs: Vec<(MontyObject, MontyObject)>,
+) -> Result<(String, Value)> {
+    let mut values = bind(parameters("call_tool")?, args, kwargs)?;
+    let name = string(required(&mut values, "name")?)?;
+    let arguments = required(&mut values, "args")?;
+    Ok((name, arguments))
 }

@@ -54,6 +54,7 @@ Entries resolve per event in the order global → tool server/package → agent:
 | `bash` | string | Inline Bash script (mutually exclusive with `python`/`script`). |
 | `python` | string | Inline Python script. |
 | `script` | path | Script file (`.sh`/`.bash` → Bash, `.py` → Python), resolved relative to the declaring file's directory. |
+| `tools` | list | Tool selectors the script may call. Empty (default) exposes no tools. |
 | `timeout` | duration | Wall-clock limit per run (default `30s`). |
 | `on_error` | `allow`/`deny` | Default `allow`. `deny` fails the event when the script run fails; valid only for `SessionStart` and `UserPromptSubmit` — elsewhere it is a config error. |
 | `fetch` | list | Exact HTTP(S) hosts the script may request. Empty (default) denies all. |
@@ -70,7 +71,8 @@ hooks:
   max_resume: 1
   SessionStart:
     - name: session-context
-      bash: add_context "Server notes: see RUNBOOK.md"
+      tools: [fs_read]
+      bash: add_context "$(fs_read --path RUNBOOK.md -o text)"
   UserPromptSubmit:
     - name: no-secrets
       bash: |
@@ -142,6 +144,129 @@ The `event_input` payload contains `event`, `session_id`, `cwd`,
 
 `resume` may be called with an empty message. Effects from a failed run are
 discarded entirely.
+
+## Calling tools
+
+Hook entries can declare an opt-in `tools:` allowlist to call tools from Bash
+or Python scripts. Selectors use the same syntax and resolution as agent
+`use_tools` and middleware `tools:` (tool names, wildcards like `fs_*`, or
+package-qualified names). An omitted or empty `tools:` list gives the script
+no tools.
+
+### Bash and Python examples
+
+In Bash, each allowlisted tool is available as a builtin command with standard
+CLI flags (`--kebab-case`, `--json`, `-o json|text`).
+
+`add_context` takes its message as an argument rather than reading standard input,
+so pass tool output using command substitution:
+
+```bash
+# Entry declares tools: [plans_get_plan]
+plan_text=$(plans_get_plan --plan "cid:plan:team/main/sprint" -o text)
+add_context "$plan_text"
+
+# Or in a single statement:
+add_context "$(plans_get_plan --plan "cid:plan:team/main/sprint" -o text)"
+```
+
+In Python, call tools with `call_tool(name, args)`:
+
+```python
+# Entry declares tools: [fs_read]
+result = call_tool("fs_read", {"path": "RUNBOOK.md"})
+add_context(result["content"][0]["text"])
+```
+
+If an entry omits `tools:`, no tool commands exist in Bash (calling one returns
+command not found), and `call_tool` is not registered in Python.
+
+### Allowlist and exclusions
+
+Tools are strictly filtered before execution:
+
+* **Host-side allowlist:** Only tools matching the entry's resolved allowlist
+  can be dispatched. In Bash, unlisted tools are not registered; invoking one
+  returns exit 127 (unknown command), which stops the script under the default
+  `set -e`. In Python, calling `call_tool` on an unlisted tool stops the
+  interpreter immediately. Neither language ever dispatches an unlisted tool.
+* **Exclusions:** Interactive and agent-steering tools are never exposed to hook
+  scripts, even when a selector like `*` matches them. Specifically, `bash`,
+  `ask_user`, `switch_agent`, and every `*_session_handoff` tool are excluded.
+
+### Recoverable errors vs host failures
+
+Tool execution outcomes distinguish recoverable errors from host failures:
+
+* **Recoverable errors return to the script:** When a tool returns a provider
+  error, is blocked by tool middleware, or requests user interaction
+  (`interactions are not supported here`), the tool call returns an error-flagged
+  result to the script (`is_error: true` in JSON, or `result["is_error"]` and
+  `result["error"]` in Python). The script keeps running, can inspect the
+  result, and effects recorded afterward (such as `add_context`) still apply.
+  In Bash, recoverable tool errors exit 0 and write `{"is_error": true, ...}` to
+  stdout, so direct command substitution like `add_context "$(tool ...)"` injects
+  the error JSON into context. Inspect the output with `jq` first:
+
+  ```bash
+  raw=$(plans_get_plan --plan "cid:plan:team/main/sprint" -o json)
+  if [ "$(echo "$raw" | jq -r '.is_error // false')" = "false" ]; then
+    add_context "$(echo "$raw" | jq -r '.content[0].text')"
+  fi
+  ```
+* **Host-level failures stop the script:** In Python, calling an unlisted tool
+  stops the script immediately. Fatal evaluation errors and script cancellation
+  (hook timeout or session abort) stop execution immediately in both languages.
+  In Bash, an unlisted tool is an unknown command (exit 127), so it stops the
+  script unless handled or errexit is disabled. When a run fails, all effects
+  recorded during that run are discarded, and the entry's `on_error` policy
+  applies (`allow` drops effects and continues to the next hook; `deny` fails
+  the event).
+
+### Interactions not supported
+
+Hook scripts run autonomously and cannot suspend for user input. If a tool or
+its middleware attempts an interaction (`confirm`, `save`, `answer`, `next`),
+the call fails recoverably with an error indicating that interactions are not
+supported.
+
+### Tool middleware applies
+
+Hook-originated tool calls pass through configured tool middleware chains.
+Policy middleware, audit logging, and credential injectors (such as `proxy_auth`
+or `aws_creds`) remain effective on tool calls made by hooks.
+
+### Transcript visibility
+
+Tool calls made by lifecycle hooks are internal helper calls. They do not
+append `ToolCalls` or `ToolResults` entries to the session transcript, and they
+do not produce UI tool-call events.
+
+### Operation name collisions
+
+Tool names must not collide with registered event-hook operations for that event
+(`event_input`, `fetch`, `add_context`, `block`, `rewrite_prompt`, `resume`).
+If an allowlisted tool shares a name with an operation on that event, the hook
+entry is rejected before running (`allowlisted tool collides with an event-hook operation`).
+Neither command runs, effects are dropped, and `on_error` applies.
+
+### Helper tool server startup on workers
+
+When the NATS worker daemon manages tool servers locally, servers required only
+by hook `tools:` selectors start automatically on session activation. You do not
+need to list hook tools in the agent's `use_tools` to start their servers.
+
+Selectors are gathered across enabled hook entries for all four events
+(`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`). Disabled entries
+contribute nothing. If hook configuration fails to resolve, the worker logs a
+warning and continues starting servers for agent and middleware selectors.
+
+### Downgrades and rollback
+
+Configuration parsing rejects unknown fields (`deny_unknown_fields`). If you
+roll back to an older harnx version that lacks hook tool support, any hook entry
+declaring `tools:` will fail config load. Remove `tools:` from hook entries
+before downgrading.
 
 ## Composition
 

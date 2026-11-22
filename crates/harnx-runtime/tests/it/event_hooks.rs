@@ -2,6 +2,8 @@
 //! `on_error` policies, Stop resume ordering, StopFailure diagnostics, and
 //! legacy-config rejection with migration guidance.
 
+mod tools;
+
 use harnx_core::hooks::{
     EventHookDefinition, EventHookEntry, EventHookOnError, EventHooksList, HookEventKind,
     HooksConfig,
@@ -19,6 +21,7 @@ fn hook(name: &str, bash: &str, on_error: EventHookOnError) -> EventHookEntry {
         source: MiddlewareSourceConfig::Bash {
             bash: bash.to_string(),
         },
+        tools: vec![],
         fetch: vec![],
         timeout: Duration::from_secs(30),
         on_error,
@@ -31,6 +34,7 @@ fn python_hook(name: &str, python: &str) -> EventHookEntry {
         source: MiddlewareSourceConfig::Python {
             python: python.to_string(),
         },
+        tools: vec![],
         fetch: vec![],
         timeout: Duration::from_secs(30),
         on_error: EventHookOnError::Allow,
@@ -73,6 +77,7 @@ async fn run(
             ..Default::default()
         },
         &create_abort_signal(),
+        || async { panic!("hooks without tools must not build a tool context") },
     )
     .await
 }
