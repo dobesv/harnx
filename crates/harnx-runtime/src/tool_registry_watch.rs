@@ -1,0 +1,162 @@
+//! Registry-watch freshness for NATS tool discovery (decision 5b).
+//!
+//! The worker's 30-second discovery cache must not delay a newly written or
+//! deleted registration to the next completion. Two mechanisms cooperate:
+//!
+//! - [`registry_state_revision`] is the deterministic guarantee. The registry
+//!   bucket's stream sequence moves synchronously with every write and
+//!   delete, so the next completion compares it against the sequence a
+//!   cached snapshot started scanning under. No event delivery is involved,
+//!   so a registration published through `<server>_connect` is visible on
+//!   the very next completion even if that completion runs immediately.
+//!
+//! - The asynchronous watch below bumps a global epoch on every bucket
+//!   change as a best-effort extra signal: it can invalidate a cached
+//!   snapshot early, but by the time its event is delivered the revision
+//!   check would have caught the same change anyway. It never *establishes*
+//!   freshness; only the revision check does.
+//!
+//! Both are best-effort on failure: if the broker is unreachable, discovery
+//! falls back to the plain 30-second TTL, which is the pre-change behavior.
+
+use crate::config::Config;
+use futures_util::StreamExt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use harnx_toolset_server::TOOL_REGISTRY_BUCKET;
+
+/// How often the watcher retries attaching to a bucket that doesn't exist yet.
+const WATCH_ATTACH_RETRY: Duration = Duration::from_millis(500);
+
+/// The current registry epoch. Any change to the bucket bumps it, which
+/// invalidates every cached discovery snapshot at once.
+pub fn registry_epoch() -> u64 {
+    REGISTRY_EPOCH.load(Ordering::Acquire)
+}
+
+static REGISTRY_EPOCH: AtomicU64 = AtomicU64::new(0);
+static WATCH_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Ensure a registry watcher runs for this process, if it isn't already.
+///
+/// Cheap to call on every discovery: the fast path is one atomic load. The
+/// watcher spans the whole bucket rather than one scope's prefix because a
+/// single process only ever discovers tools against one cluster, and
+/// over-invalidation costs one KV scan while a missed change would cost a
+/// stale tool list for the full 30-second cache interval.
+pub(crate) async fn ensure_registry_watch(config: &Config) {
+    if WATCH_RUNNING.load(Ordering::Relaxed) {
+        return;
+    }
+    if WATCH_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let cluster = config.default_cluster_key().to_string();
+    let config = config.clone();
+    tokio::spawn(async move {
+        watch_loop(&config, &cluster).await;
+        // The loop only returns when the config can no longer connect; let a
+        // later discovery try again rather than disabling freshness forever.
+        WATCH_RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
+async fn watch_loop(config: &Config, cluster: &str) {
+    loop {
+        let client = match config.nats_client(cluster).await {
+            Ok(client) => client,
+            Err(error) => {
+                log::debug!("tool registry watch connect failed: {error:#}");
+                return;
+            }
+        };
+        let jetstream = async_nats::jetstream::new(client);
+        // A bucket that doesn't exist yet carries no registrations to be
+        // stale about, but the first `ensure_bucket_with_ttl` by a tool
+        // server can appear at any moment, so retry at a short interval.
+        let store = loop {
+            match jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await {
+                Ok(store) => break store,
+                Err(error) => {
+                    log::debug!(
+                        "tool registry watch waiting for bucket \
+                         '{TOOL_REGISTRY_BUCKET}': {error}"
+                    );
+                    tokio::time::sleep(WATCH_ATTACH_RETRY).await;
+                }
+            }
+        };
+        // The watcher yields an initial entry per existing key; those bumps
+        // only cost the very next discovery one extra scan.
+        let mut watcher = match store.watch_all().await {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                log::warn!("tool registry watch failed: {error:#}");
+                tokio::time::sleep(WATCH_ATTACH_RETRY).await;
+                continue;
+            }
+        };
+        // The only way out of this inner loop is the stream ending (bucket
+        // deleted) or the runtime shutting down; both detach the watch and
+        // let the outer loop re-attach.
+        while let Some(_entry) = watcher.next().await {
+            REGISTRY_EPOCH.fetch_add(1, Ordering::Release);
+        }
+        log::debug!("tool registry watch stream ended; re-attaching");
+    }
+}
+
+/// The registry bucket's latest stream sequence, for deterministic
+/// next-completion freshness (decision 5b).
+///
+/// A KV write is acknowledged only after the registry stream records it, so
+/// this sequence moves synchronously with every registration write and
+/// delete — no event delivery involved. A discovery snapshot stores the
+/// sequence it *started* scanning under, and the next completion compares
+/// that stored sequence against this one; any mismatch forces a rescan.
+/// This is what actually guarantees the "very next completion" rule: the
+/// asynchronous watch above may not have delivered its event yet when the
+/// next completion runs, but the broker has already committed the sequence.
+///
+/// `Ok(None)`: the registry stream doesn't exist, so no registrations exist
+/// under any scope yet (callers treat that as sequence 0).
+pub(crate) async fn registry_state_revision(config: &Config) -> anyhow::Result<Option<u64>> {
+    use async_nats::jetstream::{context::GetStreamErrorKind, ErrorCode};
+
+    let cluster = config.default_cluster_key().to_string();
+    let client = config.nats_client(&cluster).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    match jetstream
+        .get_stream(format!("KV_{TOOL_REGISTRY_BUCKET}"))
+        .await
+    {
+        // `get_stream` fetches the info with the same round trip; use the
+        // cached copy rather than paying for a second request.
+        Ok(stream) => Ok(Some(stream.cached_info().state.last_sequence)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                GetStreamErrorKind::JetStream(ref error) if error.kind() == ErrorCode::STREAM_NOT_FOUND
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoch_counter_bumps_are_visible_to_readers() {
+        harnx_core::require_nextest();
+        let before = registry_epoch();
+        REGISTRY_EPOCH.fetch_add(1, Ordering::Release);
+        assert_eq!(registry_epoch(), before.wrapping_add(1));
+        REGISTRY_EPOCH.fetch_sub(1, Ordering::Release);
+        assert_eq!(registry_epoch(), before);
+    }
+}

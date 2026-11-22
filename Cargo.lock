@@ -4612,7 +4612,30 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "unicode-width 0.2.3",
+ "url",
  "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "harnx-credentials"
+version = "0.34.22"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "futures-util",
+ "harnx-nats-common",
+ "harnx-test-bins",
+ "oauth2",
+ "ring",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "uuid",
 ]
 
@@ -4897,21 +4920,36 @@ name = "harnx-mcp-remote"
 version = "0.34.22"
 dependencies = [
  "anyhow",
+ "async-nats",
+ "async-trait",
  "axum",
+ "base64 0.23.1",
+ "chrono",
  "clap",
+ "futures",
  "harnx-core",
+ "harnx-credentials",
  "harnx-healthz",
  "harnx-metrics",
  "harnx-nats-common",
  "harnx-telemetry",
+ "harnx-test-bins",
+ "harnx-toolset",
+ "harnx-toolset-server",
+ "ipnet",
  "log",
+ "oauth2",
  "reqwest",
  "rmcp",
  "schemars 1.2.3",
  "serde",
  "serde_json",
+ "sse-stream",
+ "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
+ "tracing",
  "url",
 ]
 
@@ -5405,11 +5443,13 @@ version = "0.34.22"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]
@@ -7287,6 +7327,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "oauth2"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.2.17",
+ "http",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8336,7 +8395,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -8357,7 +8416,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.15.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -9113,6 +9172,7 @@ dependencies = [
  "http-body-util",
  "indexmap 2.14.2",
  "libc",
+ "oauth2",
  "pastey",
  "percent-encoding",
  "pin-project-lite",
@@ -9133,6 +9193,7 @@ dependencies = [
  "tracing",
  "unicode-general-category",
  "unicode-normalization",
+ "url",
  "uuid",
 ]
 
@@ -11237,6 +11298,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

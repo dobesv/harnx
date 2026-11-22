@@ -1257,6 +1257,12 @@ pub(crate) enum TuiEvent {
         output: String,
         error: Option<String>,
     },
+    /// Mid-run output from a `.credentials` command (connect link shown while
+    /// the flow is still waiting in the browser).
+    CredentialsUpdate {
+        task: AbortSignal,
+        text: String,
+    },
     /// Local commands/startup only. Never used by a live NATS follower.
     LocalAgent(harnx_core::event::AgentEvent),
     Agent {

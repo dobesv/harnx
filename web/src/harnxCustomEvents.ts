@@ -35,6 +35,8 @@ export interface PendingInteraction {
   message: string;
   pendingCount: number;
   payload?: unknown;
+  /** Present for `url` interactions: the https or loopback-http link the user opens (decision 6). */
+  url?: string;
 }
 
 export interface MessageAttachmentMeta {
@@ -218,6 +220,14 @@ export function parsePendingInteraction(value: unknown): PendingInteraction | nu
     };
     if (rec.payload !== undefined) {
       interaction.payload = rec.payload;
+    }
+    if (kind === 'url' && typeof rec.url === 'string' && rec.url.length > 0) {
+      interaction.url = rec.url;
+    } else if (kind === 'url') {
+      const payloadUrl = eventRecord(rec.payload).url;
+      if (typeof payloadUrl === 'string' && payloadUrl.length > 0) {
+        interaction.url = payloadUrl;
+      }
     }
     return interaction;
   }

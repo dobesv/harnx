@@ -25,6 +25,12 @@ pub(crate) fn pending_value(entries: &[(u64, SessionLogEntry)]) -> Option<Value>
     if first.request.kind == "a2ui" && !first.request.payload.is_null() {
         val["payload"] = first.request.payload.clone();
     }
+    // `url` challenges keep the link in the payload (`{url, message}`, built
+    // by the runtime's tool-challenge middleware); frontends render the link
+    // from it (decision 6).
+    if first.request.kind == "url" && !first.request.payload.is_null() {
+        val["payload"] = first.request.payload.clone();
+    }
     Some(val)
 }
 

@@ -1,12 +1,10 @@
-use super::{modal, snapshot, tui_with_pending};
+use super::{drawn_screen, modal, snapshot, tui_with_pending};
 use crate::interaction_confirmation::a2ui::{A2UIFormState, FocusTarget, FormField};
 use crate::interaction_confirmation::{InteractionEvent, InteractionKey, ModalState};
-use crate::types::Tui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::interaction::response::build_data;
 use harnx_core::session::SessionLogEntry;
 use harnx_runtime::interactions::InteractionDecisionOutcome;
-use ratatui::{backend::TestBackend, Terminal};
 use serde_json::{json, Value};
 
 fn sample_a2ui_payload() -> Value {
@@ -81,25 +79,6 @@ fn a2ui_round_entries(id: &str, payload: Value) -> Vec<(u64, SessionLogEntry)> {
             },
         ),
     ]
-}
-
-fn render_screen(
-    tui: &Tui,
-    state: &mut super::InteractionModal,
-    width: u16,
-    height: u16,
-) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    terminal
-        .draw(|frame| tui.render_interaction_modal(frame, frame.area(), state))
-        .unwrap();
-    terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|c| c.symbol())
-        .collect::<String>()
 }
 
 #[tokio::test]
@@ -193,7 +172,7 @@ async fn a2ui_modal_renders_in_tui_and_submits_primary_action() {
     let mut state = modal(&mut tui).clone();
     assert!(state.a2ui.is_some());
 
-    let screen = render_screen(&tui, &mut state, 100, 20);
+    let screen = drawn_screen(&mut tui, &mut state, 100, 20);
     assert!(screen.contains("Pick deployment target"));
     assert!(screen.contains("Staging"));
     assert!(screen.contains("Production"));
@@ -261,7 +240,7 @@ async fn a2ui_unsupported_component_falls_back_to_deny_only() {
     assert!(state.a2ui.is_none());
     assert_eq!(state.pending.kind, "a2ui");
 
-    let screen = render_screen(&tui, &mut state, 100, 10);
+    let screen = drawn_screen(&mut tui, &mut state, 100, 10);
     assert!(screen.contains("not supported by this client. Deny only."));
 }
 

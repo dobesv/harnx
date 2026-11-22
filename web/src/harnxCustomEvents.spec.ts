@@ -287,6 +287,45 @@ describe('pending_interaction events and parsing', () => {
       });
     });
 
+    it('extracts the url for url interactions from payload or top-level field', () => {
+      const fromPayload = parsePendingInteraction({
+        interaction_id: 'int-url',
+        request_seq: 3,
+        tool_call_id: 'tool-connect',
+        kind: 'url',
+        message: 'Connect Jira',
+        pending_count: 0,
+        payload: { url: 'https://example.com/connect/abc', message: 'Connect Jira' },
+      });
+      expect(fromPayload).toMatchObject({
+        kind: 'url',
+        url: 'https://example.com/connect/abc',
+        payload: { url: 'https://example.com/connect/abc', message: 'Connect Jira' },
+      });
+
+      const topLevel = parsePendingInteraction({
+        interaction_id: 'int-url',
+        request_seq: 3,
+        tool_call_id: 'tool-connect',
+        kind: 'url',
+        message: 'Connect Jira',
+        pending_count: 0,
+        url: 'https://example.com/connect/abc',
+      });
+      expect(topLevel?.url).toBe('https://example.com/connect/abc');
+
+      // A url interaction without a usable link parses but leaves url unset.
+      const bare = parsePendingInteraction({
+        interaction_id: 'int-url',
+        request_seq: 3,
+        tool_call_id: 'tool-connect',
+        kind: 'url',
+        message: 'Connect Jira',
+        pending_count: 0,
+      });
+      expect(bare?.url).toBeUndefined();
+    });
+
     it('returns null when value is null (authoritative clear signal)', () => {
       expect(parsePendingInteraction(null)).toBeNull();
     });

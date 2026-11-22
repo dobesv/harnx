@@ -894,6 +894,7 @@ mod tests {
     mod interaction;
     mod malformed_image;
     mod middleware;
+    mod operator_url;
 
     use super::*;
     use anyhow::anyhow;

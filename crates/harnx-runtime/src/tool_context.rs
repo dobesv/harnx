@@ -3,12 +3,11 @@ use crate::config::HARNX_NATS_URL_ENV;
 use crate::config::{Config, GlobalConfig, Input};
 use crate::nats_tool_provider::{NatsInFlightCalls, NatsToolProvider};
 use crate::tool::{CompletionText, PrepareHandoffFn};
+use crate::tool_registry_watch::{registry_epoch, registry_state_revision};
 use crate::utils::AbortSignal;
 use harnx_core::instance::ServerScope;
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -37,7 +36,7 @@ pub struct BuildToolEvalContextParams<'a> {
     pub prepare_handoff_fn: Option<Arc<PrepareHandoffFn>>,
 
     pub pending_async_context: Option<Arc<Mutex<Option<String>>>>,
-    /// Round context handoff for the script-mode `bash` provider (C6). The
+    /// Round context handoff for the script-mode `bash` provider. The
     /// caller fills the slot with the built context wrapped in an `Arc` right
     /// after construction; `None` means `bash` fails closed on this path.
     pub bash_context_slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
@@ -112,6 +111,7 @@ struct ToolDiscoveryKey {
     instance_id: ServerScope,
     active_package: Option<String>,
     parent_session_id: Option<String>,
+    session_owner: Option<String>,
 }
 type ToolDiscoveryCache =
     std::sync::Mutex<HashMap<ToolDiscoveryKey, CachedDiscovery<NatsToolProvider>>>;
@@ -126,77 +126,132 @@ fn tool_discovery_key(
         instance_id: instance_id.clone(),
         active_package: active_package.map(str::to_string),
         parent_session_id: config.session.as_ref().map(|session| session.storage_key()),
+        // The snapshot carries the owner's user-scoped registrations, so it
+        // may only be shared with discoveries for the same identity.
+        session_owner: config
+            .extract_agent()
+            .user_principals()
+            .and_then(|principals| principals.user_id.clone()),
     }
 }
 
 struct CachedDiscovery<T> {
     provider: Option<Arc<T>>,
     discovered_at: Instant,
+    /// The registry epoch the snapshot was taken under. The registry watch
+    /// (decision 5b) bumps the global epoch on every bucket change, so an
+    /// entry from an older epoch is stale no matter how fresh its TTL is.
+    epoch: u64,
+    /// The registry bucket's stream sequence when the snapshot *started* its
+    /// scan. Every KV write and delete moves the sequence at the moment the
+    /// broker acks it, so comparing against the sequence the next completion
+    /// reads is the deterministic half of decision 5b: no event delivery, no
+    /// timing dependence on the async watch.
+    revision: u64,
 }
 
+// Only the tests below use the epoch-only forms; production goes through the
+// revision-aware matching variants.
+#[cfg(test)]
 fn cached_discovery<K: Eq + std::hash::Hash, T>(
     cache: &std::sync::Mutex<HashMap<K, CachedDiscovery<T>>>,
     key: &K,
     now: Instant,
     ttl: Duration,
+    epoch: u64,
+) -> Option<Option<Arc<T>>> {
+    cached_discovery_matching(cache, key, now, ttl, |entry| entry.epoch == epoch)
+}
+
+/// [`cached_discovery`] with a caller-supplied freshness predicate, so the
+/// NATS path can require the registry revision to match as well (decision
+/// 5b's deterministic half).
+fn cached_discovery_matching<K: Eq + std::hash::Hash, T>(
+    cache: &std::sync::Mutex<HashMap<K, CachedDiscovery<T>>>,
+    key: &K,
+    now: Instant,
+    ttl: Duration,
+    is_current: impl Fn(&CachedDiscovery<T>) -> bool,
 ) -> Option<Option<Arc<T>>> {
     let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.retain(|_, entry| now.saturating_duration_since(entry.discovered_at) < ttl);
-    cache.get(key).map(|entry| entry.provider.clone())
+    cache
+        .get(key)
+        .filter(|entry| is_current(entry))
+        .map(|entry| entry.provider.clone())
 }
 
+#[cfg(test)]
 fn cache_discovery<K: Clone + Eq + std::hash::Hash, T>(
     cache: &std::sync::Mutex<HashMap<K, CachedDiscovery<T>>>,
     key: K,
     provider: Option<Arc<T>>,
     discovered_at: Instant,
+    epoch: u64,
+) {
+    cache_discovery_with_revision(
+        cache,
+        key,
+        CachedDiscovery {
+            provider,
+            discovered_at,
+            epoch,
+            revision: 0,
+        },
+    )
+}
+
+fn cache_discovery_with_revision<K: Clone + Eq + std::hash::Hash, T>(
+    cache: &std::sync::Mutex<HashMap<K, CachedDiscovery<T>>>,
+    key: K,
+    entry: CachedDiscovery<T>,
 ) {
     let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let discovered_at = entry.discovered_at;
     if cache
         .get(&key)
-        .is_some_and(|entry| entry.discovered_at > discovered_at)
+        .is_some_and(|current| current.discovered_at > discovered_at)
     {
         return;
     }
     // Session-scoped keys may never be read again after completion, so writes
     // must prune stale entries too. The capacity also bounds short-lived bursts;
     // refreshing an existing session never evicts another provider.
-    cache.retain(|_, entry| {
-        discovered_at.saturating_duration_since(entry.discovered_at) < REGISTRATION_REFRESH_INTERVAL
+    cache.retain(|_, current| {
+        discovered_at.saturating_duration_since(current.discovered_at)
+            < REGISTRATION_REFRESH_INTERVAL
     });
     if !cache.contains_key(&key) && cache.len() >= DISCOVERY_CACHE_MAX_ENTRIES {
         let oldest_key = cache
             .iter()
-            .min_by_key(|(_, entry)| entry.discovered_at)
+            .min_by_key(|(_, current)| current.discovered_at)
             .map(|(key, _)| key.clone());
         if let Some(oldest_key) = oldest_key {
             cache.remove(&oldest_key);
         }
     }
-    cache.insert(
-        key,
-        CachedDiscovery {
-            provider,
-            discovered_at,
-        },
-    );
+    cache.insert(key, entry);
 }
 
-async fn discover_cached<'a, K: Eq + std::hash::Hash, T>(
-    cache: &std::sync::Mutex<HashMap<K, CachedDiscovery<T>>>,
-    key: &K,
-    fresh_discovery: impl FnOnce() -> Pin<Box<dyn Future<Output = Option<Arc<T>>> + Send + 'a>>,
-) -> Option<Arc<T>> {
-    if let Some(provider) =
-        cached_discovery(cache, key, Instant::now(), REGISTRATION_REFRESH_INTERVAL)
-    {
-        return provider;
+/// Freshness predicate for a cached snapshot (decision 5b).
+///
+/// `revision` is the registry stream's sequence as of *now*: `Some(seq)` pins
+/// both the watch epoch and the sequence, and `None` means the freshness check
+/// could not reach the broker, so only the watch epoch can vouch for the
+/// snapshot — the pre-change best-effort behavior.
+fn discovery_snapshot_is_current<T>(
+    entry: &CachedDiscovery<T>,
+    epoch: u64,
+    revision: Option<u64>,
+) -> bool {
+    match revision {
+        Some(revision) => entry.epoch == epoch && entry.revision == revision,
+        None => entry.epoch == epoch,
     }
-    fresh_discovery().await
 }
 
 pub async fn discover_nats_tool_provider_cached(
@@ -204,16 +259,46 @@ pub async fn discover_nats_tool_provider_cached(
     instance_id: &ServerScope,
     active_package: Option<&str>,
 ) -> Option<Arc<NatsToolProvider>> {
+    // Decision 5b: a registration written or deleted under this scope must be
+    // visible to the very next completion, without waiting out the 30 s cache
+    // interval. The watch keeps an epoch for eager invalidation, but the
+    // deterministic guarantee is the revision check below: every KV write and
+    // delete moves the registry stream's sequence at the moment the broker
+    // acks it, so comparing against the sequence this snapshot started
+    // scanning under cannot miss a change, no matter when the watch delivers.
+    crate::tool_registry_watch::ensure_registry_watch(config).await;
     let cache = NATS_TOOL_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let key = tool_discovery_key(config, instance_id, active_package);
-    discover_cached(cache, &key, || {
-        Box::pin(discover_nats_tool_provider_fresh(
-            config,
-            instance_id,
-            active_package,
-        ))
+    let now = Instant::now();
+    let epoch = registry_epoch();
+    let revision = registry_freshness_revision(config).await;
+    match cached_discovery_matching(cache, &key, now, REGISTRATION_REFRESH_INTERVAL, |entry| {
+        discovery_snapshot_is_current(entry, epoch, revision)
+    }) {
+        Some(provider) => provider,
+        None => discover_nats_tool_provider_fresh(config, instance_id, active_package).await,
+    }
+}
+
+/// The registry stream revision the cached snapshot must match, or `None`
+/// when the freshness check itself can't reach the broker; discovery would
+/// fail the same way, so serving the cached snapshot (when the watch still
+/// agrees) is the pre-change best-effort behavior.
+// Type-erased box: the revision probe reaches the async-nats connect chain,
+// and a concrete boxed future would still push dependent crates' trait-solver
+// recursion budget over the limit.
+fn registry_freshness_revision<'a>(
+    config: &'a Config,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send + 'a>> {
+    Box::pin(async move {
+        match registry_state_revision(config).await {
+            Ok(revision) => Some(revision.unwrap_or(0)),
+            Err(error) => {
+                log::debug!("tool registry freshness check failed: {error:#}");
+                None
+            }
+        }
     })
-    .await
 }
 
 /// Refresh tool discovery immediately and replace the cached snapshot.
@@ -228,6 +313,16 @@ pub(crate) async fn discover_nats_tool_provider_fresh(
 ) -> Option<Arc<NatsToolProvider>> {
     let cache = NATS_TOOL_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let key = tool_discovery_key(config, instance_id, active_package);
+    // Read the registry sequence *before* the scan (decision 5b). A write the
+    // broker acked before this read is in both the scan and the sequence; a
+    // write acked after it bumps the sequence past the stored value, so the
+    // next completion's comparison catches it and rescans. Reading it after
+    // the scan would hide a write that landed mid-scan and was missed by it.
+    let revision = registry_state_revision(config)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
     // Don't hold the process-wide lock while connecting to NATS or scanning KV.
     let provider = match NatsToolProvider::discover(
         config,
@@ -250,7 +345,16 @@ pub(crate) async fn discover_nats_tool_provider_fresh(
             None
         }
     };
-    cache_discovery(cache, key, provider.clone(), Instant::now());
+    cache_discovery_with_revision(
+        cache,
+        key,
+        CachedDiscovery {
+            provider: provider.clone(),
+            discovered_at: Instant::now(),
+            epoch: registry_epoch(),
+            revision,
+        },
+    );
     provider
 }
 
@@ -273,23 +377,38 @@ pub(crate) fn has_broker_address() -> bool {
 
 /// Refresh declarations before completion request construction.
 pub async fn refresh_nats_tool_declarations(config: &GlobalConfig, instance_id: &ServerScope) {
-    if !has_broker_address() {
-        return;
+    if let Some(refresh) =
+        has_broker_address().then(|| refresh_nats_tool_declarations_now(config, instance_id))
+    {
+        refresh.await;
     }
+}
 
-    let config_snapshot = config.read().clone();
-    let active_package = config_snapshot.active_package();
-    let provider = discover_nats_tool_provider_cached(
-        &config_snapshot,
-        instance_id,
-        active_package.as_deref(),
-    )
-    .await;
-    if let Some(provider) = &provider {
-        // A mismatched scope is silent otherwise: the worker scans one prefix,
-        // a typo'd server registers under another, and this turn's declarations
-        // just come back empty — indistinguishable from having no tools
-        // configured at all.
+// Type-erased box for the same reason as `registry_freshness_revision`.
+fn refresh_nats_tool_declarations_now<'a>(
+    config: &'a GlobalConfig,
+    instance_id: &'a ServerScope,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let config_snapshot = config.read().clone();
+        let active_package = config_snapshot.active_package();
+        let provider = discover_nats_tool_provider_cached(
+            &config_snapshot,
+            instance_id,
+            active_package.as_deref(),
+        )
+        .await;
+        log_discovery_report(provider.as_deref());
+        let declarations = declarations_for_all_tools(provider.as_deref());
+        *config.read().nats_tool_declarations.write() = declarations;
+    })
+}
+
+/// A mismatched scope is silent otherwise: the worker scans one prefix, a
+/// typo'd server registers under another, and this turn's declarations just
+/// come back empty — indistinguishable from having no tools configured at all.
+fn log_discovery_report(provider: Option<&NatsToolProvider>) {
+    if let Some(provider) = provider {
         let report = provider.discovery_report();
         if report.found == 0 {
             log::warn!("{}", report.message);
@@ -297,11 +416,14 @@ pub async fn refresh_nats_tool_declarations(config: &GlobalConfig, instance_id: 
             log::debug!("{}", report.message);
         }
     }
-    let declarations = provider
-        .as_ref()
+}
+
+fn declarations_for_all_tools(
+    provider: Option<&NatsToolProvider>,
+) -> Vec<harnx_core::tool::ToolDeclaration> {
+    provider
         .map(|provider| provider.declarations_for_use_tools(Some("*")))
-        .unwrap_or_default();
-    *config.read().nats_tool_declarations.write() = declarations;
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -385,6 +507,7 @@ mod tests {
             instance_id.clone(),
             Some(Arc::clone(&first)),
             discovered_at,
+            0,
         );
 
         let cached = cached_discovery(
@@ -392,6 +515,7 @@ mod tests {
             &instance_id,
             discovered_at + Duration::from_secs(29),
             Duration::from_secs(30),
+            0,
         )
         .flatten()
         .expect("fresh provider cached");
@@ -402,6 +526,7 @@ mod tests {
             &instance_id,
             discovered_at + Duration::from_secs(30),
             Duration::from_secs(30),
+            0
         )
         .is_none());
         let refreshed = Arc::new(());
@@ -410,12 +535,14 @@ mod tests {
             instance_id.clone(),
             Some(Arc::clone(&refreshed)),
             discovered_at + Duration::from_secs(30),
+            0,
         );
         let cached = cached_discovery(
             &cache,
             &instance_id,
             discovered_at + Duration::from_secs(31),
             Duration::from_secs(30),
+            0,
         )
         .flatten()
         .expect("refreshed provider cached");
@@ -434,6 +561,7 @@ mod tests {
             instance_id.clone(),
             Some(Arc::clone(&provider)),
             discovered_at,
+            0,
         );
 
         let cached = cached_discovery(
@@ -441,6 +569,7 @@ mod tests {
             &instance_id,
             discovered_at + REGISTRATION_REFRESH_INTERVAL - Duration::from_millis(1),
             REGISTRATION_REFRESH_INTERVAL,
+            0,
         )
         .flatten()
         .expect("fresh tool provider cached");
@@ -450,6 +579,7 @@ mod tests {
             &instance_id,
             discovered_at + REGISTRATION_REFRESH_INTERVAL,
             REGISTRATION_REFRESH_INTERVAL,
+            0
         )
         .is_none());
     }
@@ -458,12 +588,13 @@ mod tests {
     fn discovery_cache_prunes_expired_entries_during_insert() {
         let cache = std::sync::Mutex::new(HashMap::<String, CachedDiscovery<()>>::new());
         let discovered_at = Instant::now();
-        cache_discovery(&cache, "expired".into(), None, discovered_at);
+        cache_discovery(&cache, "expired".into(), None, discovered_at, 0);
         cache_discovery(
             &cache,
             "fresh".into(),
             None,
             discovered_at + REGISTRATION_REFRESH_INTERVAL - Duration::from_millis(1),
+            0,
         );
 
         cache_discovery(
@@ -471,6 +602,7 @@ mod tests {
             "new".into(),
             None,
             discovered_at + REGISTRATION_REFRESH_INTERVAL,
+            0,
         );
 
         let cache = cache.lock().expect("cache lock");
@@ -491,6 +623,7 @@ mod tests {
                 key,
                 None::<Arc<&str>>,
                 discovered_at + Duration::from_millis(key as u64),
+                0,
             );
         }
         cache_discovery(
@@ -498,6 +631,7 @@ mod tests {
             0,
             Some(Arc::clone(&refreshed_provider)),
             discovered_at + Duration::from_millis(DISCOVERY_CACHE_MAX_ENTRIES as u64),
+            0,
         );
 
         cache_discovery(
@@ -505,6 +639,7 @@ mod tests {
             DISCOVERY_CACHE_MAX_ENTRIES,
             None,
             discovered_at + Duration::from_millis(DISCOVERY_CACHE_MAX_ENTRIES as u64 + 1),
+            0,
         );
 
         let cache = cache.lock().expect("cache lock");
@@ -522,6 +657,88 @@ mod tests {
     }
 
     #[test]
+    fn discovery_cache_invalidates_when_registry_epoch_moves() {
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let instance_id = ServerScope::from_string("epoch-invalidation-test");
+        let discovered_at = Instant::now();
+        let provider = Arc::new(());
+        cache_discovery(
+            &cache,
+            instance_id.clone(),
+            Some(Arc::clone(&provider)),
+            discovered_at,
+            7,
+        );
+
+        // Fresh within the TTL, but the registry watch bumped the epoch: the
+        // entry is stale (decision 5b — next-completion freshness).
+        assert!(cached_discovery(
+            &cache,
+            &instance_id,
+            discovered_at + Duration::from_secs(1),
+            REGISTRATION_REFRESH_INTERVAL,
+            8,
+        )
+        .is_none());
+
+        // Same epoch: the entry is still reused.
+        let cached = cached_discovery(
+            &cache,
+            &instance_id,
+            discovered_at + Duration::from_secs(2),
+            REGISTRATION_REFRESH_INTERVAL,
+            7,
+        )
+        .flatten()
+        .expect("same-epoch entry reused");
+        assert!(Arc::ptr_eq(&provider, &cached));
+    }
+
+    #[test]
+    fn discovery_cache_invalidates_when_registry_revision_moves() {
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let instance_id = ServerScope::from_string("revision-invalidation-test");
+        let discovered_at = Instant::now();
+        let provider = Arc::new(());
+        cache_discovery_with_revision(
+            &cache,
+            instance_id.clone(),
+            CachedDiscovery {
+                provider: Some(Arc::clone(&provider)),
+                discovered_at,
+                epoch: 7,
+                revision: 12,
+            },
+        );
+
+        // Fresh within the TTL and the epoch matches, but the registry
+        // stream's sequence moved (a write or delete acked after the scan
+        // started): the deterministic decision-5b check rejects the entry
+        // even though the async watch hasn't delivered anything (the epoch
+        // still matches).
+        assert!(cached_discovery_matching(
+            &cache,
+            &instance_id,
+            discovered_at + Duration::from_secs(1),
+            REGISTRATION_REFRESH_INTERVAL,
+            |entry| entry.epoch == 7 && entry.revision == 13,
+        )
+        .is_none());
+
+        // Same epoch and sequence: the entry is still reused.
+        let cached = cached_discovery_matching(
+            &cache,
+            &instance_id,
+            discovered_at + Duration::from_secs(2),
+            REGISTRATION_REFRESH_INTERVAL,
+            |entry| entry.epoch == 7 && entry.revision == 12,
+        )
+        .flatten()
+        .expect("unchanged registry entry reused");
+        assert!(Arc::ptr_eq(&provider, &cached));
+    }
+
+    #[test]
     fn discovery_cache_rejects_out_of_order_refresh() {
         let cache = std::sync::Mutex::new(HashMap::new());
         let discovered_at = Instant::now();
@@ -531,9 +748,10 @@ mod tests {
             "key",
             Some(Arc::clone(&newer_provider)),
             discovered_at + Duration::from_secs(1),
+            0,
         );
 
-        cache_discovery(&cache, "key", Some(Arc::new("older")), discovered_at);
+        cache_discovery(&cache, "key", Some(Arc::new("older")), discovered_at, 0);
 
         let cache = cache.lock().expect("cache lock");
         let entry = cache.get("key").expect("newer entry retained");
@@ -549,7 +767,7 @@ mod tests {
         let cache = std::sync::Mutex::new(HashMap::<ServerScope, CachedDiscovery<()>>::new());
         let instance_id = ServerScope::from_string("none-cache-test");
         let discovered_at = Instant::now();
-        cache_discovery(&cache, instance_id.clone(), None, discovered_at);
+        cache_discovery(&cache, instance_id.clone(), None, discovered_at, 0);
 
         assert!(matches!(
             cached_discovery(
@@ -557,6 +775,7 @@ mod tests {
                 &instance_id,
                 discovered_at + Duration::from_secs(1),
                 Duration::from_secs(30),
+                0
             ),
             Some(None)
         ));

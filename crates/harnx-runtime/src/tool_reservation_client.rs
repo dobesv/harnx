@@ -66,6 +66,28 @@ impl ToolReservationHandle {
             session_id: Some(session.session_id().to_owned()),
             ..Default::default()
         });
+        // Decision 11: this connection is an operator, and it must
+        // act under the operator's own default identity for the reservation's
+        // cluster — the same identity `create_backing_session` records in the
+        // backing session's metadata. Without stamping it here, discovery
+        // derives no session owner and `ToolRequest.user_id` stays `None`:
+        // per-user tool servers reject the call, and `--single-user`
+        // (ownerless-only) servers accept an identified operator against
+        // ownerless credentials. Installing the identity on the session-derived
+        // agent routes it through both discovery scoping and request
+        // stamping, like the worker-side operator path does
+        // (`apply_operator_principals`).
+        let operator = config.default_user_id_for_cluster(config.default_cluster_key());
+        if let Some(operator) = operator.filter(|id| !id.trim().is_empty()) {
+            let mut agent = config.extract_agent();
+            agent.set_user_principals(Some(harnx_core::user_principals::from_resolved(
+                Some(&operator),
+                None,
+                &[],
+                &[],
+            )));
+            config.agent = Some(agent);
+        }
         let reservation = reserve(&client, &subject, session.storage_key(), &view).await?;
         let (sender, state) = watch::channel(ToolReservationState {
             generation: 0,

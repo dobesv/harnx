@@ -99,6 +99,7 @@ fn call(raw: &str) -> OperatorToolCommand {
     OperatorToolCommand::Call {
         name: "visible".into(),
         args_json: raw.into(),
+        tool_input: None,
     }
 }
 
@@ -159,11 +160,12 @@ async fn list_info_call_and_patterns_never_expose_or_dispatch_hidden_tools() {
         OperatorToolCommand::Call {
             name: "hidden".into(),
             args_json: "{}".into(),
+            tool_input: None,
         },
     ] {
         let (ctx, seen) = fixture(json!(null));
-        // Hidden tools are denied as a typed unauthorized-tool reply
-        // (review C10/C26), not a transport error: operators see a
+        // Hidden tools are denied as a typed unauthorized-tool reply,
+        // not a transport error: operators see a
         // structured denial instead of a string-matched failure.
         let reply = evaluate(
             ctx,
@@ -358,3 +360,104 @@ async fn handlers_reject_missing_session_and_invalid_json_before_discovery() {
 mod bash;
 mod protocol;
 mod selection;
+
+#[tokio::test]
+async fn operator_call_tool_input_reaches_the_leaf_dispatch_scope() {
+    // Decision 11: `evaluate` scopes a Call's `tool_input` to its leaf
+    // dispatch. The NATS provider builds `ToolRequest.input_responses` /
+    // `request_state` from `middleware::current_tool_input()`, so this
+    // fixture reads that scope: present exactly for a call that carries
+    // `tool_input`, absent for one that doesn't.
+    struct ScopedProvider(Arc<Mutex<Vec<Option<crate::middleware::ToolInputResume>>>>);
+    #[async_trait::async_trait]
+    impl ToolProvider for ScopedProvider {
+        fn name(&self) -> &str {
+            "operator-scoped-fixture"
+        }
+        fn has_tool(&self, name: &str) -> bool {
+            name == "visible"
+        }
+        async fn call_tool(
+            &self,
+            _: &str,
+            _args: Value,
+            _: &crate::utils::AbortSignal,
+        ) -> std::result::Result<ToolProviderOutput, ToolError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(crate::middleware::current_tool_input());
+            Ok(Value::Null.into())
+        }
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let ctx = context(Arc::new(ScopedProvider(seen.clone())));
+    let abort = create_abort_signal();
+    fn scoped_call(args_json: &str, tool_input: Option<OperatorToolInput>) -> OperatorToolCommand {
+        OperatorToolCommand::Call {
+            name: "visible".into(),
+            args_json: args_json.into(),
+            tool_input,
+        }
+    }
+    evaluate(
+        ctx,
+        &scoped_call(
+            r#"{"text":"a"}"#,
+            Some(OperatorToolInput::url_response(
+                "connect-round-1".into(),
+                harnx_core::tool::ToolInputRequired::URL_ACTION_CONTINUE,
+                json!({ "challenge_id": "abc", "round": 1 }),
+            )),
+        ),
+        crate::tool_output::ToolOutputFormat::Json,
+        &abort,
+    )
+    .await
+    .unwrap();
+    evaluate(
+        context(Arc::new(ScopedProvider(seen.clone()))),
+        &scoped_call(r#"{"text":"b"}"#, None),
+        crate::tool_output::ToolOutputFormat::Json,
+        &abort,
+    )
+    .await
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    let Some(input) = seen[0].as_ref() else {
+        panic!("tool_input must reach the dispatch scope")
+    };
+    assert_eq!(
+        input.responses.get("connect-round-1").unwrap().action,
+        harnx_core::tool::ToolInputRequired::URL_ACTION_CONTINUE
+    );
+    assert_eq!(input.request_state["challenge_id"], json!("abc"));
+    assert!(
+        seen[1].is_none(),
+        "a call without tool_input must not see another call's answers"
+    );
+}
+
+/// The tri-state `OperatorToolRequest::user_id` serde contract: the field
+/// serializes as a plain optional, and an explicit `null` deserializes as
+/// `Some(None)` (ownerless operator) rather than a legacy absent field.
+#[test]
+fn operator_user_id_tri_state_serializes_and_deserializes() {
+    fn serialized(value: &Option<Option<String>>) -> Value {
+        let mut buf = Vec::new();
+        let mut serializer = serde_json::Serializer::new(&mut buf);
+        super::operator_user_id::serialize(value, &mut serializer).unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    fn deserialized(raw: &str) -> Option<Option<String>> {
+        let mut deserializer = serde_json::Deserializer::from_str(raw);
+        super::operator_user_id::deserialize(&mut deserializer).unwrap()
+    }
+
+    assert_eq!(serialized(&None), Value::Null);
+    assert_eq!(serialized(&Some(None)), Value::Null);
+    assert_eq!(serialized(&Some(Some("alice".into()))), json!("alice"));
+    assert_eq!(deserialized("null"), Some(None));
+    assert_eq!(deserialized("\"alice\""), Some(Some("alice".into())));
+}

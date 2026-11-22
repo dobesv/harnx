@@ -1,4 +1,4 @@
-use super::{InteractionModal, Tui};
+use super::{footer::interaction_footer, InteractionModal, Tui};
 use crate::tool_confirmation::TOOL_CONFIRM_IDLE_GATE;
 use crate::types::ModalState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -170,7 +170,7 @@ impl Tui {
             .borders(Borders::ALL)
             .title(if state.child.is_some() {
                 "Child confirmation"
-            } else if state.a2ui.is_some() {
+            } else if state.a2ui.is_some() || state.pending.kind == "url" {
                 "Interaction"
             } else {
                 "Middleware confirmation"
@@ -178,13 +178,16 @@ impl Tui {
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        // `url` interactions carry no note (decision 6: the stored response is
+        // the action alone), so their modal shows no note area.
+        let is_url = state.pending.kind == "url";
         let note_area = super::render_modal_body(
             frame,
             inner,
             super::ModalBodyParts {
                 body: interaction_body(state),
                 footer: interaction_footer(state, self.interactions.read_error.as_deref()).into(),
-                note_height: NOTE_HEIGHT,
+                note_height: if is_url { 0 } else { NOTE_HEIGHT },
             },
             &mut state.scroll,
         );
@@ -192,13 +195,15 @@ impl Tui {
             .a2ui
             .as_ref()
             .is_some_and(|f| f.focus == super::a2ui::FocusTarget::Note);
-        super::render_note_area(
-            frame,
-            note_area,
-            &mut state.note,
-            note_focused,
-            "Note (optional)",
-        );
+        if !is_url {
+            super::render_note_area(
+                frame,
+                note_area,
+                &mut state.note,
+                note_focused,
+                "Note (optional)",
+            );
+        }
     }
 }
 
@@ -219,15 +224,46 @@ fn insert_pasted_text(state: &mut InteractionModal, text: &str) {
 fn interaction_body(state: &InteractionModal) -> Vec<Line<'static>> {
     if let Some(form) = &state.a2ui {
         let mut lines = super::a2ui_render::render_form_lines(form, A2UI_BODY_COLUMNS);
-        if state.pending.pending_count > 0 {
-            lines.push(Line::from(""));
-            lines.push(Line::from(format!(
-                "{} more pending; shown one at a time.",
-                state.pending.pending_count
-            )));
-        }
+        lines.extend(more_pending_lines(state));
         return lines;
     }
+    if state.pending.kind == "url" {
+        return url_body_lines(state);
+    }
+    confirm_body_lines(state)
+}
+
+/// `2 more pending; shown one at a time.` — only one request is ever on
+/// screen; this says how many queue behind it.
+fn more_pending_lines(state: &InteractionModal) -> Vec<Line<'static>> {
+    if state.pending.pending_count == 0 {
+        return Vec::new();
+    }
+    vec![
+        Line::from(""),
+        Line::from(format!(
+            "{} more pending; shown one at a time.",
+            state.pending.pending_count
+        )),
+    ]
+}
+
+fn url_body_lines(state: &InteractionModal) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(state.pending.message.clone()), Line::from("")];
+    let url = state
+        .pending
+        .payload
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    // Plain text on screen; the OSC 8 wrapping is added by the terminal
+    // writer as the frame leaves (decision 6).
+    lines.push(crate::hyperlink::url_span(url));
+    lines.extend(more_pending_lines(state));
+    lines
+}
+
+fn confirm_body_lines(state: &InteractionModal) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(state.pending.message.clone())];
     if state.pending.kind != "confirm" {
         lines.push(Line::from(format!(
@@ -235,12 +271,7 @@ fn interaction_body(state: &InteractionModal) -> Vec<Line<'static>> {
             state.pending.kind
         )));
     }
-    if state.pending.pending_count > 0 {
-        lines.push(Line::from(format!(
-            "{} more pending; shown one at a time.",
-            state.pending.pending_count
-        )));
-    }
+    lines.extend(more_pending_lines(state));
     // Literal text, not markdown: a confirm message cannot add links or actions.
     lines
         .into_iter()
@@ -251,37 +282,4 @@ fn interaction_body(state: &InteractionModal) -> Vec<Line<'static>> {
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-fn interaction_footer(state: &InteractionModal, read_error: Option<&str>) -> String {
-    let read_error = read_error.filter(|_| state.child.is_none());
-    let interrupt = if state.child.is_some() {
-        "interrupt child"
-    } else {
-        "interrupt"
-    };
-    let help = if state.submitting {
-        format!("Submitting… · Ctrl+C {interrupt}")
-    } else if state.a2ui.is_some() {
-        super::a2ui_render::footer_help(interrupt)
-    } else if state.pending.kind != "confirm" {
-        format!("Ctrl+D deny · Ctrl+C {interrupt} · PgUp/PgDn scroll")
-    } else {
-        let idle = Instant::now().saturating_duration_since(state.last_key_at);
-        let approve = if idle < TOOL_CONFIRM_IDLE_GATE {
-            format!(
-                "ENTER approve ({:.1}s)",
-                TOOL_CONFIRM_IDLE_GATE.saturating_sub(idle).as_secs_f32()
-            )
-        } else {
-            "ENTER approve".to_string()
-        };
-        format!(
-            "{approve} · Ctrl+D deny · Ctrl+C {interrupt} · Shift+Enter newline · PgUp/PgDn scroll"
-        )
-    };
-    match read_error.or(state.error.as_deref()) {
-        Some(error) => format!("{help}\n{error}"),
-        None => help,
-    }
 }

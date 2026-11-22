@@ -126,7 +126,11 @@ async fn bounded_operation(
     Ok(reply)
 }
 
-async fn execute(cli: &Cli, command: OperatorToolCommand, json: bool) -> Result<OperatorToolReply> {
+pub(crate) async fn execute(
+    cli: &Cli,
+    command: OperatorToolCommand,
+    json: bool,
+) -> Result<OperatorToolReply> {
     // Reject JSON before loading configuration or starting any worker/tool process.
     validate(&command)?;
     let abort = create_abort_signal();
@@ -196,13 +200,13 @@ async fn execute(cli: &Cli, command: OperatorToolCommand, json: bool) -> Result<
     result
 }
 
-struct CallerSelection {
-    config: harnx_runtime::config::Config,
-    named: Option<(String, String)>,
-    cluster: String,
+pub(crate) struct CallerSelection {
+    pub(crate) config: harnx_runtime::config::Config,
+    pub(crate) named: Option<(String, String)>,
+    pub(crate) cluster: String,
 }
 
-async fn resolve_caller(cli: &Cli) -> Result<CallerSelection> {
+pub(crate) async fn resolve_caller(cli: &Cli) -> Result<CallerSelection> {
     let mut config = tokio::time::timeout(
         Duration::from_secs(60),
         crate::init_frontend_config(WorkingMode::Cmd, true),
@@ -346,13 +350,15 @@ mod tests {
         for args in ["null", "[]", "1", "true", "{bad"] {
             assert!(validate(&OperatorToolCommand::Call {
                 name: "fs_read".into(),
-                args_json: args.into()
+                args_json: args.into(),
+                tool_input: None,
             })
             .is_err());
         }
         validate(&OperatorToolCommand::Call {
             name: "fs_read".into(),
             args_json: r#"{"path":"a b", "quote":"\""}"#.into(),
+            tool_input: None,
         })
         .unwrap();
     }

@@ -21,6 +21,7 @@ async fn append_orphan_round(log: &NatsSessionLog) -> Result<u64> {
 
 fn orphan_request(key: &str, session_id: &str, round: u64) -> ToolRequest {
     ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,

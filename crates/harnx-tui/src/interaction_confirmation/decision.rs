@@ -33,11 +33,17 @@ impl Tui {
             }
             return;
         }
-        if approve && state.pending.kind != "confirm" {
+        // `url` interactions answer continue/cancel; only `confirm` approves.
+        let Some(action) = resolve_decision_action(&state.pending.kind, approve) else {
             return;
-        }
-        let note = state.note.lines().join("\n");
-        let response = decision_response(approve, note);
+        };
+        // Decision 6: a `url` response stores the action alone — no note.
+        let note = if state.pending.kind == "url" {
+            String::new()
+        } else {
+            state.note.lines().join("\n")
+        };
+        let response = decision_response_for(action, note);
         self.dispatch_modal_decision(response);
     }
 
@@ -190,8 +196,28 @@ fn spawn_decision_task(ctx: DecisionTaskContext, response: InteractionResponse) 
 }
 
 pub(super) fn decision_response(approve: bool, note: String) -> InteractionResponse {
+    decision_response_for(if approve { "approve" } else { "deny" }, note)
+}
+
+/// Map an approval-impulse and a pending kind to the durable action. Confirm
+/// answers approve/deny, url answers continue/cancel (decision 6); an
+/// affirmative press on any other kind is refused (deny stays available).
+pub(super) fn resolve_decision_action(kind: &str, approve: bool) -> Option<&'static str> {
+    match (approve, kind) {
+        (true, "confirm") | (false, "confirm") => Some(if approve { "approve" } else { "deny" }),
+        (true, "url") => Some("continue"),
+        (false, "url") => Some("cancel"),
+        (true, _) => None,
+        (false, _) => Some("deny"),
+    }
+}
+
+/// Build the durable response for a resolved action. `confirm` answers
+/// approve/deny, `url` answers continue/cancel (decision 6); `data` stays
+/// empty for both kinds.
+pub(super) fn decision_response_for(action: &str, note: String) -> InteractionResponse {
     InteractionResponse {
-        action: if approve { "approve" } else { "deny" }.to_string(),
+        action: action.to_string(),
         data: Default::default(),
         note: (!note.trim().is_empty()).then_some(note),
     }

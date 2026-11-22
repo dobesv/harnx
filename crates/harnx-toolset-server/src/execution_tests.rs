@@ -17,6 +17,7 @@ fn tool_request(session: &str, call_id: &str) -> ToolRequest {
         tool_call_id: None,
         capabilities: Default::default(),
         tool_round: None,
+        user_id: None,
     }
 }
 

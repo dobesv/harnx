@@ -43,6 +43,7 @@ mod nats_read_convergence;
 mod nats_read_reconcile_heal;
 mod nats_read_restart_persistence;
 mod nats_read_state_list;
+mod nats_registration_audience;
 mod nats_remote_transcript;
 mod nats_run_limits;
 mod nats_session;

@@ -161,19 +161,46 @@ async fn round_may_request_input(
     agent_name: &str,
     calls: &[ToolCall],
 ) -> bool {
-    if calls.is_empty() || !crate::tool_context::has_broker_address() {
-        return false;
-    }
-    let package = harnx_core::package_namespace::pkg_from_qualified(agent_name).map(str::to_string);
-    let config = config.read().clone();
-    let Some(provider) =
-        discover_nats_tool_provider_cached(&config, instance_id, package.as_deref()).await
-    else {
+    let Some(provider) = round_nats_provider(config, instance_id, agent_name, calls).await else {
         return false;
     };
     calls
         .iter()
         .any(|call| provider.may_request_input(&call.name))
+}
+
+/// The round's cached NATS provider when the round may consult one. A round
+/// with no calls has nothing to look up, and a process without a broker
+/// address must not start one just to check for input-capable tools.
+// Type-erased box, not a plain `Box::pin`: auto-trait evaluation still
+// descends through `Pin<Box<impl Future>>`, and discovery reaches the deep
+// async-nats connect chain, so a concrete box here overflows dependent
+// crates' trait-solver recursion budget. Erasing the future type cuts the
+// chain.
+fn round_nats_provider<'a>(
+    config: &'a GlobalConfig,
+    instance_id: &'a harnx_core::instance::ServerScope,
+    agent_name: &'a str,
+    calls: &'a [ToolCall],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<NatsToolProvider>>> + Send + 'a>>
+{
+    Box::pin(async move {
+        match round_can_consult_nats_tools(calls, crate::tool_context::has_broker_address()) {
+            true => {
+                let package = harnx_core::package_namespace::pkg_from_qualified(agent_name)
+                    .map(str::to_string);
+                let config = config.read().clone();
+                discover_nats_tool_provider_cached(&config, instance_id, package.as_deref()).await
+            }
+            false => None,
+        }
+    })
+}
+
+/// A round with no calls has nothing to look up, and a process without a
+/// broker address must not start one just to check for input-capable tools.
+fn round_can_consult_nats_tools(calls: &[ToolCall], has_broker: bool) -> bool {
+    !calls.is_empty() && has_broker
 }
 
 async fn screen_round_with_saved_denials(
@@ -474,19 +501,24 @@ async fn resolve_nats_provider(
     active_package: Option<&str>,
     injected: Option<Arc<NatsToolProvider>>,
 ) -> Option<Arc<NatsToolProvider>> {
-    if injected.is_some() {
-        return injected;
+    match should_discover_nats_provider(
+        injected.is_some(),
+        crate::tool_context::has_broker_address(),
+    ) {
+        true => discover_nats_tool_provider_cached(config, instance_id, active_package).await,
+        false => injected,
     }
-    // In-process tests without a broker must not start the developer's broker.
-    if !crate::tool_context::has_broker_address() {
-        return None;
-    }
-    discover_nats_tool_provider_cached(config, instance_id, active_package).await
+}
+
+/// In-process tests without a broker must not start the developer's broker,
+/// and an explicitly injected provider wins over discovery.
+fn should_discover_nats_provider(injected: bool, has_broker: bool) -> bool {
+    !injected && has_broker
 }
 
 /// Build tool providers, middleware, and rendering state for one tool round.
 pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> ToolEvalContext {
-    build_tool_eval_context_inner(params, None).await
+    Box::pin(build_tool_eval_context_inner(params, None)).await
 }
 
 /// Build against an admitted discovery snapshot, without consulting the cache.
@@ -494,7 +526,7 @@ pub async fn build_tool_eval_context_with_provider(
     params: BuildToolEvalContextParams<'_>,
     provider: Arc<crate::nats_tool_provider::NatsToolProvider>,
 ) -> ToolEvalContext {
-    build_tool_eval_context_inner(params, Some(provider)).await
+    Box::pin(build_tool_eval_context_inner(params, Some(provider))).await
 }
 
 async fn build_tool_eval_context_inner(

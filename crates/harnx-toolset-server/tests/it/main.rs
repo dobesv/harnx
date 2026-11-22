@@ -18,6 +18,7 @@ mod nats_server;
 mod new_message;
 mod partial_result;
 mod progress;
+mod registration_handle;
 mod replay;
 mod reply_projection;
 mod result_limits;

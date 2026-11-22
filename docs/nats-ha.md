@@ -92,7 +92,15 @@ Harnx automatically manages the following JetStream resources:
   - Workers bump `last_attention_seq` on `TurnEnd` (final message) and `HitlApprovalRequested`.
   - Invalidation subject: `harnx.session.{storage_key}.read.invalidated` (separate from metadata invalidation).
 - **KV Bucket**: `harnx_tool_registry` — tool server discovery, with a
-  per-registration TTL.
+  per-registration TTL. One server identity can hold several registrations:
+  global (bare `{scope}.{identity}`), user-scoped (`{scope}.{identity}.u.{user}`)
+  and ownerless-only (`{scope}.{identity}.anon`); a session sees the global ones
+  plus the one registration in its audience. Workers re-read the bucket's
+  stream sequence before every completion, so a registration published before
+  `<server>_connect` returns is visible on the very next completion without
+  waiting out the 30 s discovery cache; the async KV watch is only best-effort
+  early invalidation, never the guarantee (`crates/harnx-runtime/src/tool_registry_watch.rs`).
+  See [Tool Server Credentials](tool-credentials.md).
 - **Streams**: `SESSION_<sha256(id)>` (Subject: `sessions.{id}.log`) stores only the
   durable append-only conversation history. Agent identity, settings, rendered
   prompts, and titles do not belong in this stream. Hash the exact, case-sensitive
@@ -627,6 +635,32 @@ boundary.
 Each worker also serves its own sub-agent toolset in-process. When several
 workers share a scope they all register that toolset under the same key and
 join one queue group, so any worker may serve any sub-agent request.
+
+### Per-User Credentials for Remote Tool Servers
+
+A remote MCP server can run in native mode so every user connects their own
+account (OAuth or a token) instead of sharing one upstream credential. The
+server needs the cluster connection env vars and `HARNX_SERVER_SCOPE` like any
+independently deployed tool server, plus its key file:
+
+```bash
+# Tool server container (native per-user credential mode)
+HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
+  HARNX_SERVER_SCOPE=shared harnx-mcp-remote \
+  --url https://atlassian.com/…/mcp --name jira \
+  --credentials-key-file /etc/harnx/jira-credentials-key.json \
+  --auth-methods oauth --oauth-scope offline_access \
+  --public-base-url https://harnx.example.com/mcp-remote/ \
+  --http-bind 0.0.0.0:8080
+```
+
+The public base URL must be routed to the server's HTTP port (an ingress
+subpath or a dedicated host), and a hosted deployment must also set
+`--trusted-user-header` so the request's user identity is authenticated. The
+credential itself never passes through NATS or tool arguments; users enter it
+on the connect page. Connection management from any front-end:
+`harnx credentials list|connect|disconnect` or the TUI `.credentials`
+command. See [Tool Server Credentials](tool-credentials.md) for details.
 
 ## Using Remote Agents
 

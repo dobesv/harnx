@@ -11,6 +11,7 @@ mod cancellation;
 mod event_isolation;
 pub mod event_source;
 mod exit_confirmation;
+pub mod hyperlink;
 pub mod input;
 mod input_attachments;
 mod input_commands;
@@ -42,6 +43,7 @@ pub mod types;
 
 mod compaction_history;
 mod completion;
+mod credentials;
 mod detail_view;
 mod operator_tools;
 mod remote_session;

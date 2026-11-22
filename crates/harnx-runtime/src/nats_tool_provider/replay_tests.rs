@@ -108,6 +108,7 @@ async fn a_saved_failure_rolls_forward_with_its_reply_time_partial_result() -> a
     let client = async_nats::connect(&url).await?;
     let js = async_nats::jetstream::new(client.clone());
     let request = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -222,6 +223,7 @@ async fn record_retryable_call(js: &async_nats::jetstream::Context) -> anyhow::R
         .await?
         .record(
             &ToolRequest {
+                user_id: None,
                 input_responses: None,
                 request_state: None,
                 run_context: None,
@@ -278,6 +280,7 @@ async fn replay_responder(
 
 async fn save_reply(js: &async_nats::jetstream::Context) -> anyhow::Result<()> {
     let request = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -322,6 +325,7 @@ async fn saved_reply_provider(client: async_nats::Client) -> anyhow::Result<Nats
         parent_session_id: Some("parent".into()),
         parent_agent: None,
         parent_local_session_id: None,
+        session_owner: None,
         tools: HashMap::from([(
             "retryable_echo".to_string(),
             RegisteredTool {
@@ -383,6 +387,7 @@ async fn the_journal_bucket_takes_the_configured_replica_count() -> anyhow::Resu
     assert_eq!(provider.journal_replicas, 3);
 
     let request = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -459,6 +464,7 @@ async fn expired_pending_replay_reports_scope_but_completed_reply_still_recovers
             None,
         );
         let request = ToolRequest {
+            user_id: None,
             input_responses: None,
             request_state: None,
             call_id: format!("wire-{index}"),

@@ -301,3 +301,38 @@ fn pending_text_renders_the_surface() {
     assert!(text.contains("Deploy?"));
     assert!(!text.contains("cannot be answered from the CLI"));
 }
+
+#[test]
+fn url_kind_prints_the_link_and_answers_with_continue_or_cancel() {
+    let target = pending(
+        "url",
+        json!({"url": "https://example.com/connect/abc", "message": "Connect Jira"}),
+    );
+    let text = pending_text(&target);
+    assert!(text.contains("Pending interaction int-form (kind url, request sequence 3)"));
+    assert!(text.contains("https://example.com/connect/abc"), "{text}");
+    assert!(text.contains("Connect Jira"), "{text}");
+    assert!(!text.contains("cannot be answered from the CLI"), "{text}");
+
+    for action in ["continue", "cancel"] {
+        let response = build_response(&target, action, &[], None, None).unwrap();
+        assert_eq!(response.action, action);
+        assert!(response.data.is_empty(), "url responses carry no data");
+        assert!(response.note.is_none(), "url responses carry no note");
+    }
+    let error = build_response(&target, "approve", &[], None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("only 'continue' or 'cancel'"), "{error}");
+    // The stored response is the action alone: a note is rejected outright.
+    let error = build_response(
+        &target,
+        "continue",
+        &[],
+        None,
+        Some("done in browser".into()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("carry no note"), "{error}");
+}

@@ -135,13 +135,16 @@ pub struct ToolInputRequired {
     /// challenges need distinct keys: an exact repeat of an answered
     /// (key, kind, payload) gets its previous answer back.
     pub key: String,
-    /// Interaction kind: [`ToolInputRequired::KIND_CONFIRM`] or
-    /// [`ToolInputRequired::KIND_A2UI`].
+    /// Interaction kind: [`ToolInputRequired::KIND_CONFIRM`],
+    /// [`ToolInputRequired::KIND_A2UI`] or [`ToolInputRequired::KIND_URL`].
     pub kind: String,
-    /// The question text for `confirm` challenges.
+    /// The question text for `confirm` and `url` challenges.
     pub message: Option<String>,
     /// The A2UI envelope for `a2ui` challenges (validated before suspending).
     pub surface: Option<serde_json::Value>,
+    /// The link URL for `url` challenges. Only `https:` and loopback `http:`
+    /// are valid; the provider validates before mapping a wire challenge here.
+    pub url: Option<String>,
     pub summary: String,
     /// Opaque tool state stored in the call's checkpoint and resent beside
     /// the responses on the rerun, never inside `arguments`.
@@ -153,6 +156,22 @@ impl ToolInputRequired {
     pub const KIND_CONFIRM: &'static str = "confirm";
     /// Frontends route on this kind with their A2UI rendering.
     pub const KIND_A2UI: &'static str = "a2ui";
+    /// Frontends route on this kind with their link UI (decision 6).
+    pub const KIND_URL: &'static str = "url";
+    /// `url` challenge action: proceed after opening the link.
+    pub const URL_ACTION_CONTINUE: &'static str = "continue";
+    /// `url` challenge action: abort the flow.
+    pub const URL_ACTION_CANCEL: &'static str = "cancel";
+
+    /// URL policy for `url` challenges (decision 6): only `https:` and
+    /// loopback `http:` are valid. Everything else makes the challenge
+    /// invalid; callers degrade it to a recoverable error, never to a
+    /// suspended interaction. The rule lives in `harnx-toolset` (the
+    /// wire-side contract this crate builds on); delegate to it so the
+    /// two can never drift.
+    pub fn validate_url(raw: &str) -> Result<(), String> {
+        harnx_toolset::ToolInputRequired::validate_url(raw)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -768,6 +787,21 @@ pub fn extract_user_display_text(result: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn validate_url_accepts_https_and_loopback_http_only() {
+        // Decision 6: https anywhere, http only on loopback hosts.
+        assert!(ToolInputRequired::validate_url("https://example.com/connect/abc").is_ok());
+        assert!(ToolInputRequired::validate_url("http://localhost:8080/connect").is_ok());
+        assert!(ToolInputRequired::validate_url("http://127.0.0.1:8080/connect").is_ok());
+        assert!(ToolInputRequired::validate_url("http://[::1]:8080/connect").is_ok());
+        // Everything else is an invalid challenge: it must degrade to a
+        // recoverable error, never a suspended interaction.
+        assert!(ToolInputRequired::validate_url("http://example.com/connect").is_err());
+        assert!(ToolInputRequired::validate_url("ftp://example.com/f").is_err());
+        assert!(ToolInputRequired::validate_url("not a url").is_err());
+        assert!(ToolInputRequired::validate_url("").is_err());
+    }
 
     #[test]
     fn test_extract_all_display_text() {

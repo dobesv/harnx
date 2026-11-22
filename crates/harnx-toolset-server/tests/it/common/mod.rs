@@ -396,6 +396,7 @@ pub(crate) async fn round_trip(client: &async_nats::Client) -> Result<()> {
 /// A session-scoped `echo` request whose operation ID matches its call ID.
 pub(crate) fn request(session: &str, call_id: &str) -> ToolRequest {
     ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,

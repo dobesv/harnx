@@ -33,6 +33,7 @@ fn pending_text(item: &PendingInteraction) -> String {
             .and_then(Value::as_str)
             .unwrap_or_else(|| item.summary())
             .to_string(),
+        "url" => text::render_url(&item.request.payload),
         kind => format!(
             "{}\n\nThis interaction kind ('{kind}') cannot be answered from the CLI.",
             item.summary()

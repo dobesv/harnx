@@ -29,6 +29,7 @@ impl Calls {
             &self.client,
             &crate::operator_tools::subject("local", &SessionActivationRoute::ClusterShared)?,
             &OperatorToolRequest {
+                user_id: None,
                 version: 1,
                 session_key: self.session.storage_key().into(),
                 use_tools: Some(vec!["metis_session_prompt".into()]),
@@ -77,6 +78,7 @@ impl Calls {
         let command = OperatorToolCommand::Call {
             name: "metis_session_prompt".into(),
             args_json: json!({"message":"child work", "timeout_secs":604800}).to_string(),
+            tool_input: None,
         };
         let (reply, storage) = if named {
             (
@@ -354,6 +356,7 @@ async fn assert_missing_lineage(calls: &Calls) -> Result<()> {
         &OperatorToolCommand::Call {
             name: "metis_session_prompt".into(),
             args_json: json!({"message":"no authority"}).to_string(),
+            tool_input: None,
         },
         crate::tool_output::ToolOutputFormat::Json,
         &create_abort_signal(),
@@ -376,6 +379,7 @@ async fn assert_expired_not_renewed(calls: &Calls, mut inherited: RunLimitsRecor
     let command = OperatorToolCommand::Call {
         name: "metis_session_prompt".into(),
         args_json: json!({"message":"expired"}).to_string(),
+        tool_input: None,
     };
     for named in [false, true] {
         let requests = calls.client.subscribe(">".to_owned()).await?;

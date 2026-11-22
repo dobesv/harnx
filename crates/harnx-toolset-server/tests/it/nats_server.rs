@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 fn make_test_tool_request(name: &str, call_id: &str, args: serde_json::Value) -> ToolRequest {
     ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -51,6 +52,7 @@ async fn assert_registration(harness: &TestHarness) -> Result<()> {
 async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
     let invocations_before = harness.toolset.echo_invocations.load(Ordering::SeqCst);
     let request = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -90,6 +92,7 @@ async fn assert_idempotent_replay(harness: &TestHarness) -> Result<()> {
 
 async fn assert_invocation_context(harness: &TestHarness) -> Result<()> {
     let mut request = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -167,6 +170,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
         }
     });
     let opted_in = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -197,6 +201,7 @@ async fn assert_execution_context_capability_is_per_request(harness: &TestHarnes
     assert_eq!(provenance["call_id"], opted_in.call_id);
 
     let opted_out = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -233,6 +238,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
     let invocations_before = harness.toolset.echo_invocations.load(Ordering::SeqCst);
     let args = json!({ "value": 43, "delay_ms": 100 });
     let first = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -249,6 +255,7 @@ async fn assert_concurrent_idempotency(harness: &TestHarness) -> Result<()> {
         tool_round: None,
     };
     let second = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -326,6 +333,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
     )
     .await?;
     let mismatched = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -349,6 +357,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
     )
     .await?;
     let missing_key = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -377,6 +386,7 @@ async fn assert_early_failure_replies(harness: &TestHarness) -> Result<()> {
 
 async fn assert_cancellation(harness: &TestHarness) -> Result<()> {
     let request = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -627,6 +637,7 @@ async fn shutdown_drains_in_flight_requests() -> Result<()> {
     assert_registration(&harness).await?;
 
     let request = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,

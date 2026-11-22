@@ -150,6 +150,12 @@ means a bigger number on a finding both sides have: a longer function, higher
 complexity, deeper nesting, more parameters or more `unwrap`s. A file already
 over the length limit may grow; only crossing the limit counts.
 
+On a multi-commit branch, a per-task run with `--base HEAD` measures only the
+last commit's delta and misses findings earlier commits added — a branch
+whose tasks each ran the gate that way reached pre-submit with 120 unmeasured
+findings. Measure the whole branch the way CI will, against the merge base
+(`cargo xtask quality --base origin/main`).
+
 rustqual is pinned in `xtask/rustqual/Cargo.toml` and its lockfile, so nothing
 needs installing; the first run builds it, which takes about a minute. Its
 settings live in `rustqual.toml`, and both sides of the comparison use the
@@ -1499,6 +1505,17 @@ A departing replica holding the latest revision will delete the key, leaving sur
 undiscoverable until their next refresh (up to 30s). Only use `DeleteIfCurrent` for
 singletons that are guaranteed never to share their registration identity.
 
+User-scoped (`…{identity}.u.{user}`) and ownerless-only (`…{identity}.anon`)
+registrations — the per-principal additions credentialed tool servers publish
+(`harnx_toolset_server::RegistrationHandle`) — follow a stricter rule than either
+policy: no blind puts and no unconditional deletes. Every refresh is a CAS on the
+KV revision the writer last read, and every delete additionally checks the stored
+`connection_id` (`ConditionalDelete::ConnectionMismatch` leaves a newer connection's
+registration alone), so a stale instance can keep a removed principal's registration
+alive for at most one refresh interval and can never clobber or recreate a newer
+connection's. See `crates/harnx-toolset-server/src/registration_handle.rs` and
+`docs/tool-credentials.md`.
+
 
 ### Canonical `cid:` URL scheme
 
@@ -1720,6 +1737,31 @@ arms.
 Build the workspace before cross-process tests after changing tool wire
 types. Those tests launch workspace sidecars as well as linked test code; a stale
 tool binary can fail decoding even when a per-crate build succeeds.
+
+### Future size and type erasure in harnx-runtime
+
+harnx-runtime's async chains are deep enough that large futures fail in two
+distinct ways, and the two need different fixes:
+
+- **Test stack overflows.** Nextest's test processes use the default 8 MiB
+  stack, and a large inline future (tool discovery, tool-context construction)
+  counts toward the *caller's* stack frame while it is awaited. Growth anywhere
+  in the chain can tip razor-edge tests into SIGSEGV before any of the new code
+  runs (`nats_worker::operator_tools::admission_tests::real_subagent_operator_roots_and_inherited_deadlines`
+  failed this way; commit `361687041` fixed it). Fix: `Box::pin` the big future
+  at its builder entry point so its state lives on the heap while the caller
+  waits on network I/O — `execute_tool_round`,
+  `build_tool_eval_context`/`build_tool_eval_context_with_provider` and
+  `run_reserved_tool_command`'s `reserved_eval_context` all do this.
+- **E0275 in dependent crates.** rustc's auto-trait evaluation recurses through
+  the concrete future *type*, and `Pin<Box<impl Future>>` doesn't shorten that
+  chain: the compiler still walks every nested future inside the box. A concrete
+  future reaching the async-nats/rustls connect chain overflows the trait-solver
+  recursion budget in crates that merely call harnx-runtime (harnx-serve).
+  Fix: type-erase to `Pin<Box<dyn Future<Output = …> + Send>>`, as
+  `Config::nats_client` (`config/nats_split.rs`),
+  `NatsToolProvider::open_discovery_transport` and `round_nats_provider`
+  (`tool.rs`) do. A plain `Box::pin` there is not enough.
 
 ### TUI transcript items are TUI-local
 

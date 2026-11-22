@@ -51,31 +51,7 @@ pub async fn run_named_tool_command(
         bash_timeout_secs,
     } = execution;
     let config = Arc::new(crate::config::ConfigLock::new(config.clone()));
-    let session = crate::NatsSession::from_global_config(
-        crate::NatsSessionConfig {
-            cluster: cluster.into(),
-            initializer: crate::SessionInitializer::named(agent, Default::default()),
-            session_id: None,
-            activation_route: route.clone(),
-        },
-        &config,
-        abort.clone(),
-    )
-    .await?;
-    // Subagent tools append progress to their caller even without a root prompt.
-    let snapshot = config.read().clone();
-    let replicas = snapshot
-        .resolve_nats_server(cluster)
-        .await?
-        .resolved_replicas();
-    crate::nats_session_log::NatsSessionLog::new_with_replicas(
-        session.jetstream().clone(),
-        session.storage_key(),
-        replicas,
-    )
-    .last_entry_async()
-    .await
-    .context("failed to create named tool caller transcript")?;
+    let session = open_named_tool_session(&config, agent, cluster, &route, abort).await?;
     let request = OperatorToolRequest {
         version: 1,
         session_key: session.storage_key().into(),
@@ -85,6 +61,9 @@ pub async fn run_named_tool_command(
         command: command.clone(),
         json,
         bash_timeout_secs,
+        // Decision 11: the operator acts under their own default identity
+        // for the selected cluster, not the session's owner.
+        user_id: Some(config.read().default_user_id_for_cluster(cluster)),
     };
     // CLI keeps this future alive through its cancellation drain, so it awaits
     // the existing acknowledgement/cancel handshake instead of detaching it.
@@ -95,6 +74,49 @@ pub async fn run_named_tool_command(
         abort,
     )
     .await
+}
+
+/// Attach to the named agent's session and confirm its transcript is
+/// reachable: subagent tools append progress to their caller even without
+/// a root prompt, so the log backend must exist before the request goes
+/// out. Failing here surfaces a broken session instead of a dropped reply.
+// Type-erased box: the attach path reaches the local broker's async-nats
+// connect chain, and a concrete boxed future would still overflow dependent
+// crates' trait-solver recursion budget.
+fn open_named_tool_session<'a>(
+    config: &'a crate::config::GlobalConfig,
+    agent: &'a str,
+    cluster: &'a str,
+    route: &'a crate::SessionActivationRoute,
+    abort: &'a AbortSignal,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::NatsSession>> + Send + 'a>> {
+    Box::pin(async move {
+        let session = crate::NatsSession::from_global_config(
+            crate::NatsSessionConfig {
+                cluster: cluster.into(),
+                initializer: crate::SessionInitializer::named(agent, Default::default()),
+                session_id: None,
+                activation_route: route.clone(),
+            },
+            config,
+            abort.clone(),
+        )
+        .await?;
+        let snapshot = config.read().clone();
+        let replicas = snapshot
+            .resolve_nats_server(cluster)
+            .await?
+            .resolved_replicas();
+        crate::nats_session_log::NatsSessionLog::new_with_replicas(
+            session.jetstream().clone(),
+            session.storage_key(),
+            replicas,
+        )
+        .last_entry_async()
+        .await
+        .context("failed to create named tool caller transcript")?;
+        Ok(session)
+    })
 }
 
 pub fn ensure_current(
@@ -132,7 +154,10 @@ pub async fn run_reserved_tool_command(
     let context = if let OperatorToolCommand::Bash { selection, .. } = command {
         ReservedContext::Bash(reserved_bash_context(config, view, &scope, selection).await?)
     } else {
-        ReservedContext::Plain(Box::new(reserved_eval_context(config, view, &scope).await?))
+        // Context discovery carries large NATS/config futures. Keep the future
+        // off the caller's stack while it is suspended on network I/O.
+        let context = Box::pin(reserved_eval_context(config, view, &scope)).await?;
+        ReservedContext::Plain(Box::new(context))
     };
     let mut state = reservation.subscribe();
     let observed = state.borrow_and_update().clone();
