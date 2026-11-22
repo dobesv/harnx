@@ -206,6 +206,20 @@ impl BashCliFixture {
         let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(payload["partial_result"]["exit_code"], 3, "{payload}");
 
+        // Without --json the CLI behaves like `bash -c`.
+        let (code, output) = self
+            .run(&["call", "bash", "echo out; echo err >&2; exit 3"])
+            .await;
+        assert_eq!(
+            code,
+            Some(3),
+            "the script's status is the CLI's: {output:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("err"), "{stderr}");
+        assert!(!stderr.contains("error:"), "{stderr}");
+
         Ok(())
     }
 

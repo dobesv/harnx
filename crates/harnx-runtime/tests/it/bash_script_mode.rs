@@ -221,14 +221,17 @@ async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
     let output = &results[0].output;
     assert_eq!(output["status"], "ok", "{}", output);
     assert_eq!(output["exit_code"], 0);
-    assert_eq!(output["trace"][0]["name"], "time_get_current_time");
-    assert_eq!(output["trace"][0]["status"], "ok");
-    // One JSON result line through `wc -l`.
-    let stdout = output["stdout"].as_str().expect("stdout text");
-    assert_eq!(stdout.trim(), "1", "{}", output);
+    assert!(output.get("stdout").is_none(), "{}", output);
     let text = output["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("status: ok"), "{text}");
-    assert!(text.contains("<!-- start stdout -->"), "{text}");
+    assert!(text.contains("- time_get_current_time ok"), "{text}");
+    // One JSON result line through `wc -l`.
+    let stdout_block = text
+        .split("<!-- start stdout -->")
+        .nth(1)
+        .and_then(|rest| rest.split("<!-- end stdout -->").next())
+        .expect("stdout block");
+    assert!(stdout_block.contains('1'), "{text}");
     Ok(())
 }
 

@@ -621,6 +621,7 @@ fn build_tool_providers(
     bash_context_slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
     command_bash: Option<crate::bash_provider::CommandBashInputs>,
 ) -> Vec<Arc<dyn ToolProvider>> {
+    let operator_command = command_bash.is_some();
     let (bash_active, bash_inner_declarations) = match command_bash {
         Some(inputs) => (true, inputs.inner_declarations),
         None => (
@@ -663,6 +664,7 @@ fn build_tool_providers(
             base_providers: base_providers.clone(),
             slot: bash_context_slot,
             payload_limit,
+            full_payload: operator_command,
         })
         .with_attachment_fetcher(attachment_fetcher)
         .with_media_store(media_store),

@@ -148,6 +148,7 @@ fn harness_with_post_hook(
         base_providers: vec![Arc::new(FakeTool { value, fail })],
         slot: Some(slot.clone()),
         payload_limit: None,
+        full_payload: true,
     })
     .with_attachment_fetcher(fetcher)
     .with_media_store(store);
