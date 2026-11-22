@@ -4905,7 +4905,6 @@ dependencies = [
  "harnx-nats-common",
  "harnx-telemetry",
  "log",
- "parking_lot",
  "reqwest",
  "rmcp",
  "schemars 1.2.3",
