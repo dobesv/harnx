@@ -14,6 +14,8 @@ use harnx_runtime::{
     },
     tool_reservation_client::ToolReservationHandle,
 };
+mod bash_streams;
+
 use std::{future::Future, sync::Arc, time::Duration};
 
 fn validate(command: &OperatorToolCommand) -> Result<()> {
@@ -268,6 +270,7 @@ async fn execute_reserved(
 }
 
 pub(crate) async fn run(cli: &Cli, command: OperatorToolCommand, json: bool) -> Result<u8> {
+    let is_bash = matches!(command, OperatorToolCommand::Bash { .. });
     let reply = execute(cli, command, json)
         .await
         .unwrap_or_else(|error| OperatorToolReply {
@@ -275,6 +278,11 @@ pub(crate) async fn run(cli: &Cli, command: OperatorToolCommand, json: bool) -> 
             error: Some(format!("{error:#}")),
             error_kind: None,
         });
+    if is_bash && !json {
+        if let Some(code) = bash_streams::print(&reply) {
+            return Ok(code);
+        }
+    }
     let failed = reply.error.is_some();
     if !reply.output.is_empty() {
         println!("{}", reply.output);
@@ -296,6 +304,7 @@ pub(crate) async fn run(cli: &Cli, command: OperatorToolCommand, json: bool) -> 
 mod tests {
     use super::*;
     use clap::Parser;
+
     #[test]
     fn virtual_view_never_uses_a_default_agent() {
         assert_eq!(

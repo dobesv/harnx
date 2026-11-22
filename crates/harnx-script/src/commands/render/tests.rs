@@ -1,4 +1,4 @@
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::{error_text, is_mcp_error, output};
 use crate::cli_map::OutputFormat::{Json, Text};
@@ -107,4 +107,58 @@ fn mcp_domain_errors_are_distinct_from_raw_status_like_data() {
         error_text(&json!({"content":[],"isError":true,"error":"detail"})),
         "detail"
     );
+}
+
+fn audience_result() -> Value {
+    json!({"content":[
+        {"type":"text","text":"a.rs\nb.rs","annotations":{"audience":["assistant"]}},
+        {"type":"text","text":"Found 2 matches","annotations":{"audience":["user"]}},
+        {"type":"text","text":"both","annotations":{"audience":["user","assistant"]}},
+        {"type":"text","text":"plain"},
+        {"type":"text","text":"priority only","annotations":{"priority":1.0}}
+    ]})
+}
+
+#[test]
+fn text_output_skips_blocks_not_addressed_to_the_assistant() {
+    let expected = "a.rs\nb.rs\nboth\nplain\npriority only\n";
+    assert_eq!(output(&audience_result(), None), expected);
+    assert_eq!(output(&audience_result(), Some(Text)), expected);
+    // The envelope is the escape hatch and keeps every block.
+    assert!(output(&audience_result(), Some(Json)).contains("Found 2 matches"));
+}
+
+#[test]
+fn user_only_success_prints_nothing() {
+    let value = json!({"content":[
+        {"type":"text","text":"Wrote 3 files","annotations":{"audience":["user"]}}
+    ]});
+    assert_eq!(output(&value, None), "");
+}
+
+#[test]
+fn empty_audience_array_is_not_addressed_to_the_assistant() {
+    let value = json!({"content":[
+        {"type":"text","text":"nobody","annotations":{"audience":[]}},
+        {"type":"text","text":"kept"}
+    ]});
+    assert_eq!(output(&value, None), "kept\n");
+}
+
+#[test]
+fn error_text_falls_back_to_user_blocks_when_nothing_else_is_left() {
+    let user_only = json!({"isError":true,"content":[
+        {"type":"text","text":"denied","annotations":{"audience":["user"]}}
+    ]});
+    assert_eq!(error_text(&user_only), "denied");
+    let mixed = json!({"isError":true,"content":[
+        {"type":"text","text":"path not found","annotations":{"audience":["assistant"]}},
+        {"type":"text","text":"Read failed","annotations":{"audience":["user"]}}
+    ]});
+    assert_eq!(error_text(&mixed), "path not found");
+    let blank_assistant = json!({"isError":true,"content":[
+        {"type":"text","text":"  \n","annotations":{"audience":["assistant"]}},
+        {"type":"text","text":"denied","annotations":{"audience":["user"]}}
+    ]});
+    assert_eq!(error_text(&blank_assistant), "denied");
 }

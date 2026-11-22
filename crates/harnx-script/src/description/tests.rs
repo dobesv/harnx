@@ -165,3 +165,16 @@ fn pipeline_falls_back_without_a_compatible_reader() {
 }
 
 mod execution;
+
+#[test]
+fn description_says_when_to_script_and_how_flags_and_output_behave() {
+    let text = bash_tool_description(&fixture(), 8, 1000);
+    for expected in [
+        "Worth it for loops, many calls, or filtering a large result",
+        "call the tool directly",
+        "optional ones too",
+        "without its user-facing summary lines",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}");
+    }
+}

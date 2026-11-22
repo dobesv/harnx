@@ -24,6 +24,7 @@ impl BashHarness {
                 base_providers: vec![inner.clone()],
                 slot: Some(slot.clone()),
                 payload_limit: None,
+                full_payload: true,
             },
         ));
         let mut allowed: HashSet<String> = inner_declarations

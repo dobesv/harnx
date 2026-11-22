@@ -49,6 +49,8 @@ pub(crate) struct Property<'a> {
     pub key: &'a str,
     pub flag: String,
     pub schema: &'a Value,
+    /// The schema with a `T | null` union read as `T`.
+    pub value: &'a Value,
     pub kind: FlagKind,
     pub required: bool,
 }
@@ -63,30 +65,98 @@ impl Property<'_> {
     }
 }
 
+const COMPLEX_KEYS: [&str; 9] = [
+    "$ref",
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "prefixItems",
+];
+
+fn is_null_branch(schema: &Value) -> bool {
+    schema.get("type").and_then(Value::as_str) == Some("null")
+}
+
+fn union_branches(schema: &Value) -> Option<&Vec<Value>> {
+    let any_of = schema.get("anyOf");
+    let one_of = schema.get("oneOf");
+    // Both keywords together are an intersection of unions, not a nullable.
+    match (any_of, one_of) {
+        (Some(branches), None) | (None, Some(branches)) => branches.as_array(),
+        _ => None,
+    }
+}
+
+/// True when the schema admits `null`, however it spells it.
+pub(crate) fn accepts_null(schema: &Value) -> bool {
+    let in_type_list = schema
+        .get("type")
+        .and_then(Value::as_array)
+        .is_some_and(|types| types.iter().any(|ty| ty.as_str() == Some("null")));
+    in_type_list
+        || schema.get("nullable").and_then(Value::as_bool) == Some(true)
+        || union_branches(schema).is_some_and(|branches| branches.iter().any(is_null_branch))
+}
+
+fn has_other_complex_key(schema: &Value) -> bool {
+    COMPLEX_KEYS
+        .iter()
+        .filter(|key| !matches!(**key, "anyOf" | "oneOf"))
+        .any(|key| schema.get(key).is_some())
+}
+
+/// The one real branch of a `T | null` union, so `Option<T>` reads like `T`.
+/// A type or other combinator beside the union could be an intersection, so
+/// those schemas are returned unchanged.
+pub(crate) fn non_null_branch(schema: &Value) -> &Value {
+    if schema.get("type").is_some() || has_other_complex_key(schema) {
+        return schema;
+    }
+    let Some(branches) = union_branches(schema) else {
+        return schema;
+    };
+    let mut real = branches.iter().filter(|branch| !is_null_branch(branch));
+    match (real.next(), real.next()) {
+        (Some(branch), None) => branch,
+        _ => schema,
+    }
+}
+
+/// The single non-null type name, whether `type` is a string or a list such as
+/// `["string", "null"]`.
+fn type_name(schema: &Value) -> Option<&str> {
+    match schema.get("type")? {
+        Value::String(name) => Some(name),
+        Value::Array(types) => {
+            let mut real = types
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|ty| *ty != "null");
+            match (real.next(), real.next()) {
+                (Some(name), None) => Some(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn is_complex(schema: &Value) -> bool {
     // A type beside $ref/anyOf can be an intersection, not the whole schema.
     // Don't guess which branch the provider expects: use JSON in these cases.
-    schema.get("nullable").and_then(Value::as_bool) == Some(true)
-        || [
-            "$ref",
-            "anyOf",
-            "oneOf",
-            "allOf",
-            "not",
-            "if",
-            "then",
-            "else",
-            "prefixItems",
-        ]
-        .iter()
-        .any(|key| schema.get(key).is_some())
+    let schema = non_null_branch(schema);
+    COMPLEX_KEYS.iter().any(|key| schema.get(key).is_some())
 }
 
 pub(crate) fn scalar(schema: &Value) -> Option<Scalar> {
     if is_complex(schema) {
         return None;
     }
-    match schema.get("type").and_then(Value::as_str)? {
+    match type_name(non_null_branch(schema))? {
         "string" => Some(Scalar::String),
         "number" => Some(Scalar::Number),
         "integer" => Some(Scalar::Integer),
@@ -95,12 +165,20 @@ pub(crate) fn scalar(schema: &Value) -> Option<Scalar> {
     }
 }
 
+/// The non-null type name of a schema that has no combinators, if any.
+pub(crate) fn plain_type_name(schema: &Value) -> Option<&str> {
+    if is_complex(schema) {
+        return None;
+    }
+    type_name(non_null_branch(schema))
+}
+
 fn flag_kind(schema: &Value) -> FlagKind {
     if let Some(scalar) = scalar(schema) {
         return FlagKind::Scalar(scalar);
     }
-    if schema.get("type").and_then(Value::as_str) == Some("array") && !is_complex(schema) {
-        if let Some(item) = schema.get("items").and_then(scalar) {
+    if plain_type_name(schema) == Some("array") {
+        if let Some(item) = non_null_branch(schema).get("items").and_then(scalar) {
             return FlagKind::Repeated(item);
         }
     }
@@ -120,6 +198,7 @@ pub(crate) fn properties(schema: &Value) -> Vec<Property<'_>> {
             key,
             flag: kebab_case(key),
             schema: value,
+            value: non_null_branch(value),
             kind: flag_kind(value),
             required: required
                 .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(key))),

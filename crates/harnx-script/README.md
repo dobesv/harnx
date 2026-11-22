@@ -374,7 +374,8 @@ kebab-case; returned JSON keeps the schema's original property names. For exampl
 | string, number, integer | `--key value` or `--key=value` |
 | boolean | `--key` / `--no-key` (no value) |
 | array of scalars | repeat `--key value`; boolean items use `true` / `false` |
-| object, complex array, reference, union, nullable, untyped | `--key '<json>'` |
+| nullable scalar or scalar array (`type: [T, "null"]`, `nullable: true`, `anyOf` of one type and null) | same as the non-null type; `null` only through `--json` |
+| object, complex array, reference, union of two or more non-null types, untyped | `--key '<json>'` |
 
 `--json '<object>'` supplies a base object using original property names.
 `--json -` (also `--json=-`) reads that object from stdin. Stdin is otherwise
@@ -410,7 +411,7 @@ doesn't handle help requests.
 first and the description's first sentence. `help::help(name, schema, description)`
 returns NAME, SYNOPSIS, DESCRIPTION and OPTIONS sections with type, default and
 enum metadata. Both use the parser's flag/type classification, including JSON
-fallbacks for real MCP schemas with `$ref`, `anyOf` or nullable types.
+fallbacks for real MCP schemas with `$ref`, `anyOf` or unions of several types.
 
 ## Generated `bash` description
 
@@ -457,6 +458,12 @@ are JSON. Nonempty output ends with a newline. `-o text` selects content text
 instead of structured content, falling back to structured JSON if there's no
 content text. `-o json` selects structured content or, without it, the provider
 payload as a JSON document. It doesn't try to parse arbitrary text blocks as JSON.
+
+Text output leaves out content blocks whose `annotations.audience` is an array
+that doesn't include `assistant`, such as one-line summaries meant only for the
+person watching. An error message applies the same filter but falls back to all
+the text when nothing else is left. `-o json` on a result without
+`structuredContent` still prints every block.
 
 MCP image, audio, resource-link and embedded-resource blocks become
 `[attachment: <uri> <mime>]` markers instead of inline data. Without a URI the

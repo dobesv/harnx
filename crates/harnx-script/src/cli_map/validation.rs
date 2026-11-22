@@ -1,6 +1,6 @@
 use serde_json::{Number, Value};
 
-use crate::schema::{is_complex, scalar, Scalar};
+use crate::schema::{accepts_null, is_complex, non_null_branch, plain_type_name, scalar, Scalar};
 
 pub(super) fn parse_scalar(text: &str, kind: Scalar) -> Result<Value, String> {
     match kind {
@@ -40,6 +40,10 @@ fn is_integer_number(number: &Number) -> bool {
 /// Validate direct types and enums, not an entire JSON Schema dialect. References
 /// and unions deliberately pass through; admission/provider validation owns them.
 pub(super) fn validate(schema: &Value, value: &Value) -> Result<(), String> {
+    if value.is_null() && accepts_null(schema) {
+        return Ok(());
+    }
+    let schema = non_null_branch(schema);
     if let Some(kind) = scalar(schema) {
         validate_scalar_type(kind, value)?;
     } else if !is_complex(schema) {
@@ -67,7 +71,7 @@ fn is_json_integer(value: &Value) -> bool {
 }
 
 fn validate_compound_type(schema: &Value, value: &Value) -> Result<(), String> {
-    match schema.get("type").and_then(Value::as_str) {
+    match plain_type_name(schema) {
         Some("object") if !value.is_object() => Err("expected a JSON object".into()),
         Some("array") => validate_array(schema, value),
         Some("null") if !value.is_null() => Err("expected null".into()),

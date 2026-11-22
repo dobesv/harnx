@@ -49,7 +49,7 @@ fn string_option<'a>(tool: &'a ToolSpec, flag: &str, value: Option<&str>) -> Opt
     let props = properties(&tool.schema);
     flag_table(&props).ok()?;
     let property = props.iter().find(|prop| prop.flag == flag)?;
-    let schema = property.schema;
+    let schema = property.value;
     if scalar(schema) != Some(Scalar::String) {
         return None;
     }

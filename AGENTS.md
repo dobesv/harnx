@@ -1006,6 +1006,35 @@ does). A new native toolset with a map-typed parameter loses strict mode for
 that whole tool, so prefer a list of name/value objects when strictness
 matters.
 
+### What script mode reads from a tool
+
+Inside a `bash` script every tool is a command (`crates/harnx-script`), and
+two things a tool declares decide how well it works there.
+
+- **Parameter types.** A scalar, or an array of scalars, becomes a plain
+  flag, and so does its nullable form (`Option<T>`: `type: [T, "null"]`,
+  `nullable: true`, or `anyOf` of one type and null). Anything else, including
+  a union of two non-null types, a `$ref` that survived inlining or a map,
+  takes one quoted JSON argument, which models get wrong more often.
+- **Audience annotations.** A command's text output is the result's text
+  blocks minus those whose `annotations.audience` doesn't include
+  `assistant`. Put the data a script should pipe in an assistant-audience or
+  unannotated block, and the one-line summary for the person watching in a
+  user-audience block. A tool that annotates its data `user` prints nothing
+  in a script.
+
+The `bash` tool's own result has two shapes, chosen by
+`BashProviderConfig::full_payload`. A model round gets `status`, `exit_code`,
+the truncation flags and the rendered report in `content`. An operator
+command (`harnx call bash`, `.call bash`) also gets `stdout`, `stderr` and
+`trace` as fields. Code that renders or inspects a model round's `bash` result
+has to read `content`.
+
+A script that runs to a non-zero `exit` comes back as status `error` with no
+`error` text; status `ok` always means exit code 0. Only a failure of the run
+itself (a resource limit, a timeout, a cancel, a fatal inner call) carries
+`error` text (`crates/harnx-script/src/bashkit_backend/outcome.rs`).
+
 ### Loop protection
 
 Models, Gemini in particular, fall into loops. Two guards in

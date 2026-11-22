@@ -51,9 +51,9 @@ pub fn help(name: &str, schema: &Value, description: &str) -> String {
         if matches!(property.kind, FlagKind::Repeated(_)) {
             text.push_str("; repeat flag for each item");
         }
-        metadata(&mut text, property.schema);
+        metadata(&mut text, property.schema, property.value);
         if let Some(items) = property
-            .schema
+            .value
             .get("items")
             .and_then(|items| items.get("enum"))
         {
@@ -149,11 +149,14 @@ fn synopsis_name(name: &str, description: &str) -> String {
     }
 }
 
-fn metadata(text: &mut String, schema: &Value) {
-    for key in ["default", "enum"] {
-        if let Some(value) = schema.get(key) {
-            text.push_str(&format!("; {key}: {value}"));
-        }
+/// `default` lives on the declared schema; `enum` usually sits on the
+/// non-null branch of a nullable union, so it is read from there first.
+fn metadata(text: &mut String, declared: &Value, value: &Value) {
+    if let Some(default) = declared.get("default") {
+        text.push_str(&format!("; default: {default}"));
+    }
+    if let Some(choices) = value.get("enum").or_else(|| declared.get("enum")) {
+        text.push_str(&format!("; enum: {choices}"));
     }
 }
 

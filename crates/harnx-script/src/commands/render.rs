@@ -13,7 +13,11 @@ pub fn is_mcp_error(value: &Value) -> bool {
 }
 
 pub fn error_text(value: &Value) -> String {
-    let text = content_text(value);
+    // A failure whose only text is user-addressed still has to say why; the
+    // blank assistant blocks are left out so they don't pad that text.
+    let text = Some(content_text(value))
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| joined_text(value, |block| !addressed_to_assistant(block)));
     if !text.trim().is_empty() {
         text
     } else if let Some(error) = value.get("error").and_then(Value::as_str) {
@@ -87,14 +91,29 @@ fn append_block_text(text: &mut String, part: &str) {
     text.push_str(part);
 }
 
+/// Text output is data for pipes: a block annotated for someone other than
+/// the assistant (e.g. a "Found 10 matches" summary) is not part of it.
+fn addressed_to_assistant(block: &Value) -> bool {
+    match block
+        .pointer("/annotations/audience")
+        .and_then(Value::as_array)
+    {
+        Some(audience) => audience.iter().any(|a| a.as_str() == Some("assistant")),
+        None => true,
+    }
+}
+
 fn content_text(value: &Value) -> String {
+    joined_text(value, addressed_to_assistant)
+}
+
+fn joined_text(value: &Value, keep: impl Fn(&Value) -> bool) -> String {
     let Some(blocks) = value.get("content").and_then(Value::as_array) else {
         return String::new();
     };
     let mut text = String::new();
-    for block in blocks {
-        let part = block_text(block);
-        append_block_text(&mut text, &part);
+    for block in blocks.iter().filter(|block| keep(block)) {
+        append_block_text(&mut text, &block_text(block));
     }
     text
 }

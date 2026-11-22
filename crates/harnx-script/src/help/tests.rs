@@ -69,8 +69,8 @@ fn first_sentence_and_whitespace_table() {
 fn json_fallback_documentation_matches_parser_types() {
     for shape in [
         json!({"$ref":"#/$defs/Thing"}),
-        json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
-        json!({"type":["string","null"]}),
+        json!({"anyOf":[{"type":"string"},{"type":"integer"},{"type":"null"}]}),
+        json!({"type":["string","integer","null"]}),
         json!({"type":"array","items":{"type":"object"}}),
         json!({}),
     ] {
