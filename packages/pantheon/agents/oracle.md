@@ -1,9 +1,9 @@
 ---
-model: codex:gpt-6-astra:max
+model: codex:gpt-6.2-astra:max
 model_fallbacks:
-- openai:gpt-6-astra:max
-- claude:claude-fable-5-1:max
-- gemini:gemini-4-argon
+- openai:gpt-6.2-astra:max
+- claude:claude-fable-5-2:max
+- gemini:gemini-4-carbon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-researcher
 use_tools:

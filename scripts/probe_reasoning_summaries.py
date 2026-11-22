@@ -30,6 +30,10 @@ session metadata and opaque reasoning signatures. Inspect before sharing. No raw
 provider output is printed. Report timings are request-to-last-event wall time,
 not separate CLI process timings. Missing thought text is reported, not treated
 as replay failure. Exit 1 if any model's tool-result continuation isn't accepted.
+The analyzer reads the Responses, Gemini, Bedrock Converse and Claude Messages
+wire formats. A model on another format, such as Chat Completions, is reported
+as FAILED / not demonstrated even when its exchange worked: when the CLI exit
+code beside that verdict is 0, read the trace.
 --reanalyze prints revised Markdown to stdout using existing traces plus recorded
 exit codes/status from the sibling .md report. It never sources credentials,
 builds, uses network, or writes files. Auxiliary calls (e.g. titles) are listed
@@ -174,7 +178,7 @@ def object_nodes(value):
 
 def has_tool_result(body):
     return any(
-        item.get("type") == "function_call_output" or item.get("role") == "tool"
+        item.get("type") in ("function_call_output", "tool_result") or item.get("role") == "tool"
         or "functionResponse" in item or "toolResult" in item
         for item in object_nodes(body)
     )
@@ -183,6 +187,7 @@ def has_tool_result(body):
 SUMMARY_FIELDS = (
     (("reasoning",), "summary", "reasoning.summary"),
     (("additionalModelRequestFields", "thinking"), "display", "thinking.display"),
+    (("thinking",), "display", "thinking.display"),
     (("generationConfig", "thinkingConfig"), "includeThoughts", "includeThoughts"),
 )
 
@@ -216,6 +221,10 @@ def streamed_thoughts(entry):
     if field(entry, "provider") in ("gemini", "vertexai"):
         yield from gemini_thoughts(body)
         return
+    if field(entry, "provider") == "claude":
+        if field(body, "delta", "type") == "thinking_delta":
+            yield field(body, "delta", "thinking")
+        return
     if field(entry, "provider") != "bedrock":
         return
     if field(body, "smithy_type") == "contentBlockDelta":
@@ -232,6 +241,14 @@ def bedrock_completed(body):
     if field(body, "smithy_type") != "messageStop":
         return False
     return field(body, "event", "stopReason") in ("end_turn", "tool_use")
+
+
+def claude_completed(body):
+    # message_stop ends every Messages stream, whatever stopped it. The stop
+    # reason is on the message_delta before it.
+    if field(body, "type") != "message_delta":
+        return False
+    return field(body, "delta", "stop_reason") in ("end_turn", "tool_use")
 
 
 def openai_completed(body):
@@ -251,6 +268,8 @@ def completed(entry):
         return any(candidate.get("finishReason") == "STOP" for candidate in gemini_candidates(body))
     if field(entry, "provider") == "bedrock":
         return bedrock_completed(body)
+    if field(entry, "provider") == "claude":
+        return claude_completed(body)
     return False
 
 
@@ -290,6 +309,8 @@ def request_identity(entry):
     elif re.search(r"/model/.+/converse(?:-stream)?$", path):
         provider = "bedrock"
         model = path.split("/model/", 1)[1].rsplit("/", 1)[0]
+    elif path.endswith("/messages"):
+        provider = "claude"
     elif path.endswith("/responses"):
         provider = "openai_responses"
     elif path.endswith("/chat/completions"):
@@ -313,7 +334,7 @@ def event_identity(entry):
     provider = first_text(entry, (("provider",),))
     if provider == "gemini":
         provider = "vertexai"
-    model = first_text(body, (("modelVersion",), ("model",), ("response", "model")))
+    model = first_text(body, (("modelVersion",), ("model",), ("response", "model"), ("message", "model")))
     response_id = first_text(body, (("responseId",), ("response", "id"), ("response_id",)))
     return provider, model, response_id
 
@@ -332,8 +353,12 @@ def probe_request(body):
     return declared or has_tool_result(body)
 
 
-def trailing_bedrock_usage(entry):
-    return (field(entry, "provider"), field(entry, "body", "smithy_type")) == ("bedrock", "metadata")
+def trailing_event(entry):
+    """Events a provider sends after the one that completes its attempt."""
+    provider, body = field(entry, "provider"), field(entry, "body")
+    if provider == "bedrock":
+        return field(body, "smithy_type") == "metadata"
+    return provider == "claude" and field(body, "type") == "message_stop"
 
 
 class AttemptLedger:
@@ -369,8 +394,9 @@ class AttemptLedger:
         active = [attempt for attempt in matching if not attempt["closed"]]
         if active:
             return active
-        if trailing_bedrock_usage(entry):
-            # Converse usage arrives after messageStop, without a response ID.
+        if trailing_event(entry):
+            # Converse usage arrives after messageStop and Claude's message_stop
+            # after its stop reason, neither with a response ID.
             return matching[-1:]
         return []
 

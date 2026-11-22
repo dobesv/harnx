@@ -1,5 +1,5 @@
 # ---- llm ----
-model: openai:gpt-4o             # Specify the LLM to use
+model: openai:gpt-6.2-sol        # Specify the LLM to use
 stream: true
 
 # ---- behavior ----
@@ -10,8 +10,9 @@ keybindings: emacs
 # Titles appear in session listings and set the terminal / browser tab title.
 # `title_agent` names an agent (see agents/example-title-agent.md); leave it
 # unset to disable title generation. Point it at a small, fast chat model —
-# NOT a reasoning model (o1/o3/DeepSeek-R1), which exhaust the token budget on
-# internal reasoning and return empty/truncated titles.
+# NOT one that reasons at length (a :high or :max effort alias, DeepSeek-R1),
+# which exhausts the token budget on internal reasoning and returns
+# empty/truncated titles.
 title_agent: example-title-agent
 # Regenerate the title after this many additional tokens of conversation
 # (default 50000). The first title is generated on the first exchange. Set to 0

@@ -1,5 +1,5 @@
 ---
-model: openai:gpt-4o-mini
+model: openai:gpt-6-luna
 description: "Example session title agent — generates a short, human-readable title"
 ---
 Generate a concise session title (10 words or fewer).

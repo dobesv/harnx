@@ -1,36 +1,51 @@
 # Package model policy
 
-Reviewed 2026-10-29, following the selections for issues #1765, #1514 and #2025.
+Reviewed 2026-11-22, after the releases of Fable 5.2 (November 9), Gemini 4
+Carbon, Hydrogen and Neon (November 10 to 18) and GPT-6.2 Astra and Sol
+(November 17). Earlier selections followed issues #1765, #1514 and #2025.
 This policy covers Pantheon and the standalone coding package. It is a selection
 based on provider documentation and the agents' responsibilities, not a measured
 Harnx performance benchmark.
 
 ## Selection rationale
 
-- Oracle and Plato prioritize reasoning quality: GPT-6 Astra at maximum effort,
-  with Fable 5.1 at maximum effort as the Claude alternative.
-- Sisyphus, Daedalus, and Atlas prioritize orchestration quality with Opus 5.5.
-  Atlas now tries Sol 6.1 before Gemini 4 Argon to preserve orchestration
-  quality when Opus is unavailable.
-- General Gemini workers move to 3.8 Flash, including former Pro-preview users.
-  Heavy implementation, security/privacy review, plan review, and investigation
-  use GPT-6.1 Sol; Hephaestus retains high reasoning. Replace old Terra slots
-  with Sol 6.1 for coding and substantive judgment. Writing, visual work, and
-  research agents (Erato, Iris, Librarian, Mnemosyne, Peitho and Pytheas) use
-  Terra 6.1 as their OpenAI-family alternative. Existing GLM 5 specialists
-  keep model diversity with GLM 5.3.
+- Oracle and Plato prioritize reasoning quality: GPT-6.2 Astra at maximum
+  effort, with Fable 5.2 at maximum effort as the Claude alternative. Each
+  replaces its predecessor at a 20% lower price.
+- Sisyphus, Daedalus, and Atlas prioritize orchestration quality with Opus 5.5,
+  which Anthropic still recommends for most workloads. Atlas tries Sol 6.2
+  before Gemini 4 Neon to preserve orchestration quality when Opus is
+  unavailable.
+- General Gemini workers move from 3.8 Flash to Gemini 4 Hydrogen, which Google
+  names as the upgrade from 3.8 Flash and recommends for routine code edits and
+  parallel worker subagents. Hydrogen costs twice 3.8 Flash's introductory
+  price until that price ends on December 31, 2026, and the same afterwards.
+- Heavy implementation, security/privacy review, plan review, and investigation
+  use GPT-6.2 Sol, which replaces Sol 6.1 at the same price; Hephaestus retains
+  high reasoning. Writing, visual work, and research agents (Erato, Iris,
+  Librarian, Mnemosyne, Peitho and Pytheas) keep Terra 6.1 as their
+  OpenAI-family alternative, since OpenAI has released no newer Terra. Existing
+  GLM 5 specialists keep model diversity with GLM 5.3.
 - The reasoning-heavy agents take Kimi K3 as their Bedrock fallback: Oracle,
   Plato, Hephaestus, Daedalus, Sisyphus, Melpomene, Momus, Polyhymnia and
   Zosimus. Its vision support complements the text-only GLM 5.3 choice. Both
   have 1M context and 128K output. Mid-tier agents use GLM 5.3, including eight
   Bedrock-primary specialists, at high effort rather than the API default max.
   Kimi remains the reasoning-heavy alternative at a higher token price.
-- Reasoning-heavy agents and Atlas use Gemini 4 Argon as their Gemini
-  fallback. Routine Gemini workers retain 3.8 Flash; compactors retain
-  3.5 Flash-Lite as a fallback. Argon uses medium thinking by default.
+  Kimi K3.1 Pro (Highspeed) reached Bedrock on November 4, 2026. It costs a
+  third more than K3 for faster output, which a last-position fallback doesn't
+  need, so these chains keep K3.
+- Oracle and Plato fall back to Gemini 4 Carbon, which Google describes as its
+  strongest reasoning model. The other reasoning-heavy agents and Atlas use
+  Gemini 4 Neon, which Google recommends for multi-file refactoring and
+  repository-wide debugging while an agent waits on the answer. Both replace
+  Argon: Google's model selection guide doesn't list it, and its price
+  doubles to $4 / $20 on December 1, 2026. Compactors retain 3.5 Flash-Lite as
+  a fallback. Carbon thinks at medium by default; Neon and Hydrogen at high.
 - Minos, the Judge that checks the evidence behind every Muse finding, starts
-  on Gemini 4 Argon at that default rather than 3.8 Flash (changed 2026-11-09).
-  The catalog defines no Argon effort variants, so Minos runs at that default.
+  on Gemini 4 Neon rather than Hydrogen. It ran on Argon from 2026-11-09 until
+  this review. The catalog defines no Gemini effort variants, so Minos runs at
+  Neon's default.
 - Hermes and Hestia use Luna for small fixes and routine maintenance. Hestia
   tries direct MiniMax M3.1 Flash at low effort after both Luna routes. Their
   Claude fallback is Haiku 5.5; Bedrock MiniMax M2.5 remains available.
@@ -48,22 +63,22 @@ Codex immediately precedes the same OpenAI model and reasoning setting.
 
 | Agents | Primary → fallbacks |
 |--------|---------------------|
-| `coder`, `aristarchus` | `claude:claude-sonnet-5-5` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-3.8-flash` → `bedrock:us.zai.glm-5.3` |
+| `coder`, `aristarchus` | `claude:claude-sonnet-5-5` → `codex:gpt-6.2-sol` → `openai:gpt-6.2-sol` → `gemini:gemini-4-hydrogen` → `bedrock:us.zai.glm-5.3` |
 | All nine `compact-*` agents (including coding) | `codex:gpt-6-luna` → `openai:gpt-6-luna` → `gemini:gemini-3.5-flash-lite` → `claude:claude-haiku-5-5` → `bedrock:us.openai.gpt-6-luna` |
-| `aeacus` | `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-3.8-flash` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
-| `apollo`, `argus`, `calliope`, `clio`, `euterpe`, `terpsichore`, `thalia` | `gemini:gemini-3.8-flash` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
-| `minos` | `gemini:gemini-4-argon` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
-| `laocoon` | `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-4-argon` → `claude:claude-opus-5-5:xhigh` → `bedrock:us.moonshotai.kimi-k3` |
-| `athena`, `metis`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:us.zai.glm-5.3` → `gemini:gemini-3.8-flash` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` |
-| `atlas` | `claude:claude-opus-5-5` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-4-argon` → `bedrock:us.zai.glm-5.3` |
-| `daedalus`, `sisyphus` | `claude:claude-opus-5-5` → `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `gemini:gemini-4-argon` → `bedrock:us.moonshotai.kimi-k3` |
-| `erato`, `iris`, `librarian`, `peitho`, `pytheas` | `gemini:gemini-3.8-flash` → `codex:gpt-6.1-terra` → `openai:gpt-6.1-terra` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
-| `hephaestus` | `codex:gpt-6.1-sol:high` → `openai:gpt-6.1-sol:high` → `claude:claude-opus-5-5` → `gemini:gemini-4-argon` → `bedrock:us.moonshotai.kimi-k3` |
-| `hermes` | `codex:gpt-6-luna` → `openai:gpt-6-luna` → `gemini:gemini-3.8-flash` → `claude:claude-haiku-5-5` → `bedrock:minimax.minimax-m2.5` |
-| `hestia` | `codex:gpt-6-luna` → `openai:gpt-6-luna` → `minimax:MiniMax-M3.1-Flash` → `gemini:gemini-3.8-flash` → `claude:claude-haiku-5-5` → `bedrock:minimax.minimax-m2.5` |
-| `melpomene`, `momus`, `polyhymnia`, `zosimus` | `codex:gpt-6.1-sol` → `openai:gpt-6.1-sol` → `claude:claude-sonnet-5-5` → `gemini:gemini-4-argon` → `bedrock:us.moonshotai.kimi-k3` |
-| `mnemosyne` | `bedrock:us.zai.glm-5.3` → `gemini:gemini-3.8-flash` → `codex:gpt-6.1-terra` → `openai:gpt-6.1-terra` → `claude:claude-sonnet-5-5` |
-| `oracle`, `plato` | `codex:gpt-6-astra:max` → `openai:gpt-6-astra:max` → `claude:claude-fable-5-1:max` → `gemini:gemini-4-argon` → `bedrock:us.moonshotai.kimi-k3` |
+| `aeacus` | `codex:gpt-6.2-sol` → `openai:gpt-6.2-sol` → `gemini:gemini-4-hydrogen` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
+| `apollo`, `argus`, `calliope`, `clio`, `euterpe`, `terpsichore`, `thalia` | `gemini:gemini-4-hydrogen` → `codex:gpt-6.2-sol` → `openai:gpt-6.2-sol` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
+| `minos` | `gemini:gemini-4-neon` → `codex:gpt-6.2-sol` → `openai:gpt-6.2-sol` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
+| `laocoon` | `codex:gpt-6.2-sol` → `openai:gpt-6.2-sol` → `gemini:gemini-4-neon` → `claude:claude-opus-5-5:xhigh` → `bedrock:us.moonshotai.kimi-k3` |
+| `athena`, `metis`, `nemesis`, `opis`, `rhadamanthus`, `tyche`, `urania` | `bedrock:us.zai.glm-5.3` → `gemini:gemini-4-hydrogen` → `codex:gpt-6.2-sol` → `openai:gpt-6.2-sol` → `claude:claude-sonnet-5-5` |
+| `atlas` | `claude:claude-opus-5-5` → `codex:gpt-6.2-sol` → `openai:gpt-6.2-sol` → `gemini:gemini-4-neon` → `bedrock:us.zai.glm-5.3` |
+| `daedalus`, `sisyphus` | `claude:claude-opus-5-5` → `codex:gpt-6.2-sol` → `openai:gpt-6.2-sol` → `gemini:gemini-4-neon` → `bedrock:us.moonshotai.kimi-k3` |
+| `erato`, `iris`, `librarian`, `peitho`, `pytheas` | `gemini:gemini-4-hydrogen` → `codex:gpt-6.1-terra` → `openai:gpt-6.1-terra` → `claude:claude-sonnet-5-5` → `bedrock:us.zai.glm-5.3` |
+| `hephaestus` | `codex:gpt-6.2-sol:high` → `openai:gpt-6.2-sol:high` → `claude:claude-opus-5-5` → `gemini:gemini-4-neon` → `bedrock:us.moonshotai.kimi-k3` |
+| `hermes` | `codex:gpt-6-luna` → `openai:gpt-6-luna` → `gemini:gemini-4-hydrogen` → `claude:claude-haiku-5-5` → `bedrock:minimax.minimax-m2.5` |
+| `hestia` | `codex:gpt-6-luna` → `openai:gpt-6-luna` → `minimax:MiniMax-M3.1-Flash` → `gemini:gemini-4-hydrogen` → `claude:claude-haiku-5-5` → `bedrock:minimax.minimax-m2.5` |
+| `melpomene`, `momus`, `polyhymnia`, `zosimus` | `codex:gpt-6.2-sol` → `openai:gpt-6.2-sol` → `claude:claude-sonnet-5-5` → `gemini:gemini-4-neon` → `bedrock:us.moonshotai.kimi-k3` |
+| `mnemosyne` | `bedrock:us.zai.glm-5.3` → `gemini:gemini-4-hydrogen` → `codex:gpt-6.1-terra` → `openai:gpt-6.1-terra` → `claude:claude-sonnet-5-5` |
+| `oracle`, `plato` | `codex:gpt-6.2-astra:max` → `openai:gpt-6.2-astra:max` → `claude:claude-fable-5-2:max` → `gemini:gemini-4-carbon` → `bedrock:us.moonshotai.kimi-k3` |
 
 ## Cost and provider evidence
 
@@ -73,31 +88,36 @@ cost also depends on reasoning tokens, caching, retries, and tool turns.
 
 | Model | Input / output | Selection source |
 |-------|----------------|------------------|
-| GPT-6 Astra | $10 / $50 | [OpenAI model specifications](https://developers.openai.com/api/docs/models/gpt-6-astra) |
-| GPT-6.1 Sol / GPT-6 Luna | $2 / $10; $0.10 / $0.50 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
+| GPT-6.2 Astra | $8 / $40 | [OpenAI model specifications](https://developers.openai.com/api/docs/models/gpt-6.2-astra) |
+| GPT-6.2 Sol / GPT-6 Luna | $2 / $10; $0.10 / $0.50 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
 | GPT-6.1 Terra | $1 / $5 | [OpenAI model catalog](https://developers.openai.com/api/docs/models) |
 | Claude Opus 5.5 | $4 / $20 | [Claude model comparison](https://platform.claude.com/docs/en/about-claude/models/overview) |
-| Fable 5.1 / Sonnet 5.5 | $10 / $50; $2 / $10 | [Claude model comparison](https://platform.claude.com/docs/en/models/fable-5-1/overview) |
+| Fable 5.2 / Sonnet 5.5 | $8 / $40; $2 / $10 | [Fable 5.2 overview](https://platform.claude.com/docs/en/models/fable-5-2/overview) |
 | Haiku 5.5 | $0.10 / $0.50 up to 100K prompt tokens; $0.50 / $2.50 above 100K | [Haiku specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview) |
-| Gemini 3.8 Flash | $0.75 / $3.75 introductory | [Gemini 3.8 guide](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash) |
-| Gemini 4 Argon | $2 / $10 introductory; $4 / $20 from December 1, 2026 | [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) |
+| Gemini 4 Hydrogen | $1.50 / $7.50 | [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) |
+| Gemini 4 Neon | $3 / $15 | [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) |
+| Gemini 4 Carbon | $2 / $10 introductory; $4 / $20 from December 1, 2026 | [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) |
 | Bedrock Kimi K3 | $3.30 / $16.50 (US CRIS; $0.33 cache read) | [AWS pricing](https://aws.amazon.com/bedrock/pricing/) |
 | Bedrock GLM 5.3 / MiniMax M2.5 | $1.848 / $5.808; $0.30 / $1.20 | [AWS pricing](https://aws.amazon.com/bedrock/pricing/) |
 | Bedrock Luna | $0.11 / $0.55 up to 272K input tokens; $0.22 / $0.825 above 272K | [AWS model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-luna.html) |
 | Direct GLM 5.3 | $1.40 / $4.40 | [Z.AI pricing](https://docs.z.ai/guides/overview/pricing) |
 | Direct MiniMax M3.1 Flash | $0.15 / $0.60 | [MiniMax pricing](https://platform.minimax.io/docs/pricing/overview) |
 
-Gemini 3.8 introductory pricing ends December 31, 2026; the announced standard
-price from January 1, 2027 is $1.50 input / $7.50 output. Revisit the selection
-and shared catalog prices at that transition. Bedrock prices above are for
-`us-east-1`; other regions differ.
+Carbon's introductory price ends November 30, 2026; check the shared catalog
+price after the weekly refresh that follows. Hydrogen and Neon have no announced
+price change. GPT-6.2 requests with more than 272K input tokens cost more:
+$16 / $60 for Astra and $4 / $15 for Sol. The catalog records only the standard
+rate. Bedrock prices above are for `us-east-1`; other regions differ.
 
-[Codex's model guidance](https://developers.openai.com/codex/models/) lists Astra,
-Sol, Terra, and Luna and describes their workload tradeoffs. Availability varies
-with the account, plan, and rollout. The
+[Codex's model guidance](https://developers.openai.com/codex/models/) lists
+GPT-6.2 Astra and Sol, GPT-6.1 Terra and GPT-6 Luna and describes their workload
+tradeoffs. Availability varies with the account, plan, and rollout. Google's
+[model selection guide](https://aistudio.google.com/docs/choosing-a-model) says
+when to choose Hydrogen, Neon or Carbon, and the
 [Gemini model list](https://ai.google.dev/gemini-api/docs/models) retains
 3.5 Flash-Lite as the small, inexpensive tier.
 AWS documents [Kimi K3](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k3.html),
+[Kimi K3.1 Pro (Highspeed)](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k3-1-highspeed.html),
 [GLM 5.3](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5-3.html),
 [MiniMax M2.5](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-minimax-minimax-m2-5.html),
 and [GLM 4.7 Flash](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-4-7-flash.html)
@@ -120,6 +140,15 @@ Generic HTTP 400/404 request errors still stop the turn. This is not an account
 entitlement discovery service: unrecognized provider diagnostics remain errors.
 Missing required client settings and local Codex credentials are typed access
 failures too, so they skip retries and preserve an earlier overflow for recovery.
+
+Fable 5.2 rejects a request that identifies itself as a Claude Code release
+older than 2.1.290. The API answers HTTP 400 with `Claude Code 2.1.280 does not
+support this model; version 2.1.290 or newer is required`. This affects only a
+`claude` client whose own patches send Claude Code's `user-agent` and
+`x-anthropic-billing-header`; raise the version in both. The shipped
+`clients/claude.yaml` uses `CLAUDE_API_KEY`, sends neither header and is
+unaffected. Because the error is a generic 400, it stops Oracle's or Plato's
+turn at the Fable fallback instead of moving on to Gemini 4 Carbon.
 
 Request preparation rejects text-only models when images are present, including
 images from tool results, before message patching can strip them. A conservative
@@ -161,12 +190,13 @@ thinking enabled; the shared catalog selects high effort. Account history can
 restrict which API protocols are available, so these clients use Chat
 Completions. See the [GLM 5.3 protocol guide](https://docs.z.ai/guides/llm/glm-5.3).
 
-Argon shares a 1,048,576-token window across input, thinking and output. The
-catalog reserves 65,536 tokens for output, leaving 983,040 input tokens. The
-native Gemini client uses `streamGenerateContent` for streaming and
-`generateContent` otherwise; Argon patches cap output at 65,536 or 32,768
-respectively, preserving lower requested limits. Harnx does not implement
-Argon long-decode continuation. See the [GenerateContent limits](https://ai.google.dev/gemini-api/docs/generate-content/long-decode).
+Each Gemini 4 model shares a 1,048,576-token window across input, thinking and
+output. The catalog reserves 65,536 tokens for output, leaving 983,040 input
+tokens. The native Gemini client uses `streamGenerateContent` for streaming and
+`generateContent` otherwise. Carbon and Argon patches cap output at 65,536 or
+32,768 respectively; Hydrogen and Neon patches cap it at 65,536 for both. All
+preserve lower requested limits. Harnx does not implement long-decode
+continuation. See the [GenerateContent limits](https://ai.google.dev/gemini-api/docs/generate-content/long-decode).
 
 ## Maintaining the defaults
 
@@ -191,13 +221,16 @@ catalog with `model_catalog:`, so inheritance no longer depends on what the
 file is called.
 
 Update `scripts/model_variants.py` when adding generated reasoning aliases or
-request-specific limits. Argon's input reserve, REST output caps and sampling
-cleanup are reapplied during refresh. GLM 5.3's high-effort patch selects the
+request-specific limits. A model the weekly refresh adds gets neither until it
+is named there: GPT-6.2 arrived with only the reasoning-summary patch, and
+Gemini 4 Carbon with the whole shared window as its output limit, so check a
+new model's catalog entry before selecting it. The Gemini 4 input reserve, REST output caps and
+sampling cleanup are reapplied during refresh. GLM 5.3's high-effort patch selects the
 Chat Completions or Converse field shape without discarding other fields.
-Astra, Sol 6.1 and Terra 6.1 need Responses for tool use. Terra 6.1 request
+Astra 6.2, Sol 6.2 and Terra 6.1 need Responses for tool use. Terra 6.1 request
 patches also remove sampling parameters when reasoning is active. Gemini call
 IDs must survive parsing and appear on both the replayed call and its response.
-Fable 5.1 and Haiku 5.5 need adaptive thinking and an explicit output limit.
+Fable 5.2 and Haiku 5.5 need adaptive thinking and an explicit output limit.
 Their Claude and Vertex patches request summarized thinking and the binding-controls beta so the API drops thinking
 invalidated by dynamic prompts or compaction instead of rejecting the turn.
 Vertex accepts the same comma-separated `anthropic-beta` header; preserve other
@@ -205,7 +238,7 @@ enabled betas when adding it (see [beta headers](https://platform.claude.com/doc
 Haiku defaults to medium effort; its existing `:thinking` alias also uses
 adaptive thinking because the former fixed-budget setting returns HTTP 400.
 See the [Haiku migration guide](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide). The
-[Fable migration guide](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide)
+[Fable migration guide](https://platform.claude.com/docs/en/models/fable-5-2/migration-guide)
 also describes its conversation-history restrictions. The Bedrock Haiku
 `:thinking` alias uses adaptive medium thinking in
 `additionalModelRequestFields`, preserving the builder's output limit. These
@@ -225,6 +258,18 @@ for Bedrock, so its GLM verdict is a protocol mismatch; the Chat Completions
 trace was checked separately for high effort, the matching tool-call/result ID,
 and terminal `tool_calls` then `stop` events. This does not validate Converse
 for GLM 5.3 or account entitlements other than the credentials used for the check.
+
+On 2026-11-22, the same two-turn check with freshly built binaries confirmed
+tool calls and result continuation for GPT-6.2 Sol and GPT-6.2 Astra at maximum
+effort through the OpenAI API, and for Gemini 4 Hydrogen, Neon and Carbon
+through the native Gemini streaming client. Hydrogen and Neon returned streamed
+thoughts; Carbon and the two OpenAI models returned none in this short exchange.
+In one of four Carbon runs the first request timed out after 120 seconds without
+a response and the retry succeeded. Fable 5.2 at maximum effort passed the same
+exchange through the Claude API and returned streamed thoughts; the probe script
+reads the Messages wire format as of this change. The Codex routes have local
+catalog and request-patch tests but no live check, because the Codex
+subscription used had reached its usage limit.
 
 On the same date, Luna through Codex and Gemini 3.5 Flash-Lite were compared with
 the shipped developer, researcher and planner compactor prompts. Each received

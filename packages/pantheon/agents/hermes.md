@@ -3,7 +3,7 @@ role: subagent
 model: codex:gpt-6-luna
 model_fallbacks:
 - openai:gpt-6-luna
-- gemini:gemini-3.8-flash
+- gemini:gemini-4-hydrogen
 - claude:claude-haiku-5-5
 - bedrock:minimax.minimax-m2.5
 compaction_agent: compact-dev

@@ -15,14 +15,14 @@ from unittest import mock
 if __package__:
     from . import probe_reasoning_summaries as probe
     from .probe_reasoning_fixtures import (
-        cargo_output, concurrent_title_exchange, numbered_exchange,
-        openai_exchange, request, stream, write_trace,
+        cargo_output, claude_exchange, claude_turn, concurrent_title_exchange,
+        numbered_exchange, openai_exchange, request, stream, write_trace,
     )
 else:
     import probe_reasoning_summaries as probe
     from probe_reasoning_fixtures import (
-        cargo_output, concurrent_title_exchange, numbered_exchange,
-        openai_exchange, request, stream, write_trace,
+        cargo_output, claude_exchange, claude_turn, concurrent_title_exchange,
+        numbered_exchange, openai_exchange, request, stream, write_trace,
     )
 
 
@@ -148,6 +148,24 @@ class ProbeTests(unittest.TestCase):
                 # The title's STOP must not count as the missing main completion.
                 self.assert_replay_rejected(entries[:-1])
 
+    def test_claude_messages_replay_needs_a_normal_stop_reason(self):
+        entries = claude_exchange()
+        evidence = probe.analyze(entries, 0, "", "claude:claude-fable-5-2:max")
+        self.assertTrue(evidence["accepted"])
+        self.assertEqual(evidence["unassigned"], 0)
+        self.assertEqual(len(evidence["attempts"]), 2)
+        self.assertEqual(len(evidence["replay"]), 1)
+        self.assertEqual(evidence["thoughts"], len("Check session"))
+        self.assertEqual(probe.summary_setting(entries[0]["body"]), 'thinking.display="summarized"')
+        self.assertEqual(probe.usage_objects(evidence["replay"][0]["events"]),
+                         [{"input_tokens": 4}, {"output_tokens": 9}])
+        self.assertFalse(probe.analyze(entries, 1, "HTTP status: 400")["accepted"])
+        # message_stop also ends a stream that ran out of tokens.
+        self.assert_replay_rejected([*entries[:-8], *claude_turn("max_tokens", "continuing", 4)])
+        # Without the stop reason, message_stop alone proves nothing.
+        self.assert_replay_rejected([*entries[:-2], entries[-1]])
+        self.assert_replay_rejected(entries[:-2])
+
     def test_ambiguous_same_model_auxiliary_cannot_prove_acceptance(self):
         entries = concurrent_title_exchange("gemini")
         entries[3]["url"] = entries[2]["url"]
@@ -205,6 +223,10 @@ class ProbeTests(unittest.TestCase):
             "event": {"delta": {"reasoningContent": {"text": "thought", "signature": "sig"}}}}, "bedrock")), 7)
         self.assertEqual(probe.thought_chars(stream({"smithy_type": "contentBlockDelta",
             "event": {"delta": {"reasoningContent": {"signature": "sig"}}}}, "bedrock")), 0)
+        self.assertEqual(probe.thought_chars(stream({"type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "thought"}}, "claude")), 7)
+        self.assertEqual(probe.thought_chars(stream({"type": "content_block_delta",
+            "delta": {"type": "signature_delta", "signature": "sig"}}, "claude")), 0)
         self.assertEqual(probe.thought_chars({"kind": "request", "body": {"thought": "thought"}}), 0)
         self.assertEqual(probe.thought_chars({"kind": "response", "body": {"thought": "thought"}}), 0)
 
@@ -225,6 +247,7 @@ class ProbeTests(unittest.TestCase):
             {"contents": [{"parts": [{"functionResponse": {}}]}]},
             {"messages": [{"content": [{"toolResult": {}}]}]},
             {"messages": [{"role": "tool", "content": "{}"}]},
+            {"messages": [{"role": "user", "content": [{"type": "tool_result"}]}]},
         ):
             self.assertTrue(probe.has_tool_result(body))
         self.assertFalse(probe.has_tool_result({"input": [{"type": "function_call"}]}))
@@ -415,6 +438,9 @@ class ProbeTests(unittest.TestCase):
             stream({"candidates": {"finishReason": "STOP"}}, "gemini"),
             stream({"smithy_type": "contentBlockDelta", "event": {"delta": "invalid"}}, "bedrock"),
             stream({"smithy_type": "messageStop", "event": None}, "bedrock"),
+            stream({"type": "content_block_delta", "delta": "invalid"}, "claude"),
+            stream({"type": "message_delta", "delta": None}, "claude"),
+            stream({"type": "message_stop"}, "claude"),
         ]
         for entry in cases:
             with self.subTest(entry=entry):

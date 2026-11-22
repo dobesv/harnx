@@ -44,7 +44,7 @@ The `config.yaml` file contains global behavior and appearance settings.
 
 ### LLM
 
-- **model**: Specify the default model to use (e.g., `openai:gpt-4o`).
+- **model**: Specify the default model to use (e.g., `openai:gpt-6.2-sol`).
 
 ### Behavior
 
@@ -66,7 +66,7 @@ Each LLM provider is configured in its own YAML file within the `clients/` direc
 
 For a complete list of supported providers and their specific configuration options, see the [**LLM Providers Reference**](providers.md).
 
-**Note:** The **filename** (without `.yaml`) is used as the client's ID in `model` settings (e.g., `openai:gpt-4`). Any `name` field inside the file is ignored.
+**Note:** The **filename** (without `.yaml`) is used as the client's ID in `model` settings (e.g., `openai:gpt-6.2-sol`). Any `name` field inside the file is ignored.
 
 ### General Client Options
 
@@ -104,18 +104,17 @@ To target specific models, use `if/then` within the expression:
 ```yaml
 type: openai
 patches:
-  chat_completions:
-    - 'if .body.model == "o4-mini" then .body.reasoning_effort = "low" end'
-    - 'if .body.model == "o3" then .body.reasoning_effort = "medium" end'
-    - 'if .body.model == "gpt-4.1" then .body.reasoning_effort = "high" end'
+  responses:
+    - 'if .body.model == "gpt-6.2-sol" then .body.reasoning = {"effort":"low","summary":"auto"} end'
+    - 'if .body.model == "gpt-6.2-astra" then .body.reasoning = {"effort":"xhigh","summary":"auto"} end'
 ```
 
 For prefix or pattern matching, use `test` within the expression:
 
 ```yaml
 patches:
-  chat_completions:
-    - 'if (.body.model | test("gpt-5.*")) then .body.reasoning_effort = "high" end'
+  responses:
+    - 'if (.body.model | test("^gpt-6\\.2-")) then .body.reasoning = {"effort":"high","summary":"auto"} end'
 ```
 
 ### Reasoning Summaries and Defaults
@@ -499,7 +498,7 @@ Override the local allowance for a target agent in its Markdown front matter (`<
 
 ```yaml
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 run_limits:
   timeout_secs: 7200
 ---
@@ -578,14 +577,15 @@ You can also override the title agent for a specific agent in its front matter:
 
 ```yaml
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 title_agent: title-writer
 ---
 ```
 
-**Do not configure a reasoning model** (e.g. OpenAI `o1`/`o3`, DeepSeek-R1) as
-the `title_agent`. Such models spend their token budget on internal reasoning
-and often return an empty or truncated title. Use a standard chat model.
+**Do not configure a model that reasons at length** (a `:high` or `:max`
+effort alias, DeepSeek-R1) as the `title_agent`. Such models spend their token
+budget on internal reasoning and often return an empty or truncated title. Use
+a small, fast model such as `openai:gpt-6-luna`.
 
 To set a title manually, use the [`.set title`](tui-guide.md) command in the
 TUI. A manually set title freezes automatic regeneration for the rest of the

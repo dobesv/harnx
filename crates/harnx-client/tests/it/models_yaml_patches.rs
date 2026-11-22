@@ -180,6 +180,12 @@ fn package_openai_models_use_responses_without_sampling_parameters() {
         "gpt-6.1-sol:high",
         "gpt-6.1-sol:max",
         "gpt-6.1-terra",
+        "gpt-6.2-astra",
+        "gpt-6.2-astra:high",
+        "gpt-6.2-astra:max",
+        "gpt-6.2-sol",
+        "gpt-6.2-sol:high",
+        "gpt-6.2-sol:max",
     ] {
         let model = Model::from_config("openai", &openai.models)
             .into_iter()
@@ -257,6 +263,13 @@ fn prefix_bound_claude_models_use_adaptive_thinking_and_an_output_limit() {
             Some("max"),
             128000,
         ),
+        ("claude-fable-5-2", "claude-fable-5-2", None, 128000),
+        (
+            "claude-fable-5-2:max",
+            "claude-fable-5-2",
+            Some("max"),
+            128000,
+        ),
         ("claude-haiku-5-5", "claude-haiku-5-5", None, 128000),
         ("claude-haiku-5-5:thinking", "claude-haiku-5-5", None, 24000),
     ] {
@@ -301,6 +314,8 @@ fn vertex_thinking_binding_controls_reach_the_http_request() {
         "claude-haiku-5-5@default:thinking",
         "claude-fable-5-1",
         "claude-fable-5-1@default:max",
+        "claude-fable-5-2",
+        "claude-fable-5-2@default:max",
     ] {
         let model = provider_models("vertexai")
             .into_iter()
@@ -413,20 +428,22 @@ fn gemini_3_8_drops_sampling_settings_without_losing_thinking_or_output_limit() 
     );
 }
 
-#[test]
-fn argon_limits_fit_one_rest_request_and_preserve_smaller_output_limits() {
+/// Checks one Gemini 4 model's limits against the most a single request may
+/// return for each REST method.
+fn assert_gemini_4_limits(name: &str, rest_ceiling: u64, stream_ceiling: u64) {
     let model = provider_models("gemini")
         .into_iter()
-        .find(|model| model.name() == "gemini-4-argon")
-        .expect("Argon catalog entry");
-    assert_eq!(model.max_input_tokens(), Some(983040));
-    assert_eq!(model.max_tokens_param(), Some(65536));
-    for (method, ceiling) in [("generateContent", 32768), ("streamGenerateContent", 65536)] {
+        .find(|model| model.name() == name)
+        .unwrap_or_else(|| panic!("missing Gemini catalog entry {name}"));
+    assert_eq!(model.max_input_tokens(), Some(983040), "{name}");
+    assert_eq!(model.max_tokens_param(), Some(65536), "{name}");
+    for (method, ceiling) in [
+        ("generateContent", rest_ceiling),
+        ("streamGenerateContent", stream_ceiling),
+    ] {
         for requested in [None, Some(8192), Some(1048576)] {
             let mut envelope = request_envelope(&model);
-            envelope["url"] = json!(format!(
-                "https://example.invalid/models/gemini-4-argon:{method}"
-            ));
+            envelope["url"] = json!(format!("https://example.invalid/models/{name}:{method}"));
             envelope["body"]["generationConfig"] = json!({"temperature": 0.7, "topP": 0.9});
             if let Some(limit) = requested {
                 envelope["body"]["generationConfig"]["maxOutputTokens"] = json!(limit);
@@ -435,13 +452,27 @@ fn argon_limits_fit_one_rest_request_and_preserve_smaller_output_limits() {
             let generation = &patched["body"]["generationConfig"];
             assert_eq!(
                 generation["maxOutputTokens"],
-                requested.unwrap_or(ceiling).min(ceiling)
+                requested.unwrap_or(ceiling).min(ceiling),
+                "{name} {method}"
             );
             assert_eq!(generation["thinkingConfig"]["includeThoughts"], true);
-            assert!(generation.get("temperature").is_none());
-            assert!(generation.get("topP").is_none());
+            assert!(generation.get("temperature").is_none(), "{name}");
+            assert!(generation.get("topP").is_none(), "{name}");
         }
     }
+}
+
+#[test]
+fn argon_limits_fit_one_rest_request_and_preserve_smaller_output_limits() {
+    assert_gemini_4_limits("gemini-4-argon", 32768, 65536);
+}
+
+#[test]
+fn gemini_4_limits_fit_one_request_and_preserve_smaller_output_limits() {
+    // Carbon halves a non-streaming REST request's output as Argon does.
+    assert_gemini_4_limits("gemini-4-carbon", 32768, 65536);
+    assert_gemini_4_limits("gemini-4-hydrogen", 65536, 65536);
+    assert_gemini_4_limits("gemini-4-neon", 65536, 65536);
 }
 
 #[test]

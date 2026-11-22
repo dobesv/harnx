@@ -75,7 +75,7 @@ Harnx emits five main span types across an execution trace:
 Each `llm_request` span records LLM model metadata:
 
 - `gen_ai.system`: LLM provider identifier (e.g. `openai`, `anthropic`, `gemini`).
-- `gen_ai.request.model`: Active model name (e.g. `gpt-4o`, `claude-3-5-sonnet-20241022`).
+- `gen_ai.request.model`: Active model name (e.g. `gpt-6.2-sol`, `claude-sonnet-5-5`).
 
 Successful non-streaming spans also record token usage and cost attributes when available:
 

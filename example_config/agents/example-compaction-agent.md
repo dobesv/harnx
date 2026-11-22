@@ -1,6 +1,6 @@
 ---
 role: compaction
-model: openai:gpt-4o-mini
+model: openai:gpt-6-luna
 description: "Example compaction agent for context compression"
 ---
 You are summarizing a conversation between a user and an AI assistant.

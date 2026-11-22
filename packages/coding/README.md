@@ -47,10 +47,10 @@ OpenAI API model:
 
 | Agent | Ordered model chain |
 |-------|---------------------|
-| `coder` | Sonnet 5.5 → Codex Sol 6.1 → OpenAI Sol 6.1 → Gemini 3.8 Flash → Bedrock GLM 5.3 |
+| `coder` | Sonnet 5.5 → Codex Sol 6.2 → OpenAI Sol 6.2 → Gemini 4 Hydrogen → Bedrock GLM 5.3 |
 | `compact-coder` | Codex Luna → OpenAI Luna → Gemini 3.5 Flash-Lite → Haiku 5.5 → Bedrock Luna |
 
-Sol 6.1 preserves coding quality when Sonnet is unavailable; Luna and Flash-Lite
+Sol 6.2 preserves coding quality when Sonnet is unavailable; Luna and Flash-Lite
 keep compaction inexpensive. Haiku 5.5 supplies a lower-cost Claude compaction
 fallback with a 1M context window. Opus overrides use 5.5.
 
@@ -85,7 +85,7 @@ update), use a patch file placed next to the installed package directory:
 
 ```yaml
 agents:
-  - 'if .name == "coder" then .model = "codex:gpt-6.1-sol" end'
+  - 'if .name == "coder" then .model = "codex:gpt-6.2-sol" end'
   - 'if .name == "compact-coder" then .model = "gemini:gemini-3.5-flash-lite" end'
 ```
 

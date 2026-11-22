@@ -13,7 +13,7 @@ api_key: "your-api-key"
 
 # Models must be listed manually with 'name' matching your Azure deployment name.
 models:
-  - name: "gpt-4o"           # Deployment name on Azure
+  - name: "gpt-6.2-sol"      # Deployment name on Azure
     type: chat
   - name: "text-embedding-3-small"
     type: embeddings

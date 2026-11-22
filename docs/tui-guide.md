@@ -100,14 +100,14 @@ child session again does not overwrite the earlier invocation's summary.
 ### `.model` - change the current LLM
 
 ```
-openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
-|                 |            |             |       |     |  └─ support function callings
-|                 |            |             |       |     └─ support vision
-|                 |            |             |       └─ output price ($/1M)
-|                 |            |             └─ input price ($/1M)
-|                 |            |
-|                 |            └─ max output tokens
-|                 └─ max input tokens
+openai:gpt-6.2-sol  922000 /   128000  |       2 /     10    👁 ⚒
+|                   |            |             |       |     |  └─ support function callings
+|                   |            |             |       |     └─ support vision
+|                   |            |             |       └─ output price ($/1M)
+|                   |            |             └─ input price ($/1M)
+|                   |            |
+|                   |            └─ max output tokens
+|                   └─ max input tokens
 └─ model id
 ```
 

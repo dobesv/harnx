@@ -16,11 +16,12 @@ type: codex
 # No `models` list is needed: the codex client reuses OpenAI's built-in model
 # catalog, so updating harnx keeps the model list (context sizes, capabilities,
 # the Responses API endpoint) current automatically. Select a model with the
-# client prefix, e.g. `codex:gpt-5`. Add a `models:` list only to override
-# metadata or declare a model the catalog doesn't have yet (e.g. gpt-5-codex):
+# client prefix, e.g. `codex:gpt-6.2-sol`. Add a `models:` list only to override
+# metadata or declare a model the catalog doesn't have yet (gpt-7-preview is a
+# placeholder for one):
 # models:
-#   - name: gpt-5-codex
-#     max_input_tokens: 400000
+#   - name: gpt-7-preview
+#     max_input_tokens: 922000
 #     max_output_tokens: 128000
 #     supports_vision: true
 #     supports_tool_use: true
