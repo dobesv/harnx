@@ -13,18 +13,34 @@ use harnx_core::middleware::{
 };
 
 use super::{AgentConfig, Config, ToolServerConfig};
+use std::collections::HashSet;
 
-/// A resolved event hook, ready to run. No matcher or tool allowlist: event
-/// hooks never wrap tool calls.
+/// A resolved event hook. Tool selectors stay unresolved until provider
+/// discovery, so server startup can read them without a running provider.
 #[derive(Debug, Clone)]
 pub struct ResolvedEventHook {
     pub name: String,
     pub source: MiddlewareSource,
+    /// Original helper tool selectors, not discovered tool names.
+    pub tools: Vec<String>,
     /// Exact HTTP(S) hosts; empty denies all fetch requests.
     pub fetch: Vec<String>,
     /// Inclusive wall-clock limit for one script run.
     pub timeout: std::time::Duration,
     pub on_error: harnx_core::hooks::EventHookOnError,
+}
+
+impl ResolvedEventHook {
+    /// Resolve this entry's allowlist after discovery, using the same selection
+    /// and exclusions as middleware helpers. `config` must have declarations
+    /// cached with names visible from the active `package`.
+    pub fn allowed_tool_names(&self, config: &Config, package: Option<&str>) -> HashSet<String> {
+        config
+            .select_script_tools_for_package(&self.tools, package)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
 }
 
 /// The resolved per-event chains, in execution order.
@@ -44,6 +60,16 @@ impl ResolvedEventHooks {
             HookEventKind::Stop => &self.stop,
             HookEventKind::StopFailure => &self.stop_failure,
         }
+    }
+
+    /// Raw selectors from enabled entries across every event. Server startup
+    /// must use these instead of resolving names before discovery.
+    pub fn tool_selectors(&self) -> impl Iterator<Item = &str> {
+        HookEventKind::ALL.into_iter().flat_map(|event| {
+            self.list(event)
+                .iter()
+                .flat_map(|hook| hook.tools.iter().map(String::as_str))
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -236,6 +262,7 @@ fn resolve_definition(
     Ok(ResolvedEventHook {
         name: definition.name.clone(),
         source,
+        tools: definition.tools.clone(),
         fetch: definition.fetch.clone(),
         timeout: definition.timeout,
         on_error: definition.on_error,

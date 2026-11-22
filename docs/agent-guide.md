@@ -690,6 +690,7 @@ hooks:
 | `bash` | `string` | one of `bash`/`python`/`script` | — | Inline Bash script |
 | `python` | `string` | one of `bash`/`python`/`script` | — | Inline Python script |
 | `script` | `path` | one of `bash`/`python`/`script` | — | Script file, resolved relative to the agent file |
+| `tools` | `list` | no | none | Tool selectors the script may call |
 | `timeout` | `duration` | no | `30s` | Wall-clock limit per run |
 | `on_error` | `allow`/`deny` | no | `allow` | `deny` fails the event on a script error; not valid for `Stop`/`StopFailure` |
 | `fetch` | `list` | no | none | Exact HTTP(S) hosts the script may request |

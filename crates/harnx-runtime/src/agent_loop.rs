@@ -121,6 +121,20 @@ pub struct AgentLoopContext {
 }
 
 impl AgentLoopContext {
+    /// This future is only polled for events that declare helper tools.
+    pub(crate) async fn event_hook_tool_context(&self) -> harnx_engine::tool::ToolEvalContext {
+        crate::tool_context::refresh_nats_tool_declarations(&self.config, &self.instance_id).await;
+        let package = self.config.read().active_package();
+        // Hook selectors are independent of the model's tool selection. Admission
+        // narrows this inventory to one hook entry before any call is evaluated.
+        let mut params =
+            crate::tool::BuildToolEvalContextParams::new(&self.config, &self.instance_id)
+                .with_agent_use_tools(Some("*"))
+                .with_current_agent_package(package);
+        params.working_dir = self.working_dir.as_deref();
+        crate::tool::build_tool_eval_context(params).await
+    }
+
     /// The session log is the only interrupt authority; the abort signal is
     /// this process's view of the `Cancel` its watcher already saw. Every
     /// former gate boundary is now just this check.
@@ -520,6 +534,7 @@ async fn apply_user_prompt_hooks(
             ..Default::default()
         },
         &ctx.abort_signal,
+        || Box::pin(ctx.event_hook_tool_context()),
     )
     .await;
     match outcome {
@@ -680,6 +695,7 @@ async fn fail_model_turn(params: FailedModelTurn<'_>) -> Result<LoopResult> {
             ..Default::default()
         },
         &ctx.abort_signal,
+        || Box::pin(ctx.event_hook_tool_context()),
     )
     .await;
     if let Err(hook_error) = outcome {
@@ -835,6 +851,7 @@ async fn dispatch_text_stop(params: TextStopDispatch<'_>) -> Option<EventHookOut
             ..Default::default()
         },
         &params.ctx.abort_signal,
+        || Box::pin(params.ctx.event_hook_tool_context()),
     )
     .await;
     match outcome {

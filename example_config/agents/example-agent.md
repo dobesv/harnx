@@ -40,6 +40,7 @@ documents:                       # RAG document paths (relative to config dir)
 #   max_resume: 3
 #   Stop:
 #     - name: keep-going
+#       tools: [plans_list_notes]  # Allowlisted tools available to the script.
 #       bash: resume "finish the checklist first"
 #   SessionStart:
 #     - name: session-context

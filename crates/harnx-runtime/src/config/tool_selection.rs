@@ -141,6 +141,21 @@ impl Config {
         functions
     }
 
+    /// Resolve helper tools for middleware and lifecycle scripts, excluding
+    /// tools that must stay at the model boundary. Cached declarations must
+    /// already use the names visible from `package`, as in
+    /// [`Config::select_tools_for_package`].
+    pub(crate) fn select_script_tools_for_package(
+        &self,
+        selectors: &[String],
+        package: Option<&str>,
+    ) -> Vec<ToolDeclaration> {
+        self.select_tools_for_package(selectors, package)
+            .into_iter()
+            .filter(|tool| is_bash_inner_tool_allowed(&tool.name))
+            .collect()
+    }
+
     /// Resolve the concrete set of tool names selected by `use_tools`,
     /// expanding toolset names and glob selectors against the available
     /// `declarations`.

@@ -861,6 +861,7 @@ async fn dispatch_context_session_start(
         },
         &ctx.config,
         &ctx.abort_signal,
+        || Box::pin(ctx.event_hook_tool_context()),
     )
     .await
 }
@@ -875,11 +876,15 @@ async fn dispatch_context_session_start(
 /// SessionStart hooks observe and contribute context; the session already
 /// exists by the time they run, so there is nothing for a block to prevent —
 /// but a `deny` failure stops the activation.
-async fn dispatch_session_start(
+async fn dispatch_session_start<F>(
     params: SessionStartDispatch<'_>,
     config: &GlobalConfig,
     abort: &AbortSignal,
-) -> Result<()> {
+    tool_context: impl FnOnce() -> F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = harnx_engine::tool::ToolEvalContext>,
+{
     if params.origin == SessionOrigin::Resumed {
         return Ok(());
     }
@@ -895,6 +900,7 @@ async fn dispatch_session_start(
             ..Default::default()
         },
         abort,
+        tool_context,
     )
     .await?;
     if let Some(context) = outcome.context_text() {

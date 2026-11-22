@@ -11,7 +11,7 @@ pub(crate) mod fetch;
 mod fetch_net;
 mod frame;
 mod interact;
-mod python;
+pub(crate) mod python;
 mod resume;
 mod script;
 
@@ -19,7 +19,7 @@ pub(crate) use resume::{checkpoint_tool_request_state, current_tool_input, with_
 pub use resume::{with_resume, AcceptedInteraction, MiddlewareResume, ToolInputResume};
 pub(crate) use tool_challenge::{tool_challenge_outcome, ToolChallengeContext};
 mod tool_challenge;
-mod tools;
+pub(crate) mod tools;
 mod trace;
 mod wiring;
 

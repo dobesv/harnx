@@ -70,7 +70,8 @@ toolsets:
 #   max_resume: 1                # Stop-hook resume bound per turn.
 #   SessionStart:
 #     - name: session-context
-#       bash: add_context "Server notes: see RUNBOOK.md"
+#       tools: [fs_read]         # Allowlisted tools available to the script.
+#       bash: add_context "$(fs_read --path RUNBOOK.md -o text)"
 #   UserPromptSubmit:
 #     - name: no-secrets
 #       bash: |

@@ -13,6 +13,9 @@ use harnx_core::hooks::{
 };
 use harnx_core::middleware::MiddlewareSourceConfig;
 
+#[path = "event_hook_seam/session_start.rs"]
+mod session_start;
+
 type RecordedRequests = Arc<AsyncMutex<Vec<Vec<String>>>>;
 
 /// A one-entry UserPromptSubmit hook with the given bash source.
@@ -23,6 +26,7 @@ fn prompt_hook_config(bash: &str) -> HooksConfig {
             source: MiddlewareSourceConfig::Bash {
                 bash: bash.to_string(),
             },
+            tools: vec![],
             fetch: vec![],
             timeout: Duration::from_secs(30),
             on_error: EventHookOnError::Allow,

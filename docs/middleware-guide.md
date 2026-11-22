@@ -738,6 +738,9 @@ network builtins. Run `CARGO_BUILD_JOBS=8 cargo nextest run -p harnx-runtime mid
   too.
 - **Operator root calls (`harnx call`):** yes. Operator consent doesn't bypass
   middleware denial or rewriting.
+- **Lifecycle hook tool calls:** yes. Calls made by hook scripts pass through
+  configured tool middleware so policy and credential injection stay effective.
+  See the [Hooks Guide](hooks-guide.md#calling-tools).
 - **Middleware's allowlisted helper calls:** no. They use the inner-call machinery
   with middleware disabled, preventing recursion. They still obey tool admission
   and cancellation. Helper calls don't publish separate outer-call UI events.
@@ -782,8 +785,9 @@ to start their servers.
 - **Unmanaged workers:** Automatic startup applies only when the worker daemon
   manages tool servers locally. On unmanaged or cloud workers where tool servers
   run externally, helper servers must run independently and be available over NATS.
-- **Lifecycle hooks:** In-process event hooks (`hooks:`) are separate and do not
-  declare or start tool servers (#2798).
+- **Lifecycle hooks:** In-process event hooks (`hooks:`) also declare helper
+  tools via `tools:` and start their servers on session activation. See the
+  [Hooks Guide](hooks-guide.md#calling-tools).
 
 ## Deployment and crash limits
 

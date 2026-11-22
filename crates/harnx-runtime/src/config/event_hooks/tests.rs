@@ -153,6 +153,7 @@ fn event_hooks_invalid_entries_fail_load_naming_the_hook() {
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", root);
     for fields in [
         "bash: next, unknown: true",
+        "bash: next, tool: [fs_read]",
         "bash: next, python: pass",
         "bash: next, script: missing.sh",
         "script: missing.py",
@@ -424,4 +425,224 @@ fn event_hooks_patched_scripts_keep_loader_origins_for_every_event() {
             );
         }
     }
+}
+
+fn hooks_for_every_event(entries: serde_json::Value) -> String {
+    let hooks: serde_json::Map<String, serde_json::Value> = HookEventKind::ALL
+        .into_iter()
+        .map(|event| (event.key().to_string(), entries.clone()))
+        .collect();
+    serde_yaml::to_string(&serde_json::json!({"hooks": hooks})).unwrap()
+}
+
+#[test]
+fn event_hooks_tool_selectors_survive_composition_without_discovery() {
+    let _lock = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", root);
+    let selectors = [
+        " future_* ",
+        "pkg/tool",
+        "fs_{read,write}",
+        "readers",
+        "future_*",
+    ];
+    let file = write(
+        root,
+        "config.yaml",
+        &hooks_for_every_event(serde_json::json!([
+            {"name": "global", "bash": "event_input", "tools": selectors},
+            {"name": "override", "bash": "event_input", "tools": ["old_global"]},
+            {"name": "reset", "bash": "event_input", "tools": ["old_reset"]},
+            {"name": "disabled", "bash": "event_input", "tools": ["disabled_tool"]}
+        ])),
+    );
+    write(
+        root,
+        "tool_servers/a.yaml",
+        &tool_server_yaml(&hooks_for_every_event(serde_json::json!([
+            {"name": "override", "bash": "event_input", "tools": ["old_server"]},
+            {"name": "server", "python": "event_input()", "tools": ["server_*"]}
+        ]))),
+    );
+    write(
+        root,
+        "packages/pkg/tool_servers/b.yaml",
+        &tool_server_yaml(&hooks_for_every_event(serde_json::json!([
+            {"name": "package", "bash": "event_input", "tools": ["pkg_*"]}
+        ]))),
+    );
+    write(
+        root,
+        "tool_servers/disabled.yaml",
+        &format!(
+            "enabled: false\n{}",
+            tool_server_yaml(&hooks_for_every_event(serde_json::json!([
+                {"name": "disabled_server", "bash": "event_input", "tools": ["disabled_server_tool"]}
+            ])))
+        ),
+    );
+    let agent_file = write(
+        root,
+        "agents/test.md",
+        &agent_md(&hooks_for_every_event(serde_json::json!([
+            {"name": "override", "bash": "event_input", "tools": ["agent_*"]},
+            {"name": "reset", "bash": "event_input"},
+            {"name": "disabled", "enabled": false},
+            {"name": "empty", "bash": "event_input", "tools": []}
+        ]))),
+    );
+    let mut config = Config::load_from_file(&file).unwrap();
+    config
+        .use_agent_obj(agent::load(&agent_file).unwrap())
+        .unwrap();
+    assert!(config.nats_tool_declarations.read().is_empty());
+    let resolved = config.resolved_event_hooks().unwrap();
+    for event in HookEventKind::ALL {
+        let entries = resolved.list(event);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|hook| hook.name.as_str())
+                .collect::<Vec<_>>(),
+            ["global", "override", "reset", "server", "package", "empty"]
+        );
+        assert_eq!(entries[0].tools, selectors);
+        assert_eq!(entries[1].tools, ["agent_*"]);
+        assert!(entries[2].tools.is_empty());
+        assert_eq!(entries[3].tools, ["server_*"]);
+        assert_eq!(entries[4].tools, ["pkg_*"]);
+        assert!(entries[5].tools.is_empty());
+    }
+    let expected: Vec<&str> = HookEventKind::ALL
+        .into_iter()
+        .flat_map(|_| {
+            selectors
+                .into_iter()
+                .chain(["agent_*", "server_*", "pkg_*"])
+        })
+        .collect();
+    assert_eq!(resolved.tool_selectors().collect::<Vec<_>>(), expected);
+}
+
+fn hook_with_tools(selectors: &[&str]) -> ResolvedEventHook {
+    ResolvedEventHook {
+        name: "helper".into(),
+        source: MiddlewareSource::Bash("event_input".into()),
+        tools: selectors
+            .iter()
+            .map(|selector| selector.to_string())
+            .collect(),
+        fetch: vec![],
+        timeout: std::time::Duration::from_secs(30),
+        on_error: harnx_core::hooks::EventHookOnError::Allow,
+    }
+}
+
+fn config_with_tool_declarations(names: &[&str]) -> Config {
+    let config = Config::default();
+    config
+        .nats_tool_declarations
+        .write()
+        .extend(names.iter().map(|name| {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "description": "helper tool", "parameters": {}
+            }))
+            .unwrap()
+        }));
+    config
+}
+
+#[test]
+fn event_hook_allowed_tool_names_expand_middleware_selector_syntax() {
+    let mut config = config_with_tool_declarations(&["fs_read", "fs_write", "db_query"]);
+    config
+        .toolsets
+        .insert("readers".into(), vec!["fs_read".into(), "missing".into()]);
+    for (selectors, expected) in [
+        (vec!["fs_read"], vec!["fs_read"]),
+        (vec![" fs_* "], vec!["fs_read", "fs_write"]),
+        (vec!["fs_{read,write}"], vec!["fs_read", "fs_write"]),
+        (vec!["readers", "fs_read"], vec!["fs_read"]),
+        (vec!["missing_*"], vec![]),
+    ] {
+        let names = hook_with_tools(&selectors).allowed_tool_names(&config, None);
+        assert_eq!(
+            names,
+            expected.into_iter().map(String::from).collect(),
+            "{selectors:?}"
+        );
+    }
+}
+
+#[test]
+fn event_hook_allowed_tool_names_use_the_active_package_view() {
+    let config =
+        config_with_tool_declarations(&["fs_read", "otherpkg__fs_read", "otherpkg__db_query"]);
+    for package in [Some("pkg"), None] {
+        let hook = hook_with_tools(&["fs_read", "otherpkg/fs_read", "pkg__fs_read"]);
+        assert_eq!(
+            hook.allowed_tool_names(&config, package),
+            ["fs_read", "otherpkg__fs_read"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+    }
+}
+
+#[test]
+fn event_hook_allowed_tool_names_exclude_control_tools_even_when_matched() {
+    let blocked = [
+        "ask_user",
+        "bash",
+        "switch_agent",
+        "helper_session_handoff",
+        "pkg__helper_session_handoff",
+    ];
+    let declarations: Vec<&str> = std::iter::once("fs_read").chain(blocked).collect();
+    let mut config = config_with_tool_declarations(&declarations);
+    config.toolsets.insert(
+        "helpers".into(),
+        declarations.iter().map(|name| name.to_string()).collect(),
+    );
+    for selectors in [vec!["*"], declarations, vec!["helpers"]] {
+        let hook = hook_with_tools(&selectors);
+        let selected: HashSet<String> = config
+            .select_tools_for_package(&hook.tools, Some("pkg"))
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for name in blocked {
+            assert!(
+                selected.contains(name),
+                "{name} must match before exclusions"
+            );
+        }
+        // `*` also selects ordinary builtins, which scripts may still call.
+        let expected = selected
+            .into_iter()
+            .filter(|name| !blocked.contains(&name.as_str()))
+            .collect();
+        let names = hook.allowed_tool_names(&config, Some("pkg"));
+        assert!(names.contains("fs_read"));
+        assert_eq!(names, expected);
+    }
+}
+
+#[test]
+fn event_hook_allowed_tool_names_are_empty_without_selectors_or_tool_use() {
+    let mut config = config_with_tool_declarations(&["fs_read"]);
+    assert!(hook_with_tools(&[])
+        .allowed_tool_names(&config, None)
+        .is_empty());
+    config.tool_use = false;
+    assert!(hook_with_tools(&["fs_*"])
+        .allowed_tool_names(&config, None)
+        .is_empty());
+    assert!(ResolvedEventHooks::default()
+        .tool_selectors()
+        .next()
+        .is_none());
 }
