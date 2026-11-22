@@ -1,15 +1,15 @@
-use super::{
-    conversion::{from_python, to_python},
-    frame::Frame,
-    tools::FrameTools,
+use super::{frame::Frame, tools::FrameTools};
+use crate::script_tools::{
+    conversion::to_python,
+    python::{bind, required, string, tool_arguments},
 };
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, Result};
 use harnx_script::{
     ExcType, ExtFunctionResult, MontyException, MontyObject, ScriptHostContext,
     ScriptPythonFunctions, ScriptPythonHandler,
 };
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 const FUNCTIONS: &[&str] = &[
     "tool_input",
@@ -132,63 +132,10 @@ fn parameters(name: &str) -> Result<&'static [&'static str]> {
         "call_next" => &["args", "id"],
         "respond" => &["result"],
         "deny" => &["reason"],
-        "call_tool" => &["name", "args"],
         "confirm" => &["message", "id"],
         "answer" | "saved" => &["key"],
         "save" => &["key", "value"],
         "interact" => &["surface", "id"],
         _ => bail!("unknown middleware function '{name}'"),
     })
-}
-
-fn bind(
-    parameters: &[&str],
-    args: Vec<MontyObject>,
-    kwargs: Vec<(MontyObject, MontyObject)>,
-) -> Result<HashMap<String, Value>> {
-    ensure!(
-        args.len() <= parameters.len(),
-        "too many positional middleware arguments"
-    );
-    let mut values = HashMap::new();
-    for (name, value) in parameters.iter().zip(args) {
-        values.insert((*name).to_string(), from_python(value)?);
-    }
-    for (key, value) in kwargs {
-        let name = string(from_python(key)?)?;
-        ensure!(
-            parameters.contains(&name.as_str()),
-            "unknown middleware argument '{name}'"
-        );
-        ensure!(
-            !values.contains_key(&name),
-            "duplicate middleware argument '{name}'"
-        );
-        values.insert(name, from_python(value)?);
-    }
-    Ok(values)
-}
-
-fn required(values: &mut HashMap<String, Value>, name: &str) -> Result<Value> {
-    values
-        .remove(name)
-        .ok_or_else(|| anyhow::anyhow!("missing middleware argument '{name}'"))
-}
-
-fn string(value: Value) -> Result<String> {
-    match value {
-        Value::String(value) => Ok(value),
-        _ => bail!("middleware argument must be a string"),
-    }
-}
-
-/// Keep the hook and middleware `call_tool(name, args)` contracts identical.
-pub(crate) fn tool_arguments(
-    args: Vec<MontyObject>,
-    kwargs: Vec<(MontyObject, MontyObject)>,
-) -> Result<(String, Value)> {
-    let mut values = bind(parameters("call_tool")?, args, kwargs)?;
-    let name = string(required(&mut values, "name")?)?;
-    let arguments = required(&mut values, "args")?;
-    Ok((name, arguments))
 }

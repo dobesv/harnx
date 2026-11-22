@@ -151,3 +151,57 @@ async fn abort_during_tool_context(
     );
     result
 }
+
+#[tokio::test]
+async fn event_hook_pre_aborted_turn_skips_context_and_scripts_for_both_policies() {
+    for with_tools in [false, true] {
+        for on_error in [EventHookOnError::Allow, EventHookOnError::Deny] {
+            let entry = if with_tools {
+                tool_hook(false, "add_context must-not-run", on_error)
+            } else {
+                hook("helper", "add_context must-not-run", on_error)
+            };
+            let config = config_with_hooks(
+                HookEventKind::UserPromptSubmit,
+                vec![
+                    entry,
+                    hook(
+                        "next",
+                        "add_context must-not-run; rewrite_prompt must-not-run; block must-not-run",
+                        EventHookOnError::Allow,
+                    ),
+                ],
+            );
+            let abort = create_abort_signal();
+            abort.set_ctrlc();
+            let input = EventHookInput {
+                event: HookEventKind::UserPromptSubmit,
+                ..Default::default()
+            };
+            let called = std::sync::atomic::AtomicBool::new(false);
+            let result = tokio::time::timeout(
+                DEADLINE,
+                run_event_hooks(&config, &input, &abort, || {
+                    called.store(true, Ordering::SeqCst);
+                    std::future::pending()
+                }),
+            )
+            .await
+            .expect("pre-aborted hooks must return promptly");
+            assert!(!called.load(Ordering::SeqCst), "factory must not be called");
+            match on_error {
+                EventHookOnError::Allow => {
+                    let outcome = result.unwrap();
+                    assert!(outcome.context.is_empty());
+                    assert!(outcome.block.is_none());
+                    assert!(outcome.rewrite.is_none());
+                    assert!(outcome.resume.is_none());
+                }
+                EventHookOnError::Deny => assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "hook 'helper': hook 'helper' interrupted"
+                ),
+            }
+        }
+    }
+}

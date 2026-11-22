@@ -1,5 +1,6 @@
 //! Hook → shared script bridge → middleware → instrumented provider.
 mod cancellation;
+mod context_setup;
 mod fixture;
 
 use super::*;
@@ -153,11 +154,11 @@ async fn event_hook_fatal_tool_errors_fail_entry_and_drop_effects() {
 }
 
 #[tokio::test]
-async fn event_hook_tool_collisions_fail_without_replacing_operations() {
+async fn event_hook_glob_tool_collisions_still_fail_without_replacing_operations() {
     for python in [false, true] {
         let mut entry = tool_hook(python, "add_context('bad')", EventHookOnError::Deny);
         if let EventHookEntry::Full(definition) = &mut entry {
-            definition.tools = vec!["add_context".into()];
+            definition.tools = vec!["add_*".into()];
         }
         let fixture = Fixture::new(vec![entry]).await;
         let error = fixture

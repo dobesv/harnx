@@ -1,7 +1,5 @@
-mod inner;
-pub(crate) use inner::{tool_commands, ScriptTools};
-
 use super::{effects::DispatchGuard, frame::Frame};
+use crate::script_tools::{tool_commands, ScriptTools};
 use anyhow::{anyhow, Result};
 use harnx_core::tool::{ToolCall, ToolError};
 use harnx_script::{

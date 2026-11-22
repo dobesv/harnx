@@ -1,4 +1,11 @@
 //! Shared tool admission and evaluation for middleware and event-hook scripts.
+//!
+//! Frame checkpointing and hook operations stay with their respective callers.
+//! Python argument binding and JSON conversion live here so neither script
+//! surface depends on the other's implementation.
+
+pub(crate) mod conversion;
+pub(crate) mod python;
 
 use anyhow::{anyhow, ensure, Result};
 use harnx_core::{abort::AbortSignal, tool::ToolCall};
@@ -35,7 +42,7 @@ pub(crate) struct ScriptTools {
 }
 
 impl ScriptTools {
-    pub(super) fn middleware(
+    pub(crate) fn middleware(
         context: ToolMiddlewareContext,
         allowed_names: HashSet<String>,
     ) -> Self {
@@ -59,7 +66,7 @@ impl ScriptTools {
     }
 
     // qual:allow(iosp) — admission and the origin's round/recursion policy must be applied together before constructing the inner call.
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         &self,
         name: &str,
         arguments: Value,
@@ -100,7 +107,7 @@ impl ScriptTools {
         Ok((ctx, call))
     }
 
-    pub(super) async fn evaluate(
+    pub(crate) async fn evaluate(
         &self,
         ctx: &ToolEvalContext,
         call: ToolCall,

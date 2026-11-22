@@ -185,6 +185,64 @@ fn event_hooks_invalid_entries_fail_load_naming_the_hook() {
 }
 
 #[test]
+fn event_hook_literal_operation_selector_fails_config_load_with_context() {
+    let _lock = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    let file = write(
+        temp.path(),
+        "config.yaml",
+        &hooks_yaml(
+            "SessionStart",
+            &["{name: context-hook, bash: pass, tools: [add_context]}".to_string()],
+        ),
+    );
+
+    let error = load_error(&file);
+    assert!(error.contains("context-hook"), "{error}");
+    assert!(error.contains("SessionStart"), "{error}");
+    assert!(error.contains("add_context"), "{error}");
+}
+
+#[test]
+fn event_hook_glob_and_toolset_selectors_are_not_rejected_at_load() {
+    let _lock = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    let file = write(
+        temp.path(),
+        "config.yaml",
+        "toolsets:\n  add_context:\n    - fs_read\nhooks:\n  SessionStart:\n    - name: glob-hook\n      bash: pass\n      tools: [add_*]\n    - name: toolset-hook\n      bash: pass\n      tools: [add_context]\n",
+    );
+
+    Config::load_from_file(&file).unwrap();
+}
+
+#[test]
+fn event_hook_non_colliding_and_event_specific_literals_are_accepted() {
+    let _lock = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    let file = write(
+        temp.path(),
+        "config.yaml",
+        &format!(
+            "hooks:\n{}\n{}\n",
+            event_block(
+                "SessionStart",
+                &["{name: read-hook, bash: pass, tools: [fs_read]}".to_string()]
+            ),
+            event_block(
+                "StopFailure",
+                &["{name: resume-tool, bash: pass, tools: [resume]}".to_string()]
+            )
+        ),
+    );
+
+    Config::load_from_file(&file).unwrap();
+}
+
+#[test]
 fn event_hooks_legacy_command_entries_fail_load_with_guidance() {
     let _lock = env_lock();
     let temp = tempfile::tempdir().unwrap();

@@ -145,6 +145,33 @@ The `event_input` payload contains `event`, `session_id`, `cwd`,
 `resume` may be called with an empty message. Effects from a failed run are
 discarded entirely.
 
+## Timeouts and cancellation
+
+Each entry's `timeout` (default `30s`) limits its script run, including tool calls
+and `fetch`. A timed-out script loses its effects, and its `on_error` policy
+applies. Timing out an entry does not abort the turn.
+
+If any entry for the event declares a nonempty `tools:` list, the worker builds
+one shared tool context before running the chain. This setup has a separate
+budget equal to the **longest `timeout` among the entries declaring tools**.
+Tool-free entries do not extend that budget. For example, tool entries with
+`timeout: 2s` and `timeout: 5s` give setup up to five seconds; a tool-free entry
+with the default `30s` does not change it. Successful setup leaves each script
+its full configured timeout.
+
+If setup times out, the pending setup is cancelled and is not retried during
+that event. Each tool-declaring entry fails without running its script, with
+`tool context setup timed out after ...`, when the chain reaches that entry.
+Its `on_error` applies: `allow` skips it and continues; `deny` fails the event.
+Tool-free entries still run in their normal order unless a block, resume, or
+deny stops the chain. An event containing only tool-free entries never builds a
+tool context.
+
+Turn abort takes priority over context setup completion or timeout. An aborted
+turn interrupts all entries, including tool-free entries, with their usual
+`on_error` handling. If the turn is already aborted at dispatch, no tool context
+factory or hook script runs.
+
 ## Calling tools
 
 Hook entries can declare an opt-in `tools:` allowlist to call tools from Bash
@@ -244,11 +271,14 @@ do not produce UI tool-call events.
 
 ### Operation name collisions
 
-Tool names must not collide with registered event-hook operations for that event
-(`event_input`, `fetch`, `add_context`, `block`, `rewrite_prompt`, `resume`).
-If an allowlisted tool shares a name with an operation on that event, the hook
-entry is rejected before running (`allowlisted tool collides with an event-hook operation`).
-Neither command runs, effects are dropped, and `on_error` applies.
+A literal `tools:` selector that matches an operation registered for that event
+(`event_input`, `fetch`, `add_context`, `block`, `rewrite_prompt`, `resume`) is
+rejected while loading the configuration, with an error naming the hook, event,
+and selector. The registered operations vary by event; for example, `resume` is
+an operation for `Stop`, not `StopFailure`. Globs and toolset references aren't
+expanded during config loading, so collisions they select are still rejected at
+runtime (`allowlisted tool collides with an event-hook operation`). Neither
+command runs, effects are dropped, and `on_error` applies.
 
 ### Helper tool server startup on workers
 
