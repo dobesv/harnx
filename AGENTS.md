@@ -609,6 +609,14 @@ reasoning patch, usually because the registry doesn't mark it
 `supports_reasoning`: give it a curated patch if it reasons, or add it to the
 guard's `openai_model_without_reasoning` if it doesn't.
 
+Those two patches are all a new model gets. Effort aliases, the removal of
+sampling parameters and Gemini 4's per-request output limit are lists of model
+names in `scripts/model_variants.py` (`OPENAI_EFFORT_VARIANTS`,
+`apply_openai_base_patches`, `GEMINI_4_REQUEST_PATCHES`), and no guard fails
+for a model missing from them. GPT-6.2 arrived without `:high` and `:max`
+aliases, and Gemini 4 Carbon with its whole 1,048,576-token window as its
+output limit. Read a new model's catalog entry before an agent selects it.
+
 Claude thinking aliases come from the registry's flags rather than model
 names. `ThinkingSupport.from_registry` (`scripts/model_variants.py`) reads
 `supports_adaptive_thinking`, `supports_legacy_thinking` (a fixed
@@ -649,6 +657,15 @@ refresh one provider also imports every other provider's current upstream
 drift, which does not belong in a scoped changeset. After a scoped refresh,
 take `HEAD:crates/harnx/models.yaml`, splice in only the `provider:` block
 you meant to change, and confirm `git diff` touches that block alone.
+
+To apply a new rule in `scripts/model_variants.py` without the registry, load
+the catalog with `load_existing_data`, pass a provider's own models (minus
+those `is_generated_variant_name` matches) to `regenerate_provider_models` as
+the fetched set, and write the result with `render_models_yaml`. Rendering
+every provider unchanged reproduces the file byte for byte, so the diff shows
+only what the rule changed. This works for OpenAI and Gemini. Claude's thinking
+aliases need the registry's flags, which the catalog doesn't store, so a Claude
+provider regenerated this way loses them.
 
 ## Key Patterns
 

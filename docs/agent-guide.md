@@ -20,7 +20,7 @@ Here's a complete example showing all available front-matter fields:
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 temperature: 0
 top_p: 0.9
 use_tools:
@@ -65,7 +65,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | `string` | global default | LLM model ID (e.g. `openai:gpt-4o`, `claude:claude-3-5-sonnet`). If omitted, uses the globally configured model. |
+| `model` | `string` | global default | LLM model ID (e.g. `openai:gpt-6.2-sol`, `claude:claude-sonnet-5-5`). If omitted, uses the globally configured model. |
 | `role` | `string` | `assistant` | Agent purpose: `assistant` (interactive agent shown in menus), `subagent` (internal agent invoked via delegation), or `compaction` (session compaction agent). |
 | `temperature` | `float` | global default | Controls randomness (0 = deterministic, 1 = creative). Inherited from global config when `model` is omitted. |
 | `top_p` | `float` | global default | Nucleus sampling parameter. Alternative to temperature. Inherited from global config when `model` is omitted. |
@@ -155,7 +155,7 @@ The Markdown body below the front-matter `---` fence is the agent's system promp
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 ---
 You are a helpful assistant that explains things clearly and concisely.
 ```
@@ -564,7 +564,7 @@ This agent gives coding tools and delegation instructions only to callers in the
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 use_tools:
   - jira
   - confluence
@@ -1147,7 +1147,7 @@ A minimal agent at `<config-dir>/agents/grammar-genie.md`:
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 temperature: 0
 ---
 Your task is to take the text provided and rewrite it into a clear,
@@ -1162,7 +1162,7 @@ An agent with access to filesystem and shell tools:
 
 ```markdown
 ---
-model: claude:claude-3-5-sonnet
+model: claude:claude-sonnet-5-5
 use_tools:
   - fs_*
   - bash_exec
@@ -1206,7 +1206,7 @@ An agent that uses RAG to answer questions from project docs:
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 documents:
   - project-docs/architecture.md
   - project-docs/api-reference.md
@@ -1222,7 +1222,7 @@ documentation. If the docs don't cover something, say so clearly.
 
 Agent prompts are rendered using [MiniJinja](https://github.com/mitsuhiko/minijinja). In addition to the custom variables defined in front-matter, several dynamic variables are available:
 
-- `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-4o`). This updates automatically if the agent falls back to a different model.
+- `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-6.2-sol`). This updates automatically if the agent falls back to a different model.
 - `{{ tools }}`: A list of available tools. You can iterate over them: `{% for t in tools %}- {{ t.name }}: {{ t.description }}{% endfor %}`.
 - `{{ __os__ }}`, `{{ __arch__ }}`, `{{ __shell__ }}`, `{{ __cwd__ }}`, `{{ __now__ }}`, `{{ __locale__ }}`: Environment and system information.
 - `__user__`: The session creator's caller-principals snapshot, with exactly four fields: `user_id`, `users` (expanded user aliases), `groups`, and `roles`. When a session has no stored snapshot but does have a `user_id` (such as a legacy session), Harnx returns user-id-only principals (`user_id` set, `users: [user_id]`, empty `groups` and `roles`). Only an anonymous session gets a null `user_id` (`none`) and empty lists. Agent and session variables cannot override `__user__`. The snapshot stays fixed for the session and is inherited by subagents and handoffs; it customizes prompts, not access checks. See [Agent Patches (`patches`)](#agent-patches-patches) for tool tailoring and caveats.

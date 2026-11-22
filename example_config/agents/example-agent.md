@@ -2,7 +2,7 @@
 # Agent-specific configuration
 # Location: `<harnx-config-dir>/agents/<agent-name>.md`
 
-model: openai:gpt-4o             # Specify the LLM to use
+model: openai:gpt-6.2-sol        # Specify the LLM to use
 temperature: null                # Set default temperature parameter, range (0, 1)
 top_p: null                      # Set default top-p parameter
 use_tools:                       # Which MCP tools to allow

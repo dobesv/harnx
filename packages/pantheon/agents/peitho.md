@@ -1,6 +1,6 @@
 ---
 role: subagent
-model: gemini:gemini-3.8-flash
+model: gemini:gemini-4-hydrogen
 model_fallbacks:
 - codex:gpt-6.1-terra
 - openai:gpt-6.1-terra

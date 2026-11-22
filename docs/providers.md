@@ -124,7 +124,7 @@ Authenticate with an existing ChatGPT Pro/Plus/Team subscription instead of a me
 1. Install the official `codex` CLI (OpenAI's Codex command-line tool).
 2. Run `codex login` and complete the browser sign-in. This writes credentials to `~/.codex/auth.json`.
 3. Create `clients/codex.yaml` with `type: codex` (see example below).
-4. Select a model with the client prefix, e.g. `codex:gpt-5`.
+4. Select a model with the client prefix, e.g. `codex:gpt-6.2-sol`.
 
 | Field | Description | Env Var Override |
 |-------|-------------|------------------|
@@ -139,15 +139,15 @@ type: codex
 The `codex` client reuses OpenAI's built-in model catalog, so you don't need a
 `models` list — updating harnx keeps the model list (context sizes, capabilities,
 the Responses API endpoint) current automatically. Select a model with the client
-prefix, e.g. `codex:gpt-5`. Add a `models` list only to override metadata or to
-declare a model the catalog doesn't ship yet (for example `gpt-5-codex`, which
-isn't in the base OpenAI catalog):
+prefix, e.g. `codex:gpt-6.2-sol`. Add a `models` list only to override metadata
+or to declare a model the catalog doesn't ship yet (`gpt-7-preview` here is a
+placeholder for one):
 
 ```yaml
 type: codex
 models:
-  - name: gpt-5-codex
-    max_input_tokens: 400000
+  - name: gpt-7-preview
+    max_input_tokens: 922000
     max_output_tokens: 128000
     supports_vision: true
     supports_tool_use: true
@@ -158,7 +158,7 @@ models:
 harnx reads the OAuth access token from the configured auth file — `auth_file` (or `CODEX_AUTH_FILE`) when set, otherwise `~/.codex/auth.json` — and refreshes it automatically against OpenAI's token endpoint when it expires, so no API key is needed. Refreshed tokens are held in memory only; harnx does not modify the auth file (so it won't interfere with the `codex` CLI).
 
 **Notes and Limitations:**
-- Only Responses-API models offered by your subscription work here (e.g. `gpt-5-codex`, `gpt-5`).
+- Only Responses-API models offered by your subscription work here (e.g. `gpt-6.2-sol`, `gpt-6-luna`).
 - Server-side conversation storage is disabled (`store: false`).
 - This uses the same first-party client path as the Codex CLI and depends on endpoints OpenAI hasn't published as a stable public API; treat it as best-effort for personal subscription use, and make sure your usage complies with OpenAI's terms.
 - If you see authentication errors, re-run `codex login` to refresh your saved credentials.
@@ -272,7 +272,7 @@ type: azure-openai
 api_base: "https://my-resource.openai.azure.com"
 api_key: "..."
 models:
-  - name: "gpt-4o-deployment"
+  - name: "gpt-6.2-sol-deployment"
     type: chat
 ```
 

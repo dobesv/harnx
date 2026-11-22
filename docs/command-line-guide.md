@@ -38,7 +38,7 @@ harnx-serve --addr 0.0.0.0:8080                # Run server with addr
 harnx-mcp-bridge --list-tools -- my-server      # Inspect external MCP tools (standalone binary)
 harnx-mcp-bridge --call-tool query --tool-args '{"q": "test"}' -- my-server
 
-harnx -m openai:gpt-4o                         # Select LLM
+harnx -m openai:gpt-6.2-sol                    # Select LLM
 
 harnx -s                                       # Begin a temp session
 harnx -s session1                              # Use session 'session1'
@@ -239,7 +239,7 @@ Common flags:
 ```sh
 harnx-serve --addr 0.0.0.0:8000
 harnx-serve --public-url https://harnx.example.com
-harnx-serve --model claude:claude-3-5-sonnet-20240620
+harnx-serve --model claude:claude-sonnet-5-5
 harnx-serve --dry-run
 harnx-serve --agent-variable env production --agent-variable debug true
 ```

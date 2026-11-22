@@ -1,5 +1,5 @@
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 description: "A demonstration agent bundled with example-pkg"
 use_tools:
   - bash_execute

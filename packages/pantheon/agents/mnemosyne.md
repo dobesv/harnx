@@ -2,7 +2,7 @@
 role: subagent
 model: bedrock:us.zai.glm-5.3
 model_fallbacks:
-- gemini:gemini-3.8-flash
+- gemini:gemini-4-hydrogen
 - codex:gpt-6.1-terra
 - openai:gpt-6.1-terra
 - claude:claude-sonnet-5-5

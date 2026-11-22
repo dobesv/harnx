@@ -2,9 +2,9 @@
 role: assistant
 model: claude:claude-sonnet-5-5
 model_fallbacks:
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
-- gemini:gemini-3.8-flash
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
+- gemini:gemini-4-hydrogen
 - bedrock:us.zai.glm-5.3
 compaction_agent: compact-coder
 

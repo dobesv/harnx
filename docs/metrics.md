@@ -373,15 +373,15 @@ Example output:
 ```text
 # HELP harnx_llm_tokens_total Chat-completion token count
 # TYPE harnx_llm_tokens_total counter
-harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="input"} 1420
-harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="output"} 385
-harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="cache_read"} 512
-harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="cache_write"} 0
-harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-4o",type="cached"} 512
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-6.2-sol",type="input"} 1420
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-6.2-sol",type="output"} 385
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-6.2-sol",type="cache_read"} 512
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-6.2-sol",type="cache_write"} 0
+harnx_llm_tokens_total{agent="coding",client="openai",provider="openai",model="gpt-6.2-sol",type="cached"} 512
 
 # HELP harnx_llm_cost_dollars Cumulative estimated LLM cost in USD
 # TYPE harnx_llm_cost_dollars gauge
-harnx_llm_cost_dollars{agent="coding",client="openai",provider="openai",model="gpt-4o"} 0.0074
+harnx_llm_cost_dollars{agent="coding",client="openai",provider="openai",model="gpt-6.2-sol"} 0.0067
 ```
 
 ### HTTP Server Metrics

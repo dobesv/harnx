@@ -200,8 +200,8 @@ Patch files use **jq filter strings** to modify package configurations. Each ent
 
 ```yaml
 agents:
-  - '.model = "claude:claude-3-5-sonnet"'          # applies to every agent
-  - 'if .name == "coder" then .model_fallbacks = ["openai:gpt-4o"] end'
+  - '.model = "claude:claude-sonnet-5-5"'          # applies to every agent
+  - 'if .name == "coder" then .model_fallbacks = ["openai:gpt-6.2-sol"] end'
 
 clients:
   - 'if .name == "claude" then .api_key = "sk-..." end'
