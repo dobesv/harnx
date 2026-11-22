@@ -1,7 +1,7 @@
 //! Lifecycle operations and Python/Bash adapters share one run's effects.
 
 use super::{tools::HookTools, RunState};
-use crate::{config::ResolvedEventHook, middleware::tools::ScriptTools};
+use crate::{config::ResolvedEventHook, event_hook_operations::names, script_tools::ScriptTools};
 use anyhow::{anyhow, ensure, Result};
 use harnx_core::hooks::HookEventKind;
 use harnx_script::{
@@ -11,23 +11,6 @@ use harnx_script::{
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::sync::Arc;
-
-/// Operations registered for each event. Everything else is unknown and fails
-/// the run — that is how interactions stay unavailable here.
-pub(super) fn names(event: HookEventKind) -> &'static [&'static str] {
-    match event {
-        HookEventKind::SessionStart => &["event_input", "fetch", "add_context"],
-        HookEventKind::UserPromptSubmit => &[
-            "event_input",
-            "fetch",
-            "add_context",
-            "block",
-            "rewrite_prompt",
-        ],
-        HookEventKind::Stop => &["event_input", "fetch", "resume"],
-        HookEventKind::StopFailure => &["event_input", "fetch"],
-    }
-}
 
 pub(super) fn register(
     hook: &ResolvedEventHook,
@@ -186,7 +169,7 @@ impl ScriptPythonHandler for PythonOperation {
                     .tools
                     .as_ref()
                     .ok_or_else(|| anyhow!("event-hook tools are not enabled"))?;
-                let (name, arguments) = crate::middleware::python::tool_arguments(args, kwargs)?;
+                let (name, arguments) = crate::script_tools::python::tool_arguments(args, kwargs)?;
                 return tools
                     .execute(&name, arguments, host.cancel.clone())
                     .await
@@ -207,7 +190,7 @@ impl ScriptPythonHandler for PythonOperation {
         .await;
         match result.and_then(|value| {
             value
-                .map(crate::middleware::conversion::to_python)
+                .map(crate::script_tools::conversion::to_python)
                 .transpose()
         }) {
             Ok(object) => ExtFunctionResult::Return(object.unwrap_or(MontyObject::None)),
@@ -236,11 +219,11 @@ fn bind(
     let mut values = parameters
         .iter()
         .zip(args)
-        .map(|(_, value)| crate::middleware::conversion::from_python(value))
+        .map(|(_, value)| crate::script_tools::conversion::from_python(value))
         .collect::<Result<Vec<_>>>()?;
     values.resize_with(parameters.len(), || Value::Null);
     for (key, value) in kwargs {
-        let name = match crate::middleware::conversion::from_python(key)? {
+        let name = match crate::script_tools::conversion::from_python(key)? {
             Value::String(name) => name,
             _ => anyhow::bail!("event-hook keyword names must be strings"),
         };
@@ -248,7 +231,7 @@ fn bind(
             .iter()
             .position(|parameter| *parameter == name)
             .ok_or_else(|| anyhow!("unknown event-hook argument '{name}'"))?;
-        values[index] = crate::middleware::conversion::from_python(value)?;
+        values[index] = crate::script_tools::conversion::from_python(value)?;
     }
     Ok(values)
 }

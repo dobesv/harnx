@@ -1,7 +1,7 @@
-use super::operations;
 use crate::{
     config::{Config, ResolvedEventHook},
-    middleware::tools::{tool_commands, ScriptTools},
+    event_hook_operations::names,
+    script_tools::{tool_commands, ScriptTools},
     utils::AbortSignal,
 };
 use anyhow::{ensure, Result};
@@ -22,6 +22,65 @@ pub(super) struct HookTools {
     pub executor: Option<Arc<ScriptTools>>,
 }
 
+pub(super) enum ToolContext {
+    Ready(Box<EventTools>),
+    TimedOut(String),
+    Unused,
+}
+
+impl ToolContext {
+    pub async fn prepare<F>(
+        config: &crate::config::GlobalConfig,
+        hooks: &[ResolvedEventHook],
+        abort: &AbortSignal,
+        tool_context: impl FnOnce() -> F,
+    ) -> Self
+    where
+        F: std::future::Future<Output = ToolEvalContext>,
+    {
+        let timeout = hooks
+            .iter()
+            .filter(|hook| !hook.tools.is_empty())
+            .map(|hook| hook.timeout)
+            .max();
+        let Some(timeout) = timeout else {
+            return Self::Unused;
+        };
+        let evaluation = tokio::select! {
+            biased;
+            () = harnx_core::abort::wait_abort_signal(abort) => return Self::Unused,
+            () = tokio::time::sleep(timeout) => {
+                return Self::TimedOut(format!("tool context setup timed out after {timeout:?}"));
+            }
+            // Defer factory invocation until polling, so a pre-aborted turn skips it.
+            evaluation = async { tool_context().await } => evaluation,
+        };
+        Self::Ready(Box::new(EventTools {
+            evaluation: Arc::new(evaluation),
+            config: config.read().clone(),
+            abort: abort.clone(),
+        }))
+    }
+
+    pub fn for_hook(
+        &self,
+        hook: &ResolvedEventHook,
+        event: HookEventKind,
+    ) -> std::result::Result<HookTools, String> {
+        if hook.tools.is_empty() {
+            return Ok(HookTools::default());
+        }
+        match self {
+            Self::Ready(context) => context
+                .for_hook(hook, event)
+                .map_err(|error| format!("{error:#}")),
+            Self::TimedOut(failure) => Err(failure.clone()),
+            // Tool-declaring hooks never reach this arm; the early return handles tool-free hooks.
+            Self::Unused => Ok(HookTools::default()),
+        }
+    }
+}
+
 impl EventTools {
     pub fn for_hook(&self, hook: &ResolvedEventHook, event: HookEventKind) -> Result<HookTools> {
         let allowed_names = hook.allowed_tool_names(
@@ -33,7 +92,7 @@ impl EventTools {
         ensure!(
             !allowed_names
                 .iter()
-                .any(|name| operations::names(event).contains(&name.as_str())),
+                .any(|name| names(event).contains(&name.as_str())),
             "allowlisted tool collides with an event-hook operation"
         );
         let declarations = self

@@ -108,8 +108,34 @@ impl Config {
                 }
             }
         }
+        validate_operation_name_collisions(self, &resolved)?;
         Ok(resolved)
     }
+}
+
+fn validate_operation_name_collisions(config: &Config, hooks: &ResolvedEventHooks) -> Result<()> {
+    for event in HookEventKind::ALL {
+        for hook in hooks.list(event) {
+            for selector in &hook.tools {
+                let selector = selector.trim();
+                let sanitized = harnx_core::package_namespace::sanitize_for_tool_name(selector);
+                let is_toolset = config.toolsets.contains_key(selector)
+                    || (sanitized != selector && config.toolsets.contains_key(&sanitized));
+                if !is_toolset
+                    && !crate::tool_selector::is_glob(selector)
+                    && crate::event_hook_operations::names(event).contains(&selector)
+                {
+                    bail!(
+                        "hook '{}' ({}) has tools selector '{}' that collides with an event-hook operation",
+                        hook.name,
+                        event.key(),
+                        selector
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn apply_server_level(

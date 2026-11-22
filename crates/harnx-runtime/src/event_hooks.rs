@@ -7,7 +7,7 @@
 //! `add_context` (SessionStart, UserPromptSubmit), `block`/`rewrite_prompt`
 //! (UserPromptSubmit), and `resume` (Stop). Entries that declare `tools:`
 //! also get those tools as script commands and `call_tool`, through the
-//! shared bridge in `middleware::tools` (see "Calling tools" in
+//! shared bridge in `script_tools` (see "Calling tools" in
 //! `docs/hooks-guide.md`). Interaction operations
 //! (`confirm`, `save`, `next`, …) are intentionally not registered: an event
 //! hook that tries one fails, which the hook's `on_error` policy handles.
@@ -23,7 +23,7 @@
 mod operations;
 mod tools;
 
-use tools::{EventTools, HookTools};
+use tools::ToolContext;
 
 use crate::config::{GlobalConfig, ResolvedEventHook};
 use anyhow::{anyhow, Result};
@@ -131,15 +131,21 @@ struct RunState {
 
 /// Run one event's hooks in-process.
 ///
-/// `tool_context` is called once, only if an entry for this event declares tools.
+/// `tool_context` is called at most once, only if an entry for this event declares tools.
 /// It must refresh discovered declarations in `config` before returning the base
 /// context. Use a factory returning a boxed future to keep the large context
 /// builder off the agent loop's stack, without allocating for tool-free hooks.
 /// An eagerly constructed (unboxed) future here overflowed Tokio's default
 /// stack in existing worker middleware tests even with no hooks configured —
 /// new dispatch sites must keep the `|| Box::pin(...)` pattern.
-/// Shared context construction observes turn abort but is outside per-hook
-/// script timeouts.
+/// Before scripts run, shared context setup gets a separate budget: the maximum
+/// `timeout` among this event's entries with nonempty `tools`. Expiry drops the
+/// setup future without aborting the turn or retrying. Tool-declaring entries
+/// then fail at their normal chain positions according to `on_error`; tool-free
+/// entries still run unless block, resume or deny stops the chain. Each script
+/// retains its full per-entry timeout after successful setup. Turn abort wins
+/// over setup completion or timeout, and a pre-aborted turn never calls the
+/// factory. Events with only tool-free entries skip setup entirely.
 // qual:allow(complexity, max_cognitive=18) reason: "The per-hook loop folds four policies (first-resume-wins, block discards, per-hook on_error, deny wins) that belong to one chain walk; extracting them would hide the ordering contract."
 // qual:allow(iosp) — chain state (blocks, rewrite, resume) accumulates per hook in declaration order; a helper per policy would re-thread the same mutable outcome.
 pub async fn run_event_hooks<F>(
@@ -156,22 +162,7 @@ where
     if hooks.is_empty() {
         return Ok(EventHookOutcome::default());
     }
-    let tools = if hooks.iter().any(|hook| !hook.tools.is_empty()) {
-        let evaluation = tokio::select! {
-            biased;
-            () = wait_abort_signal(abort_signal) => None,
-            evaluation = tool_context() => Some(evaluation),
-        };
-        evaluation.map(|evaluation| {
-            Box::new(EventTools {
-                evaluation: Arc::new(evaluation),
-                config: config.read().clone(),
-                abort: abort_signal.clone(),
-            })
-        })
-    } else {
-        None
-    };
+    let tools = ToolContext::prepare(config, &hooks, abort_signal, tool_context).await;
     let mut outcome = EventHookOutcome::default();
     let mut prompt = input.prompt.clone();
     for hook in &hooks {
@@ -179,7 +170,7 @@ where
         if let (Some(prompt), Some(object)) = (&prompt, input_json.as_object_mut()) {
             object.insert("prompt".to_string(), json!(prompt));
         }
-        match run_one(hook, event, &input_json, abort_signal, tools.as_deref()).await {
+        match run_one(hook, event, &input_json, abort_signal, &tools).await {
             Ok(state) => {
                 outcome.context.extend(state.context);
                 if let Some(reason) = state.block {
@@ -219,17 +210,13 @@ async fn run_one(
     event: HookEventKind,
     input_json: &Value,
     abort_signal: &AbortSignal,
-    tools: Option<&EventTools>,
+    tools: &ToolContext,
 ) -> std::result::Result<RunState, String> {
     // Also covers abort while the shared tool context was being built.
     if abort_signal.aborted() {
         return Err(format!("hook '{}' interrupted", hook.name));
     }
-    let tools = match tools.filter(|_| !hook.tools.is_empty()) {
-        Some(context) => context.for_hook(hook, event),
-        None => Ok(HookTools::default()),
-    }
-    .map_err(|error| format!("{error:#}"))?;
+    let tools = tools.for_hook(hook, event)?;
     let state = Arc::new(Mutex::new(RunState::default()));
     let (script_commands, python_functions) =
         operations::register(hook, event, input_json, state.clone(), tools);
