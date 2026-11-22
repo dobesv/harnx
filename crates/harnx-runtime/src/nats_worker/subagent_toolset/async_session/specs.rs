@@ -1,6 +1,5 @@
 //! Tool specs and schemas for `session_send` and `session_wait`.
 
-use super::super::session_read::read_object_schema;
 use super::{WAIT_DEFAULT_SECS, WAIT_MAX_SECS};
 use harnx_toolset::{
     ToolProgressKind, ToolSpec, SUBAGENT_SESSION_SEND_TOOL, SUBAGENT_SESSION_WAIT_TOOL,
@@ -27,20 +26,20 @@ const WAIT_SUMMARY_ARM: &str = concat!(
     "{% else %}{{ result.status | default('unknown', true) }}",
     "{% if result.wait_expired %} (wait expired){% endif %}",
     "{% if result.stopped_by %} ({{ result.stopped_by }}){% endif %}",
-    "{% if result.output.observation.error and result.output.observation.error != 'soft_wait_expired' %}",
-    " — {{ result.output.observation.error }}{% endif %}",
-    "{% if result.terminal and result.status != 'completed' %}",
-    "{% set diagnostic = result.output.events | default([]) | selectattr('type', 'equalto', 'error') | list | last %}",
-    "{% if diagnostic.text %} — {{ diagnostic.text | replace('\r', ' ') | replace('\n', ' ') | truncate(100) }}{% endif %}",
+    "{% if result.observation.error and result.observation.error != 'soft_wait_expired' %}",
+    " — {{ result.observation.error }}{% endif %}",
+    "{% if result.terminal and result.failure %}",
+    " — {{ result.failure | replace('\r', ' ') | replace('\n', ' ') | truncate(100) }}",
     "{% endif %}{% endif %}",
 );
 
-/// Dispatch-only `session_send` (no `wait`) never rendered a page: no events,
-/// not terminal, no expiry or stop, and no observation error. Everything else
-/// is a wait-shaped observation and falls through to the shared summary.
+/// Dispatch-only `session_send` (no `wait`) never observed the child: not
+/// terminal, no expiry or stop, no observation error and no activity sample.
+/// Everything else is a wait-shaped observation and falls through to the
+/// shared summary.
 const SEND_DISPATCH_ARM: &str = concat!(
     "{% elif not result.terminal and not result.wait_expired and not result.stopped_by",
-    " and not result.output.observation.error and result.output.events is not defined",
+    " and not result.observation.error and result.activity is not defined",
     " and result.status != 'blocked' %}",
     "dispatched{% if result.session_id %} {{ result.session_id }}{% endif %}",
     "{% if result.dispatch == 'unconfirmed' %} (unconfirmed){% endif %}",
@@ -69,7 +68,7 @@ pub(crate) fn wait_properties() -> serde_json::Map<String, Value> {
             "maximum": WAIT_MAX_SECS,
             "default": WAIT_DEFAULT_SECS,
             "description": "Soft observation budget in seconds, 1 to 240 \
-    (default 240). Expiry returns the partial snapshot; the child keeps running. To \
+    (default 240). Expiry returns the current status; the child keeps running. To \
     check status without waiting, use session_load with prompt_id. Not combinable \
     with forever."
         },
@@ -81,11 +80,11 @@ pub(crate) fn wait_properties() -> serde_json::Map<String, Value> {
         },
         "include_partial": {
             "type": "boolean",
-            "description": "Whether to include partial child output while the \
-    prompt is pending or blocked. Default true. Explicit false omits pending/\
-    blocked text; terminal output is still returned under the same byte bound."
-        },
-        "read": json!({"anyOf": [read_object_schema(), {"type": "null"}]})
+            "description": "Whether a pending or blocked result includes \
+    `activity`: the child's tool call count, token usage, title and latest step \
+    (its narration and the tools it called, trimmed). Default true. A settled \
+    result returns the child's final reply as `response` either way."
+        }
     }) else {
         unreachable!("wait properties are an object")
     };
@@ -120,7 +119,7 @@ start a new session with a generated ID. A message to a running child joins its 
 current turn under that turn's existing deadline; timeout_secs does not extend it. \
 Returns a durable {{session_id, \
 prompt_id}} handle immediately; omit wait for dispatch-only, pass wait to soft-wait \
-up to 240 seconds here (a new message for you may end the wait early; stopped_by: \"caller_deadline\" means your own run deadline is near, so report now instead of waiting again), use \
+up to 240 seconds here for the child's final reply (`response`) (a new message for you may end the wait early; stopped_by: \"caller_deadline\" means your own run deadline is near, so report now instead of waiting again), use \
 session_wait to wait later and session_load to check status without waiting. Sub-agents return \
 files by including cid: attachment URLs in their reply. {}",
             super::super::policy_description(policy)
@@ -200,8 +199,10 @@ pub(crate) fn session_wait_spec(agent: &str) -> ToolSpec {
         description: format!(
             "Wait (soft) for the result of a prompt previously dispatched to the \
 '{agent}' agent with session_send, for up to 240 seconds or until it settles. \
-Returns the prompt's durable observation: status, terminal flag and bounded \
-output with continuation metadata. A new message for you may end the wait early with \
+Returns the prompt's status and terminal flag. A settled prompt returns the \
+child's final reply as `response` (and `failure` for a failed turn); a pending or \
+blocked one returns a short `activity` sample. Read the child's transcript with \
+session_load. A new message for you may end the wait early with \
 stopped_by: \"new_message\". stopped_by: \"caller_deadline\" means your own \
 run deadline is near: report now instead of waiting again. Repeated waits recover the same result and \
 never consume it. The wait never cancels the child or extends its execution \

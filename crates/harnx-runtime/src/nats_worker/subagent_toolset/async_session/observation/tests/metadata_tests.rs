@@ -21,7 +21,7 @@ fn minimum_budget_keeps_escaped_handles_status_and_maximal_error_metadata() {
         assert_eq!(result["session_id"], handle.session_id);
         assert_eq!(result["prompt_id"], handle.prompt_id);
         assert_eq!(result["status"], "unknown");
-        assert!(result["output"]["observation"].is_object());
+        assert!(result["observation"].is_object());
         assert!(serialized(&result) <= 1024);
     }
     assert!(accepted > 1);
@@ -33,12 +33,14 @@ async fn impossible_identifier_budget_is_rejected_before_send_side_effects() -> 
     for checkpointed in [false, true] {
         let mut args = f.request.args.clone();
         let mut context = f.send_context();
+        // An identifier longer than the whole result budget.
+        let session_id = "x".repeat(super::super::RESULT_MAX_BYTES + 1);
         if checkpointed {
-            context.checkpoint = Some(json!({"session_id": "x".repeat(1000)}));
+            context.checkpoint = Some(json!({"session_id": session_id}));
         } else {
-            args["session_id"] = json!("x".repeat(1000));
+            args["session_id"] = json!(session_id);
         }
-        args["wait"] = json!({"seconds": 1, "read": {"max_output_bytes": 1024}});
+        args["wait"] = json!({"seconds": 1});
         let error = send(&f.toolset, args, CancellationToken::new(), context)
             .await
             .unwrap_err();
@@ -72,7 +74,7 @@ async fn oversized_diagnostic_identity_cannot_discard_handle_or_observation_meta
     let result = frame.finish(&budget);
     assert_eq!(result["prompt_id"], "original-prompt");
     assert!(result["invocation_id"].is_null());
-    assert!(result["output"]["observation"]["running_ms"].is_number());
+    assert!(result["observation"]["running_ms"].is_number());
     assert!(serialized(&result) <= 1024);
     Ok(())
 }

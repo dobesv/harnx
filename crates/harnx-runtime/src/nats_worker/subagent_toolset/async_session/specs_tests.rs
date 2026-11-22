@@ -1,6 +1,6 @@
 use super::{session_send_spec, session_wait_spec};
 use crate::nats_worker::subagent_toolset::async_session::{
-    DispatchConfirmation, SessionPromptResult, SessionPromptStatus,
+    DispatchConfirmation, PromptHandle, SessionPromptResult, SessionPromptStatus,
 };
 use harnx_core::tool::{render_tool_call_template, render_tool_result_template};
 use serde_json::{json, Value};
@@ -36,7 +36,7 @@ fn wait_call_is_one_line_for_packaged_and_bare_agents() {
             "session_id": "abcdefgh-long-session-id",
             "prompt_id": "long-prompt-id",
             "seconds": 240,
-            "read": {"max_output_bytes": 65536}
+            "include_partial": false
         });
         let rendered = render_tool_call_template(template, &args, "raw fallback").unwrap();
         assert_eq!(rendered, format!("@ {agent} [abcdefgh] wait long-pro"));
@@ -55,16 +55,14 @@ fn wait_results_summarize_every_status_without_dumping_output() {
         (SessionPromptStatus::Unknown, "unknown"),
     ] {
         let result = serde_json::to_value(SessionPromptResult {
-            session_id: "abcdefgh-long-session-id".into(),
-            prompt_id: "long-prompt-id".into(),
-            invocation_id: None,
-            dispatch: None,
             status,
             terminal: status.is_terminal(),
-            wait_expired: false,
-            stopped_by: None,
             elapsed_ms: 240_000,
-            output: json!({"text": "child output\n".repeat(100), "observation": {"error": null}}),
+            response: status.is_terminal().then(|| "child output\n".repeat(100)),
+            ..SessionPromptResult::empty(&PromptHandle {
+                session_id: "abcdefgh-long-session-id".into(),
+                prompt_id: "long-prompt-id".into(),
+            })
         })
         .unwrap();
         assert_eq!(render_result(&result), expected);
@@ -75,7 +73,7 @@ fn wait_results_summarize_every_status_without_dumping_output() {
 fn wait_result_keeps_expiry_stop_reasons_and_observation_errors_visible() {
     for (fields, expected) in [
         (
-            json!({"wait_expired": true, "output": {"observation": {"error": "soft_wait_expired"}}}),
+            json!({"wait_expired": true, "observation": {"error": "soft_wait_expired"}}),
             "pending (wait expired)",
         ),
         (
@@ -87,7 +85,7 @@ fn wait_result_keeps_expiry_stop_reasons_and_observation_errors_visible() {
             "pending (caller_deadline)",
         ),
         (
-            json!({"output": {"observation": {"error": "durable_observation_unavailable"}}}),
+            json!({"observation": {"error": "durable_observation_unavailable"}}),
             "pending — durable_observation_unavailable",
         ),
     ] {
@@ -124,16 +122,14 @@ fn wait_result_handles_recoverable_errors_and_missing_envelopes() {
 fn wait_terminal_failure_includes_a_short_single_line_diagnostic() {
     let result = json!({
         "status": "failed", "terminal": true,
-        "output": {"events": [
-            {"type": "message", "text": "unrelated output"},
-            {"type": "error", "text": "worker failed\nnetwork unavailable"}
-        ]}
+        "response": "unrelated output",
+        "failure": "worker failed\nnetwork unavailable"
     });
     assert_eq!(
         render_result(&result),
         "failed — worker failed network unavailable"
     );
-    let result = json!({"status": "failed", "terminal": true, "output": {}});
+    let result = json!({"status": "failed", "terminal": true});
     assert_eq!(render_result(&result), "failed");
 }
 
@@ -149,8 +145,6 @@ fn send_dispatch_only_result_reports_the_handle_in_one_line() {
         (None, "dispatched ab12cd"),
     ] {
         let result = serde_json::to_value(SessionPromptResult {
-            session_id: "ab12cd".into(),
-            prompt_id: "long-prompt-id".into(),
             invocation_id: Some("long-prompt-id".into()),
             dispatch,
             status: if dispatch.is_some() {
@@ -158,12 +152,11 @@ fn send_dispatch_only_result_reports_the_handle_in_one_line() {
             } else {
                 SessionPromptStatus::Unknown
             },
-            terminal: false,
-            wait_expired: false,
-            stopped_by: None,
             elapsed_ms: 4,
-            output: json!({"observation": {"observed_at_ms": 1, "running_ms": 1,
-                "complete": false, "error": null}}),
+            ..SessionPromptResult::empty(&PromptHandle {
+                session_id: "ab12cd".into(),
+                prompt_id: "long-prompt-id".into(),
+            })
         })
         .unwrap();
         assert_eq!(render_send_result(&result), expected);
@@ -184,12 +177,12 @@ fn send_wait_results_match_the_wait_summary_line() {
         (
             json!({
                 "status": "blocked",
-                "output": {"observation": {"error": null}}
+                "observation": {"error": null}
             }),
             "blocked",
         ),
         (
-            json!({"output": {"observation": {"error": "durable_observation_unavailable"}}}),
+            json!({"observation": {"error": "durable_observation_unavailable"}}),
             "pending — durable_observation_unavailable",
         ),
         (
@@ -200,7 +193,8 @@ fn send_wait_results_match_the_wait_summary_line() {
         let mut result = json!({
             "session_id": "ab12cd", "prompt_id": "long-prompt-id",
             "status": "pending", "terminal": false,
-            "output": {"events": [], "observation": {"error": null}},
+            "activity": {"latest": {"index": 3, "calls": ["fs_read"]}},
+            "observation": {"error": null},
         });
         result
             .as_object_mut()
@@ -225,8 +219,8 @@ fn send_result_handles_errors_and_missing_envelopes() {
         "raw fallback"
     );
     for result in [json!({}), Value::Null] {
-        // No events key, nothing terminal, expired or stopped: the dispatch
-        // arm still fires, so an empty envelope degrades to a bare line.
+        // No activity, nothing terminal, expired or stopped: the dispatch arm
+        // still fires, so an empty envelope degrades to a bare line.
         assert_eq!(render_send_result(&result), "dispatched");
     }
 }

@@ -1138,10 +1138,11 @@ const ASYNC_DELEGATION_HEADING: &str = "Async Sub-Agent Delegation (session_send
 /// inherited hard policy, durable handle, re-wait safety, explicit
 /// next_index→read.index_min paging, and cancellation only when the tool is
 /// available.
-const ASYNC_DELEGATION_PHRASES: [&str; 8] = [
+const ASYNC_DELEGATION_PHRASES: [&str; 9] = [
     "Send with `wait: {}` to wait up to 240 seconds",
     "hard execution deadline stays inherited from the target agent's policy",
     "durable handle: `session_id` + `prompt_id`",
+    "the child's final reply is in `response`",
     "Repeated waits recover the same result and never consume it",
     "returned `next_index` as `read.index_min`",
     "If a `{agent}_session_cancel` tool is available to you",

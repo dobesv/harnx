@@ -27,9 +27,14 @@ its deadline.
   and wakes waits that stop on new messages. The message runs under that turn's existing
   deadline; `timeout_secs` doesn't extend it.
 - The result is a durable handle: `session_id` + `prompt_id`. Keep it.
+- When the prompt settles, the child's final reply is in `response`, as `session_prompt`
+  returns it; a `failed` turn also has the worker's error in `failure`.
 - If the wait expires (`wait_expired: true`, `status: "pending"`), re-wait on the same handle
   with `{agent}_session_wait`, passing `seconds` (1 to 240, default 240) at
-  the top level. Repeated waits recover the same result and never consume it.
+  the top level. Repeated waits recover the same result and never consume it. The expired
+  result's `activity` shows whether the child is progressing: its tool call count, token
+  usage and latest step (narration plus the tools it called). It never contains the
+  transcript; pass `include_partial: false` if you don't need it.
 - A wait that returns `stopped_by: "new_message"` ended because a new message arrived for you.
   Read it before waiting again.
 - A wait that returns `stopped_by: "caller_deadline"` ended because your own run deadline is
@@ -38,9 +43,11 @@ its deadline.
   `status` and `terminal` immediately.
 - Dispatch-only: omit `wait` to return immediately after the prompt is durably queued, then
   observe later with wait or load.
-- Inspect bounded child history with `{agent}_session_load`; page forward by passing the
-  returned `next_index` as `read.index_min` on the next call, and recover oversized events
-  with `read.entry_index` + `read.byte_offset`.
+- Read the child's transcript only when you need detail beyond the reply, with
+  `{agent}_session_load` (add `prompt_id` to keep to one prompt's turn); page forward by
+  passing the returned `next_index` as `read.index_min` on the next call, and recover
+  oversized events with `read.entry_index` + `read.byte_offset`. A reply marked
+  `response_truncated: true` was cut to fit; load its turn for the rest.
 - If a `{agent}_session_cancel` tool is available to you, stop the child with it on its
   `session_id`. Soft wait expiry alone never stops the child.
 - A child waiting for user input returns `status: "blocked", terminal: false`, including

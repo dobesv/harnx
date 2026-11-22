@@ -67,8 +67,9 @@ async fn first_terminal_survives_steering_compaction_later_approval_deadline_and
     )
     .await?;
     assert_eq!(later["status"], "completed");
-    assert_eq!(later["output"]["events"], first["output"]["events"]);
-    assert!(!later["output"].to_string().contains("later failure"));
+    assert_eq!(first["response"], "original answer");
+    assert_eq!(later["response"], first["response"]);
+    assert!(!later.to_string().contains("later failure"), "{later}");
     assert_eq!(f.activation_count().await?, 1);
     Ok(())
 }
@@ -134,7 +135,10 @@ async fn durable_error_cancel_and_matching_timeout_are_distinct_and_first_wins()
             .await?;
         assert_eq!(result["status"], expected);
         assert_eq!(result["terminal"], true);
-        assert!(!result["output"]["events"].as_array().unwrap().is_empty());
+        // Only a failed turn's error is a failure; a stop or timeout says so
+        // in its status.
+        let failure = (expected == "failed").then_some("worker failed");
+        assert_eq!(result["failure"].as_str(), failure, "{result}");
     }
     Ok(())
 }
@@ -148,18 +152,26 @@ async fn approval_is_blocked_nonterminal_and_partial_off_never_hides_terminal_ou
     let blocked = f.poll(json!({"include_partial": false})).await?;
     assert_eq!(blocked["status"], "blocked");
     assert_eq!(blocked["terminal"], false);
-    assert!(blocked["output"].get("events").is_none());
+    assert!(blocked.get("activity").is_none(), "{blocked}");
+    let sampled = f.poll(json!({"seconds": 1})).await?;
+    assert_eq!(sampled["status"], "blocked");
+    assert_eq!(sampled["activity"]["latest"]["calls"], json!(["danger"]));
     assert_eq!(f.activation_count().await?, 1);
+    f.append(message(
+        "answer",
+        MessageRole::Assistant,
+        "approved and done",
+    ))
+    .await?;
     f.append(end(1)).await?;
     let completed = f.poll(json!({"include_partial": false})).await?;
     assert_eq!(completed["status"], "completed");
-    assert!(completed["output"].get("events").is_some());
+    assert_eq!(completed["response"], "approved and done");
     Ok(())
 }
 
 #[tokio::test]
-async fn prompt_identity_is_not_execution_identity_and_filters_never_classify_lifecycle(
-) -> Result<()> {
+async fn prompt_identity_is_not_execution_identity() -> Result<()> {
     let f = Fixture::new().await?;
     let parent = serde_json::from_value(f.request.run_context.as_ref().unwrap().snapshot.clone())?;
     let authority = AdmissionAuthority::Inherited {
@@ -190,15 +202,11 @@ async fn prompt_identity_is_not_execution_identity_and_filters_never_classify_li
     f.append(message("answer", MessageRole::Assistant, "old reply"))
         .await?;
     f.append(end(seq)).await?;
-    let result = f
-        .poll(
-            json!({"seconds": 1, "read": {"types": ["message"], "text_regex": "nothing matches"}}),
-        )
-        .await?;
+    let result = f.poll(json!({"seconds": 1})).await?;
     assert_eq!(result["status"], "completed");
     assert_eq!(result["invocation_id"], "different-execution");
     assert_eq!(result["prompt_id"], "original-prompt");
-    assert_eq!(result["output"]["events"], json!([]));
+    assert_eq!(result["response"], "old reply");
     Ok(())
 }
 
@@ -257,9 +265,6 @@ async fn compaction_with_parked_approval_stays_unknown() -> Result<()> {
     .await?;
     let result = f.poll(json!({"seconds": 1})).await?;
     assert_eq!(result["status"], "unknown");
-    assert_eq!(
-        result["output"]["observation"]["error"],
-        "live_state_unprovable"
-    );
+    assert_eq!(result["observation"]["error"], "live_state_unprovable");
     Ok(())
 }

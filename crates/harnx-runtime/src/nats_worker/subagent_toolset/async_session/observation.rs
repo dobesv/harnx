@@ -27,8 +27,9 @@ pub(in crate::nats_worker::subagent_toolset) use load::{
 
 use super::super::{normalize_session_id, SubagentToolset};
 use super::{
-    dispatch, parse_send_args, parse_wait_args, progress, DispatchConfirmation, PromptHandle,
-    ResolvedWait, SessionPromptResult, SessionPromptStatus, WaitStop,
+    dispatch, parse_send_args, parse_wait_args, progress, serialized_len, Activity,
+    DispatchConfirmation, LatestStep, Observation, PromptHandle, ResolvedWait, SessionPromptResult,
+    SessionPromptStatus, WaitStop, RESULT_MAX_BYTES,
 };
 use crate::nats_worker::subagent_progress::SharedSnapshots;
 use budget::{Budget, BudgetStops};
@@ -56,7 +57,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn send(
     cancel: CancellationToken,
     context: ToolInvocationContext,
 ) -> Result<Value, ToolInvokeError> {
-    let (args, wait) = parse_send_args(arguments.clone()).map_err(ToolInvokeError::Recoverable)?;
+    let (args, _) = parse_send_args(arguments.clone()).map_err(ToolInvokeError::Recoverable)?;
     let prospective = PromptHandle {
         session_id: context
             .checkpoint
@@ -67,11 +68,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn send(
             .unwrap_or_else(|| "000000".into()),
         prompt_id: context.call_id.clone(),
     };
-    let max_bytes = wait.as_ref().map_or(
-        super::super::session_read::DEFAULT_MAX_OUTPUT_BYTES as usize,
-        |w| w.read.max_output_bytes,
-    );
-    Frame::new(&prospective, max_bytes).preflight(Some(&context.call_id))?;
+    Frame::new(&prospective, RESULT_MAX_BYTES).preflight(Some(&context.call_id))?;
     let (dispatched, wait) =
         dispatch::dispatch_send(toolset, arguments, cancel.clone(), context.clone()).await?;
     // The prompt is durably admitted and activated: announce it as Running
@@ -104,7 +101,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn send(
         )
         .await
     } else {
-        let mut frame = Frame::new(&dispatched.handle, max_bytes);
+        let mut frame = Frame::new(&dispatched.handle, RESULT_MAX_BYTES);
         frame.set_invocation(dispatched.prompt.execution_id());
         frame.result.dispatch = dispatched.dispatch;
         frame.result.status = if dispatched.dispatch.is_some() {
@@ -217,7 +214,7 @@ fn wait_watcher(
 }
 
 /// The wait's observation budget: single-pass when the caller's deadline is
-/// already reached (the caller still deserves one bounded page, as
+/// already reached (the caller still deserves one observation, as
 /// `session_load` takes), otherwise the full soft budget for the wait.
 fn observation_budget(
     wait: &ResolvedWait,
@@ -244,16 +241,19 @@ fn live_snapshot(
 /// Publishing remains the caller's job.
 fn finish_with_terminal_progress(
     observer: &Observer<'_>,
-    frame: Frame,
+    mut frame: Frame,
     watcher_share: Option<&SharedSnapshots>,
 ) -> Value {
     let toolset = observer.toolset;
-    let max_bytes = observer.wait.read.max_output_bytes;
+    let max_bytes = RESULT_MAX_BYTES;
     let terminal = observer.snapshot.terminal_evidence();
     let observed = (
         frame.result.session_id.clone(),
         frame.result.prompt_id.clone(),
     );
+    if observer.wait.include_partial {
+        frame.set_live(live_snapshot(watcher_share));
+    }
     let mut value = frame.finish(&observer.budget);
     if let Some((status, usage)) = terminal {
         // Merge the live watcher's last published snapshot: title, tool count
@@ -307,7 +307,7 @@ async fn observe(
     #[cfg(test)]
     let _ = OBSERVATION_ENTERED.try_with(|entered| entered.notify_one());
     let (budget, single_pass) = observation_budget(&wait, cancel, context);
-    let mut frame = Frame::new(&handle, wait.read.max_output_bytes);
+    let mut frame = Frame::new(&handle, RESULT_MAX_BYTES);
     frame.preflight(None)?;
     frame.result.dispatch = dispatch;
     let scope = match Scope::resolve(toolset, &handle, context, &budget).await {
@@ -420,8 +420,9 @@ impl Observer<'_> {
             let refresh = self.snapshot.refresh(&log, &self.scope, &self.budget).await;
             frame.update(&self.snapshot);
             refresh?;
-            // Cache a bounded partial page before sleeping. On expiry/cancellation
-            // there is no extra I/O allowance outside the absolute soft deadline.
+            // Record the latest step (or the settled reply) before sleeping. On
+            // expiry/cancellation there is no extra I/O allowance outside the
+            // absolute soft deadline.
             frame.render(self).await?;
             if self.single_pass {
                 return Err(Stop::CallerDeadline);

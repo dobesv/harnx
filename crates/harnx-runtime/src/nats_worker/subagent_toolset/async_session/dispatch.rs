@@ -55,10 +55,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
 ) -> Result<(DispatchedPrompt, Option<ResolvedWait>), ToolInvokeError> {
     let (args, wait) = parse_send_args(arguments).map_err(ToolInvokeError::Recoverable)?;
     let inherited = validate_send_context(&args, &context)?;
-    let budget = wait.as_ref().map_or(
-        super::super::session_read::DEFAULT_MAX_OUTPUT_BYTES as usize,
-        |wait| wait.read.max_output_bytes,
-    );
+    let budget = super::RESULT_MAX_BYTES;
     let requested_id = normalize_session_id(args.session_id.clone());
     // New IDs are six ASCII bytes. Include the diagnostic invocation identity
     // in preflight; Task1's handle-only reservation intentionally omits it.
@@ -234,23 +231,21 @@ fn ensure_receipt_fits(
     budget: usize,
 ) -> Result<(), ToolInvokeError> {
     let receipt = SessionPromptResult {
-        session_id: session_id.into(),
-        prompt_id: prompt_id.into(),
         invocation_id: Some(prompt_id.into()),
         dispatch: Some(DispatchConfirmation::Unconfirmed),
         status: SessionPromptStatus::Cancelled,
-        terminal: false,
-        wait_expired: false,
-        stopped_by: None,
         elapsed_ms: u64::MAX,
-        output: Value::Null,
+        ..SessionPromptResult::empty(&super::PromptHandle {
+            session_id: session_id.into(),
+            prompt_id: prompt_id.into(),
+        })
     };
     let size = serde_json::to_vec(&receipt)
         .map_err(|error| ToolInvokeError::Fatal(error.to_string()))?
         .len();
     if size > budget {
         return Err(ToolInvokeError::Recoverable(format!(
-            "dispatch result metadata ({size} bytes) exceeds max_output_bytes budget {budget}"
+            "dispatch result metadata ({size} bytes) exceeds the {budget} byte result budget"
         )));
     }
     Ok(())

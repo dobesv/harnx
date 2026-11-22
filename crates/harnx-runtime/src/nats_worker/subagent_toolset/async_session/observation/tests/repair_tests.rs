@@ -132,16 +132,11 @@ async fn approval_committed_after_snapshot_suppresses_repair_on_refresh() -> Res
 }
 
 #[tokio::test]
-async fn activation_repair_failure_keeps_partial_output_and_recoverable_handle() -> Result<()> {
+async fn activation_repair_failure_keeps_activity_and_recoverable_handle() -> Result<()> {
     use async_nats::jetstream::stream::DiscardPolicy;
     let f = Fixture::new().await?;
     f.dispatch().await?;
-    f.append(message(
-        "partial",
-        MessageRole::Assistant,
-        "durable partial output",
-    ))
-    .await?;
+    f.append(tool_calls("partial-call", "ping")).await?;
     let mut stream = f.js.get_stream("WORK_NOTIFY_observe").await?;
     let mut config = stream.info().await?.config.clone();
     config.max_messages = 1;
@@ -151,16 +146,13 @@ async fn activation_repair_failure_keeps_partial_output_and_recoverable_handle()
     assert_eq!(result["prompt_id"], "original-prompt");
     assert_eq!(result["status"], "pending");
     assert_eq!(result["dispatch"], "unconfirmed");
-    assert!(result["output"]
-        .to_string()
-        .contains("durable partial output"));
+    assert_eq!(result["activity"]["latest"]["calls"], json!(["ping"]));
     assert_eq!(f.log.load_events_latest_async().await?.len(), 2);
     Ok(())
 }
 
 #[tokio::test]
-async fn lifecycle_scan_walks_bounded_pages_and_does_not_use_presentation_filters_or_latest_tail(
-) -> Result<()> {
+async fn lifecycle_scan_walks_bounded_pages_and_reply_ignores_later_turns() -> Result<()> {
     let f = Fixture::new().await?;
     let original = f.dispatch().await?;
     for _ in 0..1002 {
@@ -178,32 +170,17 @@ async fn lifecycle_scan_walks_bounded_pages_and_does_not_use_presentation_filter
     f.append(end(original.prompt.user_msg_seq())).await?;
     f.append(message("later", MessageRole::User, "must not leak"))
         .await?;
-    // This test checks lifecycle paging, not read speed. The first poll makes
-    // ~2,000 sequential broker reads (lifecycle scan plus presentation window)
-    // and the second ~1,000, which can take over a second on slower CI runners
-    // (Windows). A timed-out poll keeps its terminal status but drops the page,
-    // so give it plenty of room; it returns as soon as the page is ready.
-    let result = f.poll(json!({"seconds": 30, "read": {"index_min": 1, "index_max": 1004, "types": ["message"]}})).await?;
+    // This test checks lifecycle paging, not read speed. The poll makes
+    // ~1,000 sequential broker reads, which can take over a second on slower
+    // CI runners (Windows). A timed-out poll keeps its terminal status but
+    // drops the reply, so give it plenty of room; it returns as soon as the
+    // reply is ready.
+    let result = f.poll(json!({"seconds": 30})).await?;
     assert_eq!(result["status"], "completed");
-    // Lifecycle crossed the physical page cap; presentation still pages rather
-    // than loading the entire history to satisfy a sparse filter.
-    let next = result["output"]["next_index"]
-        .as_u64()
-        .context("bounded presentation must expose progress")?;
-    let page = f
-        .poll(json!({"seconds": 30, "read": {"index_min": next, "types": ["message"]}}))
-        .await?;
-    assert_eq!(page["status"], "completed");
-    assert!(page["output"]
-        .to_string()
-        .contains("answer after historical page"));
-    assert!(!page["output"].to_string().contains("must not leak"));
-    assert!(!result["output"].to_string().contains("must not leak"));
-    assert!(result["output"]["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|e| e["index"].as_u64().unwrap() >= original.prompt.user_msg_seq()));
+    // Lifecycle crossed the physical page cap; the reply read only the rows
+    // just before the terminal, and nothing after it.
+    assert_eq!(result["response"], "answer after historical page");
+    assert!(!result.to_string().contains("must not leak"), "{result}");
     Ok(())
 }
 
