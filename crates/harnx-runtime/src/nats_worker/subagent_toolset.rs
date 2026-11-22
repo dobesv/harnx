@@ -1202,9 +1202,9 @@ fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
     .with_kind(kind)
 }
 
-/// Task 4b: session_load is a bounded, read-only inspection page. The shared
-/// `read` object matches session_wait/send waits; `prompt_id` restricts the
-/// page to one dispatched prompt's durable turn.
+/// Task 4b: session_load is a bounded, read-only inspection page, and the one
+/// tool that reads a child's transcript (waits return only the final reply);
+/// `prompt_id` restricts the page to one dispatched prompt's durable turn.
 fn session_load_spec(agent: &str) -> ToolSpec {
     ToolSpec {
         cancellation_guarantee: Default::default(),

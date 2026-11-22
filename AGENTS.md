@@ -1556,7 +1556,7 @@ reused; its abort flag is now set, and a replacement turn must create a fresh ha
 
 `session_send` and `session_wait` (issue #1550) add durable dispatch and
 prompt-specific observation on top of the unchanged synchronous
-`session_prompt`; `session_load` gained the same bounded `read` contract.
+`session_prompt`; `session_load` gained a bounded `read` contract.
 Implementation: `nats_worker/subagent_toolset/async_session/`,
 `nats_session/dispatch.rs`, `nats_session_log/window.rs`,
 `nats_worker/subagent_toolset/session_read.rs`.
@@ -1597,8 +1597,20 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    cannot claim the read-only hint. `session_load` is a pure read — it never
    resumes, activates or repairs.
 
-5. **Bounded read contract** — the entire serialized result, metadata
-   included, fits `max_output_bytes` (default 131072, range 1024..307200).
+5. **Waits return the final reply, never a transcript** — a settled wait
+   carries the child's last assistant reply as `response` (found in the 32
+   rows before the terminal, `observation/output.rs`), the way
+   `session_prompt` returns it; a running one carries a ~2 KiB `activity`
+   sample built from the tool round the snapshot already holds, so a poll
+   costs no extra read (`async_session/activity.rs`). Waits take no `read`
+   option. The first version paged the turn forward from its prompt, so
+   every repeated wait on a long child returned the same oldest 128 KiB and
+   a finished child's reply was cut off; `session_load` is the only
+   transcript reader.
+
+6. **Bounded read contract (`session_load`)** — the entire serialized result,
+   metadata included, fits `max_output_bytes` (default 131072, range
+   1024..307200).
    Per-event previews default to 250 head lines and 750 tail lines;
    physical scans cap at 1000 records / 8 MiB per page
    (`nats_session_log/window.rs`); holes are explicit `omitted_ranges`
@@ -1609,7 +1621,7 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    not synthetic conversion tests — strict-mode clients send `null` for
    omitted nested objects (see "Tool parameter schemas").
 
-6. **Async admissions are detached from parent interruption** (issue #2779) —
+7. **Async admissions are detached from parent interruption** (issue #2779) —
    `session_send` sets `InvocationAdmission.detached` before durable append for
    new invocations. Joined messages keep the existing invocation's admission.
    Parent `Cancel`/`Error`, including restart recovery's prompt-scoped stop,
@@ -1624,7 +1636,7 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    detached work. The default-false field preserves old admission JSON without
    adding an `InvocationEdgeKind` variant that older readers would reject.
 
-7. **Dispatched prompts report progress from a parent-side watcher, not from
+8. **Dispatched prompts report progress from a parent-side watcher, not from
    the child's turn** (issue #2664) — successful dispatch and an authorized
    `session_wait` start (`async_session/progress.rs`) a
    `SubagentProgressReporter` watcher, deduplicated per prompt in-process.

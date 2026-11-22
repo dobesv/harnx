@@ -150,9 +150,8 @@ fn production_subagent_async_specs_export_with_nullable_nested_options() {
         assert_eq!(properties["seconds"]["maximum"], json!(240));
         assert_eq!(properties["seconds"]["default"], json!(240));
         assert_eq!(properties["forever"]["type"], json!("boolean"));
-        let read = &properties["read"];
-        assert_eq!(read["anyOf"][1], json!({"type":"null"}));
-        assert_eq!(read["anyOf"][0]["additionalProperties"], json!(false));
+        assert_eq!(properties["include_partial"]["type"], json!("boolean"));
+        assert!(properties.get("read").is_none(), "waits take no read");
     }
     assert_eq!(tools[0].input_schema["required"], json!(["message"]));
     assert_eq!(

@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use harnx_core::{
-    pending_interaction::{
-        PendingInteractionRequest, PendingInteractionSummary, PENDING_INTERACTION_MESSAGE_MAX_BYTES,
-    },
+    pending_interaction::{PendingInteractionRequest, PendingInteractionSummary},
     require_nextest,
     session::SessionLogEntry,
 };
@@ -198,38 +196,5 @@ async fn subagent_blocked_async_send_wait_load_legacy_hitl() -> Result<()> {
     assert_eq!(send_summary, top_summary);
     assert_blocked_summary(&send_out, &top_summary);
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subagent_blocked_max_output_bytes_overflow() -> Result<()> {
-    require_nextest();
-    let (_harness, _req_seq, _interaction_id, prompt_id, provider) =
-        suspended_child_case("call_overflow", "call-ovf").await?;
-
-    let small_budget_out = call_subagent_tool(
-        &provider,
-        "session_wait",
-        json!({
-            "session_id": SESSION_ID,
-            "prompt_id": prompt_id,
-            "seconds": 1,
-            "read": { "max_output_bytes": 1024 }
-        }),
-    )
-    .await?;
-    assert!(serde_json::to_vec(&small_budget_out)?.len() <= 1024);
-    assert_eq!(small_budget_out["status"], "blocked");
-    assert!(
-        small_budget_out.get("pending_interaction").is_some(),
-        "top-level pending_interaction summary must survive max_output_bytes: 1024 overflow"
-    );
-    let summary: PendingInteractionSummary =
-        serde_json::from_value(small_budget_out["pending_interaction"].clone())?;
-    assert_eq!(summary.agent, AGENT_NAME);
-    assert_eq!(summary.cluster, "local");
-    assert_eq!(summary.session_id, SESSION_ID);
-    assert_eq!(summary.tool_name, "probe_run");
-    assert!(summary.message.len() <= PENDING_INTERACTION_MESSAGE_MAX_BYTES);
     Ok(())
 }

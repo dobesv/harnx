@@ -29,16 +29,12 @@ fn stopped_by_new_message_serializes_and_fits_reserved_metadata() {
         json!("new_message")
     );
     let stopped = SessionPromptResult {
-        session_id: "child".into(),
-        prompt_id: "prompt".into(),
-        invocation_id: None,
-        dispatch: None,
-        status: SessionPromptStatus::Unknown,
-        terminal: false,
-        wait_expired: false,
         stopped_by: Some(WaitStop::NewMessage),
         elapsed_ms: u64::MAX,
-        output: Value::Null,
+        ..SessionPromptResult::empty(&PromptHandle {
+            session_id: "child".into(),
+            prompt_id: "prompt".into(),
+        })
     };
     let size = serde_json::to_string(&stopped).unwrap().len();
     assert!(

@@ -1,4 +1,5 @@
-//! Live state follows the shared turn; output still starts at the joined prompt.
+//! Live state follows the shared turn; a transcript page still starts at the
+//! joined prompt, and a wait never returns one.
 use super::*;
 use std::time::Duration;
 
@@ -22,6 +23,17 @@ fn assert_joined_output(value: &Value, start: u64) {
     assert!(output.contains("joined steering content"), "{output}");
     assert!(!output.contains("original\""), "{output}");
     assert!(!output.contains("tool_calls"), "{output}");
+}
+
+/// A wait on the joined prompt returns no transcript, not even the joined
+/// message itself.
+fn assert_no_transcript(value: &Value) {
+    assert!(value.get("output").is_none(), "{value}");
+    assert!(value.get("response").is_none(), "{value}");
+    assert!(
+        !value.to_string().contains("joined steering content"),
+        "{value}"
+    );
 }
 
 async fn assert_joined_blocked(f: &Fixture, start: u64) -> Result<()> {
@@ -48,7 +60,10 @@ async fn assert_joined_blocked(f: &Fixture, start: u64) -> Result<()> {
         assert_eq!(result["status"], "blocked");
         assert_eq!(result["terminal"], false);
         assert_eq!(result["wait_expired"], false);
-        assert_joined_output(&result, start);
+        assert_no_transcript(&result);
+        // The sample is the shared turn's live step, which the joined prompt
+        // is waiting behind, even though it started before the join.
+        assert_eq!(result["activity"]["latest"]["calls"], json!(["danger"]));
     }
     Ok(())
 }
@@ -113,7 +128,9 @@ async fn joined_prompt_does_not_inherit_rounds_from_finished_turns() -> Result<(
         assert_eq!(loaded["status"], "pending");
         assert_eq!(waited["status"], "pending");
         assert_joined_output(&loaded, joined.prompt.user_msg_seq());
-        assert_joined_output(&waited, joined.prompt.user_msg_seq());
+        assert_no_transcript(&waited);
+        // The finished turn's round is gone, so there is no step to sample.
+        assert!(waited["activity"].get("latest").is_none(), "{waited}");
         // No old ToolCalls may make an orphan fragment in this turn look valid.
         f.append(approval_request()).await?;
         assert_eq!(load_status(&f, "join-call").await?["status"], "unknown");
@@ -134,9 +151,6 @@ async fn joined_prompt_does_not_inherit_uncertainty_from_finished_turn() -> Resu
     assert_eq!(load_status(&f, "join-call").await?["status"], "pending");
     let waited = wait_as(&f, "join-call", 1, &parent_b_context()).await?;
     assert_eq!(waited["status"], "pending");
-    assert_eq!(
-        waited["output"]["observation"]["error"],
-        "soft_wait_expired"
-    );
+    assert_eq!(waited["observation"]["error"], "soft_wait_expired");
     Ok(())
 }

@@ -88,9 +88,7 @@ async fn joined_prompt_observes_for_sender_starter_and_unrelated_caller() -> Res
         let pending = wait_as(&f, "join-call", 1, &context).await?;
         assert_eq!(pending["status"], "pending");
         assert_eq!(pending["terminal"], false);
-        let output = serde_json::to_string(&pending["output"])?;
-        assert!(output.contains("joined steering content"), "{output}");
-        assert!(!output.contains("original\""), "{output}");
+        assert!(pending.get("response").is_none(), "{pending}");
     }
     assert_eq!(load_status(&f, "join-call").await?["status"], "pending");
     // The turn ends covering the joined message.
@@ -99,25 +97,14 @@ async fn joined_prompt_observes_for_sender_starter_and_unrelated_caller() -> Res
     f.append(end(joined.prompt.user_msg_seq())).await?;
     let completed = wait_as(&f, "join-call", 1, &parent_b_context()).await?;
     assert_eq!(completed["status"], "completed");
-    let output = serde_json::to_string(&completed["output"])?;
-    assert!(
-        output.contains("joined answer"),
-        "output starts at the joined message: {output}"
-    );
-    assert!(
-        !output.contains("original\""),
-        "the invocation's own prompt stays outside the joined scope: {output}"
-    );
-    // Ownership doesn't restrict observation. Every caller sees the joined
-    // message and answer, not the invocation starter's original prompt.
+    assert_eq!(completed["response"], "joined answer");
+    // Ownership doesn't restrict observation. Every caller gets the joined
+    // turn's answer.
     for context in [f.wait_context(), unrelated_context()] {
         let observed = wait_as(&f, "join-call", 1, &context).await?;
         assert_eq!(observed["status"], "completed");
         assert_eq!(observed["terminal"], true);
-        let output = serde_json::to_string(&observed["output"])?;
-        assert!(output.contains("joined steering content"), "{output}");
-        assert!(output.contains("joined answer"), "{output}");
-        assert!(!output.contains("original\""), "{output}");
+        assert_eq!(observed["response"], "joined answer");
     }
     let loaded = load_status(&f, "join-call").await?;
     assert_eq!(loaded["status"], "completed");
@@ -180,17 +167,11 @@ async fn joined_prompt_on_external_admission_observes_for_the_joining_parent() -
     f.append(end(joined.prompt.user_msg_seq())).await?;
     let completed = wait_as(&f, "join-call", 1, &parent_b_context()).await?;
     assert_eq!(completed["status"], "completed");
-    let output = serde_json::to_string(&completed["output"])?;
-    assert!(
-        output.contains("external turn answer"),
-        "joined scope output: {output}"
-    );
+    assert_eq!(completed["response"], "external turn answer");
     let external = wait_as(&f, "external-prompt", 1, &unrelated_context()).await?;
     assert_eq!(external["status"], "completed");
     assert_eq!(external["terminal"], true);
-    let output = serde_json::to_string(&external["output"])?;
-    assert!(output.contains("external original"), "{output}");
-    assert!(output.contains("external turn answer"), "{output}");
+    assert_eq!(external["response"], "external turn answer");
     Ok(())
 }
 
@@ -254,11 +235,8 @@ async fn unrelated_observer_rejects_invocation_content_substituted_for_joined_co
     let observed = wait_as(&f, "join-call", 1, &unrelated_context()).await?;
     assert_eq!(observed["status"], "unknown");
     assert_eq!(observed["terminal"], false);
-    assert_eq!(
-        observed["output"]["observation"]["error"],
-        "prompt_content_mismatch"
-    );
-    assert!(observed["output"].get("events").is_none());
+    assert_eq!(observed["observation"]["error"], "prompt_content_mismatch");
+    assert!(observed.get("response").is_none(), "{observed}");
     assert!(load_status(&f, "join-call").await.is_err());
     assert_eq!(f.activation_count().await?, activations);
     Ok(())

@@ -789,7 +789,7 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
   - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
   - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. `attachments` is a list of `cid:` attachment URLs passed to the sub-agent; repeated URLs are ignored. The parent session ID is propagated internally.
   - `{agent}_session_send`: Asynchronously dispatches a prompt (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `wait`) and returns a durable `{session_id, prompt_id}` handle immediately instead of waiting for the child to finish. Omit `wait` (or pass `null`) for dispatch-only; pass `wait: {}` (240 seconds) or `wait: {seconds: N}` or `wait: {forever: true}` for a soft observation window.
-  - `{agent}_session_wait`: Soft-waits on a previously dispatched prompt (`session_id`, `prompt_id`, and top-level `seconds` (1 to 240, default 240) or `forever: true`, plus optional `include_partial` and `read`). Repeated waits recover the same result and never consume it. The wait never cancels the child or extends its execution deadline.
+  - `{agent}_session_wait`: Soft-waits on a previously dispatched prompt (`session_id`, `prompt_id`, and top-level `seconds` (1 to 240, default 240) or `forever: true`, plus optional `include_partial`). A settled prompt returns the child's final reply as `response`; a running one returns a short `activity` sample. Repeated waits recover the same result and never consume it. The wait never cancels the child or extends its execution deadline.
   - `{agent}_session_load`: Reads a bounded, filterable page of prior event history for an existing sub-agent session log. Omitted or truncated material can be recovered with continuation metadata; loading never resumes, activates, or repairs a session.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
 - **Route-aware execution**: On persistent clusters, sub-agent turns use the
@@ -900,8 +900,16 @@ send with an explicit soft wait and leave the hard execution policy inherited:
   shortened run limit. Inherited deadlines can shorten the effective allowance, but the caller
   never widens it.
 - The send result is a durable handle: `session_id` + `prompt_id`, plus `dispatch`
-  (`confirmed`/`unconfirmed`), `status`, `terminal`, and bounded partial output while waiting.
-  Keep the handle; every later wait and load keys off it.
+  (`confirmed`/`unconfirmed`), `status` and `terminal`. Keep the handle; every later wait and
+  load keys off it.
+- A wait that sees the prompt settle returns the child's final reply as `response`, with
+  thinking stripped, the same text `session_prompt` returns. A `failed` turn also carries the
+  worker's error as `failure`. A reply too long for the 128 KiB result is cut short and marked
+  `response_truncated: true`; read the rest with `{agent}_session_load`.
+- A wait that ends while the child is still `pending` or `blocked` returns `activity`: the
+  child's tool call count, token usage and title, plus `latest`, its most recent tool step
+  (the first 300 bytes of its narration and up to four calls with trimmed arguments). It never
+  includes the child's transcript or thinking. Pass `include_partial: false` to leave it out.
 
 **Workflows with the handle:**
 

@@ -296,10 +296,7 @@ pub(super) fn assert_pending(value: &Value, wait_expired: bool) {
 pub(super) fn assert_unprovable(value: &Value, wait_expired: bool) {
     assert_eq!(value["status"], "unknown");
     assert_eq!(value["wait_expired"], wait_expired);
-    assert_eq!(
-        value["output"]["observation"]["error"],
-        "live_state_unprovable"
-    );
+    assert_eq!(value["observation"]["error"], "live_state_unprovable");
 }
 
 pub(super) async fn assert_initial_dispatch_unchanged(f: &Fixture) -> Result<()> {

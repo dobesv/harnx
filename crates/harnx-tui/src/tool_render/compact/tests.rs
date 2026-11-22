@@ -111,7 +111,8 @@ fn compact_call_defers_when_header_metadata_or_body_needs_more_space() {
 
 #[test]
 fn compact_wait_result_keeps_full_output_in_detail_view() {
-    let output = serde_json::json!({"status": "completed", "output": {"text": "child output\n".repeat(100)}});
+    let output =
+        serde_json::json!({"status": "completed", "response": "child output\n".repeat(100)});
     let items =
         crate::tool_transcript::tool_completed_to_transcript_items(&output, Some("completed"));
     let [crate::types::TranscriptItem::ToolResultMarkdown {
@@ -137,8 +138,8 @@ fn compact_send_dispatch_result_keeps_full_output_in_detail_view() {
         "terminal": false,
         "wait_expired": false,
         "elapsed_ms": 4,
-        "output": {"observation": {"observed_at_ms": 1, "running_ms": 1,
-            "complete": false, "error": null}},
+        "observation": {"observed_at_ms": 1, "running_ms": null,
+            "complete": false, "error": null},
     });
     let items = crate::tool_transcript::tool_completed_to_transcript_items(
         &output,

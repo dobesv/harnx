@@ -285,6 +285,19 @@ impl Snapshot {
         self.terminal.map_or(self.through, |(seq, _)| seq)
     }
 
+    /// The child's latest tool step, from the round this scan already keeps:
+    /// a round starts at its `ToolCalls`, so the first kept row is the step.
+    /// `None` before the first step, after compaction or once the round was
+    /// dropped for size.
+    pub(super) fn latest_step(&self) -> Option<super::super::LatestStep> {
+        match self.round.first()? {
+            (seq, SessionLogEntry::ToolCalls { text, calls, .. }) => {
+                Some(super::super::LatestStep::new(*seq, text, calls))
+            }
+            _ => None,
+        }
+    }
+
     /// The prompt's durable terminal classification with the `TurnEnd` usage
     /// total, when the scan proved one. `Failed`/`Cancelled`/`TimedOut`
     /// terminals have no `TurnEnd`, so the usage is `None` there — callers

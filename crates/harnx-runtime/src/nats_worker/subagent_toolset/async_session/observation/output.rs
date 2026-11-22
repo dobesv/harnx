@@ -1,17 +1,28 @@
-//! Reserve the whole result, including live metadata, before fitting a page.
+//! Assemble a wait result: the final reply once the prompt settles, the
+//! activity sample while it runs. Identity and lifecycle fields are reserved
+//! first; only the reply and the sample give way to the byte budget.
 use super::{
     budget::{Budget, Stop},
     scope::Scope,
+    serialized_len,
     snapshot::{Snapshot, LIVE_UNPROVABLE},
-    DispatchConfirmation, Observer, PromptHandle, SessionPromptResult, SessionPromptStatus,
-    WaitStop,
+    Activity, DispatchConfirmation, LatestStep, Observation, Observer, PromptHandle,
+    SessionPromptResult, SessionPromptStatus, WaitStop,
 };
+use crate::nats_session::NatsSession;
 use crate::nats_session_log::NatsSessionLog;
-use crate::nats_worker::subagent_toolset::session_read::{
-    read_session_log_window, ReadMode, ResolvedRead,
-};
+use harnx_core::event::SubAgentProgress;
+use harnx_core::text::strip_think_tag;
 use harnx_toolset::ToolInvokeError;
-use serde_json::{json, Value};
+use serde_json::Value;
+
+/// Rows before the terminal a settled observation reads to find the final
+/// reply. The reply is normally the row right before the `TurnEnd`, so a
+/// short window keeps the read cheap however long the turn ran.
+const REPLY_SCAN_ROWS: u64 = 32;
+/// Extra bytes cut from an oversized reply so the `response_truncated` flag
+/// it adds still fits; the fitting loop takes care of the rest.
+const TRUNCATION_SLACK: usize = 32;
 
 pub(super) struct Frame {
     pub(super) result: SessionPromptResult,
@@ -20,24 +31,15 @@ pub(super) struct Frame {
     running_base: Option<u64>,
     error: Option<&'static str>,
     complete: bool,
-    rendered_through: Option<u64>,
+    reply_loaded: bool,
+    latest: Option<LatestStep>,
+    live: Option<SubAgentProgress>,
 }
 
 impl Frame {
     pub(super) fn new(handle: &PromptHandle, max_bytes: usize) -> Self {
         Self {
-            result: SessionPromptResult {
-                session_id: handle.session_id.clone(),
-                prompt_id: handle.prompt_id.clone(),
-                invocation_id: None,
-                dispatch: None,
-                status: SessionPromptStatus::Unknown,
-                terminal: false,
-                wait_expired: false,
-                stopped_by: None,
-                elapsed_ms: 0,
-                output: json!({}),
-            },
+            result: SessionPromptResult::empty(handle),
             max_bytes,
             observed_base: chrono::Utc::now()
                 .timestamp_millis()
@@ -46,7 +48,9 @@ impl Frame {
             running_base: None,
             error: None,
             complete: false,
-            rendered_through: None,
+            reply_loaded: false,
+            latest: None,
+            live: None,
         }
     }
 
@@ -55,7 +59,10 @@ impl Frame {
         let reserved = self.reserve();
         // Reject before send mutates, never after losing an accepted handle.
         if reserved + 256 > self.max_bytes {
-            return Err(ToolInvokeError::Recoverable(format!("observation metadata ({reserved} bytes) leaves insufficient max_output_bytes budget {} for a bounded page", self.max_bytes)));
+            return Err(ToolInvokeError::Recoverable(format!(
+                "observation metadata ({reserved} bytes) leaves too little of the {} byte result budget for a reply",
+                self.max_bytes
+            )));
         }
         Ok(())
     }
@@ -92,16 +99,19 @@ impl Frame {
         }
     }
 
-    fn observation(&self, elapsed: u64) -> Value {
-        json!({"observed_at_ms": self.observed_base.saturating_add(elapsed),
-            "running_ms": self.running_base.map(|base| base.saturating_add(elapsed)),
-            "complete": self.complete, "error": self.error})
+    fn observation(&self, elapsed: u64) -> Observation {
+        Observation {
+            observed_at_ms: self.observed_base.saturating_add(elapsed),
+            running_ms: self.running_base.map(|base| base.saturating_add(elapsed)),
+            complete: self.complete,
+            error: self.error,
+        }
     }
 
+    /// Bytes of the widest envelope this frame can produce without a reply
+    /// or an activity sample.
     fn reserve(&self) -> usize {
         let worst = SessionPromptResult {
-            session_id: self.result.session_id.clone(),
-            prompt_id: self.result.prompt_id.clone(),
             invocation_id: self
                 .result
                 .invocation_id
@@ -109,57 +119,68 @@ impl Frame {
                 .or_else(|| Some("0".repeat(36))),
             dispatch: Some(DispatchConfirmation::Unconfirmed),
             status: SessionPromptStatus::Cancelled,
-            terminal: false,
-            wait_expired: false,
             stopped_by: Some(WaitStop::WIDEST),
             elapsed_ms: u64::MAX,
-            output: Value::Null,
+            observation: Observation::widest(),
+            ..SessionPromptResult::empty(&PromptHandle {
+                session_id: self.result.session_id.clone(),
+                prompt_id: self.result.prompt_id.clone(),
+            })
         };
-        let extra = json!({"observation": {"observed_at_ms": u64::MAX, "running_ms": u64::MAX,
-            "complete": false, "error": "durable_observation_unavailable"}});
-        serde_json::to_vec(&worst).expect("envelope JSON").len() - 4
-            + serde_json::to_vec(&extra).expect("observation JSON").len()
-            - 1
+        serialized_len(&worst)
     }
 
+    /// Settled: read the final reply once. Running: note the latest step,
+    /// which the snapshot already holds, so a poll costs no extra read.
     pub(super) async fn render(&mut self, observer: &Observer<'_>) -> Result<(), Stop> {
         let snapshot = &observer.snapshot;
         self.update(snapshot);
-        if self.rendered_through == Some(snapshot.through) {
+        if snapshot.evidence_error().is_some() {
             return Ok(());
         }
-        if !self.should_render(observer) {
-            return Ok(());
+        if self.result.terminal {
+            return self.load_reply(observer).await;
         }
-        let read = match scoped_read(observer) {
-            Ok(read) => read,
-            Err(error) => {
-                self.error = Some(error);
-                return Ok(());
-            }
-        };
-        let log = NatsSessionLog::new(observer.toolset.jetstream.clone(), &observer.scope.storage);
-        let page = observer
-            .budget
-            .io(read_session_log_window(&log, &read, self.reserve()))
-            .await?;
-        observer.budget.check()?;
-        match page {
-            Ok(page) => {
-                self.result.output = page;
-                self.rendered_through = Some(snapshot.through);
-                self.error = snapshot.live_error();
-            }
-            Err(_) => {
-                self.error = Some("presentation_unavailable");
-            }
-        }
+        self.latest = observer
+            .wait
+            .include_partial
+            .then(|| snapshot.latest_step())
+            .flatten();
         Ok(())
     }
 
-    fn should_render(&self, observer: &Observer<'_>) -> bool {
-        let allowed = observer.wait.include_partial || self.result.terminal;
-        allowed && observer.snapshot.evidence_error().is_none()
+    async fn load_reply(&mut self, observer: &Observer<'_>) -> Result<(), Stop> {
+        let snapshot = &observer.snapshot;
+        let Some(prompt) = snapshot.prompt.filter(|_| !self.reply_loaded) else {
+            return Ok(());
+        };
+        let end = snapshot.output_end();
+        let start = prompt
+            .saturating_add(1)
+            .max(end.saturating_sub(REPLY_SCAN_ROWS - 1));
+        let log = NatsSessionLog::new(observer.toolset.jetstream.clone(), &observer.scope.storage);
+        let window = observer
+            .budget
+            .io(log.load_window_async(Some(start), Some(end)))
+            .await?;
+        observer.budget.check()?;
+        let Ok(window) = window else {
+            self.error = Some("presentation_unavailable");
+            return Ok(());
+        };
+        let (reply, failure) =
+            NatsSession::extract_turn_outcome_bounded(&window.entries, prompt, end);
+        // Strip at the delegation boundary, as session_prompt does.
+        self.result.response = reply.map(|reply| strip_think_tag(&reply).into_owned());
+        self.result.failure = failure.filter(|_| self.result.status == SessionPromptStatus::Failed);
+        self.reply_loaded = true;
+        self.error = snapshot.live_error();
+        Ok(())
+    }
+
+    /// The watcher's live counters for the activity sample.
+    pub(super) fn set_live(&mut self, live: Option<SubAgentProgress>) {
+        self.live = live;
     }
 
     /// Repair republishes an activation for a prompt that is provably pending.
@@ -202,40 +223,39 @@ impl Frame {
     pub(super) fn finish(mut self, budget: &Budget) -> Value {
         let elapsed = budget.elapsed_ms();
         self.result.elapsed_ms = elapsed;
-        let observation = self.observation(elapsed);
-        self.result
-            .output
-            .as_object_mut()
-            .expect("page object")
-            .insert("observation".into(), observation.clone());
-        let mut value = serde_json::to_value(self.result).expect("result JSON");
-        // Preflight and bind reserve this metadata even on error paths. Only
-        // presentation is expendable; identifiers and lifecycle proof stay intact.
-        if serde_json::to_vec(&value).expect("result JSON").len() > self.max_bytes {
-            value["output"] = json!({"observation": observation});
+        self.result.observation = self.observation(elapsed);
+        if !self.result.terminal {
+            self.result.activity = Activity::new(self.live.as_ref(), self.latest.take());
         }
-        value
+        self.fit();
+        serde_json::to_value(self.result).expect("result JSON")
     }
-}
 
-fn scoped_read(observer: &Observer<'_>) -> Result<ResolvedRead, &'static str> {
-    let start = observer
-        .snapshot
-        .prompt
-        .ok_or("original_prompt_not_found")?;
-    let end = observer.snapshot.output_end();
-    let mut read = observer.wait.read.clone();
-    match &mut read.mode {
-        ReadMode::Sequential(seq) => {
-            seq.index_min = Some(seq.index_min.unwrap_or(start).max(start));
-            seq.index_max = Some(seq.index_max.unwrap_or(end).min(end));
-        }
-        ReadMode::Continuation { entry_index, .. }
-            if *entry_index < start || *entry_index > end =>
-        {
-            return Err("entry_outside_prompt_scope");
-        }
-        _ => {}
+    fn size(&self) -> usize {
+        serialized_len(&self.result)
     }
-    Ok(read)
+
+    /// Preflight and bind reserve the identity, lifecycle and observation
+    /// bytes even on error paths. What gives way is the activity sample, then
+    /// the tail of the reply, then the failure text.
+    fn fit(&mut self) {
+        if self.size() <= self.max_bytes {
+            return;
+        }
+        self.result.activity = None;
+        loop {
+            let size = self.size();
+            if size <= self.max_bytes {
+                return;
+            }
+            let over = size - self.max_bytes;
+            let Some(reply) = self.result.response.as_mut().filter(|r| !r.is_empty()) else {
+                break;
+            };
+            let keep = reply.len().saturating_sub(over + TRUNCATION_SLACK);
+            reply.truncate(reply.floor_char_boundary(keep));
+            self.result.response_truncated = true;
+        }
+        self.result.failure = None;
+    }
 }

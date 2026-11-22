@@ -39,7 +39,7 @@ async fn pending_wait_observes_durable_visibility_lag_before_terminal_arrives() 
     let result = result?;
     assert_eq!(result["status"], "completed");
     assert_eq!(result["wait_expired"], false);
-    assert!(result["output"].to_string().contains("not terminal yet"));
+    assert_eq!(result["response"], "not terminal yet");
     assert_eq!(f.activation_count().await?, 2);
     Ok(())
 }
@@ -61,7 +61,7 @@ async fn approval_arriving_during_wait_returns_blocked_without_another_repair_or
     let result = result?;
     assert_eq!(result["status"], "blocked");
     assert_eq!(result["terminal"], false);
-    assert!(result["output"].get("events").is_none());
+    assert!(result.get("activity").is_none(), "{result}");
     assert_eq!(f.activation_count().await?, 2);
     assert!(!f
         .log
@@ -112,11 +112,9 @@ async fn content_mismatch_cannot_be_replaced_by_a_later_correct_copy_or_terminal
     let result = f.poll(json!({"seconds": 120})).await?;
     assert_eq!(result["status"], "unknown");
     assert_eq!(result["terminal"], false);
-    assert_eq!(
-        result["output"]["observation"]["error"],
-        "prompt_content_mismatch"
-    );
-    assert!(result["output"].get("events").is_none());
+    assert_eq!(result["observation"]["error"], "prompt_content_mismatch");
+    assert!(result.get("response").is_none(), "{result}");
+    assert!(result.get("activity").is_none(), "{result}");
     assert_eq!(f.activation_count().await?, 1);
     Ok(())
 }

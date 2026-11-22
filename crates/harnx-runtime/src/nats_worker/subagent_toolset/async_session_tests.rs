@@ -1,7 +1,6 @@
 //! Contract tests for the shared async send/wait schemas, wait
 //! defaults, handle metadata budget, and the frozen result envelope.
 
-use super::super::session_read::read_object_schema;
 use super::specs::wait_object_schema;
 use super::*;
 use serde_json::json;
@@ -22,18 +21,13 @@ fn serialized(value: &Value) -> usize {
 fn wait_defaults_apply_to_omitted_and_null_fields() {
     for wait in [
         json!({}),
-        json!({ "seconds": null, "forever": null, "include_partial": null, "read": null }),
+        json!({ "seconds": null, "forever": null, "include_partial": null }),
     ] {
         let resolved: WaitOptions = serde_json::from_value(wait).expect("wait options parse");
         let resolved = resolved.resolve().expect("defaults resolve");
         assert_eq!(resolved.limit, WaitLimit::Seconds(WAIT_DEFAULT_SECS));
         assert_eq!(resolved.limit, WaitLimit::Seconds(240));
         assert!(resolved.include_partial);
-        let super::super::session_read::ReadMode::Sequential(seq) = &resolved.read.mode else {
-            panic!("default read should be sequential");
-        };
-        assert_eq!(seq.limit, 100);
-        assert_eq!(resolved.read.max_output_bytes, 131_072);
     }
 }
 
@@ -75,14 +69,15 @@ fn forever_resolves_and_excludes_seconds() {
 }
 
 #[test]
-fn wait_validates_nested_read_options() {
-    let error = wait_options(json!({ "read": { "limit": 0 } })).unwrap_err();
-    assert_eq!(error, "read.limit must be between 1 and 500");
-    let error = wait_options(json!({ "read": { "max_output_bytes": 307_201 } })).unwrap_err();
-    assert_eq!(
-        error,
-        "read.max_output_bytes must be between 1024 and 307200"
-    );
+fn waits_no_longer_take_a_read_option() {
+    assert!(serde_json::from_value::<WaitOptions>(json!({ "read": {} })).is_err());
+    let error = parse_send_args(json!({ "message": "hello", "wait": { "read": {} } }))
+        .expect_err("send's wait rejects read");
+    assert!(error.contains("unknown field `read`"), "{error}");
+    assert!(error.contains("session_load with prompt_id"), "{error}");
+    let error = wait_args_with(json!({ "read": null })).expect_err("wait rejects read");
+    assert!(error.contains("unknown field `read`"), "{error}");
+    assert!(error.contains("session_load with prompt_id"), "{error}");
 }
 
 #[test]
@@ -135,7 +130,11 @@ fn result_envelope_shape_is_frozen() {
         wait_expired: false,
         stopped_by: None,
         elapsed_ms: 1234,
-        output: json!({ "events": [] }),
+        response: None,
+        response_truncated: false,
+        failure: None,
+        activity: None,
+        observation: Observation::default(),
     };
     let value = serde_json::to_value(&envelope).expect("serializes");
     let keys: Vec<&str> = value
@@ -154,7 +153,7 @@ fn result_envelope_shape_is_frozen() {
             "terminal",
             "wait_expired",
             "elapsed_ms",
-            "output"
+            "observation"
         ]
     );
     assert_eq!(value["dispatch"], json!("confirmed"));
@@ -170,12 +169,40 @@ fn result_envelope_shape_is_frozen() {
         wait_expired: true,
         stopped_by: None,
         elapsed_ms: 120_000,
-        output: Value::Null,
+        response: None,
+        response_truncated: false,
+        failure: None,
+        activity: None,
+        observation: Observation::default(),
     };
     let value = serde_json::to_value(&unknown).expect("serializes");
     assert_eq!(value["invocation_id"], json!("inv-3"));
     assert_eq!(value["dispatch"], json!(null));
     assert_eq!(value["wait_expired"], json!(true));
+
+    // A settled prompt carries its reply where the transcript page used to be.
+    let settled = SessionPromptResult {
+        status: SessionPromptStatus::Failed,
+        terminal: true,
+        response: Some("partial answer".into()),
+        response_truncated: true,
+        failure: Some("provider error".into()),
+        ..SessionPromptResult::empty(&PromptHandle {
+            session_id: "child-1".into(),
+            prompt_id: "prompt-9".into(),
+        })
+    };
+    let value = serde_json::to_value(&settled).expect("serializes");
+    let keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys[keys.len() - 4..],
+        ["response", "response_truncated", "failure", "observation"]
+    );
 }
 
 #[test]
@@ -184,11 +211,12 @@ fn result_metadata_rejects_identifiers_that_cannot_fit_their_handle() {
     let error = ensure_result_metadata_fits(&"s".repeat(1_000), &"p".repeat(1_000), 1024)
         .expect_err("oversized identifiers must be rejected");
     assert!(
-        error.contains("exceeds") && error.contains("max_output_bytes budget"),
+        error.contains("exceeds") && error.contains("byte result budget"),
         "unexpected budget error: {error}"
     );
     // The reserved size is worst-case envelope bytes, real metadata included.
-    assert!(result_metadata_bytes("child-1", "prompt-9") < 200);
+    let reserved = result_metadata_bytes("child-1", "prompt-9");
+    assert!((250..350).contains(&reserved), "{reserved}");
 }
 
 #[test]
@@ -228,12 +256,12 @@ fn parse_send_args_rejects_unknown_fields_and_invalid_wait() {
 
     let error = parse_send_args(json!({
         "message": "hello",
-        "wait": { "read": { "entry_index": 1 } },
+        "wait": { "include_partial": "yes" },
     }))
-    .expect_err("invalid nested read rejected");
+    .expect_err("invalid wait field rejected");
     assert!(
-        error.contains("must be provided together"),
-        "nested read errors surface through send: {error}"
+        error.starts_with("invalid session_send arguments"),
+        "{error}"
     );
 }
 
@@ -252,8 +280,8 @@ fn parse_send_args_keeps_prompt_deadline_semantics() {
 fn parse_send_args_rejects_session_ids_that_break_the_handle_budget() {
     let error = parse_send_args(json!({
         "message": "hello",
-        "session_id": "x".repeat(1_000),
-        "wait": { "read": { "max_output_bytes": 1024 } },
+        "session_id": "x".repeat(200_000),
+        "wait": {},
     }))
     .expect_err("oversized identifiers must fail before dispatch");
     assert!(
@@ -330,11 +358,9 @@ fn parse_wait_args_rejects_empty_ids_and_unknown_fields() {
 
 #[test]
 fn parse_wait_args_rejects_handles_that_cannot_be_returned() {
-    // With the caller's own small budget the handle cannot fit its envelope.
     let error = parse_wait_args(json!({
-        "session_id": "s".repeat(1_000),
-        "prompt_id": "p".repeat(1_000),
-        "read": { "max_output_bytes": 1024 },
+        "session_id": "s".repeat(100_000),
+        "prompt_id": "p".repeat(100_000),
     }))
     .expect_err("oversized handle rejected");
     assert!(
@@ -360,18 +386,7 @@ fn tool_schemas_are_strict_and_nested() {
         wait["properties"]["include_partial"]["type"],
         json!("boolean")
     );
-    let read_property = &wait["properties"]["read"];
-    assert_eq!(read_property["anyOf"][1], json!({"type":"null"}));
-    let read = &read_property["anyOf"][0];
-    assert_eq!(read["additionalProperties"], json!(false));
-    assert_eq!(
-        read["properties"]["max_output_bytes"]["maximum"],
-        json!(307200)
-    );
-    assert_eq!(
-        read["properties"]["max_output_bytes"]["minimum"],
-        json!(1024)
-    );
+    assert!(wait["properties"].get("read").is_none(), "{wait}");
 
     let wait_tool = session_wait_spec("pkg/helper");
     assert_eq!(wait_tool.name, "session_wait");
@@ -382,6 +397,7 @@ fn tool_schemas_are_strict_and_nested() {
     assert_eq!(wait_tool.input_schema["additionalProperties"], json!(false));
     let properties = &wait_tool.input_schema["properties"];
     assert!(properties.get("wait").is_none(), "session_wait is flat");
+    assert!(properties.get("read").is_none(), "{properties}");
     assert_seconds_and_forever(properties);
 }
 
@@ -411,51 +427,25 @@ fn descriptions_do_not_mention_cache() {
 }
 
 #[test]
-fn nullable_wait_and_nested_read_schema_match_parser() {
+fn nullable_wait_schema_matches_parser() {
     // Specs come from production tool_specs, not an independent schema fixture.
     let tools = super::super::tool_specs("pkg/helper");
     let send = &tools[2].input_schema["properties"]["wait"];
     assert_eq!(send["anyOf"][1], json!({"type":"null"}));
     assert_eq!(send["anyOf"][0]["additionalProperties"], json!(false));
-    let flat = &tools[3].input_schema["properties"];
-    for read in [&send["anyOf"][0]["properties"]["read"], &flat["read"]] {
-        assert_eq!(read["anyOf"][1], json!({"type":"null"}));
-        assert_eq!(read["anyOf"][0]["additionalProperties"], json!(false));
-    }
     assert!(parse_send_args(json!({"message":"x"})).is_ok());
     assert!(parse_send_args(json!({"message":"x", "wait":null})).is_ok());
     assert!(parse_wait_args(json!({"session_id":"s", "prompt_id":"p"})).is_ok());
-    assert!(parse_wait_args(
-        json!({"session_id":"s", "prompt_id":"p", "seconds":null, "forever":null, "read":null})
-    )
+    assert!(parse_wait_args(json!({
+        "session_id":"s", "prompt_id":"p", "seconds":null, "forever":null, "include_partial":null
+    }))
     .is_ok());
-    assert!(wait_options(json!({"seconds":null, "include_partial":null, "read":null})).is_ok());
+    assert!(wait_options(json!({"seconds":null, "forever":null, "include_partial":null})).is_ok());
 }
 
 #[test]
 fn send_and_wait_schemas_stay_within_their_bounds() {
     // Validation and the advertised schema must agree on the frozen bounds.
-    let schema = read_object_schema();
-    let limits = [
-        (json!({ "limit": 500 }), true),
-        (json!({ "limit": 501 }), false),
-        (json!({ "max_output_bytes": 1024 }), true),
-        (json!({ "max_output_bytes": 1023 }), false),
-    ];
-    assert_eq!(schema["properties"]["limit"]["maximum"], json!(500));
-    assert_eq!(
-        schema["properties"]["max_output_bytes"]["minimum"],
-        json!(1024)
-    );
-    for (read_options, valid) in limits {
-        assert_eq!(
-            ReadOptions::resolve(
-                &serde_json::from_value::<ReadOptions>(read_options).expect("read options parse")
-            )
-            .is_ok(),
-            valid
-        );
-    }
     let wait_schema = wait_object_schema();
     assert_eq!(wait_schema["properties"]["seconds"]["maximum"], json!(240));
     assert!(wait_options(json!({ "seconds": 240 })).is_ok());
