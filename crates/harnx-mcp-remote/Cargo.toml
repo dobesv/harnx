@@ -20,7 +20,6 @@ tokio-util = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 reqwest = { workspace = true }
-parking_lot = { workspace = true }
 url = "2"
 
 [[bin]]

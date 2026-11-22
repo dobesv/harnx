@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::extract::Request;
@@ -10,12 +11,15 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ClientCapabilities, ContentBlock, ErrorData, Implementation,
-    InitializeRequestParams, ServerConfig,
+    InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourcesResult,
+    PaginatedRequestParams, Prompt, Resource, ServerConfig,
 };
-use rmcp::service::{RequestContext, RoleClient, RoleServer};
+use rmcp::service::{
+    ClientLifecycleMode, RequestContext, RoleClient, RoleServer, RxJsonRpcMessage, TxJsonRpcMessage,
+};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::transport::TokioChildProcess;
+use rmcp::transport::{TokioChildProcess, Transport};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde_json::{json, Map, Value};
 use tokio::task::JoinHandle;
@@ -42,6 +46,7 @@ impl ClientHandler for TestClientHandler {
 pub struct TestHttpServer {
     expected_auth: Option<String>,
     include_headers: bool,
+    initialize_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
@@ -88,22 +93,68 @@ impl TestHttpServer {
 
 #[tool_handler]
 impl ServerHandler for TestHttpServer {
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        self.initialize_count.fetch_add(1, Ordering::SeqCst);
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
+    }
+
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(
+        let mut info = ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .enable_completions()
                 .build(),
-        )
+        );
+        info.server_info = Implementation::new("upstream-test-server", "1.0.0");
+        info.instructions = Some("upstream test instructions".to_owned());
+        info.meta = Some(rmcp::model::MetaObject(tool_args(
+            json!({"upstream": true}),
+        )));
+        info
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        Ok(ListPromptsResult {
+            prompts: vec![Prompt::new("upstream-prompt", None::<String>, None)],
+            ..Default::default()
+        })
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult {
+            resources: vec![Resource::new("test://upstream", "upstream-resource")],
+            ..Default::default()
+        })
     }
 }
 
 pub struct HttpTestServerHandle {
     pub port: u16,
+    pub initialize_count: Arc<AtomicUsize>,
     shutdown: CancellationToken,
     join: JoinHandle<()>,
 }
 
 impl HttpTestServerHandle {
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/mcp", self.port)
+    }
+
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         self.join.await.expect("test HTTP server task panicked");
@@ -115,15 +166,26 @@ pub async fn spawn_http_test_server(
     expected_auth: Option<String>,
     include_headers: bool,
 ) -> Result<HttpTestServerHandle> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    spawn_http_test_server_on_listener(listener, expected_auth, include_headers).await
+}
+
+pub async fn spawn_http_test_server_on_listener(
+    listener: tokio::net::TcpListener,
+    expected_auth: Option<String>,
+    include_headers: bool,
+) -> Result<HttpTestServerHandle> {
     let shutdown = CancellationToken::new();
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_cancellation_token(shutdown.child_token())
         .disable_allowed_hosts();
+    let initialize_count = Arc::new(AtomicUsize::new(0));
     let server = TestHttpServer {
         expected_auth,
         include_headers,
+        initialize_count: initialize_count.clone(),
         tool_router: TestHttpServer::tool_router(),
     };
     let mcp_service = StreamableHttpService::new(
@@ -132,7 +194,6 @@ pub async fn spawn_http_test_server(
         config,
     );
     let app = Router::new().nest_service("/mcp", mcp_service);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     let shutdown_wait = shutdown.clone();
     let join = tokio::spawn(async move {
@@ -147,6 +208,7 @@ pub async fn spawn_http_test_server(
     });
     Ok(HttpTestServerHandle {
         port,
+        initialize_count,
         shutdown,
         join,
     })
@@ -160,9 +222,11 @@ pub async fn spawn_auth_guard_server(expected_auth: &'static str) -> Result<Http
         .with_json_response(true)
         .with_cancellation_token(shutdown.child_token())
         .disable_allowed_hosts();
+    let initialize_count = Arc::new(AtomicUsize::new(0));
     let server = TestHttpServer {
         expected_auth: None,
         include_headers: false,
+        initialize_count: initialize_count.clone(),
         tool_router: TestHttpServer::tool_router(),
     };
     let mcp_service = StreamableHttpService::new(
@@ -206,6 +270,7 @@ pub async fn spawn_auth_guard_server(expected_auth: &'static str) -> Result<Http
     });
     Ok(HttpTestServerHandle {
         port,
+        initialize_count,
         shutdown,
         join,
     })
@@ -214,6 +279,63 @@ pub async fn spawn_auth_guard_server(expected_auth: &'static str) -> Result<Http
 pub async fn spawn_proxy_client(
     args: &[&str],
 ) -> Result<rmcp::service::RunningService<RoleClient, TestClientHandler>> {
+    Ok(
+        spawn_proxy_client_with_lifecycle(args, ClientLifecycleMode::Initialize)
+            .await?
+            .0,
+    )
+}
+
+pub type RecordedMethods = Arc<Mutex<Vec<String>>>;
+
+struct RecordingTransport<T> {
+    inner: T,
+    methods: RecordedMethods,
+}
+
+impl<T: Transport<RoleClient>> Transport<RoleClient> for RecordingTransport<T> {
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: TxJsonRpcMessage<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        let value = serde_json::to_value(&item).expect("serialize outgoing MCP message");
+        if let Some(method) = value["method"].as_str() {
+            self.methods
+                .lock()
+                .expect("record methods")
+                .push(method.to_owned());
+        }
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+        self.inner.receive().await
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.inner.close().await
+    }
+}
+
+/// Spawns the proxy binary and connects to it with the given client lifecycle,
+/// returning the running service plus a recording of every JSON-RPC method
+/// sent downstream.
+///
+/// Each spawn costs ~3s at teardown: the binary does not exit on stdin EOF
+/// (its main waits for a shutdown signal after the transport closes), so
+/// rmcp's `TokioChildProcess` shutdown runs its full 3s grace period
+/// (`MAX_WAIT_ON_DROP_SECS` in rmcp) before killing the child. Reuse one proxy
+/// across assertions where you can; `discover_flow_connects_on_first_proxied_request`
+/// spawns four and takes ~12s for this reason.
+pub async fn spawn_proxy_client_with_lifecycle(
+    args: &[&str],
+    lifecycle: ClientLifecycleMode,
+) -> Result<(
+    rmcp::service::RunningService<RoleClient, TestClientHandler>,
+    RecordedMethods,
+)> {
     let bin = proxy_binary_path().context("harnx-mcp-remote binary not found")?;
     let mut command = tokio::process::Command::new(bin);
     command.args(args);
@@ -228,10 +350,16 @@ pub async fn spawn_proxy_client(
         let _ = stderr.read_to_string(&mut stderr_buf).await;
         stderr_buf
     });
-    match rmcp::service::serve_client(TestClientHandler, transport).await {
+    let methods = RecordedMethods::default();
+    let transport = RecordingTransport {
+        inner: transport,
+        methods: methods.clone(),
+    };
+    match rmcp::service::serve_client_with_lifecycle(TestClientHandler, transport, lifecycle).await
+    {
         Ok(service) => {
             std::mem::drop(stderr_task);
-            Ok(service)
+            Ok((service, methods))
         }
         Err(err) => {
             let stderr_buf = stderr_task

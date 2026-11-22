@@ -11,6 +11,10 @@ Key capabilities include:
 - **Flexible Authentication**: Support for Bearer tokens, custom HTTP headers, and mutual TLS (mTLS).
 - **Environment-First Configuration**: Most settings can be provided via CLI flags or environment variables for easy deployment (`--header` remains CLI-only).
 
+## Connection Lifecycle
+
+The upstream connection opens lazily, on the first request that needs it. Legacy clients connect at the `initialize` handshake as before; MCP 2026-07-28 discover-flow clients (such as `harnx-mcp-bridge`) never send `initialize`, so their first `tools/list`, `tools/call`, `prompts/list`, or `resources/list` connects on demand. Concurrent first requests share one connection attempt, a failed attempt is retried on the next request, and shutdown cancels a connect that is still in progress. There is no deadline on the upstream handshake: if the upstream accepts the connection but never answers, requests block until shutdown.
+
 ## Installation
 
 To install `harnx-mcp-remote` from the `harnx` workspace:
