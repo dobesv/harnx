@@ -9,6 +9,7 @@ members = [
     "crates/harnx-script",
     "crates/harnx-client",
     "crates/harnx-core",
+    "crates/harnx-credentials",
     "crates/harnx-engine",
     "crates/harnx-session",
     "crates/harnx-aws-creds",
@@ -85,6 +86,7 @@ debug = "line-tables-only"
 opt-level = "z"
 
 [workspace.dependencies]
+thiserror = "2"
 bashkit = { version = "=0.20.2", default-features = false, features = ["jq"] }
 anyhow = "1.0.69"
 bytes = "1.4.0"
@@ -192,7 +194,9 @@ which = "8.0.0"
 fuzzy-matcher = "0.3.7"
 terminal-colorsaurus = "1.0.3"
 duct = "1.0.0"
-rmcp = { version = "3.0", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
+ring = "0.17.14"
+oauth2 = { version = "5", default-features = false }
+rmcp = { version = "3.0", features = ["auth", "client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
 process-wrap = { version = "10", features = ["tokio1"] }
 libc = "0.2"
 async-nats = { version = "0.51", default-features = false, features = ["server_2_10", "server_2_11", "ring", "jetstream", "kv", "object-store", "websockets"] }
@@ -211,6 +215,7 @@ jiff = { version = "0.2.23", features = ["serde"] }
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
 harnx-core = { path = "crates/harnx-core" }
+harnx-credentials = { path = "crates/harnx-credentials" }
 harnx-nats-common = { path = "crates/harnx-nats-common" }
 harnx-telemetry = { path = "crates/harnx-telemetry" }
 harnx-toolset = { path = "crates/harnx-toolset" }

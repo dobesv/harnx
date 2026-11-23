@@ -179,7 +179,7 @@ fn remote_follow_finishes_attachment_at_ready_interaction_not_at_request() {
 }
 
 #[test]
-fn pending_interaction_includes_payload_for_a2ui_kind_only() {
+fn pending_interaction_includes_payload_for_a2ui_kind() {
     let a2ui_payload = json!({
         "version": "1.0",
         "createSurface": {
@@ -238,4 +238,56 @@ fn pending_interaction_includes_payload_for_a2ui_kind_only() {
     let val = pending_value(&entries).expect("pending value");
     assert_eq!(val["kind"], "a2ui");
     assert_eq!(val["payload"], a2ui_payload);
+}
+
+#[test]
+fn pending_interaction_includes_payload_for_url_kind() {
+    let url_payload = json!({
+        "url": "https://example.com/connect/abc",
+        "message": "Connect Jira"
+    });
+    let url_request = SessionLogEntry::InteractionRequested {
+        tool_round_seq: 1,
+        tool_call_id: "tool_1".into(),
+        interaction_id: "url_int".into(),
+        producer: "tool:jira/connect".into(),
+        step_path: vec![],
+        key: "connect".into(),
+        kind: "url".into(),
+        payload: url_payload.clone(),
+        summary: "Connect Jira".into(),
+        chain_version: "v1".into(),
+        checkpoint: "private".into(),
+        fence_token: 1,
+    };
+    let entries = vec![
+        (
+            1,
+            SessionLogEntry::ToolCalls {
+                text: String::new(),
+                thought: None,
+                timestamp: None,
+                fence_token: None,
+                calls: vec![ToolCall::new(
+                    "tool_1".into(),
+                    json!({}),
+                    Some("tool_1".into()),
+                    None,
+                )],
+            },
+        ),
+        (2, url_request),
+        (
+            3,
+            SessionLogEntry::SuspensionReady {
+                tool_round_seq: 1,
+                pending: vec!["url_int".into()],
+                fence_token: 1,
+            },
+        ),
+    ];
+
+    let val = pending_value(&entries).expect("pending value");
+    assert_eq!(val["kind"], "url");
+    assert_eq!(val["payload"], url_payload);
 }

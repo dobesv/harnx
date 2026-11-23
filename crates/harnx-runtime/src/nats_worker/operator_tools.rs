@@ -150,29 +150,14 @@ async fn execute(
         runtime.config.read().clone(),
     ));
     super::daemon::install_session_metadata_agent(&config, &record.metadata)?;
-    {
-        let mut config = config.write();
-        let mut session = crate::config::session::new(&config, &record.metadata.session_id, None)?;
-        if let Some(selectors) = &request.use_tools {
-            session.set_use_tools(Some(selectors.clone()));
-        }
-        // The session metadata tools reach the session through its sink. A
-        // direct call holds no lease, so it writes unfenced, as a frontend's
-        // dot commands do; nothing on this path appends to the log.
-        let sink: Arc<dyn crate::config::session::SessionAppendSink> = Arc::new(
-            super::NatsSessionLogBackend::new(
-                runtime.jetstream.clone(),
-                request.session_key.clone(),
-                runtime.lease.replicas,
-            )
-            .with_metadata_store(Some(runtime.session_metadata.clone())),
-        );
-        session.runtime = Some(Arc::new(sink));
-        config.session = Some(session);
-        // Isolate declaration caches too; Config::clone shares its cache Arc.
-        config.nats_tool_declarations = Arc::new(parking_lot::RwLock::new(Vec::new()));
-        config.maintenance_abort = Some(abort.clone());
-    }
+    activate_operator_identity(&config, &request, &record.metadata.variables)?;
+    install_operator_session(
+        runtime,
+        &config,
+        &request,
+        &record.metadata.session_id,
+        abort,
+    )?;
     admit_operator_call(runtime, &config, &request).await?;
     let mut claim = Claim {
         reconciler: runtime.server_reconciler.clone(),
@@ -190,6 +175,75 @@ async fn execute(
     .await;
     claim.close().await;
     result
+}
+
+/// Decision 11: an operator request carries the operator's own identity
+/// (filled by the CLI/TUI from the cluster default), and every tool call
+/// it dispatches must act as the operator, not the active session's
+/// owner — including discovery, which filters user-scoped registrations
+/// by this identity. Legacy requests without the field keep the session
+/// owner. Re-stamping the principals over the just-installed session
+/// agent is the same activation path, just with the operator's snapshot.
+fn activate_operator_identity(
+    config: &crate::config::GlobalConfig,
+    request: &OperatorToolRequest,
+    variables: &harnx_core::agent_config::AgentVariables,
+) -> Result<()> {
+    if let Some(operator) = request.user_id.as_ref() {
+        apply_operator_principals(config, operator.as_deref(), variables)?;
+    }
+    Ok(())
+}
+
+/// Resolve the operator's principals and stamp them over the session agent.
+fn apply_operator_principals(
+    config: &crate::config::GlobalConfig,
+    operator: Option<&str>,
+    variables: &harnx_core::agent_config::AgentVariables,
+) -> Result<()> {
+    let principals = harnx_core::user_principals::from_resolved(operator, None, &[], &[]);
+    config
+        .write()
+        .apply_session_agent_patches(&principals, variables)
+        .context("activate operator identity")
+}
+
+/// Apply the request's tool selectors to the session, leaving the fresh
+/// session's config-derived selection alone when the request has none.
+fn apply_use_tools(session: &mut crate::config::session::Session, selectors: &Option<Vec<String>>) {
+    if let Some(selectors) = selectors {
+        session.set_use_tools(Some(selectors.clone()));
+    }
+}
+
+/// Give the operator call its own isolated session: declaration caches are
+/// not shared (`Config::clone` shares the Arc), and the session metadata
+/// tools reach the session through its sink — a direct call holds no
+/// lease, so it writes unfenced, as a frontend's dot commands do; nothing
+/// on this path appends to the log.
+fn install_operator_session(
+    runtime: &WorkerRuntime,
+    config: &crate::config::GlobalConfig,
+    request: &OperatorToolRequest,
+    session_id: &str,
+    abort: &crate::utils::AbortSignal,
+) -> Result<()> {
+    let mut config = config.write();
+    let mut session = crate::config::session::new(&config, session_id, None)?;
+    apply_use_tools(&mut session, &request.use_tools);
+    let sink: Arc<dyn crate::config::session::SessionAppendSink> = Arc::new(
+        super::NatsSessionLogBackend::new(
+            runtime.jetstream.clone(),
+            request.session_key.clone(),
+            runtime.lease.replicas,
+        )
+        .with_metadata_store(Some(runtime.session_metadata.clone())),
+    );
+    session.runtime = Some(Arc::new(sink));
+    config.session = Some(session);
+    config.nats_tool_declarations = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    config.maintenance_abort = Some(abort.clone());
+    Ok(())
 }
 
 async fn admit_operator_call(
@@ -452,3 +506,7 @@ mod tests;
 #[cfg(test)]
 #[path = "operator_tools/admission_tests.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "operator_tools/reserved_identity_tests.rs"]
+mod reserved_identity_tests;

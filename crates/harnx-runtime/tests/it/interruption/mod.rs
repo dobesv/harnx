@@ -219,6 +219,7 @@ async fn await_wind_up(log: &NatsSessionLog, call_id: &str) -> Result<Vec<(u64, 
 /// transcript call to its row.
 fn journal_request(session_key: &str, call_id: &str, round: u64) -> ToolRequest {
     ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,

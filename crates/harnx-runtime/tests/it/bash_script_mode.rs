@@ -238,8 +238,8 @@ async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
 /// Recovery: after worker loss the engine replays the call across providers
 /// in order; an active BashProvider must answer `bash` with the interrupted
 /// report so the script is never rerun (J-RHAD-r2-1). Active means the
-/// agent's `bash_tools` actually resolve against registered declarations
-/// (PR3 review F9), so this test stands up the real NATS broker and time
+/// agent's `bash_tools` actually resolve against registered declarations,
+/// so this test stands up the real NATS broker and time
 /// tool server like the pipeline e2e above. It needs no dispatch: the
 /// provider answers from its own policy before any remote replay.
 #[tokio::test(flavor = "multi_thread")]
@@ -312,8 +312,8 @@ async fn interrupted_bash_replays_as_reported_not_rerun() -> Result<()> {
     Ok(())
 }
 
-/// PR3 review F9: when no declarations resolve (script mode inactive), even
-/// a bare `bash` call must fall through replay untouched so a
+/// When no declarations resolve (script mode inactive), even a bare `bash`
+/// call must fall through replay untouched so a
 /// tool-server-native `bash` keeps normal NATS journal recovery. The
 /// provider-internal halves of both cases are covered in
 /// `bash_provider::tests`; this pins the engine-level fall-through.
@@ -360,8 +360,8 @@ async fn inactive_script_mode_leaves_bash_replay_to_other_providers() -> Result<
     Ok(())
 }
 
-/// PR3 round-2 review R4: the fall-through above must actually reach NATS
-/// journal recovery. Seeds the journal the way a completed tool-server-native
+/// The fall-through above must actually reach NATS journal recovery.
+/// Seeds the journal the way a completed tool-server-native
 /// `bash` call leaves it — one row under (session, round, tool-call id) with
 /// its final reply — and asserts replay hands back the saved reply instead
 /// of a synthetic interruption.
@@ -434,6 +434,7 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
 
 async fn seed_journaled_bash_reply(client: &async_nats::Client) -> Result<()> {
     let request = harnx_toolset::ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,

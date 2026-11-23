@@ -112,6 +112,7 @@ impl ToolProvider for Probe {
                     kind: "confirm".into(),
                     message: Some("Approve hook?".into()),
                     surface: None,
+                    url: None,
                     summary: "Approve hook?".into(),
                     request_state: json!({}),
                 }),

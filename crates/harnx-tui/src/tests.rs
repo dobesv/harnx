@@ -90,6 +90,7 @@ mod broker_isolation_tests;
 mod browse_actions;
 mod cancellation_escape_tests;
 mod command_completion;
+mod credentials_command;
 mod delegation_tests;
 mod exit_interrupt_tests;
 mod handler_decomposition_tests;

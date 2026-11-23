@@ -28,6 +28,27 @@ pub fn render(payload: &Value) -> String {
     text
 }
 
+/// Plain-text rendering of a `url` interaction payload (decision 6): the
+/// message, the link, and how to answer. The caller (`harnx interact list`)
+/// already prints the exact `harnx interact answer` invocation.
+pub fn render_url(payload: &Value) -> String {
+    let url = payload.get("url").and_then(Value::as_str).unwrap_or("");
+    let message = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut text = String::new();
+    if !message.is_empty() {
+        text.push_str(message);
+        text.push_str("\n\n");
+    }
+    text.push_str(url);
+    text.push_str(
+        "\n\nOpen the link to proceed, then answer `continue`. Answer `cancel` to abort.",
+    );
+    text
+}
+
 #[derive(Default)]
 struct Renderer {
     lines: Vec<String>,

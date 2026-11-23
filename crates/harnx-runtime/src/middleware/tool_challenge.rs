@@ -10,6 +10,7 @@ use harnx_core::interaction::{
 };
 use harnx_core::tool::ToolInputRequired;
 use harnx_engine::tool::{ToolCallCheckpoint, ToolMiddlewareOutcome};
+use serde_json::json;
 
 use super::interact::{stamped_surface, surface_summary};
 use super::resume::CheckpointState;
@@ -51,7 +52,24 @@ pub(crate) fn tool_challenge_request(
     context: &ToolChallengeContext,
 ) -> Result<InteractionRequest> {
     validate_challenge(input, context)?;
-    let (payload, summary) = match input.kind.as_str() {
+    let (payload, summary) = challenge_payload_summary(input)?;
+    let request = InteractionRequest {
+        interaction_id: String::new(),
+        producer: input.producer.clone(),
+        step_path: context.step_path.clone(),
+        key: input.key.clone(),
+        kind: input.kind.clone(),
+        payload,
+        summary,
+        chain_version: context.chain_version.clone(),
+    };
+    stamp_interaction_id(request, context)
+}
+
+/// The kind-specific stored payload and its summary line. Validation has
+/// already run, so each arm can unwrap its fields with `context` errors.
+fn challenge_payload_summary(input: &ToolInputRequired) -> Result<(serde_json::Value, String)> {
+    Ok(match input.kind.as_str() {
         ToolInputRequired::KIND_CONFIRM => {
             let message = input
                 .message
@@ -74,19 +92,34 @@ pub(crate) fn tool_challenge_request(
             };
             (payload, summary)
         }
+        ToolInputRequired::KIND_URL => {
+            let url = input.url.as_deref().context("missing url challenge url")?;
+            let message = input
+                .message
+                .as_deref()
+                .context("missing url challenge message")?
+                .to_string();
+            // Frontends read the link from the stored payload; the challenge
+            // itself never carries credentials (decision 6).
+            let payload = json!({ "url": url, "message": message });
+            let summary = if input.summary.is_empty() {
+                message.clone()
+            } else {
+                input.summary.clone()
+            };
+            (payload, summary)
+        }
         _ => bail!("unsupported tool challenge kind after validation"),
-    };
-    let request = InteractionRequest {
-        interaction_id: String::new(),
-        producer: input.producer.clone(),
-        step_path: context.step_path.clone(),
-        key: input.key.clone(),
-        kind: input.kind.clone(),
-        payload,
-        summary,
-        chain_version: context.chain_version.clone(),
-    };
-    let interaction_id = interaction_id(&InteractionIdentity {
+    })
+}
+
+/// Stamp the durable interaction id onto the assembled request; the id
+/// derives from every D6 identity field, including the payload just built.
+fn stamp_interaction_id(
+    mut request: InteractionRequest,
+    context: &ToolChallengeContext,
+) -> Result<InteractionRequest> {
+    request.interaction_id = interaction_id(&InteractionIdentity {
         session: &context.session,
         tool_round_seq: context.tool_round_seq,
         tool_call_id: &context.tool_call_id,
@@ -97,10 +130,7 @@ pub(crate) fn tool_challenge_request(
         kind: &request.kind,
         payload: &request.payload,
     });
-    Ok(InteractionRequest {
-        interaction_id,
-        ..request
-    })
+    Ok(request)
 }
 
 /// The call's checkpoint for a tool challenge: middleware frame state is
@@ -130,6 +160,16 @@ pub(crate) fn tool_challenge_checkpoint(
 /// the wire shape, and the provider re-validated it, so this is the last
 /// gate before the challenge becomes a visible interaction.
 fn validate_challenge(input: &ToolInputRequired, context: &ToolChallengeContext) -> Result<()> {
+    validate_challenge_identity(input, context)?;
+    validate_kind_fields(input)
+}
+
+/// Producer, step path, key and request-state bounds: the shape every
+/// tool challenge shares, whatever its kind.
+fn validate_challenge_identity(
+    input: &ToolInputRequired,
+    context: &ToolChallengeContext,
+) -> Result<()> {
     ensure!(
         input.producer.starts_with("tool:")
             && input
@@ -158,6 +198,11 @@ fn validate_challenge(input: &ToolInputRequired, context: &ToolChallengeContext)
         "tool challenge request_state exceeds {} bytes",
         harnx_toolset::MAX_TOOL_REQUEST_STATE_BYTES
     );
+    Ok(())
+}
+
+/// Kind-specific field checks, mirroring the toolset wire contract.
+fn validate_kind_fields(input: &ToolInputRequired) -> Result<()> {
     match input.kind.as_str() {
         ToolInputRequired::KIND_CONFIRM => ensure!(
             input
@@ -173,7 +218,27 @@ fn validate_challenge(input: &ToolInputRequired, context: &ToolChallengeContext)
                 .is_some_and(|surface| !surface.is_null()),
             "a2ui tool challenge needs a surface"
         ),
+        ToolInputRequired::KIND_URL => {
+            let url = input
+                .url
+                .as_deref()
+                .filter(|url| !url.is_empty())
+                .context("url tool challenge needs a url")?;
+            harnx_toolset::ToolInputRequired::validate_url(url)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            ensure!(
+                input
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| !message.is_empty()),
+                "url tool challenge needs a message"
+            );
+        }
         other => anyhow::bail!("unsupported tool challenge kind '{other}'"),
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tool_challenge_tests.rs"]
+mod tests;

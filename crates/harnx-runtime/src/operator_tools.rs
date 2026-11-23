@@ -1,6 +1,7 @@
 //! Explicit operator tools, without a model request or shared approval policy.
 
 pub mod cli;
+pub mod credentials;
 
 use crate::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
 use crate::nats_worker::{LocalWorkerTarget, SessionActivationRoute};
@@ -28,6 +29,14 @@ pub enum OperatorToolCommand {
     Call {
         name: String,
         args_json: String,
+        /// Transport-owned rerun input for credential connect flows
+        /// (decision 11): the accepted challenge response plus the tool's
+        /// opaque request state, delivered beside the arguments exactly the
+        /// way the durable model path delivers them — never inside the args.
+        /// Absent on every pre-credentials request, so old wire forms are
+        /// unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_input: Option<OperatorToolInput>,
     },
     /// Operator BashKit script call (#2630). `script` is the raw, unmodified
     /// script; `selection` records how its inner tools were chosen, kept
@@ -37,6 +46,39 @@ pub enum OperatorToolCommand {
         script: String,
         selection: BashToolSelection,
     },
+}
+
+/// Rerun input one operator `call` carries beside its arguments (decision 11):
+/// the accepted response to the tool's latest input challenge, keyed by the
+/// challenge key, plus the tool's opaque request state. The CLI/TUI fill it
+/// when polling a `<server>_connect` flow; the runtime injects it into the
+/// tool request the same way the durable model path does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorToolInput {
+    pub responses: std::collections::BTreeMap<String, harnx_toolset::ToolInputResponse>,
+    pub request_state: serde_json::Value,
+}
+
+impl OperatorToolInput {
+    /// One `url`-challenge answer for a connect flow round. `url` responses
+    /// carry nothing beyond the action (decision 6).
+    pub fn url_response(
+        challenge_key: String,
+        action: &str,
+        request_state: serde_json::Value,
+    ) -> Self {
+        Self {
+            responses: std::collections::BTreeMap::from([(
+                challenge_key,
+                harnx_toolset::ToolInputResponse {
+                    action: action.to_string(),
+                    data: Default::default(),
+                    note: None,
+                },
+            )]),
+            request_state,
+        }
+    }
 }
 
 /// Tool selection intent for an operator Bash script call (#2630).
@@ -93,6 +135,7 @@ pub fn parse_operator_tool_command(cmd: &str, args: Option<&str>) -> Result<Oper
             Ok(OperatorToolCommand::Call {
                 name: name.into(),
                 args_json: raw.into(),
+                tool_input: None,
             })
         }
         // `.call bash` (#2630): the raw remainder is the script, preserving
@@ -153,6 +196,47 @@ pub(crate) struct OperatorToolRequest {
     /// command, so the serialized old forms are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bash_timeout_secs: Option<u64>,
+    /// The operator's harnx user identity (decision 11): the CLI/TUI fill it
+    /// from `Config::default_user_id` for the selected cluster, and the
+    /// worker forwards it into `ToolRequest.user_id` for these calls instead
+    /// of the session owner. The outer option distinguishes a legacy request
+    /// that predates the field (`None`: the worker keeps the session owner)
+    /// from an explicit operator identity, including an explicit ownerless
+    /// one (`Some(None)`).
+    #[serde(
+        default,
+        with = "operator_user_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_id: Option<Option<String>>,
+}
+
+/// Serde helpers for the tri-state [`OperatorToolRequest::user_id`]: the field
+/// serializes as a plain optional, but an explicit `null` deserializes as
+/// `Some(None)` (operator with no identity) while an absent field stays the
+/// `default` `None` (legacy request).
+mod operator_user_id {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(crate) fn serialize<S>(
+        value: &Option<Option<String>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value
+            .as_ref()
+            .and_then(Option::as_ref)
+            .serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Some(Option::<String>::deserialize(deserializer)?))
+    }
 }
 
 /// Operator Bash claims and admission selectors for worker-side commands
@@ -395,6 +479,10 @@ pub async fn run_session_tool_command(
         // TUI commands run with the existing operator envelope; the worker
         // admits them with the effective session use_tools plus bash_tools.
         bash_timeout_secs: None,
+        // Decision 11: credential-relevant operator calls act for the
+        // operator's own identity, not the active session's owner. The same
+        // default the CLI stamps on new sessions.
+        user_id: Some(snapshot.default_user_id_for_cluster(cluster)),
     };
     request_command(
         &session.jetstream().client(),
@@ -496,8 +584,8 @@ pub(crate) async fn evaluate(
             if declarations.iter().any(|tool| tool.name == *name) {
                 format_tool_declaration(find_tool(&declarations, name)?, format)?
             } else {
-                // Same typed denial as `call` (review C10/C26): callers
-                // must not string-match the transport error to detect an
+                // Same typed denial as `call`: callers must not
+                // string-match the transport error to detect an
                 // unauthorized tool.
                 return Ok(unavailable_tool_reply(name));
             }
@@ -505,11 +593,32 @@ pub(crate) async fn evaluate(
         OperatorToolCommand::List { pattern } => {
             format_tool_list(&selected_declarations(&declarations, pattern), format)?
         }
-        OperatorToolCommand::Call { name, args_json } => {
+        OperatorToolCommand::Call {
+            name,
+            args_json,
+            tool_input,
+        } => {
             if !declarations.iter().any(|tool| tool.name == *name) {
                 return Ok(unavailable_tool_reply(name));
             }
-            return eval_call(ctx, name, args_json, format, abort).await;
+            let eval = eval_call(ctx, name, args_json, format, abort);
+            let reply = match tool_input {
+                // Decision 11: a polling `credentials connect` re-call carries
+                // its accepted url-challenge response and the tool's request
+                // state beside the arguments, scoped to this one dispatch.
+                Some(input) => {
+                    crate::middleware::with_tool_input(
+                        crate::middleware::ToolInputResume {
+                            responses: input.responses.clone(),
+                            request_state: input.request_state.clone(),
+                        },
+                        eval,
+                    )
+                    .await?
+                }
+                None => eval.await?,
+            };
+            return Ok(reply);
         }
         // Operator paths evaluate Bash on the command-scoped context
         // (`evaluate_bash`): the script provider needs the slot-installed
@@ -525,8 +634,8 @@ pub(crate) async fn evaluate(
     })
 }
 
-/// Typed denial for a tool the session's operator surface does not expose
-/// (review C10/C26): callers match `error_kind`, never the message string.
+/// Typed denial for a tool the session's operator surface does not expose:
+/// callers match `error_kind`, never the message string.
 fn unavailable_tool_reply(name: &str) -> OperatorToolReply {
     OperatorToolReply {
         output: String::new(),

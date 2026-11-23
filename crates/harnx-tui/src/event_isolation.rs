@@ -3,6 +3,8 @@ use crate::types::{TranscriptItem, Tui, TuiEvent};
 use anyhow::Result;
 use harnx_core::{abort::AbortSignal, event::AgentEvent};
 use harnx_runtime::nats_event_sink::LiveEventState;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -41,6 +43,22 @@ pub(crate) struct SessionObservation {
     pub historical: bool,
 }
 
+/// The observation record both session-event arms share: which session the
+/// event targets, the attachment stamp it was captured under, and whether it
+/// comes from durable history rather than the live stream.
+fn session_observation(
+    historical: bool,
+    stamp: EventStamp,
+    session_id: String,
+    cluster: String,
+) -> SessionObservation {
+    SessionObservation {
+        target: (session_id, cluster),
+        stamp,
+        historical,
+    }
+}
+
 impl SessionObservation {
     pub fn accepts(&self, tui: &Tui) -> bool {
         tui.session_activity_target.as_ref() == Some(&self.target)
@@ -50,15 +68,28 @@ impl SessionObservation {
 }
 
 impl Tui {
-    pub(crate) async fn handle_tui_event(&mut self, event: TuiEvent) -> Result<()> {
-        Box::pin(self.handle_tui_event_inner(event)).await
+    /// Type-erased seam for the run loop (PR #2835 Windows CI query-depth
+    /// overflow): `Pin<Box<dyn Future>>` stops rustc's cumulative layout
+    /// walk of the loop's future at this await; see AGENTS.md "Future size
+    /// and type erasure in harnx-runtime".
+    pub(crate) fn handle_tui_event_erased(
+        &mut self,
+        event: TuiEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + '_>> {
+        Box::pin(self.handle_tui_event_inner(event))
     }
 
-    // qual:allow(complexity, max_function_lines=69) reason: "flat one-line dispatch per TuiEvent; the surface arm matches the existing style"
+    pub(crate) async fn handle_tui_event(&mut self, event: TuiEvent) -> Result<()> {
+        self.handle_tui_event_erased(event).await
+    }
+
     pub(super) async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
         match event {
             TuiEvent::Interaction(event) => self.handle_interaction_event(event),
             TuiEvent::Surface(event) => self.handle_surface_event(event),
+            TuiEvent::CredentialsUpdate { task, text } => {
+                self.handle_credentials_update(task, text);
+            }
             event @ (TuiEvent::OperatorToolFinished { .. }
             | TuiEvent::PromptTaskFinished { .. }) => {
                 self.handle_task_completion(event).await;
@@ -75,15 +106,8 @@ impl Tui {
                 cluster,
                 active,
             } => {
-                self.handle_session_activity(
-                    SessionObservation {
-                        target: (session_id, cluster),
-                        stamp,
-                        historical,
-                    },
-                    active,
-                )
-                .await;
+                self.on_session_activity(historical, stamp, session_id, cluster, active)
+                    .await;
             }
             TuiEvent::SessionAgent {
                 stamp,
@@ -92,15 +116,8 @@ impl Tui {
                 cluster,
                 event,
             } => {
-                self.handle_shared_session_agent_event(
-                    SessionObservation {
-                        target: (session_id, cluster),
-                        stamp,
-                        historical,
-                    },
-                    event,
-                )
-                .await;
+                self.on_shared_session_agent(historical, stamp, session_id, cluster, event)
+                    .await;
             }
             TuiEvent::SubAgentSessionSnapshot { key, snapshot } => {
                 self.handle_subagent_snapshot(key, snapshot);
@@ -123,6 +140,39 @@ impl Tui {
             }
         }
         Ok(())
+    }
+
+    /// Fold the activity arm's payload into the observation record its
+    /// handler gates on; keeps the flat dispatch match under the line budget.
+    async fn on_session_activity(
+        &mut self,
+        historical: bool,
+        stamp: EventStamp,
+        session_id: String,
+        cluster: String,
+        active: bool,
+    ) {
+        self.handle_session_activity(
+            session_observation(historical, stamp, session_id, cluster),
+            active,
+        )
+        .await;
+    }
+
+    /// Same fold for the shared-session agent arm.
+    async fn on_shared_session_agent(
+        &mut self,
+        historical: bool,
+        stamp: EventStamp,
+        session_id: String,
+        cluster: String,
+        event: AgentEvent,
+    ) {
+        self.handle_shared_session_agent_event(
+            session_observation(historical, stamp, session_id, cluster),
+            event,
+        )
+        .await;
     }
 
     async fn handle_task_completion(&mut self, event: TuiEvent) {

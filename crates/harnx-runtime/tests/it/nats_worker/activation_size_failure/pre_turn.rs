@@ -28,6 +28,7 @@ pub(super) async fn seed_journaled_reply(
     let round = append_orphan_round(log).await?;
     let journal = InvocationJournal::ensure(js, 1).await?;
     let request = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         call_id: "operation".into(),

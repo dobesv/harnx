@@ -1,3 +1,4 @@
+use crate::hyperlink::HyperlinkWriter;
 use crate::types::Tui;
 use anyhow::Result;
 use crossterm::event::{
@@ -97,29 +98,56 @@ impl Tui {
         input
     }
 
-    pub(super) fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        stdout.execute(EnterAlternateScreen)?;
-        if supports_keyboard_enhancement()? {
-            stdout.execute(PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
-            ))?;
-        }
-        stdout.execute(EnableMouseCapture)?;
-        stdout.execute(EnableBracketedPaste)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(terminal)
+    pub(super) fn setup_terminal() -> Result<Terminal<CrosstermBackend<HyperlinkWriter<Stdout>>>> {
+        let stdout = enter_terminal_modes()?;
+        Ok(Terminal::new(CrosstermBackend::new(HyperlinkWriter::new(
+            stdout,
+            hyperlink_emission_ok(),
+        )))?)
     }
 
     pub(super) fn restore_terminal(
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CrosstermBackend<HyperlinkWriter<Stdout>>>,
     ) -> Result<()> {
         cleanup_terminal_state();
         terminal.show_cursor()?;
         Ok(())
     }
+}
+
+/// Enter raw mode and the alternate screen, then enable mouse capture and
+/// bracketed paste, returning the configured stdout.
+fn enter_terminal_modes() -> Result<Stdout> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    push_keyboard_enhancement_flags(&mut stdout)?;
+    stdout.execute(EnableMouseCapture)?;
+    stdout.execute(EnableBracketedPaste)?;
+    Ok(stdout)
+}
+
+/// Push the kitty keyboard-enhancement flags when the terminal supports
+/// them; an unsupported terminal must not see the escape sequence.
+fn push_keyboard_enhancement_flags(stdout: &mut Stdout) -> Result<()> {
+    if supports_keyboard_enhancement()? {
+        stdout.execute(PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+        ))?;
+    }
+    Ok(())
+}
+
+/// Whether the terminal can be assumed to render OSC 8 hyperlinks: same
+/// static gate as the terminal status indicator (TTY, TERM != dumb, CI unset).
+/// When false the hyperlink writer still strips its sentinel characters, so
+/// the URL text renders as plain text.
+fn hyperlink_emission_ok() -> bool {
+    use std::io::IsTerminal;
+    io::stdout().is_terminal()
+        && std::env::var("TERM").as_deref() != Ok("dumb")
+        && std::env::var("CI").is_err()
 }
 
 #[cfg(test)]

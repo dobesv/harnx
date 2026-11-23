@@ -256,14 +256,19 @@ pub struct ToolInputRequired {
     /// challenges need distinct keys: an exact repeat of an answered
     /// (key, kind, payload) gets its previous answer back.
     pub key: String,
-    /// Interaction kind: `confirm` or `a2ui`.
+    /// Interaction kind: `confirm`, `a2ui` or `url`.
     pub kind: String,
-    /// The question text for `confirm` challenges.
+    /// The question text for `confirm` and `url` challenges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// The A2UI envelope for `a2ui` challenges (validated before suspending).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<Value>,
+    /// The link URL for `url` challenges. Only `https:` and loopback `http:`
+    /// are valid ([`ToolInputRequired::validate_url`]); anything else makes
+    /// the challenge invalid, which degrades to a recoverable error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(default)]
     pub summary: String,
     /// Opaque tool state resent beside the responses on the rerun, never
@@ -277,6 +282,8 @@ impl ToolInputRequired {
     pub const KIND_CONFIRM: &'static str = "confirm";
     /// Frontends route on this kind with their A2UI rendering.
     pub const KIND_A2UI: &'static str = "a2ui";
+    /// Frontends route on this kind with their link UI (decision 6).
+    pub const KIND_URL: &'static str = "url";
 
     /// Build a `confirm` challenge: a question with Approve/Deny semantics.
     pub fn confirm(
@@ -289,6 +296,7 @@ impl ToolInputRequired {
             kind: Self::KIND_CONFIRM.into(),
             message: Some(message.into()),
             surface: None,
+            url: None,
             summary: String::new(),
             request_state,
         }
@@ -306,7 +314,28 @@ impl ToolInputRequired {
             kind: Self::KIND_A2UI.into(),
             message: None,
             surface: Some(surface),
+            url: None,
             summary: summary.into(),
+            request_state,
+        }
+    }
+
+    /// Build a `url` challenge: a link the user opens out of band, answered
+    /// with `continue` or `cancel` and no data. The URL must pass
+    /// [`ToolInputRequired::validate_url`].
+    pub fn url(
+        key: impl Into<String>,
+        url: impl Into<String>,
+        message: impl Into<String>,
+        request_state: Value,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            kind: Self::KIND_URL.into(),
+            message: Some(message.into()),
+            surface: None,
+            url: Some(url.into()),
+            summary: String::new(),
             request_state,
         }
     }
@@ -314,6 +343,12 @@ impl ToolInputRequired {
     /// Check the wire shape. The runtime re-validates before suspending; this
     /// keeps oversized or malformed challenges from leaving the tool server.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_key()?;
+        self.validate_kind_fields()?;
+        self.validate_state_size()
+    }
+
+    fn validate_key(&self) -> Result<(), String> {
         if self.key.is_empty() {
             return Err("input_required key must not be empty".into());
         }
@@ -322,19 +357,60 @@ impl ToolInputRequired {
                 "input_required key exceeds {MAX_TOOL_INPUT_KEY_BYTES} bytes"
             ));
         }
+        Ok(())
+    }
+
+    fn validate_kind_fields(&self) -> Result<(), String> {
         match self.kind.as_str() {
-            Self::KIND_CONFIRM => {
-                if self.message.as_deref().map(str::is_empty).unwrap_or(true) {
-                    return Err("confirm input_required needs a message".into());
-                }
-            }
-            Self::KIND_A2UI => {
-                if self.surface.as_ref().is_none_or(Value::is_null) {
-                    return Err("a2ui input_required needs a surface".into());
-                }
-            }
-            other => return Err(format!("unsupported input_required kind '{other}'")),
+            Self::KIND_CONFIRM => self.validate_confirm_fields(),
+            Self::KIND_A2UI => self.validate_a2ui_fields(),
+            Self::KIND_URL => self.validate_url_fields(),
+            other => Err(format!("unsupported input_required kind '{other}'")),
         }
+    }
+
+    fn validate_confirm_fields(&self) -> Result<(), String> {
+        if optional_field_is_blank(self.message.as_deref()) {
+            return Err("confirm input_required needs a message".into());
+        }
+        Ok(())
+    }
+
+    fn validate_a2ui_fields(&self) -> Result<(), String> {
+        if self.surface.as_ref().is_none_or(Value::is_null) {
+            return Err("a2ui input_required needs a surface".into());
+        }
+        Ok(())
+    }
+
+    fn validate_url_fields(&self) -> Result<(), String> {
+        self.require_url_field()?;
+        self.require_url_message()?;
+        self.validate_url_value()
+    }
+
+    fn require_url_field(&self) -> Result<(), String> {
+        if optional_field_is_blank(self.url.as_deref()) {
+            return Err("url input_required needs a url".into());
+        }
+        Ok(())
+    }
+
+    fn require_url_message(&self) -> Result<(), String> {
+        if optional_field_is_blank(self.message.as_deref()) {
+            return Err("url input_required needs a message".into());
+        }
+        Ok(())
+    }
+
+    fn validate_url_value(&self) -> Result<(), String> {
+        match self.url.as_deref() {
+            Some(url) => Self::validate_url(url),
+            None => Ok(()),
+        }
+    }
+
+    fn validate_state_size(&self) -> Result<(), String> {
         let state = serde_json::to_vec(&self.request_state).unwrap_or_default();
         if state.len() > MAX_TOOL_REQUEST_STATE_BYTES {
             return Err(format!(
@@ -343,6 +419,32 @@ impl ToolInputRequired {
         }
         Ok(())
     }
+
+    /// URL policy for `url` challenges (decision 6): only `https:` and
+    /// loopback `http:` are valid. Everything else makes the challenge
+    /// invalid; the runtime maps that to a recoverable error, never to a
+    /// suspended interaction. `harnx-core` delegates its operator-exception
+    /// copy to this one, so the rule has a single home.
+    pub fn validate_url(raw: &str) -> Result<(), String> {
+        let parsed = url::Url::parse(raw).map_err(|_| format!("invalid url '{raw}'"))?;
+        match parsed.scheme() {
+            "https" => Ok(()),
+            "http" => match parsed.host() {
+                Some(url::Host::Domain(host)) if host.eq_ignore_ascii_case("localhost") => Ok(()),
+                Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Ok(()),
+                Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Ok(()),
+                _ => Err(format!("url '{raw}' must be https or loopback http")),
+            },
+            scheme => Err(format!(
+                "url scheme '{scheme}' must be https or loopback http"
+            )),
+        }
+    }
+}
+
+/// A challenge field that is absent or empty text carries no value on the wire.
+fn optional_field_is_blank(field: Option<&str>) -> bool {
+    field.map(str::is_empty).unwrap_or(true)
 }
 
 /// Answers to a tool's input-required challenges, keyed by the challenge's
@@ -470,6 +572,13 @@ pub struct ToolInvocationContext {
     /// The tool's opaque request state from its latest challenge (MRTR
     /// `requestState`), resent beside the responses. Null on a first call.
     pub request_state: Value,
+    /// The caller's harnx user identity, decoded from
+    /// [`ToolRequest::user_id`] by the transport. Trusted context: the worker
+    /// fills it from the canonical session owner for model-originated calls
+    /// and from the operator identity for operator calls, never from
+    /// model-authored arguments. `None` for older callers and anonymous
+    /// (ownerless) sessions.
+    pub user_id: Option<String>,
 }
 
 /// Re-export SessionRef to allow harnx-toolset-server to pass it through
@@ -513,6 +622,7 @@ impl fmt::Debug for ToolInvocationContext {
             .field("new_message", &self.new_message.is_cancelled())
             .field("input_responses", &self.input_responses)
             .field("request_state", &self.request_state)
+            .field("user_id", &self.user_id)
             .finish()
     }
 }
@@ -670,6 +780,13 @@ pub struct ToolRequest {
     /// `requestState`), resent beside the responses, never inside `args`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_state: Option<Value>,
+    /// The caller's harnx user identity, for tool servers that act per user.
+    /// Filled only by trusted callers: the worker stamps the canonical session
+    /// owner for model-originated calls, or the operator identity for operator
+    /// calls. It is transport-attested context like `parent_session_id`, never
+    /// read from model-authored tool arguments, and absent for older callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 /// One attempt to replay a call whose original result was never observed,
@@ -814,11 +931,120 @@ pub struct Registration {
     pub tools: Vec<ToolSpec>,
     pub schema_version: u32,
     pub proto_version: u32,
+    /// The user this registration is scoped to, when the registration holds
+    /// one user's tools (per-user tool servers). Published under
+    /// `{scope}.{identity_token}.u.{U}`; see [`registration_kv_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// True for an ownerless-only registration (`--single-user` servers),
+    /// visible to sessions without a harnx user identity only. Published
+    /// under `{scope}.{identity_token}.anon`; mutually exclusive with
+    /// `user_id`.
+    #[serde(default)]
+    pub ownerless_only: bool,
+    /// The credential connection this registration was derived from, for
+    /// CAS fencing of refreshes and conditional deletes (a newer connection
+    /// must not be overwritten or deleted by a stale writer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+}
+
+impl Registration {
+    /// Which sessions this registration is visible to (invariant (a) of the
+    /// user-credentials plan: an owned session sees global registrations plus
+    /// its owner's; an ownerless session sees global plus ownerless-only).
+    pub fn audience(&self) -> RegistrationAudience {
+        if let Some(user_id) = &self.user_id {
+            RegistrationAudience::User(user_key_segment(user_id))
+        } else if self.ownerless_only {
+            RegistrationAudience::OwnerlessOnly
+        } else {
+            RegistrationAudience::Global
+        }
+    }
+}
+
+/// Which sessions one registration is visible to.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum RegistrationAudience {
+    /// Every session under the scope.
+    #[default]
+    Global,
+    /// Sessions whose owner's key segment equals this one (see
+    /// [`user_key_segment`]).
+    User(String),
+    /// Sessions without an owner only (`--single-user` servers).
+    OwnerlessOnly,
+}
+
+/// Key suffix segment separating a user-scoped registration key from its
+/// server's global registration key. Older workers accept only keys exactly
+/// equal to `{scope}.{identity_token}`, so `.u.{U}` and `.anon` keys are
+/// invisible to them without a protocol-version bump.
+pub const REGISTRATION_USER_SEGMENT: &str = "u";
+/// Key suffix marking an ownerless-only registration.
+pub const REGISTRATION_OWNERLESS_SEGMENT: &str = "anon";
+
+/// Unpadded base64url encoding of a user id, safe in NATS KV keys and never
+/// containing `.`, so a `{token}.u.{U}` key splits unambiguously.
+pub fn user_key_segment(user_id: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    URL_SAFE_NO_PAD.encode(user_id)
+}
+
+/// The KV key a registration publishes under: `{scope}.{identity_token}` for a
+/// global registration, `{scope}.{identity_token}.u.{U}` for a user-scoped
+/// one, `{scope}.{identity_token}.anon` for an ownerless-only one. All kinds
+/// route to the same tool subject; only discovery visibility differs.
+pub fn registration_kv_key(scope: &str, registration: &Registration) -> String {
+    let identity_token = server_identity_token(
+        registration.package.as_deref(),
+        &registration.config,
+        &registration.server,
+    );
+    match registration.audience() {
+        RegistrationAudience::Global => format!("{scope}.{identity_token}"),
+        RegistrationAudience::User(segment) => {
+            format!("{scope}.{identity_token}.{REGISTRATION_USER_SEGMENT}.{segment}")
+        }
+        RegistrationAudience::OwnerlessOnly => {
+            format!("{scope}.{identity_token}.{REGISTRATION_OWNERLESS_SEGMENT}")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Split the part of a registry key after its `{scope}.` prefix into the
+    /// server's identity token and the registration's audience.
+    ///
+    /// `None` for an empty suffix. A suffix without a recognized trailing
+    /// `.u.{U}` or `.anon` segment classifies as global, which is exactly the key
+    /// shape every pre-change worker accepted.
+    fn split_registration_key_suffix(suffix: &str) -> Option<(String, RegistrationAudience)> {
+        if suffix.is_empty() {
+            return None;
+        }
+        if let Some(token) = suffix.strip_suffix(&format!(".{REGISTRATION_OWNERLESS_SEGMENT}")) {
+            if !token.is_empty() {
+                return Some((token.to_string(), RegistrationAudience::OwnerlessOnly));
+            }
+        }
+        let user_separator = format!(".{REGISTRATION_USER_SEGMENT}.");
+        if let Some((token, segment)) = suffix.rsplit_once(&user_separator) {
+            if !token.is_empty() && !segment.is_empty() {
+                return Some((
+                    token.to_string(),
+                    RegistrationAudience::User(segment.to_string()),
+                ));
+            }
+        }
+        Some((suffix.to_string(), RegistrationAudience::Global))
+    }
+
     use serde::de::DeserializeOwned;
     use serde_json::json;
 
@@ -1219,6 +1445,7 @@ mod tests {
                 },
             )])),
             request_state: Some(json!({ "round": 2 })),
+            user_id: None,
         };
         let back: ToolRequest =
             serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
@@ -1260,6 +1487,82 @@ mod tests {
     }
 
     #[test]
+    fn url_challenge_validates_scheme_and_loopback() {
+        // Accepted: https anywhere, http only on loopback hosts.
+        for url in [
+            "https://example.com/connect/abc",
+            "http://127.0.0.1:8931/connect/abc",
+            "http://localhost:8931/connect/abc",
+            "http://[::1]:8931/connect/abc",
+            "http://127.8.4.2/connect/abc",
+        ] {
+            ToolInputRequired::validate_url(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        // Rejected: other schemes, non-loopback http, garbage.
+        for url in [
+            "http://example.com/connect/abc",
+            "http://192.168.1.4/connect/abc",
+            "ftp://example.com/x",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "not a url",
+        ] {
+            assert!(ToolInputRequired::validate_url(url).is_err(), "{url}");
+        }
+        // A well-formed challenge passes; missing fields and bad URLs fail.
+        let input = ToolInputRequired::url(
+            "k",
+            "https://example.com/connect/abc",
+            "Open the link to continue",
+            json!({ "challenge_id": "abc" }),
+        );
+        input.validate().unwrap();
+        assert!(
+            ToolInputRequired::url("k", "http://example.com/x", "m", Value::Null)
+                .validate()
+                .is_err()
+        );
+        assert!(ToolInputRequired::url("k", "", "m", Value::Null)
+            .validate()
+            .is_err());
+        assert!(
+            ToolInputRequired::url("k", "https://example.com/x", "", Value::Null)
+                .validate()
+                .is_err()
+        );
+        assert_eq!(input.kind, ToolInputRequired::KIND_URL);
+        assert_eq!(input.message.as_deref(), Some("Open the link to continue"));
+        assert_eq!(
+            input.url.as_deref(),
+            Some("https://example.com/connect/abc")
+        );
+    }
+
+    #[test]
+    fn url_challenge_round_trips_and_legacy_json_decodes_without_url() {
+        let input = ToolInputRequired::url(
+            "k",
+            "https://example.com/connect/abc",
+            "Open the link",
+            Value::Null,
+        );
+        let back: ToolInputRequired =
+            serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
+        assert_eq!(back, input);
+        // The url field is skipped when absent; older JSON decodes unchanged.
+        let legacy: ToolInputRequired = serde_json::from_value(json!({
+            "key": "k",
+            "kind": "confirm",
+            "message": "Proceed?",
+            "summary": "",
+            "request_state": null,
+        }))
+        .unwrap();
+        assert_eq!(legacy.message.as_deref(), Some("Proceed?"));
+        assert!(legacy.url.is_none());
+    }
+
+    #[test]
     fn spec_input_required_round_trips_through_meta() {
         let spec = tool_spec();
         assert!(!spec.requests_input());
@@ -1288,6 +1591,7 @@ mod tests {
             capabilities: BTreeSet::new(),
             input_responses: None,
             request_state: None,
+            user_id: None,
         };
         assert_round_trip(request.clone());
         assert_round_trip(ToolRequest {
@@ -1340,6 +1644,9 @@ mod tests {
             tools: vec![tool_spec()],
             schema_version: 1,
             proto_version: 1,
+            user_id: None,
+            ownerless_only: false,
+            connection_id: None,
         });
     }
 
@@ -1397,6 +1704,172 @@ mod tests {
             "coding__time__time"
         );
         assert_eq!(server_identity_token(None, "time", "time"), "__time__time");
+    }
+
+    #[test]
+    fn user_key_segment_is_unpadded_base64url_without_dots() {
+        assert_eq!(user_key_segment("alice"), "YWxpY2U");
+        assert_eq!(user_key_segment(""), "");
+        assert!(!user_key_segment("a.b").contains('.'));
+        // Round trip via the same encoding: two user ids never collide.
+        assert_ne!(user_key_segment("a"), user_key_segment("YQ"));
+    }
+
+    fn registration_for(audience: RegistrationAudience) -> Registration {
+        let mut registration = Registration {
+            package: Some("pkg".to_string()),
+            config: "cfg".to_string(),
+            server: "jira".to_string(),
+            tools: Vec::new(),
+            schema_version: 1,
+            proto_version: 1,
+            user_id: None,
+            ownerless_only: false,
+            connection_id: None,
+        };
+        match audience {
+            RegistrationAudience::Global => {}
+            RegistrationAudience::User(_) => registration.user_id = Some("alice".to_string()),
+            RegistrationAudience::OwnerlessOnly => registration.ownerless_only = true,
+        }
+        registration
+    }
+
+    #[test]
+    fn registration_kv_keys_carry_the_audience_suffix() {
+        let global =
+            registration_kv_key("scope-1", &registration_for(RegistrationAudience::Global));
+        assert_eq!(global, "scope-1.pkg__cfg__jira");
+        let user = registration_kv_key(
+            "scope-1",
+            &registration_for(RegistrationAudience::User(String::new())),
+        );
+        assert_eq!(
+            user,
+            format!("scope-1.pkg__cfg__jira.u.{}", user_key_segment("alice"))
+        );
+        let ownerless = registration_kv_key(
+            "scope-1",
+            &registration_for(RegistrationAudience::OwnerlessOnly),
+        );
+        assert_eq!(ownerless, "scope-1.pkg__cfg__jira.anon");
+    }
+
+    #[test]
+    fn split_registration_key_suffix_classifies_every_audience() {
+        use RegistrationAudience::{Global, OwnerlessOnly, User};
+        assert_eq!(
+            split_registration_key_suffix("pkg__cfg__jira"),
+            Some(("pkg__cfg__jira".to_string(), Global))
+        );
+        let segment = user_key_segment("alice");
+        assert_eq!(
+            split_registration_key_suffix(&format!("pkg__cfg__jira.u.{segment}")),
+            Some(("pkg__cfg__jira".to_string(), User(segment.clone())))
+        );
+        assert_eq!(
+            split_registration_key_suffix("pkg__cfg__jira.anon"),
+            Some(("pkg__cfg__jira".to_string(), OwnerlessOnly))
+        );
+        assert_eq!(split_registration_key_suffix(""), None);
+    }
+
+    /// The pre-change worker accepted a registration only when its KV key was
+    /// exactly `{scope}.{identity_token}`. `.u.{U}` and `.anon` keys must keep
+    /// failing that exact-match rule (that is the no-protocol-bump
+    /// compatibility story), while the audience-aware rule handles them.
+    #[test]
+    fn scoped_and_ownerless_keys_are_invisible_to_the_exact_match_rule() {
+        let scope = "scope-1";
+        let registrations = [
+            registration_for(RegistrationAudience::Global),
+            registration_for(RegistrationAudience::User(String::new())),
+            registration_for(RegistrationAudience::OwnerlessOnly),
+        ];
+        for registration in &registrations {
+            let key = registration_kv_key(scope, registration);
+            let identity_token = server_identity_token(
+                registration.package.as_deref(),
+                &registration.config,
+                &registration.server,
+            );
+            // The pre-change rule: one exact key shape per identity.
+            let exact_match = key == format!("{scope}.{identity_token}");
+            // The new rule classifies every key's audience.
+            let (token, audience) =
+                split_registration_key_suffix(&key[scope.len() + 1..]).expect("non-empty suffix");
+            assert_eq!(token, identity_token);
+            match registration.audience() {
+                RegistrationAudience::Global => {
+                    assert!(exact_match, "global keys stay exact-match compatible");
+                    assert_eq!(audience, RegistrationAudience::Global);
+                }
+                RegistrationAudience::User(_) | RegistrationAudience::OwnerlessOnly => {
+                    assert!(!exact_match, "scoped keys are ignored by the old rule");
+                    assert_eq!(audience, registration.audience());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registration_user_scoped_fields_default_on_legacy_payloads() {
+        let registration: Registration = serde_json::from_value(json!({
+            "server": "time",
+            "tools": [],
+            "schema_version": 1,
+            "proto_version": 1
+        }))
+        .expect("legacy registration decodes");
+        assert_eq!(registration.user_id, None);
+        assert!(!registration.ownerless_only);
+        assert_eq!(registration.connection_id, None);
+        assert_eq!(registration.audience(), RegistrationAudience::Global);
+
+        let scoped = serde_json::from_value::<Registration>(json!({
+            "server": "jira",
+            "tools": [],
+            "schema_version": 1,
+            "proto_version": 1,
+            "user_id": "alice@example.com",
+            "connection_id": "conn-7"
+        }))
+        .expect("user-scoped registration decodes");
+        assert_eq!(
+            scoped.audience(),
+            RegistrationAudience::User(user_key_segment("alice@example.com"))
+        );
+
+        let encoded = serde_json::to_value(&scoped).unwrap();
+        // `ownerless_only` is a defaulted plain bool, so it serializes
+        // explicitly; a pre-change reader ignores the unknown field.
+        assert_eq!(encoded["ownerless_only"], json!(false));
+        assert_eq!(encoded["user_id"], json!("alice@example.com"));
+        assert_eq!(encoded["connection_id"], json!("conn-7"));
+    }
+
+    #[test]
+    fn tool_request_user_id_round_trips_and_defaults_to_absent() {
+        let request: ToolRequest = serde_json::from_value(json!({
+            "operation_id": "call-1",
+            "call_id": "call-1",
+            "tool": "deploy",
+            "args": {}
+        }))
+        .expect("legacy request decodes");
+        assert_eq!(request.user_id, None);
+
+        let mut scoped = request.clone();
+        scoped.user_id = Some("alice".to_string());
+        let back: ToolRequest =
+            serde_json::from_value(serde_json::to_value(&scoped).unwrap()).unwrap();
+        assert_eq!(back, scoped);
+        assert_eq!(back.user_id.as_deref(), Some("alice"));
+
+        let encoded = serde_json::to_value(&scoped).unwrap();
+        assert_eq!(encoded["user_id"], json!("alice"));
+        let unscoped = serde_json::to_value(&request).unwrap();
+        assert!(unscoped.get("user_id").is_none());
     }
 
     #[test]

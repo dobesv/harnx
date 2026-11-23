@@ -126,15 +126,43 @@ pub async fn accept_interaction_response(
 pub use accept_interaction_response as apply_interaction_response;
 
 /// The one surface check every frontend's `a2ui` answer passes through. Other
-/// kinds (`confirm`, and the pre-T4.2 kinds) keep their existing acceptance.
+/// kinds (`confirm`, and the pre-T4.2 kinds) keep their existing acceptance;
+/// `url` answers accept only `continue`/`cancel` with no data (decision 6).
 fn validate_surface_response(
     request: &harnx_core::interaction::InteractionRequest,
     response: &InteractionResponse,
 ) -> Result<(), String> {
-    if request.kind != "a2ui" {
-        return Ok(());
+    match request.kind.as_str() {
+        "a2ui" => harnx_core::interaction::response::validate_response(&request.payload, response),
+        harnx_core::tool::ToolInputRequired::KIND_URL => validate_url_response(response),
+        _ => Ok(()),
     }
-    harnx_core::interaction::response::validate_response(&request.payload, response)
+}
+
+/// A `url` response stores nothing beyond the action: `continue` or `cancel`
+/// with an empty `data` map and no note. The session stream is cleartext, so a
+/// `url` challenge must never leak data fields into it, and the response
+/// envelope itself carries only the action (decision 6).
+fn validate_url_response(response: &InteractionResponse) -> Result<(), String> {
+    if response.action != harnx_core::tool::ToolInputRequired::URL_ACTION_CONTINUE
+        && response.action != harnx_core::tool::ToolInputRequired::URL_ACTION_CANCEL
+    {
+        return Err(format!(
+            "url interactions accept only 'continue' or 'cancel', not '{}'",
+            response.action
+        ));
+    }
+    if !response.data.is_empty() {
+        return Err("url interactions carry no data; the response is the action alone".into());
+    }
+    if response
+        .note
+        .as_deref()
+        .is_some_and(|n| !n.trim().is_empty())
+    {
+        return Err("url interactions carry no note; the response is the action alone".into());
+    }
+    Ok(())
 }
 
 async fn commit_response_cas(
@@ -194,5 +222,89 @@ async fn resolve_cas_loss(
         })
     } else {
         Ok(InteractionDecisionOutcome::LeaseLost)
+    }
+}
+
+#[cfg(test)]
+mod url_response_tests {
+    use super::*;
+    use harnx_core::interaction::{InteractionRequest, InteractionResponse};
+    use serde_json::json;
+
+    fn url_request() -> InteractionRequest {
+        InteractionRequest {
+            interaction_id: "interaction-url".into(),
+            producer: "tool:jira/connect".into(),
+            step_path: vec![],
+            key: "connect".into(),
+            kind: "url".into(),
+            payload: json!({
+                "url": "https://example.com/connect/abc",
+                "message": "Connect Jira"
+            }),
+            summary: "Connect Jira".into(),
+            chain_version: "v1".into(),
+        }
+    }
+
+    fn response(
+        action: &str,
+        data: serde_json::Map<String, serde_json::Value>,
+    ) -> InteractionResponse {
+        InteractionResponse {
+            action: action.into(),
+            data,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn url_response_accepts_continue_and_cancel_with_no_data() {
+        let request = url_request();
+        assert!(
+            validate_surface_response(&request, &response("continue", Default::default())).is_ok()
+        );
+        assert!(
+            validate_surface_response(&request, &response("cancel", Default::default())).is_ok()
+        );
+    }
+
+    #[test]
+    fn url_response_rejects_other_actions_any_data_and_any_note() {
+        let request = url_request();
+        assert!(
+            validate_surface_response(&request, &response("approve", Default::default())).is_err()
+        );
+        assert!(
+            validate_surface_response(&request, &response("deny", Default::default())).is_err()
+        );
+        let mut data = serde_json::Map::new();
+        data.insert("token".into(), json!("secret"));
+        assert!(validate_surface_response(&request, &response("continue", data)).is_err());
+        // The stored response contains nothing beyond the action: no note.
+        let noted = InteractionResponse {
+            action: "continue".into(),
+            data: Default::default(),
+            note: Some("done in browser".into()),
+        };
+        assert!(validate_surface_response(&request, &noted).is_err());
+    }
+
+    #[test]
+    fn confirm_response_keeps_existing_acceptance() {
+        let request = InteractionRequest {
+            interaction_id: "interaction-confirm".into(),
+            producer: "tool:x/y".into(),
+            step_path: vec![],
+            key: "k".into(),
+            kind: "confirm".into(),
+            payload: json!({}),
+            summary: String::new(),
+            chain_version: "v1".into(),
+        };
+        assert!(
+            validate_surface_response(&request, &response("approve", Default::default())).is_ok(),
+            "confirm keeps its pre-T4.2 acceptance"
+        );
     }
 }

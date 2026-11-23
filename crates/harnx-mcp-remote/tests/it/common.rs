@@ -194,18 +194,7 @@ pub async fn spawn_http_test_server_on_listener(
         config,
     );
     let app = Router::new().nest_service("/mcp", mcp_service);
-    let port = listener.local_addr()?.port();
-    let shutdown_wait = shutdown.clone();
-    let join = tokio::spawn(async move {
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown_wait.cancelled().await;
-            })
-            .await;
-        if let Err(err) = result {
-            panic!("test HTTP server failed: {err}");
-        }
-    });
+    let (port, join) = serve_test_app(listener, app, shutdown.clone(), "test HTTP server")?;
     Ok(HttpTestServerHandle {
         port,
         initialize_count,
@@ -256,18 +245,7 @@ pub async fn spawn_auth_guard_server(expected_auth: &'static str) -> Result<Http
                 },
             ));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
-    let shutdown_wait = shutdown.clone();
-    let join = tokio::spawn(async move {
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown_wait.cancelled().await;
-            })
-            .await;
-        if let Err(err) = result {
-            panic!("test auth server failed: {err}");
-        }
-    });
+    let (port, join) = serve_test_app(listener, app, shutdown.clone(), "test auth server")?;
     Ok(HttpTestServerHandle {
         port,
         initialize_count,
@@ -440,4 +418,24 @@ fn header_map_to_json(headers: &axum::http::HeaderMap) -> Map<String, Value> {
             (key, value)
         })
         .collect()
+}
+
+pub fn serve_test_app(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown: CancellationToken,
+    name: &'static str,
+) -> Result<(u16, tokio::task::JoinHandle<()>)> {
+    let port = listener.local_addr()?.port();
+    let join = tokio::spawn(async move {
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.cancelled().await;
+            })
+            .await;
+        if let Err(err) = result {
+            panic!("{name} failed: {err}");
+        }
+    });
+    Ok((port, join))
 }

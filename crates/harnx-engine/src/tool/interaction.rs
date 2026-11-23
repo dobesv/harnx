@@ -193,6 +193,33 @@ async fn finalize_dispatch(
             // durable layer, which completes their identity. Reaching this
             // arm means no such layer is installed (inner or operator
             // origin, or a round without the durable interaction path).
+            // One narrow exception (decision 11): an operator call that
+            // gets a `url` challenge succeeds with the link, message and
+            // request state in its result, so the CLI can show the link and
+            // poll; every other interaction kind still degrades to an error.
+            // The link must pass the shared decision 6 policy — an invalid
+            // URL is a bad challenge, not an operator result.
+            if evaluation.origin == ToolMiddlewareOrigin::Operator
+                && input.kind == harnx_core::tool::ToolInputRequired::KIND_URL
+                && input.url.as_deref().is_some_and(|url| !url.is_empty())
+                && harnx_core::tool::ToolInputRequired::validate_url(
+                    input.url.as_deref().unwrap_or_default(),
+                )
+                .is_ok()
+            {
+                let result = MaterializedToolResult::new(
+                    ToolResult::new(
+                        call.call.clone(),
+                        json!({
+                            "url": input.url,
+                            "message": input.message,
+                            "request_state": input.request_state,
+                        }),
+                    ),
+                    InnerToolCallStatus::Ok,
+                );
+                return finalize_materialized(evaluation, call, result).await;
+            }
             let name = input.producer.rsplit('/').next().unwrap_or_default();
             let result = MaterializedToolResult::new(
                 ToolResult::new(

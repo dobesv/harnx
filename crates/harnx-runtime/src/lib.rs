@@ -60,6 +60,7 @@ pub mod tool;
 pub mod tool_context;
 pub mod tool_loop_guard;
 pub mod tool_output;
+pub mod tool_registry_watch;
 pub mod tool_reservation_client;
 mod tool_selector;
 pub mod users;

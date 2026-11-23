@@ -3,6 +3,7 @@ mod cli;
 mod cli_event_sink;
 mod cli_replay_sink;
 mod compact;
+mod credentials_cmd;
 mod interact;
 mod main_runtime;
 mod oneshot_nats;
@@ -183,6 +184,7 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
             | Commands::Call(_)
             | Commands::Interact(_)
             | Commands::Surface(_)
+            | Commands::Credentials(_)
             | Commands::Compact(_)),
         ) => {
             let exit_code = run_command(command, &cli).await?;
@@ -213,6 +215,7 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
                     harnx_runtime::operator_tools::OperatorToolCommand::Call {
                         name: args.name.clone(),
                         args_json: args.args_json.clone(),
+                        tool_input: None,
                     },
                     args.json,
                 )
@@ -232,6 +235,9 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
         Commands::List(list_args) => run_list_command(list_args, cli).await,
         Commands::Interact(interact_args) => interact::run_interact_command(interact_args).await,
         Commands::Surface(surface_args) => surface::run_surface_command(surface_args).await,
+        Commands::Credentials(credentials_args) => {
+            credentials_cmd::run(cli, credentials_args).await
+        }
         Commands::Compact(compact_args) => compact::run_compact_command(compact_args, cli).await,
     }
 }

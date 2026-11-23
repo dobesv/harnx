@@ -161,6 +161,18 @@ Tool servers provide external tools to Harnx. Native toolset servers (such as `h
 
 The **filename** (without `.yaml`) is used as the server name.
 
+### Per-User Credentials (`harnx-mcp-remote` native mode)
+
+Remote MCP servers can run so that every user connects their **own** account
+(OAuth or a pasted token) and sees only their own upstream tools. Run
+`harnx-mcp-remote` with `--credentials-key-file` (no bridge), and manage
+connections with `harnx credentials list|connect|disconnect` or the TUI
+`.credentials` command. See [Tool Server Credentials](tool-credentials.md)
+for setup; ready-made server configs are in
+[`example_config/tool_servers/jira-oauth.yaml`](../example_config/tool_servers/jira-oauth.yaml),
+[`github-token.yaml`](../example_config/tool_servers/github-token.yaml) and
+[`pendo-token.yaml`](../example_config/tool_servers/pendo-token.yaml).
+
 ### Native Tool Server Example
 
 ```yaml

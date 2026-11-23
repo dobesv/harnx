@@ -27,7 +27,8 @@ fn call_bash_tui_parse_preserves_raw_script_and_uses_session_selection() {
         parse_operator_line(".call tool visible {}").unwrap(),
         OperatorToolCommand::Call {
             name: "visible".into(),
-            args_json: "{}".into()
+            args_json: "{}".into(),
+            tool_input: None,
         }
     );
     assert!(parse_operator_line(".call tool visible").is_err());
@@ -58,10 +59,57 @@ fn legacy_command_forms_serialize_unchanged() {
     assert_eq!(
         serde_json::to_value(OperatorToolCommand::Call {
             name: "fs_read".into(),
-            args_json: "{\"a\": 1}".into()
+            args_json: "{\"a\": 1}".into(),
+            tool_input: None,
         })
         .unwrap(),
         json!({"action": "call", "name": "fs_read", "args_json": "{\"a\": 1}"})
+    );
+}
+
+#[test]
+fn call_tool_input_travels_beside_the_arguments() {
+    // Decision 11 wire shape: a polling connect re-call carries the accepted
+    // url-challenge response and the tool's request state under a dedicated
+    // `tool_input` field, never inside `args_json`.
+    let command = OperatorToolCommand::Call {
+        name: "jira_connect".into(),
+        args_json: "{}".into(),
+        tool_input: Some(OperatorToolInput::url_response(
+            "connect-round-2".into(),
+            harnx_core::tool::ToolInputRequired::URL_ACTION_CONTINUE,
+            json!({ "challenge_id": "abc", "round": 2 }),
+        )),
+    };
+    let value = serde_json::to_value(&command).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "action": "call",
+            "name": "jira_connect",
+            "args_json": "{}",
+            "tool_input": {
+                "responses": { "connect-round-2": { "action": "continue", "data": {} } },
+                "request_state": { "challenge_id": "abc", "round": 2 },
+            }
+        })
+    );
+    // An old worker that predates the field still deserializes the legacy
+    // form, and the new worker still deserializes the old form.
+    assert_eq!(
+        serde_json::from_value::<OperatorToolCommand>(value).unwrap(),
+        command
+    );
+    assert_eq!(
+        serde_json::from_value::<OperatorToolCommand>(json!({
+            "action": "call", "name": "fs_read", "args_json": "{}"
+        }))
+        .unwrap(),
+        OperatorToolCommand::Call {
+            name: "fs_read".into(),
+            args_json: "{}".into(),
+            tool_input: None,
+        }
     );
 }
 

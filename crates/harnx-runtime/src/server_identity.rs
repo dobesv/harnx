@@ -127,6 +127,9 @@ mod tests {
 
     fn registration(package: Option<&str>) -> Registration {
         Registration {
+            user_id: None,
+            ownerless_only: false,
+            connection_id: None,
             package: package.map(str::to_string),
             config: "tools".to_string(),
             server: "fs".to_string(),

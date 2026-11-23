@@ -10,7 +10,7 @@ use harnx_core::child_process::ChildProcessManager;
 use harnx_core::instance::HARNX_SERVER_SCOPE;
 use harnx_toolset::{ToolInvocation, ToolInvokeError, ToolSpec, Toolset};
 
-pub mod result_limits;
+pub use harnx_toolset_server::result_limits;
 use result_limits::ResultLimits;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{

@@ -218,6 +218,7 @@ fn mcp_invocation_context(
         new_message: Default::default(),
         input_responses,
         request_state,
+        user_id: None,
     })
 }
 
