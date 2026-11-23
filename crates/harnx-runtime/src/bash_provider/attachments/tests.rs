@@ -58,7 +58,7 @@ async fn setup_nats_attachments() -> anyhow::Result<
     Option<(
         harnx_test_bins::NatsServerHandle,
         async_nats::jetstream::Context,
-        async_nats::jetstream::object_store::ObjectStore,
+        AttachmentsBucket,
     )>,
 > {
     harnx_core::require_nextest();

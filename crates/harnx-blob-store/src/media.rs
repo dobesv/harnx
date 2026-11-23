@@ -1,12 +1,14 @@
 //! Media object store operations on the `harnx_attachments` bucket.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Deref};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use async_nats::jetstream::{self, object_store, stream};
+use base64::Engine as _;
 use tokio::io::AsyncReadExt;
 
 use harnx_core::cid_url::CidUrl;
+use harnx_nats_common::leader_reads::retry_transient;
 
 /// JetStream object-store bucket containing durable session attachment blobs.
 pub const ATTACHMENTS_BUCKET: &str = "harnx_attachments";
@@ -14,11 +16,40 @@ pub const ATTACHMENTS_BUCKET: &str = "harnx_attachments";
 /// Content type metadata key for the object store.
 const CONTENT_TYPE_METADATA_KEY: &str = "content_type";
 
+/// The attachment object store and a handle for reading its stream leader.
+///
+/// `ObjectStore` doesn't expose its stream or context. Keep both handles so
+/// writes and leader reads always use the same JetStream account and domain.
+#[derive(Clone)]
+pub struct AttachmentsBucket {
+    store: object_store::ObjectStore,
+    stream: stream::Stream<()>,
+}
+
+impl AttachmentsBucket {
+    async fn new(jetstream: &jetstream::Context, store: object_store::ObjectStore) -> Result<Self> {
+        // This constructs a handle without a STREAM.INFO request.
+        let stream = jetstream
+            .get_stream_no_info(object_store_stream_name())
+            .await
+            .context("build the attachment object-store stream handle")?;
+        Ok(Self { store, stream })
+    }
+}
+
+impl Deref for AttachmentsBucket {
+    type Target = object_store::ObjectStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
 /// Put a media blob into the object store.
 ///
 /// The blob is stored at the key specified by `CidUrl::kv_key()`.
 pub async fn put_media(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     url: &CidUrl,
     bytes: &[u8],
     mime_type: &str,
@@ -47,7 +78,7 @@ pub struct MediaBlob<'a> {
 /// broker's payload ceiling when it is smaller than the client's 128 KiB default.
 /// Object metadata still has to fit in a single message; failures propagate.
 pub async fn put_media_with_chunk_limit(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     blob: MediaBlob<'_>,
     max_chunk_bytes: usize,
 ) -> Result<()> {
@@ -59,7 +90,7 @@ pub async fn put_media_with_chunk_limit(
 }
 
 async fn put_media_chunked(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     blob: MediaBlob<'_>,
     chunk_size: Option<usize>,
 ) -> Result<()> {
@@ -69,7 +100,10 @@ async fn put_media_chunked(
         mime_type,
     } = blob;
     let key = url.kv_key();
-    if store.info(&key).await.is_ok() {
+    if leader_media_info(store, &key)
+        .await?
+        .is_some_and(|info| !info.deleted)
+    {
         return Ok(()); // Already exists, skip duplicate put
     }
     let mut metadata = HashMap::new();
@@ -145,12 +179,7 @@ pub(crate) async fn get_media_with_limit(
 
     // ObjectStore::get only fetches metadata; chunk download starts on the first read.
     crate::limits::check_size(object.info().size, max_bytes)?;
-    let mime_type = object
-        .info()
-        .metadata
-        .get(CONTENT_TYPE_METADATA_KEY)
-        .cloned()
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let mime_type = media_content_type(object.info()).to_owned();
     let bytes = read_media_bytes(object, &key, max_bytes).await?;
     Ok(Some((bytes, mime_type)))
 }
@@ -216,7 +245,7 @@ async fn raise_object_store_replicas(
 pub async fn ensure_attachments_bucket(
     jetstream: &jetstream::Context,
     replicas: usize,
-) -> Result<object_store::ObjectStore> {
+) -> Result<AttachmentsBucket> {
     let create = jetstream
         .create_object_store(object_store::Config {
             bucket: ATTACHMENTS_BUCKET.to_string(),
@@ -227,31 +256,30 @@ pub async fn ensure_attachments_bucket(
         })
         .await;
     if let Ok(store) = create {
-        return Ok(store);
+        return AttachmentsBucket::new(jetstream, store).await;
     }
     if let Err(error) = raise_object_store_replicas(jetstream, replicas).await {
         log::warn!(
             "could not reconcile replicas for attachment object store '{ATTACHMENTS_BUCKET}': {error:#}"
         );
     }
-    jetstream
+    open_attachments_bucket(jetstream).await
+}
+
+async fn open_attachments_bucket(jetstream: &jetstream::Context) -> Result<AttachmentsBucket> {
+    let store = jetstream
         .get_object_store(ATTACHMENTS_BUCKET)
         .await
-        .map_err(anyhow::Error::from)
-        .context("open NATS session attachment object store")
+        .context("open NATS session attachment object store")?;
+    AttachmentsBucket::new(jetstream, store).await
 }
 
 /// Get an existing attachments bucket, or None if it doesn't exist.
 pub async fn optional_attachments_bucket(
     jetstream: &jetstream::Context,
-) -> Result<Option<object_store::ObjectStore>> {
+) -> Result<Option<AttachmentsBucket>> {
     match jetstream.get_stream(object_store_stream_name()).await {
-        Ok(_) => jetstream
-            .get_object_store(ATTACHMENTS_BUCKET)
-            .await
-            .map(Some)
-            .map_err(anyhow::Error::from)
-            .context("open NATS session attachment object store"),
+        Ok(_) => open_attachments_bucket(jetstream).await.map(Some),
         Err(error) if stream_missing(&error.kind()) => Ok(None),
         Err(error) => {
             Err(anyhow::Error::from(error)).context("inspect NATS session attachment object store")
@@ -277,12 +305,8 @@ pub async fn delete_media_prefix(jetstream: &jetstream::Context, owner: &str) ->
         }
     }
 
-    let stream = jetstream
-        .get_stream(object_store_stream_name())
-        .await
-        .context("open the attachment object-store stream")?;
     for name in &names {
-        delete_media_object(&stream, name)
+        delete_media_object(&store, name)
             .await
             .with_context(|| format!("delete media object '{}'", name))?;
     }
@@ -290,41 +314,125 @@ pub async fn delete_media_prefix(jetstream: &jetstream::Context, owner: &str) ->
     Ok(names.len())
 }
 
+fn media_metadata_subject(key: &str) -> String {
+    format!(
+        "$O.{ATTACHMENTS_BUCKET}.M.{}",
+        base64::engine::general_purpose::URL_SAFE.encode(key)
+    )
+}
+
+fn media_chunk_subject(nuid: &str) -> String {
+    format!("$O.{ATTACHMENTS_BUCKET}.C.{nuid}")
+}
+
+/// Read metadata for an object key (`CidUrl::kv_key()`) from the stream leader.
+/// Returns `None` only if the key is absent. Tombstones are returned with
+/// `deleted` set so callers can distinguish them from live objects.
+pub async fn leader_media_info(
+    store: &AttachmentsBucket,
+    key: &str,
+) -> Result<Option<object_store::ObjectInfo>> {
+    let subject = media_metadata_subject(key);
+    let message = retry_transient(|| async {
+        match store.stream.get_last_raw_message_by_subject(&subject).await {
+            Ok(message) => Ok(Some(message)),
+            Err(error) if error.kind() == stream::LastRawMessageErrorKind::NoMessageFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    })
+    .await
+    .with_context(|| format!("read media metadata for '{key}'"))?;
+    message
+        .map(|message| serde_json::from_slice(&message.payload))
+        .transpose()
+        .with_context(|| format!("decode media metadata for '{key}'"))
+}
+
+/// Content type reported by `get_media` for this object's metadata.
+pub fn media_content_type(info: &object_store::ObjectInfo) -> &str {
+    info.metadata
+        .get(CONTENT_TYPE_METADATA_KEY)
+        .map(String::as_str)
+        .unwrap_or("application/octet-stream")
+}
+
+/// Read the chunks for live metadata from [`leader_media_info`]. Uses the
+/// stream leader for every chunk, without re-reading metadata or opening a
+/// consumer. Returns an error on missing chunks or a size mismatch. The
+/// caller must verify the content digest if needed.
+pub async fn read_media_from_leader(
+    store: &AttachmentsBucket,
+    info: &object_store::ObjectInfo,
+) -> Result<Vec<u8>> {
+    ensure!(!info.deleted, "media object '{}' is deleted", info.name);
+    // next_by_subj is a filter, so don't use metadata that could match other objects.
+    ensure!(
+        !info.nuid.is_empty()
+            && info
+                .nuid
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+        "invalid chunk ID for media object '{}'",
+        info.name
+    );
+    let subject = media_chunk_subject(&info.nuid);
+    let mut sequence = 0;
+    let mut bytes = Vec::new();
+    for index in 0..info.chunks {
+        let chunk = retry_transient(|| async {
+            Ok(store
+                .stream
+                .get_first_raw_message_by_subject(&subject, sequence)
+                .await?)
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "read chunk {} of {} for '{}'",
+                index + 1,
+                info.chunks,
+                info.name
+            )
+        })?;
+        ensure!(
+            chunk.payload.len() <= info.size - bytes.len(),
+            "media object '{}' exceeds declared size of {} bytes",
+            info.name,
+            info.size
+        );
+        bytes.extend_from_slice(&chunk.payload);
+        sequence = chunk.sequence + 1;
+    }
+    ensure!(
+        bytes.len() == info.size,
+        "media object '{}' has {} bytes, expected {}",
+        info.name,
+        bytes.len(),
+        info.size
+    );
+    Ok(bytes)
+}
+
 /// Remove one object, leaving nothing behind. The object store's own `delete`
 /// writes a metadata entry marked deleted, which then stays forever. The
 /// chunks go first, so a failure between the two purges leaves an entry the
 /// next deletion still finds, rather than chunks nothing points at.
-async fn delete_media_object(stream: &stream::Stream, name: &str) -> Result<()> {
-    use base64::Engine as _;
-    // The object store names an object's metadata subject by the URL-safe
-    // base64 of its name.
-    let metadata_subject = format!(
-        "$O.{ATTACHMENTS_BUCKET}.M.{}",
-        base64::engine::general_purpose::URL_SAFE.encode(name)
-    );
-    // Read the metadata from the stream leader. `ObjectStore::info` is a direct
-    // read that a replica behind the object's latest write can answer with
-    // "not found", which would leave the object behind.
-    let message = match stream
-        .get_last_raw_message_by_subject(&metadata_subject)
-        .await
-    {
-        Ok(message) => message,
-        Err(error) if error.kind() == stream::LastRawMessageErrorKind::NoMessageFound => {
-            return Ok(());
-        }
-        Err(error) => return Err(error).context("read media object metadata"),
+async fn delete_media_object(store: &AttachmentsBucket, name: &str) -> Result<()> {
+    let Some(info) = leader_media_info(store, name).await? else {
+        return Ok(());
     };
-    let info: object_store::ObjectInfo =
-        serde_json::from_slice(&message.payload).context("decode media object metadata")?;
-    stream
+    store
+        .stream
         .purge()
-        .filter(format!("$O.{ATTACHMENTS_BUCKET}.C.{}", info.nuid))
+        .filter(media_chunk_subject(&info.nuid))
         .await
         .context("purge media object chunks")?;
-    stream
+    store
+        .stream
         .purge()
-        .filter(metadata_subject)
+        .filter(media_metadata_subject(name))
         .await
         .context("purge media object metadata")?;
     Ok(())

@@ -1,8 +1,7 @@
 //! Integration tests for harnx-attachment-tools.
 
-use async_nats::jetstream::object_store::ObjectStore;
 use harnx_attachment_tools::AttachmentToolset;
-use harnx_blob_store::media::{ensure_attachments_bucket, put_media};
+use harnx_blob_store::media::{ensure_attachments_bucket, put_media, AttachmentsBucket};
 use harnx_blob_store::media_cid_url;
 use harnx_blob_store::plans::{
     create_document, ensure_plans_bucket, serialize_plan, PlanDocument, PlanFrontMatter,
@@ -27,7 +26,7 @@ const HASH_B: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123
 struct TestContext {
     _nats: NatsServerHandle,
     toolset: AttachmentToolset,
-    store: ObjectStore,
+    store: AttachmentsBucket,
     jetstream: async_nats::jetstream::Context,
 }
 

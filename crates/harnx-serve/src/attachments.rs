@@ -2,20 +2,27 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use harnx_blob_store::media::AttachmentsBucket;
 use harnx_core::attachments::{read_attachment_async, store_attachment_bytes_async, CID_PREFIX};
 use harnx_core::cid_url::{CidUrl, SessionRef};
 use http::StatusCode;
 use multer::Multipart;
 use serde_json::json;
 
-use crate::{is_safe_agent_path, is_safe_path_segment, percent_decode, MAX_UPLOAD_BYTES};
+use crate::{
+    is_safe_agent_path, is_safe_path_segment, nats_access::is_nats_connect_error, percent_decode,
+    session_actor::ResolvedAgentTarget, Server, MAX_UPLOAD_BYTES,
+};
 
-pub(super) async fn save_attachment_file(
+/// Store the blob locally and return its identity: the same `CidUrl` the
+/// response ref is built from, whose `kv_key()` is also the object-store key
+/// the blob is published under.
+async fn save_attachment_file(
     attachments_dir: &Path,
     attachment_session: &SessionRef,
     data: &[u8],
     mime: &str,
-) -> Result<String> {
+) -> Result<CidUrl> {
     let stored_cid = store_attachment_bytes_async(attachments_dir, data, mime).await?;
     let hash = stored_cid
         .strip_prefix(CID_PREFIX)
@@ -23,8 +30,69 @@ pub(super) async fn save_attachment_file(
     Ok(CidUrl::Media {
         session: attachment_session.clone(),
         hash: hash.to_string(),
+    })
+}
+
+/// One upload request's lazy handle on the shared attachments object store.
+///
+/// JetStream is only taken when the first valid part is stored, so a request
+/// rejected by validation (unsupported MIME type, oversized part, bad
+/// multipart framing) never needs a broker and keeps its 4xx even when the
+/// broker is down.
+pub(super) struct AttachmentObjectStore<'a> {
+    server: &'a Server,
+    target: &'a ResolvedAgentTarget,
+    bucket: Option<AttachmentsBucket>,
+}
+
+impl<'a> AttachmentObjectStore<'a> {
+    pub(super) fn new(server: &'a Server, target: &'a ResolvedAgentTarget) -> Self {
+        Self {
+            server,
+            target,
+            bucket: None,
+        }
     }
-    .to_string())
+
+    /// Write one accepted blob to the object store. The first call takes
+    /// JetStream and ensures the bucket; later parts reuse both.
+    pub(super) async fn put(&mut self, url: &CidUrl, bytes: &[u8], mime: &str) -> Result<()> {
+        if self.bucket.is_none() {
+            let bucket = self.server.attachments_bucket(self.target).await?;
+            self.bucket = Some(bucket);
+        }
+        let bucket = self
+            .bucket
+            .as_ref()
+            .context("attachment bucket was ensured for this upload")?;
+        harnx_blob_store::media::put_media(bucket, url, bytes, mime).await
+    }
+}
+
+/// Object-store failures must not surface as the route's default 400, and the
+/// response must carry no refs. Connection and unavailability failures are
+/// 503 (the store is currently unreachable); any other store failure is 500.
+/// Both keep the `{"error": ...}` body shape the web UI reads.
+fn attachment_store_error(error: anyhow::Error) -> AttachmentUploadError {
+    log::error!("failed to store uploaded attachment in the NATS object store: {error:#}");
+    // `sanitize_nats_cluster_error` collapses remote connection failures to
+    // this credential-free message.
+    let unavailable = is_nats_connect_error(&error)
+        || error.chain().any(|cause| {
+            cause.to_string().starts_with("NATS cluster '")
+                && cause.to_string().ends_with("is unavailable")
+        });
+    if unavailable {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "attachment object store is unavailable"}),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": format!("failed to store attachment in the object store: {error:#}")}),
+        )
+    }
 }
 
 pub(super) async fn read_cached_or_nats_attachment(
@@ -41,12 +109,13 @@ pub(super) async fn read_cached_or_nats_attachment(
     }
 }
 
-type AttachmentUploadError = (StatusCode, serde_json::Value);
+pub(super) type AttachmentUploadError = (StatusCode, serde_json::Value);
 
 async fn process_field(
     field: multer::Field<'_>,
     attachments_dir: &Path,
     attachment_session: &SessionRef,
+    object_store: &mut AttachmentObjectStore<'_>,
     refs: &mut Vec<String>,
 ) -> Result<Option<AttachmentUploadError>> {
     let name = field.name().unwrap_or_default().to_string();
@@ -83,7 +152,15 @@ async fn process_field(
         )));
     }
 
-    refs.push(save_attachment_file(attachments_dir, attachment_session, &data, &mime).await?);
+    // Local write first: it is the content-addressed warm cache, and the hash
+    // the returned ref is built from comes from this store. A NATS failure may
+    // leave this file behind; that is a stale cache entry, not a correctness
+    // problem.
+    let url = save_attachment_file(attachments_dir, attachment_session, &data, &mime).await?;
+    if let Err(error) = object_store.put(&url, &data, &mime).await {
+        return Ok(Some(attachment_store_error(error)));
+    }
+    refs.push(url.to_string());
     Ok(None)
 }
 
@@ -92,6 +169,7 @@ pub(super) async fn process_multipart_upload(
     boundary: String,
     attachments_dir: &Path,
     attachment_session: &SessionRef,
+    object_store: &mut AttachmentObjectStore<'_>,
 ) -> Result<Result<Vec<String>, AttachmentUploadError>> {
     let stream =
         futures_util::stream::once(
@@ -105,8 +183,14 @@ pub(super) async fn process_multipart_upload(
         .await
         .map_err(|err| anyhow!("Bad Request: {err}"))?
     {
-        if let Some(error) =
-            process_field(field, attachments_dir, attachment_session, &mut refs).await?
+        if let Some(error) = process_field(
+            field,
+            attachments_dir,
+            attachment_session,
+            object_store,
+            &mut refs,
+        )
+        .await?
         {
             return Ok(Err(error));
         }
