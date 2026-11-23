@@ -132,9 +132,9 @@ without a compiler (`.github/workflows/ci-rust.yaml`; a failure shows under
 workspace bins into the checkout's own `target/debug`, so the usual ways of
 finding a sibling binary still work: next to the test's own executable,
 through `env!("CARGO_BIN_EXE_...")`, or in `target/debug` under the workspace
-root. Nothing else from the build directory is there, so a test that reads
-another file under `target/` or runs cargo to build something passes locally
-and fails in CI. Only xtask's tests may run cargo, and the test jobs
+root, and `CARGO_TARGET_TMPDIR` (`target/tmp`) exists, empty. Nothing else
+from the build directory is there, so a test that reads another file under
+`target/` or runs cargo to build something passes locally and fails in CI. Only xtask's tests may run cargo, and the test jobs
 fetch crates for them alone; a new test that runs `cargo metadata` needs its
 package added to that step's condition.
 

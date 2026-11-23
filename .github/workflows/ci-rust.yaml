@@ -295,8 +295,13 @@ jobs:
       with:
         name: tests-${{ inputs.os }}
 
+    # Integration tests make scratch directories under
+    # `env!("CARGO_TARGET_TMPDIR")`, target/tmp, which cargo creates when it
+    # builds them and the archive leaves out because it is empty.
     - name: Unpack the workspace binaries
-      run: tar -xf workspace-bins.tar
+      run: |
+        tar -xf workspace-bins.tar
+        mkdir -p target/tmp
 
     # Unpacking into the checkout, rather than nextest's default temporary
     # directory, puts the test binaries in target/ where the paths compiled
