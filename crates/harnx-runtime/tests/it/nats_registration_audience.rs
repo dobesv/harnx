@@ -471,6 +471,92 @@ async fn next_discovery_sees_written_and_deleted_registrations() -> Result<()> {
     Ok(())
 }
 
+/// An unchanged registry must reuse the cached provider — same `Arc` on the
+/// second lookup. The reuse keeps a cache hit from paying a fresh discovery
+/// (and with it a fresh connection); it is not by itself a connection-count
+/// guard, since HEAD also returned the same provider — only the pinned
+/// latency test plus this test together catch a per-lookup connection
+/// regression.
+#[tokio::test]
+async fn nats_cached_discovery_reuses_provider_while_registry_unchanged() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(fx) = fixture().await? else {
+        return Ok(());
+    };
+    // The serving task renews its registration KV entry on a fixed interval;
+    // stop it so no renewal can land between the two lookups below and
+    // legitimately invalidate the first provider.
+    fx.server_task.abort();
+    let _ = fx.server_task.await;
+
+    let config = config_for_owner(Some("alice"));
+    let first = discover_nats_tool_provider_cached(&config, &fx.instance_id, None)
+        .await
+        .context("first discovery")?;
+    let second = discover_nats_tool_provider_cached(&config, &fx.instance_id, None)
+        .await
+        .context("second discovery")?;
+
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "an unchanged registry must reuse the cached provider"
+    );
+    assert!(
+        first.has_tool(&visible_tool("creds", "manage")),
+        "the reused snapshot still sees the global registration"
+    );
+    Ok(())
+}
+
+/// Deleting the whole registry bucket invalidates the cached snapshot on the
+/// very next lookup even though the KV watch never fires a bucket-deleted
+/// event: the deleted stream reads as sequence 0, which no snapshot cached
+/// with a later revision can match (the freshness check the probe's
+/// `Some(0)` mapping exists for). The epoch is asserted unchanged across
+/// the deletion so this cannot pass vacuously by an epoch bump.
+#[tokio::test]
+async fn nats_deleting_the_registry_bucket_invalidates_cached_discovery() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(fx) = fixture().await? else {
+        return Ok(());
+    };
+    let global = visible_tool("creds", "manage");
+    let config = config_for_owner(Some("alice"));
+    let before = discover_nats_tool_provider_cached(&config, &fx.instance_id, None)
+        .await
+        .context("discovery before deletion")?;
+    assert!(before.has_tool(&global), "the global tool is registered");
+    let epoch_before = harnx_runtime::tool_registry_watch::registry_epoch();
+
+    // Stop the serving task first so its periodic renewal cannot recreate
+    // the bucket or race the deletion below.
+    fx.server_task.abort();
+    let _ = fx.server_task.await;
+    let jetstream = async_nats::jetstream::new(fx.client.clone());
+    jetstream
+        .delete_key_value(TOOL_REGISTRY_BUCKET)
+        .await
+        .context("delete the whole registry bucket")?;
+
+    let epoch_after = harnx_runtime::tool_registry_watch::registry_epoch();
+    assert_eq!(
+        epoch_before, epoch_after,
+        "the watch must not fire for a deleted bucket; only the revision check invalidates"
+    );
+    let after = discover_nats_tool_provider_cached(&config, &fx.instance_id, None)
+        .await
+        .context("discovery after bucket deletion")?;
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "the cached snapshot must not survive bucket deletion"
+    );
+    assert!(
+        !after.has_tool(&global),
+        "removed registrations must not stay advertised until the TTL"
+    );
+    Ok(())
+}
+
 /// Decision 11: an operator call acts for the operator's own identity, not
 /// the active session owner's. The worker re-stamps the config's active
 /// agent with the operator identity before dispatch

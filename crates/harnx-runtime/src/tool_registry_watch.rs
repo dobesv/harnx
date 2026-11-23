@@ -119,14 +119,20 @@ async fn watch_loop(config: &Config, cluster: &str) {
 /// asynchronous watch above may not have delivered its event yet when the
 /// next completion runs, but the broker has already committed the sequence.
 ///
+/// Callers must pass an existing connection (the discovery transport's
+/// client, or a cached provider's client). `Config::nats_client` opens a
+/// fresh connection per call — hundreds of milliseconds on CI — so probing
+/// through it on every completion multiplied session-start latency enough
+/// to push delegated child claims past their inherited deadline (PR #2835
+/// macOS CI failure).
+///
 /// `Ok(None)`: the registry stream doesn't exist, so no registrations exist
 /// under any scope yet (callers treat that as sequence 0).
-pub(crate) async fn registry_state_revision(config: &Config) -> anyhow::Result<Option<u64>> {
+pub(crate) async fn registry_state_revision(
+    jetstream: &async_nats::jetstream::Context,
+) -> anyhow::Result<Option<u64>> {
     use async_nats::jetstream::{context::GetStreamErrorKind, ErrorCode};
 
-    let cluster = config.default_cluster_key().to_string();
-    let client = config.nats_client(&cluster).await?;
-    let jetstream = async_nats::jetstream::new(client);
     match jetstream
         .get_stream(format!("KV_{TOOL_REGISTRY_BUCKET}"))
         .await
@@ -158,5 +164,81 @@ mod tests {
         assert_eq!(registry_epoch(), before.wrapping_add(1));
         REGISTRY_EPOCH.fetch_sub(1, Ordering::Release);
         assert_eq!(registry_epoch(), before);
+    }
+
+    /// The three `registry_state_revision` outcomes a cached snapshot's
+    /// freshness check distinguishes: absent stream (`Ok(None)`, callers read
+    /// sequence 0 — the state that invalidates snapshots cached with a later
+    /// revision when the whole bucket is deleted), present with a sequence
+    /// (`Ok(Some)`), and a real transport failure (`Err`, probe maps to `None`
+    /// and the epoch alone vouches for the snapshot).
+    #[tokio::test]
+    async fn nats_registry_state_revision_covers_absent_present_and_unreachable() {
+        let Some((url, mut server, _store)) = crate::nats_worker::tests::spawn_test_nats().await
+        else {
+            return;
+        };
+        let client = async_nats::connect(&url)
+            .await
+            .expect("connect to test broker");
+        let jetstream = async_nats::jetstream::new(client);
+
+        // No registry stream exists yet: absent, not an error.
+        assert_eq!(
+            registry_state_revision(&jetstream)
+                .await
+                .expect("absent stream is not an error"),
+            None
+        );
+
+        let bucket = jetstream
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: TOOL_REGISTRY_BUCKET.to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("create registry bucket");
+        bucket
+            .put("scope/server/tool", "registration".into())
+            .await
+            .expect("write registration");
+        assert!(
+            registry_state_revision(&jetstream)
+                .await
+                .expect("present stream is not an error")
+                .is_some_and(|sequence| sequence >= 1),
+            "a written registration moves the sequence past 0"
+        );
+
+        // Deleting the whole bucket returns the stream to absent — the state
+        // a snapshot cached with a later revision must read as 0, not as an
+        // error that falls back to the epoch-only path.
+        jetstream
+            .delete_key_value(TOOL_REGISTRY_BUCKET)
+            .await
+            .expect("delete registry bucket");
+        assert_eq!(
+            registry_state_revision(&jetstream)
+                .await
+                .expect("deleted stream is absent again"),
+            None
+        );
+
+        // Broker gone: a real error, distinct from both states above. The
+        // client buffers JetStream requests while it waits to reconnect, so
+        // use a short-timeout context to observe the error quickly instead
+        // of sitting out the default 10 s request timeout.
+        server.kill().expect("kill test broker");
+        let _ = server.wait();
+        let quick = async_nats::jetstream::context::ContextBuilder::new()
+            .timeout(std::time::Duration::from_secs(1))
+            .build(jetstream.client().clone());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            registry_state_revision(&quick),
+        )
+        .await
+        .expect("request against a dead broker fails within its context timeout");
+        assert!(result.is_err(), "an unreachable broker is an error");
     }
 }

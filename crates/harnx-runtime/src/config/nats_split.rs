@@ -326,6 +326,14 @@ impl Config {
     /// here pushes dependent crates' auto-trait evaluation past the
     /// recursion limit (E0275). Erasing the type cuts that chain for every
     /// caller. `Client` is owned, so no borrow escapes the box.
+    ///
+    /// Every call opens a fresh connection — there is no pool. Fine for
+    /// one-shot startup connects; hot paths (per-lookup freshness probes,
+    /// per-dispatch, per-completion checks) must reuse an existing client
+    /// (`jetstream::Context` or provider snapshot) instead. A connect costs
+    /// hundreds of milliseconds (~213 ms measured locally), and PR #2835's
+    /// per-probe connects added ~1.3 s to delegated child dispatch — enough
+    /// to push a macOS CI test past its inherited 5 s deadline.
     pub fn nats_client<'a>(
         &'a self,
         cluster_key: &'a str,
