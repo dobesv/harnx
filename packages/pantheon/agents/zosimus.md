@@ -34,7 +34,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Deep investigation agent — performs multi-step code analysis, reproduces bugs, validates hypotheses, and caches findings as plan notes for other agents. Executes targeted diagnostics and probe scripts without modifying repository source files. Named after Zosimus, the careful investigator.\n"
-version: '0.4.21'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

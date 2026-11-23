@@ -27,7 +27,7 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 description: "Testing adequacy specialist — evaluates test coverage, edge case handling, assertion quality, test isolation, and identifies untested code paths. Named after Thalia (thuh-LY-uh), the Muse of comedy — finding what's absurdly untested.\n"
-version: '0.4.21'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

@@ -1,6 +1,55 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.22 (2026-11-23)
+
+### Features
+
+- stream live progress from JSONL tool templates (#2714)
+- make script-mode tool commands pipeable (#2838)
+- move shipped agents to GPT-6.2, Fable 5.2 and Gemini 4 (#2839)
+- return image blocks and offload large tool images (#2844)
+- Bash tool templates can declare `protocol: jsonl` to stream live progress to the TUI and Web UI, and `wait_for_pr_stable` uses it to keep the link to open or view the pull request on screen while it waits.
+- Migrate pantheon bash tool execution from legacy hooks to in-process proxy-auth middleware, backed by the dedicated `proxy_auth` tool server.
+
+#### Return MCP image blocks from `harnx-fetch-tools` (`fetch_html`, `fetch_markdown`, `fetch_txt`, `fetch_json`, `fetch_readable`) for PNG, JPEG, GIF, and WebP responses up to 5 MiB. Unsupported image formats (such as SVG and AVIF) and images over 5 MiB return clear errors, while existing SSRF protections and `fetch_youtube_transcript` behavior remain unchanged.
+
+When a successful native NATS tool reply exceeds the completion budget because of inline images, the toolset server now stores those images as session-owned `cid:media:` attachments and replaces them with `resource_link` blocks so the model still receives them. This covers `fs_read`, `fetch_*`, `attachment_read`, and the Kubernetes sandbox gateway.
+
+Also allow `erato` in `pantheon` to call `fetch_fetch_markdown` for public image URLs without a sandbox, and update the `pantheon` and `coding` fetch tool configs and READMEs for image support.
+
+#### Move the shipped agents to GPT-6.2 Astra and Sol, Claude Fable 5.2 and the Gemini 4 Carbon, Neon and Hydrogen models.
+
+Oracle and Plato use GPT-6.2 Astra at maximum effort, then Fable 5.2 and Gemini 4 Carbon. Every Sol 6.1 slot becomes Sol 6.2 at the same price. Gemini 3.8 Flash slots become Gemini 4 Hydrogen, which costs twice 3.8 Flash's introductory price until December 31, 2026 and the same afterwards. The other Gemini 4 Argon slots, including Minos, become Gemini 4 Neon.
+
+The model catalog adds `:high` and `:max` aliases for `gpt-6.2-astra` and `gpt-6.2-sol` and drops their sampling parameters. Gemini 4 Carbon, Neon and Hydrogen now reserve one request's 65,536 output tokens inside their shared 1,048,576-token window instead of listing the whole window as the output limit.
+
+### Fixes
+
+- update rust crate a2a_server_lf to v0.5.3 (#2579)
+- have Clio rebase before it squashes (#2731)
+- update assistant-ui (#2745)
+- update dependency @assistant-ui/react-markdown to v0.14.26 (#2749)
+- update dependency @ag-ui/client to v1.0.4 (#2748)
+- return the final reply from sub-agent waits, not a transcript page (#2806)
+- update assistant-ui (#2822)
+- update dependency @ag-ui/client to v1.0.5 (#2824)
+- Clio now rebases a branch onto its base before squashing it, so a base that moved on since the branch was cut no longer has its new changes undone inside the squashed commit.
+- Update package README tool servers table to document in-process proxy-auth middleware, the bundled `proxy_auth` tool server, and attachment tools.
+- Claude Fable 5.2 answers HTTP 400 to a request that identifies itself as a Claude Code release older than 2.1.290. If your own `claude` client config sends Claude Code's `user-agent` and `x-anthropic-billing-header`, raise the version in both before selecting `claude-fable-5-2`; clients that use `CLAUDE_API_KEY`, including the ones the packages ship, are unaffected.
+- Sisyphus and Atlas no longer run Argus on the final task before review, on fixes for review findings, or alongside Aristarchus. Argus stays the quick check between tasks, and the pre-submit checks and Aristarchus review cover the rest. Changes that skip the review still get an Argus pass on the final task.
+- Move Daedalus's Atlas handoff and the tool-confirmation demo from legacy hook approvals to durable in-process middleware confirmations. Document frontend answers, save/restore, crash recovery and safe cluster rollout.
+- Advertise direct child approval and middleware confirmation requests in sub-agent tool results and live progress, with exact request identities. Synchronous `session_prompt` now returns a non-error blocked handle so callers can continue with `session_wait` after the user answers.
+- Compaction summaries no longer report an agent's instructions to its delegates as the user's own requests. The summarizer now receives the transcript as speaker-tagged elements (`<user>`, `<assistant>`, `<tool_call>`, `<tool_result>`, `<runtime_note>`) instead of headings, our own tag names inside message text are escaped, and a `<kept_after_summary>` block shows which messages, including the user's latest prompt, are replayed verbatim after the summary. The packaged compaction prompts and the built-in summarizer prompt explain the tags.
+
+#### `session_wait` and `session_send` with `wait` now return the child's final reply instead of a page of its transcript.
+
+A settled prompt's result carries the child's last reply as `response`, thinking stripped, the same text `session_prompt` returns, and a failed turn's error as `failure`. A reply too long for the 128 KiB result is cut short and marked `response_truncated: true`. Before, both tools returned up to 128 KiB of the turn read forward from the prompt, so a long child's reply was cut off and every repeated wait on a running child returned the same oldest events.
+
+A wait that ends while the child is still running returns `activity` instead: the child's tool call count, token usage and title, and its latest tool step (the start of its narration and up to four calls with trimmed arguments). `include_partial: false` leaves it out.
+
+The `read` option is removed from both wait tools; use `session_load` with `prompt_id` to read a prompt's transcript. Pantheon's delegation guidance describes the new result fields.
+
 ## 0.4.21 (2026-11-16)
 
 ### Fixes

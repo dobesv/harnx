@@ -44,7 +44,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Complex multi-faceted strategy and execution specialist — commands the field when a high-effort task is too complex for a specialist. Named after Athena (uh-THEE-nuh), Goddess of Strategic Warfare.\n"
-version: '0.4.21'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

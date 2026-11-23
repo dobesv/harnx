@@ -45,7 +45,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Maintenance, stability, and routine tasks specialist — keeps the codebase warm, clean, and stable for day-to-day operations. Named after Hestia (HES-tee-uh), Guardian of the Hearth.\n"
-version: '0.4.21'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

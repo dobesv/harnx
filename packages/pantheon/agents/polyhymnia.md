@@ -35,7 +35,7 @@ description: "Privacy and compliance specialist \u2014 evaluates PII handling, d
   \ protection patterns, consent flows, data retention, logging practices, and regulatory\
   \ compliance. Named after Polyhymnia (pol-ee-HIM-nee-uh), the Muse of sacred poetry\
   \ \u2014 guardian of sacred personal data.\n"
-version: '0.4.21'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics
