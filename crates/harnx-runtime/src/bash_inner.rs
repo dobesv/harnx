@@ -172,6 +172,10 @@ pub struct InnerCallExecutorConfig {
     pub max_calls: usize,
     /// NATS payload pre-flight; `None` skips the check (tests, non-NATS setups).
     pub payload_limit: Option<PayloadLimit>,
+    /// Ask tools for script-style structured results. Only the `bash` tool
+    /// sets it: its commands know each tool's output mapping. A custom script
+    /// tool's run leaves it off and gets the results a direct call gets.
+    pub structured_results: bool,
 }
 
 impl InnerCallExecutorConfig {
@@ -183,6 +187,7 @@ impl InnerCallExecutorConfig {
             max_concurrent: DEFAULT_MAX_CONCURRENT_INNER_CALLS,
             max_calls: DEFAULT_MAX_INNER_CALLS_PER_SCRIPT,
             payload_limit: None,
+            structured_results: false,
         }
     }
 
@@ -206,6 +211,7 @@ pub struct InnerCallExecutor {
     max_concurrent: usize,
     max_calls: usize,
     payload_limit: Option<Arc<PayloadLimit>>,
+    structured_results: bool,
 }
 
 impl InnerCallExecutor {
@@ -216,6 +222,7 @@ impl InnerCallExecutor {
             max_concurrent: config.max_concurrent.max(1),
             max_calls: config.max_calls,
             payload_limit: config.payload_limit.map(Arc::new),
+            structured_results: config.structured_results,
         }
     }
 
@@ -264,7 +271,6 @@ impl InnerCallExecutor {
                 observer.progress(call_id, patch);
             }
         });
-
         let mut ctx = outer.fork_for_inner_calls(InnerToolEvalOptions {
             providers: self.providers.clone(),
             tool_round,
@@ -272,6 +278,7 @@ impl InnerCallExecutor {
             emit_tool_result_fn,
             emit_tool_blocked_fn,
             emit_tool_update_fn,
+            structured_results: self.structured_results,
         });
         if let Some(limit) = &self.payload_limit {
             limit.guard_dispatch(&mut ctx);
@@ -457,6 +464,19 @@ impl InnerCallRun {
             .clone()
     }
 
+    /// Evaluate the call, reporting into the run's sink when it has one.
+    async fn evaluate_in_sink(
+        &self,
+        call: ToolCall,
+        abort_signal: &AbortSignal,
+    ) -> anyhow::Result<EvaluatedInnerCall> {
+        let eval = eval_inner_tool_call(&self.ctx, call, abort_signal);
+        match self.sink.clone() {
+            Some(sink) => with_agent_event_sink(sink, eval).await,
+            None => eval.await,
+        }
+    }
+
     /// Execute one inner call through the full admission pipeline
     /// (middleware, dispatch), enforcing the allowlist,
     /// call budget, and concurrency cap first. Payload limits apply before
@@ -511,16 +531,10 @@ impl InnerCallRun {
             .await
             .expect("inner call semaphore is never closed");
 
-        let evaluated = match self.sink.clone() {
-            // BashKit runs commands on its own tasks, which don't inherit
-            // the turn's task-local sink. Re-scope the eval so hook notices
-            // and progress land in the right session.
-            Some(sink) => {
-                with_agent_event_sink(sink, eval_inner_tool_call(&self.ctx, call, abort_signal))
-                    .await
-            }
-            None => eval_inner_tool_call(&self.ctx, call, abort_signal).await,
-        };
+        // BashKit runs commands on its own tasks, which don't inherit the
+        // turn's task-local sink. Re-scope the eval so hook notices and
+        // progress land in the right session.
+        let evaluated = self.evaluate_in_sink(call, abort_signal).await;
 
         // Keep the concurrency permit and cancellation guard until durable
         // media writes finish, so a completed command can read its path at once.
@@ -872,6 +886,7 @@ mod tests {
     /// callbacks fails the test instead of silently creating child UI rows.
     fn outer_context(providers: Vec<Arc<dyn ToolProvider>>) -> ToolEvalContext {
         ToolEvalContext {
+            structured_results: false,
             on_tool_call_completed: None,
             on_interaction: None,
             middleware_fn: None,
@@ -919,6 +934,7 @@ mod tests {
         args: Value,
         call_id: Option<String>,
         tool_round: Option<u64>,
+        structured_result: bool,
     }
 
     #[derive(Default)]
@@ -954,6 +970,7 @@ mod tests {
                     args: args.clone(),
                     call_id: origin.tool_call_id.map(str::to_string),
                     tool_round: origin.tool_round,
+                    structured_result: origin.structured_result,
                 });
             InFlightDispatch(self)
         }
@@ -1549,6 +1566,34 @@ mod tests {
         }
         // "null" serialized is 4 bytes.
         assert_eq!(run.trace()[0].bytes, 4);
+    }
+
+    /// The `bash` tool turns this on because its commands know each tool's
+    /// output mapping; a custom script tool's run leaves it off.
+    #[tokio::test]
+    async fn structured_results_are_requested_only_when_configured() {
+        for wanted in [false, true] {
+            let log = Arc::new(DispatchLog::default());
+            let provider = Arc::new(FakeToolProvider {
+                log: Arc::clone(&log),
+                handles: None,
+                progress_title: None,
+                behavior: Behavior::Null,
+            });
+            let mut config =
+                InnerCallExecutorConfig::new(vec!["tool_a".to_string()], shared(&provider));
+            config.structured_results = wanted;
+            let ctx = outer_context(shared(&provider));
+            let run = InnerCallExecutor::new(config).begin_run(&ctx, PARENT_ROUND, None);
+            let abort = create_abort_signal();
+
+            assert!(matches!(
+                run.call("tool_a", json!({}), &abort).await,
+                InnerOutcome::Ok { .. }
+            ));
+            let calls = log.calls.lock().expect("dispatch log lock");
+            assert_eq!(calls[0].structured_result, wanted);
+        }
     }
 
     fn assert_dispatch_origin(call: &RecordedDispatch, id: &str) {

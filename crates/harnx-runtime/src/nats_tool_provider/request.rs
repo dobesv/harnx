@@ -79,6 +79,7 @@ fn probe_request(tool: &str, args: &Value, context: &ProbeContext<'_>) -> ToolRe
             EXECUTION_CONTEXT_NAMESPACE.to_string(),
             CAPABILITY_TOOL_PROGRESS.to_string(),
             CAPABILITY_NEW_MESSAGE_PENDING.to_string(),
+            CAPABILITY_STRUCTURED_RESULT.to_string(),
         ]),
     }
 }
@@ -159,6 +160,7 @@ impl NatsToolProvider {
             arguments,
             route,
             ToolCallOrigin {
+                structured_result: false,
                 tool_call_id,
                 tool_round: None,
             },
@@ -185,6 +187,9 @@ impl NatsToolProvider {
         }
         if self.dispatch_with_message_pending(route) {
             capabilities.insert(CAPABILITY_NEW_MESSAGE_PENDING.to_string());
+        }
+        if origin.structured_result {
+            capabilities.insert(CAPABILITY_STRUCTURED_RESULT.to_string());
         }
         // T4.3: a rerun after a tool challenge carries the latest challenge's
         // accepted responses and opaque state beside `run_context`, never
@@ -461,6 +466,42 @@ mod probe_tests {
         assert!(max_request_bytes < script_effective_max_bytes(8 * 1024 * 1024));
     }
 
+    #[test]
+    fn probe_request_counts_the_structured_result_capability() {
+        let request = probe_request("fs_read", &serde_json::json!({}), &ProbeContext::default());
+        assert!(request.capabilities.contains(CAPABILITY_STRUCTURED_RESULT));
+    }
+
+    #[tokio::test]
+    async fn request_carries_structured_result_only_when_the_origin_asks() -> anyhow::Result<()> {
+        let broker = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow!("nats-server required"))?;
+        let client = async_nats::connect(broker.url()).await?;
+        let provider = super::tests::make_test_provider(&client).await;
+        let route = RegisteredTool::default();
+        let wants = |structured_result: bool| -> bool {
+            provider
+                .prepare_request_with_progress(
+                    serde_json::json!({}),
+                    &route,
+                    ToolCallOrigin {
+                        structured_result,
+                        ..Default::default()
+                    },
+                    false,
+                    None,
+                )
+                .unwrap_or_else(|_| panic!("prepare request"))
+                .durable
+                .capabilities
+                .contains(CAPABILITY_STRUCTURED_RESULT)
+        };
+        assert!(wants(true));
+        assert!(!wants(false));
+        Ok(())
+    }
+
     /// The probe serializes the exact `ToolRequest` shape a real inner-call
     /// dispatch builds (`prepare_request_with_progress`)
     /// — same ids, round, parents, and the full capability set so a
@@ -501,6 +542,7 @@ mod probe_tests {
         assert!(request
             .capabilities
             .contains(CAPABILITY_NEW_MESSAGE_PENDING));
+        assert!(request.capabilities.contains(CAPABILITY_STRUCTURED_RESULT));
 
         // The probe's serialized size tracks the real serialized request:
         // bigger arguments mean a strictly bigger probe.

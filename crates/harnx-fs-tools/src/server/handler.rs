@@ -126,8 +126,12 @@ impl FsServer {
         let tool_name = request.name.to_string();
         let result = match tool_name.as_str() {
             tool if self.tool_enabled(tool) => domain_result(
-                self.invoke_tool_value(tool, Value::Object(request.arguments.unwrap_or_default()))
-                    .await,
+                self.invoke_tool_value(
+                    tool,
+                    Value::Object(request.arguments.unwrap_or_default()),
+                    ResultStyle::Model,
+                )
+                .await,
             ),
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
@@ -148,6 +152,7 @@ impl FsServer {
         &self,
         tool: &str,
         args: Value,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
         let observation_args = location_args(&args);
         let arguments = match args {
@@ -157,7 +162,7 @@ impl FsServer {
         let mut result = match tool {
             "read" => {
                 let params = parse_arguments::<ReadFileParams>(arguments)?;
-                self.read_file_impl(params).await
+                self.read_file_impl(params, style).await
             }
             "write" => {
                 let params = parse_arguments::<WriteFileParams>(arguments)?;
@@ -185,15 +190,15 @@ impl FsServer {
             }
             "ls" => {
                 let params = parse_arguments::<ListDirectoryParams>(arguments)?;
-                self.list_directory_impl(params).await
+                self.list_directory_impl(params, style).await
             }
             "grep" => {
                 let params = parse_arguments::<SearchFilesParams>(arguments)?;
-                self.search_files_impl(params).await
+                self.search_files_impl(params, style).await
             }
             "find" => {
                 let params = parse_arguments::<FindFilesParams>(arguments)?;
-                self.find_files_impl(params).await
+                self.find_files_impl(params, style).await
             }
             "rollback_file" => {
                 let params = parse_arguments::<RollbackParams>(arguments)?;

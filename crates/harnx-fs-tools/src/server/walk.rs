@@ -15,6 +15,36 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "venv",
 ];
 
+/// One output line of a content search, kept structured so a script can read
+/// the fields and a model gets grep-style text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SearchLine {
+    Row {
+        path: String,
+        line: usize,
+        text: String,
+        is_match: bool,
+    },
+    BlockBreak,
+}
+
+impl SearchLine {
+    pub(crate) fn model_text(&self) -> String {
+        match self {
+            Self::Row {
+                path,
+                line,
+                text,
+                is_match,
+            } => {
+                let sep = if *is_match { ":" } else { "-" };
+                format!("{path}{sep}{line}{sep} {text}")
+            }
+            Self::BlockBreak => "--".to_string(),
+        }
+    }
+}
+
 pub(crate) fn walk_dir_flat(dir: &Path, entries: &mut Vec<String>, scan_count: &mut usize) {
     let read_dir = match std::fs::read_dir(dir) {
         Ok(read_dir) => read_dir,
@@ -91,7 +121,7 @@ pub(crate) fn search_recursive(
     context_lines: usize,
     max_results: usize,
     include_glob: Option<&glob::Pattern>,
-    results: &mut Vec<String>,
+    results: &mut Vec<SearchLine>,
 ) {
     if results.len() >= max_results {
         return;
@@ -158,7 +188,7 @@ pub(crate) fn search_file(
     regex: &Regex,
     context_lines: usize,
     max_results: usize,
-    results: &mut Vec<String>,
+    results: &mut Vec<SearchLine>,
 ) {
     if results.len() >= max_results {
         return;
@@ -215,21 +245,18 @@ pub(crate) fn search_file(
 
     for (block_index, (start, end)) in blocks.iter().enumerate() {
         if block_index > 0 {
-            results.push("--".to_string());
+            results.push(SearchLine::BlockBreak);
         }
         for (index, line_content) in lines[*start..=*end].iter().enumerate() {
             let abs_index = start + index;
             let line = truncate_line(line_content, GREP_MAX_LINE_LENGTH);
             let line_number = abs_index + 1;
-            let sep = if match_indices.contains(&abs_index) {
-                ":"
-            } else {
-                "-"
-            };
-            results.push(format!(
-                "{}{}{}{} {}",
-                relative, sep, line_number, sep, line
-            ));
+            results.push(SearchLine::Row {
+                path: relative.clone(),
+                line: line_number,
+                text: line,
+                is_match: match_indices.contains(&abs_index),
+            });
             if results.len() >= max_results {
                 return;
             }

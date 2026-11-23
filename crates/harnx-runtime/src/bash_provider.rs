@@ -102,6 +102,8 @@ pub struct BashProviderConfig {
     pub base_providers: Vec<Arc<dyn ToolProvider>>,
     pub slot: Option<Arc<BashEvalContextSlot>>,
     pub payload_limit: Option<PayloadLimit>,
+    /// Output mappings declared by tool servers, by agent-visible tool name.
+    pub script_outputs: std::collections::BTreeMap<String, harnx_toolset::ScriptOutput>,
     /// Operator commands read `stdout`, `stderr` and `trace` as fields; a
     /// model round gets them once, in the rendered report.
     pub full_payload: bool,
@@ -128,6 +130,13 @@ impl CommandBashInputs {
     }
 }
 
+/// A mapping the script layer cannot read is treated as no mapping.
+fn output_mapping(
+    output: &harnx_toolset::ScriptOutput,
+) -> Option<harnx_script::commands::OutputMapping> {
+    serde_json::from_value(serde_json::to_value(output).ok()?).ok()
+}
+
 struct ScriptInvocation<'a> {
     tool_round: Option<u64>,
     abort: &'a AbortSignal,
@@ -142,6 +151,7 @@ impl BashProvider {
             base_providers,
             slot,
             payload_limit,
+            script_outputs,
             full_payload,
         } = config;
         let allowed = inner_declarations
@@ -149,6 +159,7 @@ impl BashProvider {
             .map(|declaration| declaration.name.clone())
             .collect();
         let mut config = InnerCallExecutorConfig::new(allowed, base_providers);
+        config.structured_results = true;
         if let Some(payload_limit) = payload_limit {
             config = config.with_payload_limit(payload_limit);
         }
@@ -158,6 +169,9 @@ impl BashProvider {
                 name: declaration.name.clone(),
                 description: declaration.description.clone(),
                 schema: declaration.parameters.as_value().clone(),
+                output: script_outputs
+                    .get(&declaration.name)
+                    .and_then(output_mapping),
             })
             .collect();
         Self {

@@ -107,6 +107,9 @@ pub type WorkBoundaryFn = dyn Fn(WorkBoundary, ToolCall) -> Pin<Box<dyn Future<O
 
 #[derive(Clone)]
 pub struct ToolEvalContext {
+    /// Calls dispatched from this context come from a script that can take
+    /// the tool's data as `structuredContent`. Set only by an inner-call fork.
+    pub structured_results: bool,
     /// Wrap authorized model, inner, and operator calls.
     pub middleware_fn: Option<Arc<ToolMiddlewareFn>>,
     /// Effective per-call completion before terminal publication (including
@@ -198,6 +201,8 @@ pub struct InnerToolEvalOptions {
     pub emit_tool_blocked_fn: Arc<ToolCallEmitFn>,
     /// Route per-call progress into the parent call's aggregator.
     pub emit_tool_update_fn: Arc<ToolUpdateEmitFn>,
+    /// The forked calls come from a script that maps structured results.
+    pub structured_results: bool,
 }
 
 /// Typed outcome of one evaluated call, derived from the engine's own
@@ -233,6 +238,7 @@ impl ToolEvalContext {
     /// `AbortSignal` to [`eval_inner_tool_call`] when evaluating the fork.
     pub fn fork_for_inner_calls(&self, options: InnerToolEvalOptions) -> Self {
         Self {
+            structured_results: options.structured_results,
             middleware_fn: self.middleware_fn.clone(),
             // Inner calls don't own transcript outer completions or suspension.
             on_tool_call_completed: None,
@@ -260,6 +266,7 @@ impl ToolEvalContext {
         ToolCallOrigin {
             tool_call_id: Some(tool_call_id),
             tool_round: self.tool_round,
+            structured_result: self.structured_results,
         }
     }
 }
@@ -1296,6 +1303,7 @@ mod tests {
         emit_tool_update: impl Fn(&str, &ToolUpdatePatch) + Send + Sync + 'static,
     ) -> ToolEvalContext {
         ToolEvalContext {
+            structured_results: false,
             on_tool_call_completed: None,
             on_interaction: None,
             middleware_fn: None,

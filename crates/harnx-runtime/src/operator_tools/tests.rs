@@ -61,6 +61,7 @@ fn context(provider: Arc<dyn ToolProvider>) -> ToolEvalContext {
         })
         .collect();
     ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,

@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 
+use crate::commands::OutputMapping;
 use crate::schema::{flag_table, properties, FlagKind, Property, Scalar};
 
 /// One line of command syntax followed by the description's first sentence.
@@ -18,7 +19,12 @@ pub fn synopsis(name: &str, schema: &Value, description: &str) -> String {
 
 /// Man-page style help. Defaults are shown, not inserted by the argument parser.
 /// Reference/union/nullable properties are labeled JSON, matching parse_args.
-pub fn help(name: &str, schema: &Value, description: &str) -> String {
+pub fn help(
+    name: &str,
+    schema: &Value,
+    description: &str,
+    output: Option<&OutputMapping>,
+) -> String {
     let properties = properties(schema);
     let mut text = format!(
         "NAME\n    {}\n\nSYNOPSIS\n    {}\n\nDESCRIPTION\n",
@@ -68,7 +74,34 @@ pub fn help(name: &str, schema: &Value, description: &str) -> String {
     text.push_str("    -o json|text\n        Output rendering (handled by the command wrapper, not sent to the tool).\n");
     text.push_str("    --help\n        Show tool help (handled by the command wrapper).\n");
     text.push_str("    --\n        End options. Positional arguments aren't supported.\n");
+    if let Some(mapping) = output {
+        output_section(&mut text, mapping);
+    }
     text
+}
+
+/// What the command prints where, for a tool with an output mapping.
+fn output_section(text: &mut String, mapping: &OutputMapping) {
+    text.push_str("\nOUTPUT\n");
+    if let Some(summary) = &mapping.summary {
+        indent(text, summary.trim(), 2);
+    }
+    let parts: Vec<String> = [
+        ("stdout", &mapping.stdout),
+        ("stderr", &mapping.stderr),
+        ("exit status", &mapping.exit_code),
+    ]
+    .into_iter()
+    .filter_map(|(stream, field)| {
+        field
+            .as_ref()
+            .map(|field| format!("{stream}: the `{field}` field"))
+    })
+    .collect();
+    if !parts.is_empty() {
+        text.push_str(&format!("  {}\n", parts.join("    ")));
+    }
+    text.push_str("  -o json prints every field.\n");
 }
 
 fn property_uses_json(property: &Property<'_>, conflict: bool) -> bool {

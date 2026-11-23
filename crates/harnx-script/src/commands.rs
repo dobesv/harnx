@@ -6,18 +6,28 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::{
-    cli_map::{parse_args, split_output_args, UsageError},
+    cli_map::{parse_args, split_output_args, OutputFormat, UsageError},
     help, CancellationToken, ScriptCommand, ScriptCommandContext, ScriptCommandOutput,
 };
 
 mod discovery;
+mod mapping;
 mod render;
 pub(crate) use discovery::unknown_command_message;
+pub use mapping::OutputMapping;
 // Shared MCP domain-error classification (PR3 round-2 review R6): the runtime
 // executor uses the same detector and text extractor the command layer
 // falls back to, so later error blocks can't be dropped in one layer and
 // kept in the other.
 pub use render::{error_text, is_mcp_error};
+
+/// A tool that reported an error, unless its mapping says otherwise.
+const TOOL_ERROR_EXIT_CODE: i32 = 1;
+/// The command was found but the script layer will not run it, as the shell
+/// reports a file that exists and is not executable.
+const MAY_NOT_RUN_EXIT_CODE: i32 = 126;
+/// No such command, as in the shell.
+const UNKNOWN_COMMAND_EXIT_CODE: i32 = 127;
 
 /// The declaration subset needed for parsing and discovery. Names stay identical
 /// to direct tool names; only property names become kebab-case flags.
@@ -26,6 +36,8 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub schema: Value,
+    /// How the tool's structured result maps to stdout, stderr and exit status.
+    pub output: Option<OutputMapping>,
 }
 
 /// Admission stays with the embedder. All commands in a run share this executor,
@@ -121,7 +133,12 @@ impl ScriptCommand for ToolCommand {
         };
         if args == ["--help"] {
             return Ok(ScriptCommandOutput {
-                stdout: help::help(&self.tool.name, &self.tool.schema, &self.tool.description),
+                stdout: help::help(
+                    &self.tool.name,
+                    &self.tool.schema,
+                    &self.tool.description,
+                    self.tool.output.as_ref(),
+                ),
                 ..Default::default()
             });
         }
@@ -133,48 +150,95 @@ impl ScriptCommand for ToolCommand {
             Err(error) => return Ok(failure(2, error.message)),
         };
         let outcome = self.executor.call(&self.tool.name, args, ctx.cancel).await;
+        self.outcome_output(outcome, format)
+    }
+}
+
+impl ToolCommand {
+    /// The tool's declared mapping is tried first; anything it cannot map
+    /// renders as plain text or JSON.
+    fn success(&self, value: &Value, format: Option<OutputFormat>) -> ScriptCommandOutput {
+        let mapped = self
+            .tool
+            .output
+            .as_ref()
+            .and_then(|mapping| mapping::apply(&self.tool.name, mapping, value, format));
+        match mapped {
+            Some(mapped) => ScriptCommandOutput {
+                stdout: mapped.stdout,
+                stderr: mapped.stderr,
+                exit_code: mapped.exit_code,
+            },
+            None => ScriptCommandOutput {
+                stdout: render::output(value, format),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Turns the executor's outcome into command output; a fatal outcome
+    /// stops the run.
+    fn outcome_output(
+        &self,
+        outcome: CallOutcome,
+        format: Option<OutputFormat>,
+    ) -> Result<ScriptCommandOutput, String> {
         let output = match outcome {
             CallOutcome::Ok(value) => {
                 // MCP domain errors arrive over a successful transport. Don't
                 // mistake arbitrary raw JSON `is_error` keys for engine status.
                 if render::is_mcp_error(&value) {
-                    failure(1, render::error_text(&value))
+                    failure(self.error_exit_code(), render::error_text(&value))
                 } else {
-                    ScriptCommandOutput {
-                        stdout: render::output(&value, format),
-                        ..Default::default()
-                    }
+                    self.success(&value, format)
                 }
             }
             CallOutcome::ToolError {
                 message,
                 partial_result,
             } => {
-                let mut output = failure(1, message);
+                let mut output = failure(self.error_exit_code(), message);
                 if let Some(partial) = partial_result {
                     output.stdout = render::output(&partial, format);
                 }
                 output
             }
             CallOutcome::ApprovalRequired => failure(
-                3,
+                MAY_NOT_RUN_EXIT_CODE,
                 format!(
                     "needs approval: {}; call it directly instead of from bash",
                     self.tool.name
                 ),
             ),
-            CallOutcome::Blocked { reason } => failure(4, reason),
-            CallOutcome::Rejected { reason, kind } => failure(
-                if kind == RejectionKind::UnknownCommand {
-                    127
-                } else {
-                    5
-                },
+            CallOutcome::Blocked { reason } => {
+                failure(MAY_NOT_RUN_EXIT_CODE, prefixed("blocked: ", &reason))
+            }
+            CallOutcome::Rejected {
                 reason,
-            ),
+                kind: RejectionKind::UnknownCommand,
+            } => failure(UNKNOWN_COMMAND_EXIT_CODE, reason),
+            CallOutcome::Rejected { reason, .. } => {
+                failure(MAY_NOT_RUN_EXIT_CODE, prefixed("rejected: ", &reason))
+            }
             CallOutcome::Fatal { message } => return Err(message),
         };
         Ok(output)
+    }
+
+    fn error_exit_code(&self) -> i32 {
+        self.tool
+            .output
+            .as_ref()
+            .and_then(OutputMapping::error_exit)
+            .unwrap_or(TOOL_ERROR_EXIT_CODE)
+    }
+}
+
+fn prefixed(prefix: &str, reason: &str) -> String {
+    if reason.starts_with(prefix) {
+        reason.to_string()
+    } else {
+        format!("{prefix}{reason}")
     }
 }
 

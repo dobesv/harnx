@@ -24,6 +24,7 @@ impl BashHarness {
                 base_providers: vec![inner.clone()],
                 slot: Some(slot.clone()),
                 payload_limit: None,
+                script_outputs: Default::default(),
                 full_payload: true,
             },
         ));
@@ -34,6 +35,7 @@ impl BashHarness {
         allowed.insert(crate::config::BASH_TOOL_NAME.to_string());
         let scope = ServerScope::new();
         let ctx = ToolEvalContext {
+            structured_results: false,
             on_tool_call_completed: None,
             on_interaction: None,
             middleware_fn: None,

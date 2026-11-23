@@ -84,6 +84,18 @@ fn proxied_bash_waits_do_not_advertise_stop_on_new_message() {
         .all(|spec| !spec.stops_on_new_message()));
 }
 
+/// The file tools declare a script output mapping natively; the proxy reaches
+/// them over MCP, which cannot carry the request that makes them honour it.
+#[test]
+fn proxied_file_tools_do_not_advertise_a_script_output_mapping() {
+    let native = harnx_fs_tools::builtin_tool_specs();
+    assert!(native.iter().any(|spec| spec.script_output().is_some()));
+    assert!(native
+        .into_iter()
+        .map(proxy_spec)
+        .all(|spec| spec.script_output().is_none()));
+}
+
 #[test]
 fn endpoint_formats_ipv4_and_ipv6_addresses() {
     // Bash endpoint (port 3002)

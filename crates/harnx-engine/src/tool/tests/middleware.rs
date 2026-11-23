@@ -470,6 +470,7 @@ async fn middleware_survives_inner_context_fork() {
         })
     }));
     let inner = outer.fork_for_inner_calls(InnerToolEvalOptions {
+        structured_results: false,
         providers: vec![],
         tool_round: None,
         emit_tool_call_fn: Arc::new(|_, _| {}),
@@ -514,4 +515,97 @@ async fn middleware_next_preserves_host_operation_task_context() {
         .await
         .unwrap();
     assert_eq!(results[0].output, json!("ok"));
+}
+
+/// Records the `structured_result` of every origin it is dispatched with.
+struct OriginRecorder {
+    seen: Arc<StdMutex<Vec<bool>>>,
+}
+
+impl ToolProvider for OriginRecorder {
+    fn name(&self) -> &str {
+        "origin-recorder"
+    }
+
+    fn has_tool(&self, tool_name: &str) -> bool {
+        tool_name == "tool"
+    }
+
+    fn call_tool<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _tool_name: &'life1 str,
+        _arguments: Value,
+        _abort: &'life2 AbortSignal,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ToolProviderOutput, ToolError>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { panic!("engine must dispatch through call_tool_with_progress") })
+    }
+
+    fn call_tool_with_progress<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        _tool_name: &'life1 str,
+        _arguments: Value,
+        origin: ToolCallOrigin<'life2>,
+        _abort: &'life3 AbortSignal,
+        _progress: Arc<dyn harnx_core::tool::ToolProgress>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ToolProviderOutput, ToolError>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.seen.lock().unwrap().push(origin.structured_result);
+            Ok(ToolProviderOutput::new(json!({"ok": true})))
+        })
+    }
+}
+
+/// A script middleware runs `next` on its own worker, which does not inherit
+/// task-locals; the request has to travel on the context.
+#[tokio::test]
+async fn inner_fork_asks_for_structured_results_through_a_spawned_middleware() {
+    for wanted in [true, false] {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let mut outer = test_context(vec![Arc::new(OriginRecorder { seen: seen.clone() })]);
+        outer.middleware_fn = Some(Arc::new(|prepared, _origin, next| {
+            Box::pin(async move {
+                tokio::spawn(next(prepared.arguments))
+                    .await
+                    .expect("middleware task")
+            })
+        }));
+        let inner = outer.fork_for_inner_calls(InnerToolEvalOptions {
+            providers: outer.providers.clone(),
+            tool_round: None,
+            emit_tool_call_fn: Arc::new(|_, _| {}),
+            emit_tool_result_fn: Arc::new(|_, _| {}),
+            emit_tool_blocked_fn: Arc::new(|_, _| {}),
+            emit_tool_update_fn: Arc::new(|_, _| {}),
+            structured_results: wanted,
+        });
+        eval_inner_tool_call(&inner, test_call("tool"), &create_abort_signal())
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![wanted]);
+    }
 }

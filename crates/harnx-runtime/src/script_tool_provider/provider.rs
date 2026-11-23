@@ -104,6 +104,9 @@ fn bash_commands(
             name: declaration.name.clone(),
             description: declaration.description.clone(),
             schema: declaration.parameters.as_value().clone(),
+            // This run doesn't ask tools for structured results, so no
+            // tool's output mapping applies here.
+            output: None,
         })
         .collect();
     let mut commands = tool_commands(specs, adapter).map_err(|error| {

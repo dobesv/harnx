@@ -52,6 +52,10 @@ impl ServerHandler for McpToolsetAdapter {
                 // on, so a tool reached this way cannot stop on one, and a
                 // bridge must not advertise that it does.
                 meta.remove(harnx_toolset::STOP_ON_NEW_MESSAGE_META_KEY);
+                // The request for a script-shaped result does not travel over
+                // MCP either, so the tool would answer in model style and the
+                // mapping would describe output it never produces.
+                meta.remove(harnx_toolset::SCRIPT_OUTPUT_META_KEY);
                 if let Some(timeout_secs) = spec.timeout_secs {
                     meta.insert(
                         harnx_toolset::TOOL_TIMEOUT_META_KEY.to_owned(),

@@ -11,16 +11,20 @@ async fn read_only_allowlist_reads_but_denies_writes() {
     let server = FsServer::new(allowlist);
 
     server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file),
-            offset: None,
-            limit: None,
-            tail: None,
-            grep: None,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
+        .read_file_impl(
+            ReadFileParams {
+                path: path_string(&file),
+                offset: None,
+                limit: None,
+                tail: None,
+                grep: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                line_numbers: None,
+            },
+            ResultStyle::Model,
+        )
         .await
         .expect("read grant permits reads");
 
@@ -66,16 +70,20 @@ async fn rwx_allowlist_reads_and_writes() {
         .await
         .expect("rwx grant permits writes");
     let result = server
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file),
-            offset: None,
-            limit: None,
-            tail: None,
-            grep: None,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
+        .read_file_impl(
+            ReadFileParams {
+                path: path_string(&file),
+                offset: None,
+                limit: None,
+                tail: None,
+                grep: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                line_numbers: None,
+            },
+            ResultStyle::Model,
+        )
         .await
         .expect("rwx grant permits reads");
     assert!(text_content(&result).contains("changed"));
@@ -85,11 +93,14 @@ async fn rwx_allowlist_reads_and_writes() {
 async fn empty_allowlist_denies_default_search_path() {
     let server = FsServer::new(ResolvedAllowlist::new());
     let denied = server
-        .find_files_impl(FindFilesParams {
-            pattern: "**/*".into(),
-            path: None,
-            max_results: None,
-        })
+        .find_files_impl(
+            FindFilesParams {
+                pattern: "**/*".into(),
+                path: None,
+                max_results: None,
+            },
+            ResultStyle::Model,
+        )
         .await
         .unwrap_err();
     assert!(denied

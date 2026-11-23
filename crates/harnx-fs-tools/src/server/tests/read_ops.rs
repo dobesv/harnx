@@ -2,6 +2,9 @@ use super::*;
 
 #[derive(Default)]
 struct ReadSpec {
+    style: ResultStyle,
+    line_numbers: Option<bool>,
+    max_output_bytes: Option<usize>,
     offset: Option<usize>,
     limit: Option<usize>,
     tail: Option<usize>,
@@ -16,16 +19,20 @@ async fn read_fixture(
     let temp_dir = TestDir::new();
     let file_path = write_fixture(&temp_dir, file_name, content);
     make_server(temp_dir.path())
-        .read_file_impl(ReadFileParams {
-            path: path_string(&file_path),
-            offset: spec.offset,
-            limit: spec.limit,
-            tail: spec.tail,
-            grep: spec.grep,
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-        })
+        .read_file_impl(
+            ReadFileParams {
+                path: path_string(&file_path),
+                offset: spec.offset,
+                limit: spec.limit,
+                tail: spec.tail,
+                grep: spec.grep,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: spec.max_output_bytes,
+                line_numbers: spec.line_numbers,
+            },
+            spec.style,
+        )
         .await
 }
 
@@ -261,4 +268,206 @@ fn test_detect_image_mime_logic() {
         FsServer::detect_image_mime(Path::new("test.txt"), b"random"),
         None
     );
+}
+
+fn script_spec() -> ReadSpec {
+    ReadSpec {
+        style: ResultStyle::Script,
+        ..Default::default()
+    }
+}
+
+fn fields(result: &CallToolResult) -> &Value {
+    result.structured_content.as_ref().unwrap()
+}
+
+#[tokio::test]
+async fn model_read_is_unchanged_without_line_numbers_param() {
+    let result = read_fixture("three.txt", b"a\nb\nc\n", ReadSpec::default())
+        .await
+        .unwrap();
+    assert_eq!(text_content(&result), "1: a\n2: b\n3: c");
+    assert!(result.structured_content.is_none());
+}
+
+#[tokio::test]
+async fn line_numbers_false_removes_prefixes_in_a_direct_call() {
+    let spec = ReadSpec {
+        line_numbers: Some(false),
+        ..Default::default()
+    };
+    let result = read_fixture("three.txt", b"a\nb\nc\n", spec).await.unwrap();
+    assert_eq!(text_content(&result), "a\nb\nc");
+}
+
+#[tokio::test]
+async fn script_read_returns_plain_text_and_fields() {
+    let result = read_fixture("three.txt", b"a\nb\nc\n", script_spec())
+        .await
+        .unwrap();
+    let f = fields(&result);
+    assert_eq!(f["text"], "a\nb\nc\n");
+    assert_eq!(f["notes"], json!([]));
+    assert_eq!(f["total_lines"], 3);
+    assert_eq!(f["start_line"], 1);
+    assert_eq!(f["end_line"], 3);
+    assert_eq!(result.content.len(), 1);
+    assert_eq!(audience(&result.content[0]), Some(&vec![Role::User]));
+}
+
+#[tokio::test]
+async fn script_read_of_an_empty_file_has_empty_text() {
+    let result = read_fixture("empty.txt", b"", script_spec()).await.unwrap();
+    assert_eq!(fields(&result)["text"], "");
+    assert_eq!(fields(&result)["total_lines"], 0);
+}
+
+#[tokio::test]
+async fn script_read_reports_the_line_cap_in_notes() {
+    let spec = ReadSpec {
+        limit: Some(2),
+        ..script_spec()
+    };
+    let result = read_fixture("long.txt", b"a\nb\nc\nd\n", spec)
+        .await
+        .unwrap();
+    let f = fields(&result);
+    assert_eq!(f["text"], "a\nb\n");
+    let notes = f["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].as_str().unwrap().contains("offset=3"));
+}
+
+#[tokio::test]
+async fn script_read_stops_at_a_whole_line_within_the_byte_cap() {
+    let content = (1..=200)
+        .map(|n| format!("line number {n}\n"))
+        .collect::<String>();
+    let spec = ReadSpec {
+        max_output_bytes: Some(1024),
+        ..script_spec()
+    };
+    let result = read_fixture("big.txt", content.as_bytes(), spec)
+        .await
+        .unwrap();
+    let f = fields(&result);
+    let text = f["text"].as_str().unwrap();
+    assert!(text.len() <= 1024, "got {} bytes", text.len());
+    let last = text.lines().last().unwrap();
+    assert!(content.lines().any(|l| l == last));
+    let end = f["end_line"].as_u64().unwrap();
+    assert_eq!(text.lines().count() as u64, end);
+    let note = f["notes"][0].as_str().unwrap();
+    assert!(note.contains(&format!("offset={}", end + 1)), "got {note}");
+}
+
+#[tokio::test]
+async fn script_read_with_line_numbers_true_keeps_prefixes() {
+    let spec = ReadSpec {
+        line_numbers: Some(true),
+        ..script_spec()
+    };
+    let result = read_fixture("three.txt", b"a\nb\nc\n", spec).await.unwrap();
+    assert_eq!(fields(&result)["text"], "1: a\n2: b\n3: c\n");
+}
+
+#[tokio::test]
+async fn script_read_with_head_and_tail_drops_the_middle() {
+    let content = b"1\n2\n3\n4\n5\n6\n";
+    let result = read_fixture("ht.txt", content, script_spec())
+        .await
+        .unwrap();
+    assert_eq!(fields(&result)["text"], "1\n2\n3\n4\n5\n6\n");
+    let result = make_server_read(content, |p| {
+        p.head_lines = Some(1);
+        p.tail_lines = Some(2);
+    })
+    .await;
+    let f = fields(&result);
+    assert_eq!(f["text"], "1\n5\n6\n");
+    assert_eq!(f["notes"], json!(["3 lines left out"]));
+}
+
+async fn make_server_read(
+    content: &[u8],
+    edit: impl FnOnce(&mut ReadFileParams),
+) -> CallToolResult {
+    let temp_dir = TestDir::new();
+    let file_path = write_fixture(&temp_dir, "x.txt", content);
+    let mut params: ReadFileParams =
+        serde_json::from_value(json!({"path": path_string(&file_path)})).unwrap();
+    edit(&mut params);
+    make_server(temp_dir.path())
+        .read_file_impl(params, ResultStyle::Script)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn script_read_keeps_control_characters_and_carriage_returns() {
+    let content = b"a\x1b[31mb\r\nc\r\n";
+    let result = read_fixture("ctl.txt", content, script_spec())
+        .await
+        .unwrap();
+    assert_eq!(fields(&result)["text"], "a\u{1b}[31mb\r\nc\r\n");
+    assert_eq!(fields(&result)["total_lines"], 2);
+    let model = read_fixture("ctl.txt", content, ReadSpec::default())
+        .await
+        .unwrap();
+    assert_eq!(text_content(&model), "1: a[31mb\n2: c");
+}
+
+#[tokio::test]
+async fn script_read_keeps_a_trailing_blank_line() {
+    let result = read_fixture("blank.txt", b"a\n\n", script_spec())
+        .await
+        .unwrap();
+    assert_eq!(fields(&result)["text"], "a\n\n");
+    assert_eq!(fields(&result)["total_lines"], 2);
+}
+
+#[tokio::test]
+async fn script_read_of_a_file_without_a_final_newline() {
+    let result = read_fixture("nonl.txt", b"a\nb", script_spec())
+        .await
+        .unwrap();
+    assert_eq!(fields(&result)["text"], "a\nb");
+}
+
+#[tokio::test]
+async fn script_read_cuts_a_single_line_longer_than_the_byte_cap() {
+    let line = "h\u{e9}llo\u{4e16}".repeat(1800);
+    assert!(line.chars().count() >= 10_000);
+    let spec = ReadSpec {
+        max_output_bytes: Some(1024),
+        ..script_spec()
+    };
+    let result = read_fixture("long.txt", format!("{line}\nnext\n").as_bytes(), spec)
+        .await
+        .unwrap();
+    let f = fields(&result);
+    let text = f["text"].as_str().unwrap();
+    assert!(text.len() <= 1024 && !text.is_empty());
+    assert!(line.starts_with(text));
+    assert_eq!(f["end_line"], 1);
+    assert!(f["notes"][0].as_str().unwrap().contains("offset=2"));
+}
+
+#[tokio::test]
+async fn script_read_combines_head_tail_and_the_byte_cap() {
+    let content = (1..=100)
+        .map(|n| format!("line number {n}\n"))
+        .collect::<String>();
+    let result = make_server_read(content.as_bytes(), |p| {
+        p.head_lines = Some(40);
+        p.tail_lines = Some(40);
+        p.max_output_bytes = Some(256);
+    })
+    .await;
+    let f = fields(&result);
+    assert!(f["text"].as_str().unwrap().len() <= 256);
+    let notes = f["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 2);
+    assert_eq!(notes[0], "20 lines left out");
+    assert!(notes[1].as_str().unwrap().contains("to stay within"));
 }

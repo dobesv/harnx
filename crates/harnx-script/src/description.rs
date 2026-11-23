@@ -15,10 +15,10 @@ const PYTHON: &str = "Python: python and python3 are the same embedded Monty sub
 const ARGUMENTS: &str = "Tool arguments/discovery:\n\
 - Property names become --kebab-case flags; strings/numbers take plain values (optional ones too: --path src, not JSON), booleans use --flag / --no-flag, scalar arrays repeat flags, objects and multi-type values take quoted JSON. No positional arguments.\n\
 - --json '<object>' supplies original property keys; --json - reads stdin. Flags override base keys regardless of order. Stdin is otherwise ignored by tool commands.\n\
-- Output defaults to structuredContent JSON when present, otherwise text. -o json|text overrides rendering (not sent to the tool).\n\
-- Text output is what the tool wrote for you, without its user-facing summary lines. It can still carry decoration such as line numbers, so look at a sample before parsing it.\n\
+- Without a shell form, output defaults to structuredContent JSON when present, otherwise text, which can still carry decoration such as line numbers. -o json|text overrides rendering (not sent to the tool).\n\
+- A tool with a shell form (help <tool> shows its OUTPUT) prints like a command: a file read like cat, a search like grep -n with exit 1 when nothing matches, so under set -e use it in if or ||, or add || true. Notes about cut-off results go to stderr, so check the report before trusting a count. -o json prints the tool's fields.\n\
 - tools [quoted-glob] lists synopses; help <tool> [tool ...] or <tool> --help shows full schema-derived help without dispatch.\n\
-- Tool exits: 0 success, 1 tool error, 2 usage, 3 needs approval (call directly instead), 4 blocked, 5 rejected, 127 unknown command. Run timeout: 124; cancellation: 130.\n\n";
+- Tool exits: 0 success, 1 tool error, 2 usage error or a tool's own error status, 126 needs approval (call directly instead), blocked or rejected, 127 unknown command. Run timeout: 124; cancellation: 130.\n\n";
 
 const QUOTING: &str = "Quoting idioms:\n\
 - Literal multiline argument, with expansion inside the heredoc disabled:\n\

@@ -14,10 +14,17 @@ pub(crate) fn render_read_result(
     file_bytes: usize,
     mut notices: Vec<String>,
 ) -> Result<CallToolResult, ErrorData> {
+    let numbered = params.line_numbers != Some(false);
     let shown_content_bytes: usize = numbered_lines.iter().map(|(_, l)| l.len() + 1).sum();
     let raw_output = numbered_lines
         .into_iter()
-        .map(|(n, l)| format!("{n}: {l}"))
+        .map(|(n, l)| {
+            if numbered {
+                format!("{n}: {l}")
+            } else {
+                l.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let d = TruncateOpts::default();
@@ -73,16 +80,16 @@ fn truncate_with_notices(
     (output, byte_truncated)
 }
 
-struct ReadSlice {
-    total_lines: usize,
-    shown_start: usize,
-    shown_end: usize,
-    shown_content_bytes: usize,
-    file_bytes: usize,
-    byte_truncated: bool,
+pub(crate) struct ReadSlice {
+    pub(crate) total_lines: usize,
+    pub(crate) shown_start: usize,
+    pub(crate) shown_end: usize,
+    pub(crate) shown_content_bytes: usize,
+    pub(crate) file_bytes: usize,
+    pub(crate) byte_truncated: bool,
 }
 
-fn read_file_summary(path: &str, s: &ReadSlice) -> String {
+pub(crate) fn read_file_summary(path: &str, s: &ReadSlice) -> String {
     let all = s.shown_start == 1 && s.shown_end == s.total_lines;
     let lines_part = if all {
         format!("{} lines", s.total_lines)

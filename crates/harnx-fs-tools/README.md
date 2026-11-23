@@ -34,7 +34,7 @@ Path lists can also come from `HARNX_TOOLS_ALLOW_READ`, `HARNX_TOOLS_ALLOW_WRITE
 
 ## Tools
 
-- `read`: Read file contents with pagination, grep filtering, and truncation.
+- `read`: Read file contents with pagination, grep filtering, and truncation. Lines are prefixed with their number (`1: text`); pass `line_numbers: false` to omit them.
 - `write`: Create or overwrite a file. To copy attachment bytes (including binary), use `write_attachment`.
 - `write_attachment`: Copy exact bytes from a `cid:media:` attachment, or rendered Markdown from a `cid:plan:` URL, to a file. Creates or overwrites destination without text decoding.
 - `edit`: Perform exact-text replacement.
@@ -44,6 +44,22 @@ Path lists can also come from `HARNX_TOOLS_ALLOW_READ`, `HARNX_TOOLS_ALLOW_WRITE
 - `grep`: Search file contents with a regex.
 - `find`: Find files by glob pattern.
 - `rollback_file`: Restore a repository to a prior harnx history snapshot.
+
+### Output in `bash` scripts
+
+When a `bash` script calls these tools, they behave like the shell commands of the same name. Data goes to stdout, notes go to stderr as `fs_<tool>: <note>`, and the exit status says whether anything was found.
+
+- `fs_read` prints the selected lines as they are in the file, with no line-number prefix unless you pass `--line-numbers`. A line cap or byte cap prints a note naming the `offset` to continue from, and a single line longer than the byte cap is cut with a note.
+- `fs_ls` prints one entry name per line. `fs_find` prints one path per line, and `fs_grep` prints `path:line:text` rows; their paths start with the `--path` you gave, so they can be passed straight to `fs_read --path`.
+- `fs_grep` exits 1 when nothing matched. Scripts run with `set -e`, so a bare no-match `fs_grep` ends the script: use it in `if` or `||`, or add `|| true`.
+- `fs_find` and `fs_grep` stop at `max_results`, `fs_ls` at 500 entries, and all three at 128 KiB of output, each with a note on stderr.
+
+```bash
+fs_find --pattern '*.rs' --path src | while read -r p; do fs_read --path "$p" | grep -n TODO | head -3; done
+if fs_grep --pattern TODO --path src >/dev/null; then echo found; fi
+```
+
+`-o json` prints the result's fields instead. A direct call from a model is unchanged except that `fs_read` takes `line_numbers` (default true there, false in a script).
 
 ### Attachment resolution
 
