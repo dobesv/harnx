@@ -2,11 +2,14 @@ use super::outcome::{ScriptToolOutcome, ScriptToolTrace, STDOUT_TRUNCATION_MARKE
 use super::provider::{ScriptToolProvider, ScriptToolProviderConfig};
 use super::tool_input::ToolInputCommand;
 use crate::bash_inner::{InnerTraceEntry, InnerTraceStatus};
+use crate::structured_provider::StructuredProvider;
 use harnx_core::script_tool::ScriptToolOutput;
 use harnx_core::tool::{ToolCall, ToolError, ToolProvider, ToolProviderOutput, ToolReplay};
+use harnx_engine::tool::ToolEvalContext;
 use harnx_script::{ScriptRun, ScriptStatus};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 fn run(
     status: ScriptStatus,
@@ -344,6 +347,7 @@ async fn replay_answers_interrupted_for_owned_names_only() {
         payload_limit: None,
         attachment_fetcher: None,
         media_store: None,
+        script_outputs: BTreeMap::new(),
     });
     let abort = harnx_core::abort::create_abort_signal();
 
@@ -380,4 +384,135 @@ async fn replay_answers_interrupted_for_owned_names_only() {
             .await,
     );
     assert!(foreign.is_none(), "unowned names must not be claimed");
+}
+
+/// A script tool wrapping `faketool` with the given body, a provider over a
+/// recording fake, and a round context wired through the slot the way the
+/// runtime does it.
+fn faketool_harness(
+    body: Value,
+    outputs: BTreeMap<String, harnx_toolset::ScriptOutput>,
+) -> FakeToolHarness {
+    let mut definition = json!({
+        "name": "wrap",
+        "description": "Wrapper.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": false},
+        "tools": ["faketool"],
+    });
+    definition
+        .as_object_mut()
+        .unwrap()
+        .extend(body.as_object().unwrap().clone());
+    let definition: harnx_core::script_tool::ScriptToolDefinition =
+        serde_json::from_value(definition).unwrap();
+    let mut config = crate::config::Config::default();
+    config.set_script_tool_definitions(&[definition]).unwrap();
+    *config.nats_tool_declarations.write() = vec![serde_json::from_value(json!({
+        "name": "faketool",
+        "description": "Fake.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }))
+    .unwrap()];
+    let config = Arc::new(crate::config::ConfigLock::new(config));
+    let fake = Arc::new(StructuredProvider {
+        origins: Mutex::new(Vec::new()),
+    });
+    let slot = Arc::new(super::ScriptEvalContextSlot::default());
+    let tools = config.read().accepted_script_tools();
+    let provider = ScriptToolProvider::new(ScriptToolProviderConfig {
+        tools,
+        base_providers: vec![fake.clone()],
+        config,
+        slot: Some(slot.clone()),
+        payload_limit: None,
+        attachment_fetcher: None,
+        media_store: None,
+        script_outputs: outputs,
+    });
+    let context = Arc::new(ToolEvalContext {
+        structured_results: false,
+        on_tool_call_completed: None,
+        on_interaction: None,
+        middleware_fn: None,
+        work_boundary: None,
+        instance_id: harnx_core::instance::ServerScope::new(),
+        tool_round: Some(1),
+        render: None,
+        providers: vec![fake.clone()],
+        allowed_tool_names: Default::default(),
+        current_agent_package: None,
+        handoff_targets: Default::default(),
+        emit_tool_call_fn: Arc::new(|_, _| {}),
+        emit_tool_result_fn: Arc::new(|_, _| {}),
+        emit_tool_blocked_fn: Arc::new(|_, _| {}),
+        emit_tool_update_fn: Arc::new(|_, _| {}),
+        confirm_tool_use_fn: Arc::new(|_, _, _| panic!("inner calls must not confirm")),
+        prepare_handoff_fn: None,
+    });
+    slot.set(&context);
+    FakeToolHarness {
+        provider,
+        fake,
+        _context: context,
+    }
+}
+
+struct FakeToolHarness {
+    provider: ScriptToolProvider,
+    fake: Arc<StructuredProvider>,
+    /// The slot holds the round context weakly, so the harness owns it.
+    _context: Arc<ToolEvalContext>,
+}
+
+impl FakeToolHarness {
+    async fn call_wrap(&self) -> Value {
+        let abort = harnx_core::abort::create_abort_signal();
+        output_value(self.provider.call_tool("wrap", json!({}), &abort).await)
+    }
+
+    fn structured_requests(&self) -> Vec<bool> {
+        self.fake.origins.lock().unwrap().clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_body_inner_calls_ask_for_structured_results() {
+    let harness = faketool_harness(json!({"bash": "faketool --path a"}), BTreeMap::new());
+    harness.call_wrap().await;
+    assert_eq!(harness.structured_requests(), vec![true]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_body_prints_a_mapped_tool_like_a_command() {
+    let outputs = BTreeMap::from([(
+        "faketool".to_string(),
+        harnx_toolset::ScriptOutput {
+            stdout: Some("text".into()),
+            stderr: Some("notes".into()),
+            ..Default::default()
+        },
+    )]);
+    let harness = faketool_harness(json!({"bash": "faketool --path a | wc -l"}), outputs);
+    let value = harness.call_wrap().await;
+    assert_eq!(
+        value["content"][0]["text"].as_str().map(str::trim),
+        Some("3"),
+        "{value}"
+    );
+    assert_eq!(value["stderr"], "faketool: 2 more lines\n", "{value}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn python_body_inner_calls_keep_model_style_results() {
+    let harness = faketool_harness(
+        json!({"python": "r = call_tool(\"faketool\", {\"path\": \"a\"})\nprint('content' in r)"}),
+        BTreeMap::new(),
+    );
+    let value = harness.call_wrap().await;
+    assert_eq!(harness.structured_requests(), vec![false]);
+    assert_eq!(
+        value["content"][0]["text"].as_str().map(str::trim),
+        Some("True"),
+        "{value}"
+    );
 }

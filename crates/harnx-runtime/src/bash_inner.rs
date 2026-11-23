@@ -172,9 +172,10 @@ pub struct InnerCallExecutorConfig {
     pub max_calls: usize,
     /// NATS payload pre-flight; `None` skips the check (tests, non-NATS setups).
     pub payload_limit: Option<PayloadLimit>,
-    /// Ask tools for script-style structured results. Only the `bash` tool
-    /// sets it: its commands know each tool's output mapping. A custom script
-    /// tool's run leaves it off and gets the results a direct call gets.
+    /// Ask tools for script-style structured results. The `bash` tool and a
+    /// script tool's Bash body set it: their commands know each tool's output
+    /// mapping. A script tool's Python body leaves it off and gets the
+    /// results a direct call gets.
     pub structured_results: bool,
 }
 
@@ -1568,8 +1569,9 @@ mod tests {
         assert_eq!(run.trace()[0].bytes, 4);
     }
 
-    /// The `bash` tool turns this on because its commands know each tool's
-    /// output mapping; a custom script tool's run leaves it off.
+    /// The `bash` tool and a script tool's Bash body turn this on because
+    /// their commands know each tool's output mapping; a Python body and
+    /// middleware or hook calls leave it off.
     #[tokio::test]
     async fn structured_results_are_requested_only_when_configured() {
         for wanted in [false, true] {

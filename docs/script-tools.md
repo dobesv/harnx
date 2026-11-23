@@ -62,7 +62,7 @@ script_tools:
     tools: [fs_read]
     bash: |
       path=$(tool_input | jq -r .path)
-      fs_read --path "$path" -o text
+      fs_read --path "$path"
 ```
 
 Package definition in `packages/my-pkg/script_tools/fs_digest.yaml`:
@@ -156,26 +156,37 @@ A script tool can only invoke tools matching its `tools:` allowlist.
 ### Bash bodies
 
 In Bash bodies, each allowlisted tool is available as a shell command with the
-same CLI flags and exit codes as the `bash` tool's script mode:
+same CLI flags, output and exit codes as in the `bash` tool's script mode:
 
 - Parameters map to `--kebab-case` flags (e.g. `--number 2813`). Nullable
   scalars use the same flags, and scalar arrays (including nullable scalar
   arrays) repeat the flag for each value. Passing `null` requires `--json`.
   Objects, nested arrays, and values with multiple non-null types take JSON via
   `--json '<json>'` or `--json -` on stdin.
-- By default, output is JSON from `structuredContent` when present, or text
-  otherwise. Use `-o json` or `-o text` to override. Text output omits content
-  blocks not addressed to the assistant.
+- A tool that declares a shell form prints like the command it resembles, the
+  same as in a `bash` tool script: `fs_read` prints the file's text like `cat`,
+  `fs_ls` and `fs_find` print one name or path per line, and `fs_grep` prints
+  `path:line:text` rows. Data goes to stdout and notes go to stderr. `-o json`
+  prints the tool's fields instead. See
+  [Output in `bash` scripts](../crates/harnx-fs-tools/README.md#output-in-bash-scripts)
+  for the file tools in detail.
+- A tool without a shell form prints JSON from `structuredContent` when present,
+  or text otherwise. Use `-o json` or `-o text` to override. Text output omits
+  content blocks not addressed to the assistant.
 - Commands exit `0` on success; `1` on a tool error; `2` on a usage or flag
-  error; `3` when the call needs interactive approval (stderr reads
-  `needs approval: <tool>; call it directly instead of from bash` — an inner
-  call can never prompt); `4` when the call is blocked; `5` on any other
-  rejection, such as the run's call budget being exhausted; and `127` if the
-  tool is unknown or not allowlisted. On exit `1`, any `partial_result` is
-  rendered to stdout with the same output format as a successful result.
+  error, or when a tool reports its own error status; `126` when the call needs
+  approval (stderr reads `needs approval: <tool>; call it directly instead of
+  from bash`, since an inner call can never prompt), is blocked (`blocked:
+  <reason>`) or is rejected (`rejected: <reason>`), such as when the run's call
+  budget is exhausted; and `127` if the tool is unknown or not allowlisted. On
+  exit `1`, any `partial_result` is rendered to stdout with the same output
+  format as a successful result.
+- `fs_grep` exits `1` when nothing matches.
 
 Under BashKit's default `set -e`, a non-zero exit from an inner tool will halt
-the script unless handled with `set +e` or conditional checks (`if`, `||`).
+the script unless handled with `set +e` or conditional checks (`if`, `||`). For
+`fs_grep` that means using it in `if`, with `||`, or adding `|| true`, since a
+search with no match is not a failure of the script.
 
 ### Python bodies
 
