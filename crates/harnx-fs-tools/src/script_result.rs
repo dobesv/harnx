@@ -67,15 +67,17 @@ pub(crate) fn script_read_result(
     let ReadSelection {
         mut lines,
         total_lines,
-        start_line,
+        mut start_line,
         mut end_line,
         file_bytes,
         mut notes,
         unterminated_line,
     } = selection;
     let omitted = apply_head_tail(&mut lines, params);
+    let mut contiguous = true;
     if omitted > 0 {
         notes.push(format!("{omitted} lines left out"));
+        (start_line, end_line, contiguous) = shrink_to_kept(params, (start_line, end_line));
     }
     let mut rows = lines
         .iter()
@@ -88,7 +90,7 @@ pub(crate) fn script_read_result(
         cap,
         start_line,
         total_lines,
-        contiguous: omitted == 0,
+        contiguous,
     };
     let (byte_truncated, new_end) = bound_rows(&mut rows, &bound, &mut notes);
     end_line = new_end.unwrap_or(end_line);
@@ -142,6 +144,20 @@ fn read_fields(text: &str, notes: &[String], place: &Place<'_>) -> Value {
     })
 }
 
+/// The range the rows cover once `apply_head_tail` dropped some, and whether
+/// they are still consecutive. Keeping only a head or only a tail leaves one
+/// unbroken run, so the range shrinks to it; keeping both leaves a gap, so the
+/// range stays and the "lines left out" note describes it.
+fn shrink_to_kept(params: &ReadFileParams, (start, end): (usize, usize)) -> (usize, usize, bool) {
+    let head = params.head_lines.unwrap_or(0);
+    let tail = params.tail_lines.unwrap_or(0);
+    match (head, tail) {
+        (head, 0) => (start, (start + head).saturating_sub(1), true),
+        (0, tail) => ((end + 1).saturating_sub(tail), end, true),
+        _ => (start, end, false),
+    }
+}
+
 /// Keep the first `head_lines` and last `tail_lines` lines when the caller set
 /// either, with nothing between. Returns how many lines were dropped.
 fn apply_head_tail(lines: &mut Vec<(usize, &str)>, params: &ReadFileParams) -> usize {
@@ -150,7 +166,7 @@ fn apply_head_tail(lines: &mut Vec<(usize, &str)>, params: &ReadFileParams) -> u
     }
     let head = params.head_lines.unwrap_or(0);
     let tail = params.tail_lines.unwrap_or(0);
-    if head + tail >= lines.len() {
+    if head.saturating_add(tail) >= lines.len() {
         return 0;
     }
     let omitted = lines.len() - head - tail;
@@ -217,4 +233,21 @@ fn bound_rows(
         });
     }
     (true, bound.contiguous.then_some(end_line))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn head_tail_with_huge_counts_keeps_every_line() {
+        let params = ReadFileParams {
+            head_lines: Some(usize::MAX),
+            tail_lines: Some(1),
+            ..serde_json::from_value(json!({"path": "f"})).unwrap()
+        };
+        let mut lines = vec![(1, "a"), (2, "b")];
+        assert_eq!(apply_head_tail(&mut lines, &params), 0);
+        assert_eq!(lines, vec![(1, "a"), (2, "b")]);
+    }
 }

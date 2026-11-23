@@ -471,3 +471,25 @@ async fn script_read_combines_head_tail_and_the_byte_cap() {
     assert_eq!(notes[0], "20 lines left out");
     assert!(notes[1].as_str().unwrap().contains("to stay within"));
 }
+
+fn numbered_lines(count: usize) -> String {
+    (1..=count).map(|n| format!("{n}\n")).collect()
+}
+
+#[tokio::test]
+async fn script_read_head_lines_reports_the_lines_returned() {
+    let result = make_server_read(numbered_lines(10).as_bytes(), |p| p.head_lines = Some(2)).await;
+    let f = fields(&result);
+    assert_eq!(f["text"], "1\n2\n");
+    assert_eq!(f["start_line"], 1);
+    assert_eq!(f["end_line"], 2);
+}
+
+#[tokio::test]
+async fn script_read_tail_lines_reports_the_lines_returned() {
+    let result = make_server_read(numbered_lines(10).as_bytes(), |p| p.tail_lines = Some(3)).await;
+    let f = fields(&result);
+    assert_eq!(f["text"], "8\n9\n10\n");
+    assert_eq!(f["start_line"], 8);
+    assert_eq!(f["end_line"], 10);
+}

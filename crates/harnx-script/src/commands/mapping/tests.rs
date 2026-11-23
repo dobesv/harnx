@@ -21,9 +21,10 @@ fn apply_text(structured: Value) -> Mapped {
 }
 
 #[test]
-fn string_field_is_printed_newline_terminated() {
-    assert_eq!(apply_text(json!({"out":"a\nb"})).stdout, "a\nb\n");
-    assert_eq!(apply_text(json!({"out":"a\n"})).stdout, "a\n");
+fn string_stdout_is_printed_without_an_added_newline() {
+    assert_eq!(apply_text(json!({"out":"abc"})).stdout, "abc");
+    assert_eq!(apply_text(json!({"out":"abc\n"})).stdout, "abc\n");
+    assert_eq!(apply_text(json!({"out":"a\nb"})).stdout, "a\nb");
 }
 
 #[test]

@@ -896,15 +896,14 @@ impl FsServer {
         let context_lines = params.context_lines.unwrap_or(0);
         let max_results = params.max_results.unwrap_or(DEFAULT_GREP_LIMIT);
         let mut results = Vec::new();
-        search_recursive(
-            &search_path,
-            &search_path,
-            &regex,
+        let single_file = search_path.is_file();
+        let search = GrepSearch {
+            regex: &regex,
+            include_glob: include_glob.as_ref(),
             context_lines,
-            max_results + 1,
-            include_glob.as_ref(),
-            &mut results,
-        );
+            max_results: max_results + 1,
+        };
+        search.run(&search_path, &mut results);
 
         // Decided before the cap: a zero limit still found something. Rows
         // are only collected around a match, so any row means a match.
@@ -912,7 +911,7 @@ impl FsServer {
         let limit_reached = results.len() > max_results;
         results.truncate(max_results);
         if style == ResultStyle::Script {
-            let prefix = path_prefix(params.path.as_deref(), &search_path);
+            let prefix = grep_path_prefix(params.path.as_deref(), &search_path, single_file);
             let cut = GrepCut {
                 location: params.path.as_deref().unwrap_or("workspace"),
                 max_results,
@@ -1036,4 +1035,40 @@ impl FsServer {
             new_commit_id.to_hex(),
         ))]))
     }
+}
+
+/// What `grep` searches with, whether `path` names a directory or one file.
+struct GrepSearch<'a> {
+    regex: &'a Regex,
+    include_glob: Option<&'a glob::Pattern>,
+    context_lines: usize,
+    max_results: usize,
+}
+
+impl GrepSearch<'_> {
+    // qual:allow(iosp) — one branch choosing between two searches
+    fn run(&self, search_path: &Path, results: &mut Vec<SearchLine>) {
+        let (regex, context, max) = (self.regex, self.context_lines, self.max_results);
+        if search_path.is_file() {
+            // `grep PATTERN FILE` searches that file; `include` only filters
+            // files found by walking a directory.
+            let base = search_path.parent().unwrap_or(search_path);
+            search_file(base, search_path, regex, context, max, results);
+        } else {
+            let glob = self.include_glob;
+            search_recursive(search_path, search_path, regex, context, max, glob, results);
+        }
+    }
+}
+
+/// The prefix script-style `grep` puts before each row's path. Rows of a
+/// single-file search carry the file name, so the prefix is the directory part
+/// of the argument and the printed path equals the argument.
+fn grep_path_prefix(given: Option<&str>, searched: &Path, single_file: bool) -> Option<String> {
+    if !single_file {
+        return path_prefix(given, searched);
+    }
+    given
+        .and_then(|given| Path::new(given).parent())
+        .map(|dir| dir.display().to_string())
 }

@@ -301,7 +301,7 @@ fn duplicate_and_reserved_catalog_names_fail_before_execution() {
 #[tokio::test]
 async fn mapped_tool_success_uses_its_mapping() {
     let result = run("mapped", Arc::new(FakeExecutor::default())).await;
-    assert_eq!(result.stdout, "body\n");
+    assert_eq!(result.stdout, "body");
     assert_eq!(result.stderr, "mapped: careful\n");
     assert_eq!(result.exit_code, 3);
 }

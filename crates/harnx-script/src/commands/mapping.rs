@@ -68,10 +68,11 @@ fn text_stdout(mapping: &OutputMapping, structured: &Value) -> String {
         .unwrap_or_else(|| json_line(structured))
 }
 
-/// None for a shape the mapping cannot print.
+/// None for a shape the mapping cannot print. A string is printed exactly as
+/// stored, so a file read without a final newline copies back byte for byte.
 fn field_text(field: &Value, row: Option<&str>) -> Option<String> {
     match field {
-        Value::String(text) => Some(terminated(text.clone())),
+        Value::String(text) => Some(text.clone()),
         Value::Array(items) => lines(items, row),
         _ => None,
     }
@@ -159,13 +160,6 @@ fn exit_code(mapping: &OutputMapping, structured: &Value) -> i32 {
         .and_then(|name| structured.get(name))
         .and_then(Value::as_i64)
         .map_or(0, clamp_exit)
-}
-
-fn terminated(mut text: String) -> String {
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text
 }
 
 #[cfg(test)]

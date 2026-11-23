@@ -76,8 +76,14 @@ fn prefixed(prefix: Option<&str>, rel: &str) -> String {
 fn prefixed_on(windows: bool, prefix: Option<&str>, rel: &str) -> String {
     match prefix {
         Some(prefix) if !prefix.is_empty() && !is_absolute(windows, rel) => {
-            let prefix = without_verbatim_prefix(prefix);
-            format!("{}/{rel}", prefix.trim_end_matches(['/', '\\']))
+            // Backslash and the verbatim form are Windows syntax; on Unix they
+            // are ordinary characters of a directory name.
+            let (prefix, separators): (_, &[char]) = if windows {
+                (without_verbatim_prefix(prefix), &['/', '\\'])
+            } else {
+                (prefix.to_string(), &['/'])
+            };
+            format!("{}/{rel}", prefix.trim_end_matches(separators))
         }
         _ => rel.to_string(),
     }
@@ -288,9 +294,20 @@ mod tests {
     #[test]
     fn prefix_handles_empty_and_backslash_prefixes() {
         assert_eq!(prefixed(Some(""), "a.rs"), "a.rs");
-        assert_eq!(prefixed(Some(r"src\"), "a.rs"), "src/a.rs");
-        assert_eq!(prefixed(Some(r"C:\x\"), "a.rs"), r"C:\x/a.rs");
-        assert_eq!(prefixed(Some(r"\\?\C:\x"), "a.rs"), r"C:\x/a.rs");
+        assert_eq!(prefixed_on(true, Some(r"src\"), "a.rs"), "src/a.rs");
+        assert_eq!(prefixed_on(true, Some(r"C:\x\"), "a.rs"), r"C:\x/a.rs");
+        assert_eq!(prefixed_on(true, Some(r"\\?\C:\x"), "a.rs"), r"C:\x/a.rs");
+        assert_eq!(prefixed_on(false, Some(r"C:\x\"), "a.rs"), r"C:\x\/a.rs");
+        assert_eq!(
+            prefixed_on(false, Some(r"\\?\C:\x"), "a.rs"),
+            r"\\?\C:\x/a.rs"
+        );
+    }
+
+    #[test]
+    fn unix_keeps_a_trailing_backslash_in_the_prefix() {
+        assert_eq!(prefixed_on(false, Some("src\\"), "a.rs"), "src\\/a.rs");
+        assert_eq!(prefixed_on(true, Some("src\\"), "a.rs"), "src/a.rs");
     }
 
     #[test]

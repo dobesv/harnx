@@ -286,7 +286,7 @@ impl JsonSchema for SearchFilesParams {
                 ),
                 (
                     "path",
-                    "Directory to search in. Defaults to project root.",
+                    "Directory or file to search in. Defaults to project root.",
                     path,
                 ),
                 (
