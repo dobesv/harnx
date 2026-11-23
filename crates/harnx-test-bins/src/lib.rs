@@ -60,23 +60,43 @@ pub async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
 /// The normal test server flags supply JetStream, a private store and a free port.
 // qual:test_helper
 pub async fn spawn_configured_nats_server(config: &str) -> Result<Option<NatsServerHandle>> {
+    spawn_nats_server_with_port(config, None).await
+}
+
+/// Isolated JetStream-enabled `nats-server` on one specific port, for tests
+/// that must bring a broker up later at an address a client already holds:
+/// unlike [`spawn_nats_server`], the port is bound exactly as requested and
+/// spawning fails if it is taken.
+// qual:test_helper
+pub async fn spawn_nats_server_on_port(port: u16) -> Result<Option<NatsServerHandle>> {
+    spawn_nats_server_with_port("", Some(port)).await
+}
+
+async fn spawn_nats_server_with_port(
+    config: &str,
+    port: Option<u16>,
+) -> Result<Option<NatsServerHandle>> {
     let Some(binary) = nats_server_binary() else {
         eprintln!("skipping NATS integration test: nats-server binary not found");
         return Ok(None);
     };
 
     const MAX_SPAWN_ATTEMPTS: usize = 5;
-    let mut result = try_spawn_nats_server(&binary, config).await;
+    let mut result = try_spawn_nats_server(&binary, config, port).await;
     for _ in 1..MAX_SPAWN_ATTEMPTS {
         if result.is_ok() {
             break;
         }
-        result = try_spawn_nats_server(&binary, config).await;
+        result = try_spawn_nats_server(&binary, config, port).await;
     }
     result.map(Some)
 }
 
-async fn try_spawn_nats_server(binary: &Path, config: &str) -> Result<NatsServerHandle> {
+async fn try_spawn_nats_server(
+    binary: &Path,
+    config: &str,
+    port: Option<u16>,
+) -> Result<NatsServerHandle> {
     let store_dir = tempfile::tempdir().context("create temporary NATS store directory")?;
     let ports_dir = tempfile::tempdir().context("create temporary NATS ports directory")?;
     let mut command = Command::new(binary);
@@ -92,7 +112,7 @@ async fn try_spawn_nats_server(binary: &Path, config: &str) -> Result<NatsServer
         .arg("-a")
         .arg("127.0.0.1")
         .arg("-p")
-        .arg("-1")
+        .arg(port.map_or_else(|| "-1".to_string(), |port| port.to_string()))
         .arg("--ports_file_dir")
         .arg(ports_dir.path())
         .stdout(Stdio::null())

@@ -2,17 +2,17 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use harnx_blob_store::media::AttachmentsBucket;
 use harnx_core::attachments::{read_attachment_async, store_attachment_bytes_async, CID_PREFIX};
 use harnx_core::cid_url::{CidUrl, SessionRef};
 use http::StatusCode;
 use multer::Multipart;
 use serde_json::json;
 
-use crate::{
-    is_safe_agent_path, is_safe_path_segment, nats_access::is_nats_connect_error, percent_decode,
-    session_actor::ResolvedAgentTarget, Server, MAX_UPLOAD_BYTES,
-};
+mod upload_store;
+
+pub(super) use upload_store::{attachment_store_error, AttachmentObjectStore, UploadPutError};
+
+use crate::{is_safe_agent_path, is_safe_path_segment, percent_decode, MAX_UPLOAD_BYTES};
 
 /// Store the blob locally and return its identity: the same `CidUrl` the
 /// response ref is built from, whose `kv_key()` is also the object-store key
@@ -31,68 +31,6 @@ async fn save_attachment_file(
         session: attachment_session.clone(),
         hash: hash.to_string(),
     })
-}
-
-/// One upload request's lazy handle on the shared attachments object store.
-///
-/// JetStream is only taken when the first valid part is stored, so a request
-/// rejected by validation (unsupported MIME type, oversized part, bad
-/// multipart framing) never needs a broker and keeps its 4xx even when the
-/// broker is down.
-pub(super) struct AttachmentObjectStore<'a> {
-    server: &'a Server,
-    target: &'a ResolvedAgentTarget,
-    bucket: Option<AttachmentsBucket>,
-}
-
-impl<'a> AttachmentObjectStore<'a> {
-    pub(super) fn new(server: &'a Server, target: &'a ResolvedAgentTarget) -> Self {
-        Self {
-            server,
-            target,
-            bucket: None,
-        }
-    }
-
-    /// Write one accepted blob to the object store. The first call takes
-    /// JetStream and ensures the bucket; later parts reuse both.
-    pub(super) async fn put(&mut self, url: &CidUrl, bytes: &[u8], mime: &str) -> Result<()> {
-        if self.bucket.is_none() {
-            let bucket = self.server.attachments_bucket(self.target).await?;
-            self.bucket = Some(bucket);
-        }
-        let bucket = self
-            .bucket
-            .as_ref()
-            .context("attachment bucket was ensured for this upload")?;
-        harnx_blob_store::media::put_media(bucket, url, bytes, mime).await
-    }
-}
-
-/// Object-store failures must not surface as the route's default 400, and the
-/// response must carry no refs. Connection and unavailability failures are
-/// 503 (the store is currently unreachable); any other store failure is 500.
-/// Both keep the `{"error": ...}` body shape the web UI reads.
-fn attachment_store_error(error: anyhow::Error) -> AttachmentUploadError {
-    log::error!("failed to store uploaded attachment in the NATS object store: {error:#}");
-    // `sanitize_nats_cluster_error` collapses remote connection failures to
-    // this credential-free message.
-    let unavailable = is_nats_connect_error(&error)
-        || error.chain().any(|cause| {
-            cause.to_string().starts_with("NATS cluster '")
-                && cause.to_string().ends_with("is unavailable")
-        });
-    if unavailable {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"error": "attachment object store is unavailable"}),
-        )
-    } else {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": format!("failed to store attachment in the object store: {error:#}")}),
-        )
-    }
 }
 
 pub(super) async fn read_cached_or_nats_attachment(
@@ -157,8 +95,22 @@ async fn process_field(
     // leave this file behind; that is a stale cache entry, not a correctness
     // problem.
     let url = save_attachment_file(attachments_dir, attachment_session, &data, &mime).await?;
-    if let Err(error) = object_store.put(&url, &data, &mime).await {
-        return Ok(Some(attachment_store_error(error)));
+    match object_store.put(&url, &data, &mime).await {
+        Ok(()) => {}
+        Err(UploadPutError::Store(error)) => {
+            return Ok(Some(attachment_store_error(error)));
+        }
+        Err(UploadPutError::SessionGone) => {
+            // The session this upload addresses was deleted (or recreated
+            // with a new incarnation) while this part was being stored. 404
+            // matches how the rest of the API answers a missing session: the
+            // client is addressing a session identity that no longer exists,
+            // whether it was deleted or replaced under the same id.
+            return Ok(Some((
+                StatusCode::NOT_FOUND,
+                json!({"error": "session no longer exists"}),
+            )));
+        }
     }
     refs.push(url.to_string());
     Ok(None)

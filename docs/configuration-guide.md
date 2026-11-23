@@ -747,7 +747,7 @@ serve_role_headers:
 
 `harnx-serve` and `harnx-a2a-server` support optional, identity-based access control rules defined in `access.yaml`.
 
-When access rules are enabled, incoming requests are matched against the rules by caller identity. The servers decide which agents the caller can see, which sessions they can create or access, and which attachments they can retrieve. When no rules file is configured, access control is disabled and servers remain open as before.
+When access rules are enabled, incoming requests are matched against the rules by caller identity. The servers decide which agents the caller can see, which sessions they can create or access, and which attachments they can retrieve or supply to a prompt. When no rules file is configured, access control is disabled and servers remain open as before.
 
 ### File Location and Options
 
@@ -889,6 +889,7 @@ Attachments and plans addressed by canonical `cid:` URLs embed an owning session
 - The server checks the caller's session permissions before resolving the blob or updating activity timestamps.
 - Unauthorized callers receive HTTP `404 Not Found` (with no ETag leaked).
 - Temp or inline sessions without a named agent (`SessionRef.agent == None`) return `404`.
+- **Prompt attachment refs**: A `cid:media:` ref supplied to the JSON-RPC `session/prompt` control plane is authorized the same way, against the session that uploaded it (matching owner, alias expansion, or admin scope on that agent, normalized for the destination cluster), before the prompt is admitted. At most 32 `cid:media` refs are accepted per prompt; a longer list is rejected with `-32602` (HTTP 400) before any broker work. An unauthorized, unattributed, or undecodable source returns the generic JSON-RPC error `-32005` (`attachment not found`) for the whole ref list, with no session log append or turn activation; only confirmed broker unavailability during the check returns `-32003` (HTTP 503), logged server-side at `warn`. Prompts without `cid:media` refs do no extra broker work. Same-session refs, a caller's own cross-session refs, and admin callers work; without access rules a ref is a bearer capability.
 - **Cache policy**: Responses emit `Cache-Control: private, no-store`.
 - **Cache purge recommendation**: Enabling access rules does not invalidate entries previously cached by shared reverse proxies or CDNs. When turning on access rules in an existing deployment, purge shared HTTP caches for `/v1/cid/*`.
 

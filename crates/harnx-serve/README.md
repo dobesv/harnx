@@ -138,7 +138,8 @@ Errors: 400 for malformed CIDs, 404 if blob not found or caller is unauthorized.
 - Success returns `200` with `{"attachment_refs": ["cid:media:...", ...], "attachments": [{"cid": "..."}, ...]}`.
 - Each accepted part is written to the shared `harnx_attachments` NATS object store before its ref is returned; the serving pod's local copy is only that pod's warm cache. Refs are usable on any replica and survive pod restarts.
 - Parts are processed in order and the first error wins; a failed request returns no refs even if earlier parts were stored (stored parts are content-addressed and harmless).
-- If the object-store write fails, the response is `503` (broker unreachable) or `500` (other store error) with an `{"error": ...}` body and no refs. Validation errors (`400`/`413`/`415`) never touch the broker: JetStream is only taken for the first accepted part, so they are returned unchanged even when the broker is down.
+- If the object-store write fails, the response is `503` (broker unreachable) or `500` (other store error) with an `{"error": ...}` body and no refs. With access rules on, the upload additionally re-reads the session's metadata before buffering the body to prove the session still exists; a session that was deleted or replaced by then returns `404` `{"error": "session no longer exists"}` with no refs, and that read does touch the broker even for requests that later fail validation. With access rules off, validation errors (`400`/`413`/`415`) that occur before the first accepted part never touch the broker, so they are returned unchanged even when the broker is down. Once a part is accepted, the broker has been used: a later part's validation error still wins (the request returns no refs), but a broker failure storing that part can surface first.
+- Sessions that have a metadata record (rules on or off) are also re-checked after each stored part: a session deleted or replaced between the put and that re-read returns `404` `{"error": "session no longer exists"}` with no refs, and the object version that part just wrote is removed from the object store (`purge_media_version`: its metadata message and that version's chunks — never a newer same-CID version and never a dedup hit). A failed re-read is not treated as deletion: it returns `503`/`500` and purges nothing. Sessions that were never created through the API store unrechecked and their blobs have no garbage collection.
 
 ### Session Listing and Pagination
 
@@ -331,6 +332,31 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello", "timeout_secs": 300 } }
   ```
+
+  Optional `attachment_refs` parameter supplies `cid:media:` attachment refs
+  (as returned by the upload endpoint) with the prompt:
+  ```json
+  { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "what is this?", "attachment_refs": ["cid:media:..."] } }
+  ```
+  When access rules are configured, each newly supplied `cid:media` ref is
+  authorized against its source session before anything is admitted: the
+  caller needs the same access to the session that uploaded the attachment
+  that the session routes require — matching owner (including alias
+  expansion) or admin scope on the source agent, with the source agent
+  normalized for the destination cluster (bare for the default cluster,
+  `agent@cluster` otherwise). At most 32 `cid:media` refs are accepted per
+  prompt; a longer list is rejected as `-32602` (HTTP 400) before any broker
+  work, and prompts without `cid:media` refs do no broker work at this layer
+  at all. An unauthorized or unattributable source (no record, no named agent,
+  or a record that cannot be decoded) returns the generic `-32005` error
+  below for the whole list, before the session log gains any entry or a turn
+  is activated. If the source session's metadata cannot be read because the
+  broker is unavailable — the open, or a read classified as broker
+  unavailability — the prompt fails closed with `-32003` (HTTP 503), logged
+  server-side at `warn`, so an outage is not mistaken for a denial.
+  Admitting an authorized ref lets the destination session use its content.
+  Same-session refs, a caller's own cross-session refs, and admin callers
+  keep working; without access rules a ref remains a bearer capability.
 - **`session/cancel`**: Interrupts the session's current turn by appending one
   durable `Cancel` to its session log. Takes no parameters — an interrupt always
   targets whatever turn is running. It returns as soon as that append is
@@ -359,9 +385,11 @@ Same canonical session URL, negotiated into programmatic control.
 
 **Error Codes:**
 - `-32001`: Unknown session (HTTP 404) for operations that require an existing session, such as `session/get`, `session/history`, `session/cancel`, `session/compact`, and read-state updates. `session/prompt` creates the session if absent.
-- `-32003`: Session actor or history storage unavailable (HTTP 503). Transient: retry the call.
+- `-32003`: Session actor or history storage unavailable (HTTP 503). Transient: retry the call. Also returned by `session/prompt` when attachment source metadata cannot be read because the broker is unavailable (the store open or an unavailable-classified read): the prompt is rejected before admission, fail closed.
+- `-32004`: Prompt rejected (HTTP 409), including a prompt whose attachment refs cannot be resolved or parsed.
+- `-32005`: Attachment not found (HTTP 404): with access rules configured, a `session/prompt` attachment ref whose source session the caller cannot access, or that has no readable, decodable owner record. Generic by design; it does not reveal whether the referenced object exists.
 - `-32601`: Method not found
-- Standard JSON-RPC 2.0 codes (-32700, -32600, -32602)
+- Standard JSON-RPC 2.0 codes (-32700, -32600, -32602); with access rules configured, `session/prompt` also returns `-32602` (HTTP 400) for more than 32 `cid:media` refs.
 
 `session/cancel` on an idle session is not an error; it returns
 `{ "outcome": "idle" }`.
@@ -941,6 +969,7 @@ The group values are `CN=admins,OU=eng,O=Acme`, `CN=ops,O=Acme`, and `plain-grou
   - Callers holding only `admin` scope receive HTTP `403 Forbidden` (`session creation requires prompt scope`) when attempting to create a session.
 - **Pre-allocation Requirement**: Callers must reserve a session ID via `POST /v1/agents/{agent}/sessions` before prompting. Implicit session creation on unreserved session IDs returns HTTP `404 Not Found`.
 - **Session Listings**: `GET /v1/agents/{agent}/sessions` filters results before pagination, showing only sessions the caller is authorized to access.
+- **Prompt Attachment Refs**: `cid:media:` refs supplied to the JSON-RPC `session/prompt` are authorized against the session that uploaded them before the prompt is admitted — the caller needs the same access to that source session that the session routes require (matching owner, alias expansion, or admin scope on the source agent, normalized for the destination cluster). At most 32 `cid:media` refs are accepted per prompt (HTTP 400 / `-32602` over the cap). An unauthorized, unattributed, or otherwise unreadable source returns the generic `-32005` `attachment not found` (HTTP 404) for the whole list, before any log append or turn activation; only confirmed broker unavailability during the check returns `-32003` (HTTP 503). Prompts without `cid:media` refs do no extra broker work.
 - **CID Attachments**: `/v1/cid/*` validates caller access against the owning session embedded in the CID. Protected responses emit `Cache-Control: private, no-store`. Shared proxy caches should be purged when enabling rules.
 ## Quickstart
 

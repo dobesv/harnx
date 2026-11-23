@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use crate::{access_agents::Fixture, common};
 
 /// One `attachment` part, framed like the web UI's form upload.
-fn multipart_attachment_body(
+/// Shared with the prompt-attachment access tests.
+pub(super) fn multipart_attachment_body(
     boundary: &str,
     filename: &str,
     content_type: &str,

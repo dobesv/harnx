@@ -12,6 +12,9 @@ use hyper::{body::Incoming, Request};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use harnx_core::access_rules::AccessRules;
+use harnx_core::cid_url::CidUrl;
+
 mod cancellation;
 mod compaction;
 mod hitl_exact;
@@ -20,6 +23,13 @@ mod surface_action;
 
 pub const JSON_RPC_UNKNOWN_SESSION_CODE: i64 = -32001;
 const JSON_RPC_METHOD_NOT_FOUND_CODE: i64 = -32601;
+const JSON_RPC_INVALID_PARAMS_CODE: i64 = -32602;
+const JSON_RPC_UNAVAILABLE_CODE: i64 = -32003;
+const JSON_RPC_REJECTED_CODE: i64 = -32004;
+const JSON_RPC_ATTACHMENT_NOT_FOUND_CODE: i64 = -32005;
+/// Refs in this form carry a source session owner; other refs are validated
+/// downstream as before. `CID_PREFIX` is "cid:", so this is "cid:media:".
+const MEDIA_CID_PREFIX: &str = "cid:media:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceKind {
@@ -32,6 +42,233 @@ impl PersistenceKind {
             Self::Nats => "nats",
         }
     }
+}
+
+/// Access rules plus the trusted identity of the current request, for
+/// authorizing prompt attachments against their source session owner.
+///
+/// The identity is the same request-header snapshot the route guards use —
+/// never anything taken from JSON-RPC parameters — copied out of the request
+/// before ownership transfers to the RPC handler.
+pub struct RequestAccess<'a> {
+    pub(crate) rules: &'a AccessRules,
+    pub(crate) config: &'a harnx_runtime::config::Config,
+    pub(crate) identity: crate::request_identity::RequestIdentity,
+}
+
+/// What a `cid:media` reference check decided for a prompt.
+enum AttachmentGuard {
+    /// No rules, or every source passed the owner check.
+    Allow,
+    /// The reference does not parse; the prompt is rejected like an
+    /// unresolvable attachment, before any attachment lookup.
+    Malformed {
+        reference: String,
+        error: anyhow::Error,
+    },
+    /// More `cid:media` refs than [`MAX_PROMPT_MEDIA_REFS`]: a
+    /// validation-style rejection, before any broker work.
+    TooManyRefs { limit: usize },
+    /// The caller may not access the reference's source session, or the
+    /// source has no readable owner record. The public error is generic and
+    /// never probes whether the referenced object exists.
+    Denied,
+    /// The source session's metadata could not be read during authorization.
+    /// Fail closed, but visibly: an infrastructure outage is not an
+    /// authorization verdict. The failure is already logged at `warn`.
+    Unavailable,
+}
+
+/// Upper bound on `cid:media` refs one prompt may carry when access rules
+/// are on. Each distinct source costs a leader-backed metadata read, so
+/// without a cap a caller could turn a single prompt into unbounded broker
+/// work. The web UI sends one ref per attached image; 32 leaves generous
+/// headroom without inviting abuse. Refs are counted before dedup.
+const MAX_PROMPT_MEDIA_REFS: usize = 32;
+
+/// Why `media_sources` refused the prompt's `cid:media` refs.
+#[derive(Debug)]
+enum MediaRefsError {
+    /// A ref that does not parse; the whole list fails, matching the
+    /// actor's admission rejection.
+    Malformed {
+        reference: String,
+        error: anyhow::Error,
+    },
+    /// More `cid:media` refs than the limit.
+    TooMany { limit: usize },
+}
+
+/// Parse the prompt's `cid:media` refs, up to [`MAX_PROMPT_MEDIA_REFS`] of
+/// them. A ref that does not parse fails the whole list, matching the
+/// actor's admission rejection; non-`cid:media` refs never count toward
+/// the cap and are validated downstream as before.
+fn media_sources(refs: &[String]) -> Result<Vec<CidUrl>, MediaRefsError> {
+    let media: Vec<&String> = refs
+        .iter()
+        .filter(|reference| reference.starts_with(MEDIA_CID_PREFIX))
+        .collect();
+    if media.len() > MAX_PROMPT_MEDIA_REFS {
+        return Err(MediaRefsError::TooMany {
+            limit: MAX_PROMPT_MEDIA_REFS,
+        });
+    }
+    media
+        .into_iter()
+        .map(|reference| {
+            CidUrl::parse(reference).map_err(|error| MediaRefsError::Malformed {
+                reference: reference.clone(),
+                error,
+            })
+        })
+        .collect()
+}
+
+/// The first ref per source session: one metadata read per source, not per
+/// reference, keeping the first ref's order.
+fn dedupe_sources(sources: Vec<CidUrl>) -> Vec<CidUrl> {
+    let mut owners = std::collections::HashSet::new();
+    sources
+        .into_iter()
+        .filter(|url| owners.insert(url.session().owner()))
+        .collect()
+}
+
+/// Parse and authorize a prompt's `cid:media` references against their source
+/// session owners, in the cluster the destination prompt will resolve them.
+async fn check_prompt_attachments(
+    access: &RequestAccess<'_>,
+    params: &PromptParams,
+    cluster: &str,
+) -> AttachmentGuard {
+    match media_sources(&params.attachment_refs) {
+        Ok(sources) => authorize_sources(access, cluster, &dedupe_sources(sources)).await,
+        Err(MediaRefsError::Malformed { reference, error }) => {
+            AttachmentGuard::Malformed { reference, error }
+        }
+        Err(MediaRefsError::TooMany { limit }) => AttachmentGuard::TooManyRefs { limit },
+    }
+}
+
+/// The guard verdict for refs whose source sessions the caller may access.
+///
+/// One read-only metadata handle serves the whole prompt — one broker
+/// connection per request, not one per source — and each read stays
+/// leader-backed.
+async fn authorize_sources(
+    access: &RequestAccess<'_>,
+    cluster: &str,
+    sources: &[CidUrl],
+) -> AttachmentGuard {
+    // No cid:media refs: nothing to authorize, and a rules-on prompt must
+    // not pay a broker round trip (or gain outage failure modes) for refs
+    // it does not carry.
+    if sources.is_empty() {
+        return AttachmentGuard::Allow;
+    }
+    let store = match crate::session_access::open_session_metadata_readonly(access.config, cluster)
+        .await
+    {
+        Ok(Some(store)) => store,
+        // No session metadata exists in the cluster yet: every source
+        // is unattributed, so deny, fail closed.
+        Ok(None) => return AttachmentGuard::Denied,
+        Err(error) => {
+            log::warn!(
+                "prompt attachment authorization in cluster '{cluster}' could not read session metadata: {}",
+                crate::nats_access::sanitized_error_chain(&error)
+            );
+            return AttachmentGuard::Unavailable;
+        }
+    };
+    let caller = access.identity.caller();
+    let check = crate::session_access::SourceCheck {
+        store: &store,
+        rules: access.rules,
+        caller: caller.view(),
+        cluster,
+        default_cluster: access.config.default_cluster_for_display(),
+    };
+    for url in sources {
+        match check.access(url).await {
+            crate::session_access::SourceAccess::Authorized => {}
+            crate::session_access::SourceAccess::Denied => return AttachmentGuard::Denied,
+            // The read failure is logged at warn inside the check.
+            crate::session_access::SourceAccess::Unavailable => {
+                return AttachmentGuard::Unavailable;
+            }
+        }
+    }
+    AttachmentGuard::Allow
+}
+
+/// JSON-RPC response for a denied or malformed attachment ref; `None` when
+/// every ref passed and the prompt may continue.
+fn attachment_guard_response(
+    id: Value,
+    guard: AttachmentGuard,
+) -> Option<anyhow::Result<AppResponse>> {
+    match guard {
+        AttachmentGuard::Allow => None,
+        AttachmentGuard::Malformed { reference, error } => Some(json_rpc_response(
+            StatusCode::CONFLICT,
+            json_rpc_error(
+                id,
+                JSON_RPC_REJECTED_CODE,
+                &format!("parse attachment URL '{reference}': {error}"),
+                None,
+            ),
+        )),
+        AttachmentGuard::TooManyRefs { limit } => Some(json_rpc_response(
+            StatusCode::BAD_REQUEST,
+            json_rpc_error(
+                id,
+                JSON_RPC_INVALID_PARAMS_CODE,
+                &format!("attachment_refs: too many cid:media references (limit {limit})"),
+                None,
+            ),
+        )),
+        AttachmentGuard::Denied => Some(json_rpc_response(
+            StatusCode::NOT_FOUND,
+            json_rpc_error(
+                id,
+                JSON_RPC_ATTACHMENT_NOT_FOUND_CODE,
+                "attachment not found",
+                None,
+            ),
+        )),
+        // Confirmed unavailability, not a denial: fixed, ref-free body so
+        // callers can tell "retry later" from "do not ask again", and the
+        // cause is logged at warn server-side.
+        AttachmentGuard::Unavailable => Some(json_rpc_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json_rpc_error(
+                id,
+                JSON_RPC_UNAVAILABLE_CODE,
+                "session metadata unavailable",
+                None,
+            ),
+        )),
+    }
+}
+
+/// The response that stops a prompt whose `cid:media` refs are malformed or
+/// unauthorized; `None` lets the prompt continue. Authorization precedes the
+/// actor spawn, any resume decision routing, and any attachment lookup, so a
+/// denial leaves no durable trace.
+async fn prompt_attachment_denial(
+    id: &Value,
+    params: &PromptParams,
+    context: &RpcContext<'_>,
+    cluster: &str,
+) -> Option<anyhow::Result<AppResponse>> {
+    let guard = match context.attachment_access.as_ref() {
+        // Rules off: a ref is a bearer capability, as before. Nothing is
+        // parsed or authorized here, and no NATS dependency is added.
+        None => AttachmentGuard::Allow,
+        Some(access) => check_prompt_attachments(access, params, cluster).await,
+    };
+    attachment_guard_response(id.clone(), guard)
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +294,10 @@ pub struct RpcContext<'a> {
     /// Caller principals resolved from the request; recorded read-only when
     /// a prompt creates the session's metadata.
     pub user_principals: Option<harnx_core::user_principals::UserPrincipals>,
+    /// Access rules and trusted request identity for authorizing prompt
+    /// `cid:media` references against their source session owner. `None`
+    /// when no access rules are configured: bearer-CID behavior.
+    pub attachment_access: Option<RequestAccess<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +376,7 @@ pub async fn handle_ag_ui_rpc_bytes(
         web_base_url: None,
         user_id: None,
         user_principals: None,
+        attachment_access: None,
     };
     handle_ag_ui_rpc_bytes_for_target(request, context).await
 }
@@ -335,48 +577,16 @@ async fn handle_prompt(
     };
     params.web_base_url = context.web_base_url.clone();
 
-    let handle = registry.get_or_spawn(key);
-    let resume = match parse_resume_params(&params.resume) {
-        Ok(resume) => resume,
-        Err(err) => {
-            return json_rpc_response(
-                StatusCode::BAD_REQUEST,
-                json_rpc_error(
-                    id,
-                    -32602,
-                    "invalid params",
-                    Some(json!({ "detail": err.to_string() })),
-                ),
-            );
-        }
-    };
+    // Attachment authorization precedes the actor spawn, any resume decision
+    // routing, and any attachment lookup: a denial leaves no durable trace.
+    if let Some(response) = prompt_attachment_denial(&id, &params, context, key.cluster()).await {
+        return response;
+    }
 
-    let resume_applied = if resume.is_empty() {
-        None
-    } else {
-        let mut applied = false;
-        for decision in resume {
-            match route_hitl_decision(
-                &handle,
-                decision.interrupt_id,
-                matches!(
-                    decision.status,
-                    crate::interrupt_resume::InterruptResumeStatus::Approved
-                ),
-                decision.payload.reason,
-            )
-            .await
-            {
-                Ok(decision_applied) => applied |= decision_applied,
-                Err(message) => {
-                    return json_rpc_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        json_rpc_error(id, -32003, &message, None),
-                    );
-                }
-            }
-        }
-        Some(applied)
+    let handle = registry.get_or_spawn(key);
+    let resume_applied = match apply_resume_params(id.clone(), &handle, &params.resume).await {
+        Ok(applied) => applied,
+        Err(response) => return *response,
     };
 
     if params.text.trim().is_empty() && params.attachment_refs.is_empty() {
@@ -390,6 +600,59 @@ async fn handle_prompt(
         );
     }
     submit_prompt(id, &handle, &params, resume_applied, context).await
+}
+
+/// Parse the prompt's resume params and route each decision to the session
+/// actor, ahead of the prompt. `Ok(None)` means no resume params were
+/// present; the inner bool says whether any decision applied. `Err` is the
+/// ready JSON-RPC error response: invalid resume params, or a decision the
+/// session actor failed to route.
+async fn apply_resume_params(
+    id: Value,
+    handle: &SessionHandle,
+    resume_params: &[crate::interrupt_resume::InterruptResumeParam],
+) -> Result<Option<bool>, Box<anyhow::Result<AppResponse>>> {
+    let resume = match parse_resume_params(resume_params) {
+        Ok(resume) => resume,
+        Err(err) => {
+            return Err(Box::new(json_rpc_response(
+                StatusCode::BAD_REQUEST,
+                json_rpc_error(
+                    id,
+                    JSON_RPC_INVALID_PARAMS_CODE,
+                    "invalid params",
+                    Some(json!({ "detail": err.to_string() })),
+                ),
+            )));
+        }
+    };
+    if resume.is_empty() {
+        return Ok(None);
+    }
+    let mut applied = false;
+    for decision in resume {
+        let approved = matches!(
+            decision.status,
+            crate::interrupt_resume::InterruptResumeStatus::Approved
+        );
+        match route_hitl_decision(
+            handle,
+            decision.interrupt_id,
+            approved,
+            decision.payload.reason,
+        )
+        .await
+        {
+            Ok(decision_applied) => applied |= decision_applied,
+            Err(message) => {
+                return Err(Box::new(json_rpc_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json_rpc_error(id, JSON_RPC_UNAVAILABLE_CODE, &message, None),
+                )));
+            }
+        }
+    }
+    Ok(Some(applied))
 }
 
 fn build_prompt_options(params: &PromptParams, context: &RpcContext<'_>) -> SessionPromptOptions {
@@ -430,7 +693,7 @@ async fn submit_prompt(
         PromptResult::Rejected { reason } => {
             return json_rpc_response(
                 StatusCode::CONFLICT,
-                json_rpc_error(id, -32004, &reason, None),
+                json_rpc_error(id, JSON_RPC_REJECTED_CODE, &reason, None),
             );
         }
     };
@@ -1653,6 +1916,124 @@ mod extra_rpc_tests {
         let notification_body = response_json(notification).await;
         assert_eq!(notification_body["id"], Value::Null);
         assert_eq!(notification_body["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn media_sources_caps_cid_media_refs_and_ignores_other_refs() {
+        let media = |i: usize| format!("cid:media:allowed/sess01/{i:064x}");
+        let at_cap: Vec<String> = (0..MAX_PROMPT_MEDIA_REFS).map(media).collect();
+        assert_eq!(
+            media_sources(&at_cap).expect("refs at the cap parse").len(),
+            MAX_PROMPT_MEDIA_REFS
+        );
+
+        // One over the cap is a validation rejection, counted before dedup.
+        let mut over = at_cap.clone();
+        over.push(media(MAX_PROMPT_MEDIA_REFS));
+        match media_sources(&over) {
+            Err(MediaRefsError::TooMany { limit }) => assert_eq!(limit, MAX_PROMPT_MEDIA_REFS),
+            other => panic!("expected TooMany, got {other:?}"),
+        }
+
+        // Only cid:media refs count; other refs are validated downstream.
+        let mut mixed = vec![
+            "cid:image".to_string(),
+            "https://example.com/a.png".to_string(),
+        ];
+        mixed.extend(at_cap);
+        assert_eq!(
+            media_sources(&mixed).expect("mixed refs parse").len(),
+            MAX_PROMPT_MEDIA_REFS
+        );
+
+        // A malformed ref among fewer than the limit still names the ref.
+        let malformed = vec!["cid:media:not-a-hash".to_string()];
+        match media_sources(&malformed) {
+            Err(MediaRefsError::Malformed { reference, .. }) => {
+                assert_eq!(reference, "cid:media:not-a-hash");
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_guard_response_maps_too_many_and_unavailable() {
+        let too_many = attachment_guard_response(
+            json!(1),
+            AttachmentGuard::TooManyRefs {
+                limit: MAX_PROMPT_MEDIA_REFS,
+            },
+        )
+        .expect("over-cap refs produce a response")
+        .expect("response built");
+        assert_eq!(too_many.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(too_many).await;
+        assert_eq!(
+            body["error"]["code"], JSON_RPC_INVALID_PARAMS_CODE,
+            "{body}"
+        );
+        assert_eq!(
+            body["error"]["message"],
+            format!(
+                "attachment_refs: too many cid:media references (limit {MAX_PROMPT_MEDIA_REFS})"
+            ),
+            "{body}"
+        );
+        assert!(body["result"].is_null(), "{body}");
+
+        let unavailable = attachment_guard_response(json!(2), AttachmentGuard::Unavailable)
+            .expect("unavailable produces a response")
+            .expect("response built");
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(unavailable).await;
+        assert_eq!(body["error"]["code"], JSON_RPC_UNAVAILABLE_CODE, "{body}");
+        assert_eq!(
+            body["error"]["message"], "session metadata unavailable",
+            "{body}"
+        );
+        assert!(body["result"].is_null(), "{body}");
+    }
+
+    /// A rules-on prompt with no `cid:media` refs must not open the metadata
+    /// store (D1): `authorize_sources` returns `Allow` before any broker
+    /// work, so the common prompt keeps its pre-F7 cost and cannot pick up
+    /// the open's outage failure modes. The contrast case proves the config's
+    /// cluster really cannot open a store: with a source to authorize, the
+    /// open runs and fails.
+    #[tokio::test]
+    async fn authorize_sources_with_no_refs_allows_without_opening_metadata() {
+        let _guard = TestStateGuard::new(None).await;
+        let rules = AccessRules::from_yaml(
+            "rules:\n  - agents: [allowed]\n    scopes: [prompt]\n    users: [alice]\n",
+        )
+        .expect("parse access rules");
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_nats_server("dead", "url: nats://127.0.0.1:1\n");
+        let mut config = sandbox.config();
+        config.nats_routing = harnx_runtime::config::NatsRouting::Cluster("dead".to_string());
+        let access = RequestAccess {
+            rules: &rules,
+            config: &config,
+            identity: Default::default(),
+        };
+
+        // Zero refs: allowed, without the store open the dead cluster would
+        // turn into Unavailable.
+        assert!(matches!(
+            authorize_sources(&access, "dead", &[]).await,
+            AttachmentGuard::Allow
+        ));
+
+        // The same cluster with a source does open the store and fails, so
+        // the empty case above is not passing for the wrong reason.
+        let url = CidUrl::parse(
+            "cid:media:allowed/sess01/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("parse cid ref");
+        assert!(matches!(
+            authorize_sources(&access, "dead", std::slice::from_ref(&url)).await,
+            AttachmentGuard::Unavailable
+        ));
     }
 }
 

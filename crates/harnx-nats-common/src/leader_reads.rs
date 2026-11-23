@@ -100,6 +100,15 @@ where
     Fut: Future<Output = Result<T>>,
 {
     let deadline = Instant::now() + crate::recovery::RECOVERY_TIMEOUT;
+    retry_transient_until(deadline, operation).await
+}
+
+/// As [`retry_transient`], but stop at the caller's absolute deadline.
+pub async fn retry_transient_until<T, F, Fut>(deadline: Instant, operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
     crate::recovery::retry_until(deadline, operation, is_transient).await
 }
 
