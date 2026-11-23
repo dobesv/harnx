@@ -24,6 +24,7 @@ mod middleware;
 mod nats_activation_replicas;
 mod nats_agent_variables_e2e;
 mod nats_attachments;
+mod nats_attachments_stale_replica;
 mod nats_connect;
 mod nats_control;
 mod nats_deadline_admission;

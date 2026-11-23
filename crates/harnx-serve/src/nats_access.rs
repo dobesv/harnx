@@ -35,14 +35,20 @@ pub(crate) fn sanitize_nats_cluster_error(cluster: &str, error: anyhow::Error) -
     }
 }
 
-pub(crate) fn sanitize_nats_session_error(cluster: &str, error: anyhow::Error) -> anyhow::Error {
-    let is_connect_error = error.chain().any(|cause| {
+/// Whether this error is a failure to reach the broker, as opposed to a
+/// failure of a store operation on a working connection. Both a raw
+/// `ConnectError` and the context `Config::nats_client` adds count.
+pub(crate) fn is_nats_connect_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
         cause.downcast_ref::<async_nats::ConnectError>().is_some()
             || cause
                 .to_string()
                 .starts_with("Failed to connect to NATS cluster")
-    });
-    if is_connect_error {
+    })
+}
+
+pub(crate) fn sanitize_nats_session_error(cluster: &str, error: anyhow::Error) -> anyhow::Error {
+    if is_nats_connect_error(&error) {
         nats_cluster_unavailable(cluster, error)
     } else {
         error

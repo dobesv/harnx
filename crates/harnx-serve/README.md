@@ -97,6 +97,7 @@ never used as a persistence or routing key.
 | `GET` | `/v1/agents/:agent/sessions/:session/events` | `Accept: text/event-stream` | Notify passive clients when any frontend updates the session. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Accept: text/event-stream` | **Subscription Plane**: SSE event stream. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Content-Type: application/json` | **Control Plane**: JSON-RPC 2.0 interface. |
+| `POST` | `/v1/agents/:agent/sessions/:session/attachments` | `multipart/form-data` | Upload attachments; returns `cid:media:` refs. |
 | `GET` | `/v1/agents/:agent/sessions/:session/attachments/:cid` | `image/*` | Retrieve attachment blob by content-ID. |
 | `GET` | `/v1/cid/:encoded_cid` | `*/*` | Resolve `cid:` URL (bearer capability when rules are off; session-authorized when rules are on). |
 
@@ -129,6 +130,15 @@ Errors: 400 for malformed CIDs, 404 if blob not found or caller is unauthorized.
 - Reads local content-addressed cache first, falls back to NATS ObjectStore.
 - MIME allowlist: `image/png`, `image/jpeg`, `image/webp`, `image/gif`. Returns `415 Unsupported Media Type` for other types.
 - Headers: `Content-Type: <mime>`, `X-Content-Type-Options: nosniff`, `Cache-Control: private, max-age=86400`.
+
+### Attachment Upload
+
+`POST /v1/agents/:agent/sessions/:session/attachments` accepts a `multipart/form-data` body of `attachment` parts (filename plus part `Content-Type`):
+- Accepted part types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `application/pdf`, `text/plain`; anything else is `415 Unsupported Media Type`. The whole request is capped at 20 MiB (`413 Payload Too Large`).
+- Success returns `200` with `{"attachment_refs": ["cid:media:...", ...], "attachments": [{"cid": "..."}, ...]}`.
+- Each accepted part is written to the shared `harnx_attachments` NATS object store before its ref is returned; the serving pod's local copy is only that pod's warm cache. Refs are usable on any replica and survive pod restarts.
+- Parts are processed in order and the first error wins; a failed request returns no refs even if earlier parts were stored (stored parts are content-addressed and harmless).
+- If the object-store write fails, the response is `503` (broker unreachable) or `500` (other store error) with an `{"error": ...}` body and no refs. Validation errors (`400`/`413`/`415`) never touch the broker: JetStream is only taken for the first accepted part, so they are returned unchanged even when the broker is down.
 
 ### Session Listing and Pagination
 

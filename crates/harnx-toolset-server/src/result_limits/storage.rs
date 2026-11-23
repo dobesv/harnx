@@ -1,7 +1,7 @@
 //! Session-owned uploads reuse the serving connection and broker chunk ceiling.
 
-use async_nats::jetstream::{self, object_store::ObjectStore};
-use harnx_blob_store::media::MediaBlob;
+use async_nats::jetstream;
+use harnx_blob_store::media::{AttachmentsBucket, MediaBlob};
 use harnx_core::{
     attachments::cid_for_data_url_with_session,
     cid_url::{CidUrl, SessionRef},
@@ -12,7 +12,7 @@ use tokio::sync::OnceCell;
 pub(super) struct Storage {
     jetstream: jetstream::Context,
     replicas: usize,
-    bucket: OnceCell<ObjectStore>,
+    bucket: OnceCell<AttachmentsBucket>,
 }
 
 impl Storage {
@@ -46,7 +46,7 @@ impl Storage {
 }
 
 pub(super) struct AttachmentUploads<'a> {
-    store: &'a ObjectStore,
+    store: &'a AttachmentsBucket,
     max_chunk_bytes: usize,
 }
 

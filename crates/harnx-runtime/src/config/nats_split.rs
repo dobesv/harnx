@@ -320,6 +320,20 @@ impl Config {
         self.nats_server(cluster_key).map(Cow::Borrowed)
     }
 
+    /// The JetStream replica count to use for this cluster's buckets.
+    ///
+    /// Resolves the reserved `__local__` identity the same way
+    /// [`Config::nats_client`] does, so it also covers front-end local
+    /// routing of `__local__` to a managed or external cluster. Unlike
+    /// `nats_server(cluster).resolved_replicas()`, it does not fail for
+    /// `__local__`.
+    pub async fn resolve_nats_replicas(&self, cluster_key: &str) -> Result<usize> {
+        Ok(self
+            .resolve_nats_server(cluster_key)
+            .await?
+            .resolved_replicas())
+    }
+
     /// Type-erased box: resolving the local cluster may start or join the
     /// shared broker, and the connect chain's future (async-nats connect
     /// into the rustls ECH types) is deep enough that a concrete future

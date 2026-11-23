@@ -79,6 +79,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::stream::StreamExt;
+use harnx_blob_store::media::AttachmentsBucket;
 #[cfg(test)]
 use harnx_core::attachments::store_attachment_bytes_async;
 use harnx_core::attachments::{collect_cid_refs, CID_PREFIX};
@@ -1100,65 +1101,46 @@ impl Server {
         Ok(response)
     }
 
+    /// One JetStream handle and the `harnx_attachments` bucket for the upload
+    /// path. For the local cluster the shared frontend broker must be running
+    /// before any JetStream I/O. The config here is a snapshot, so no config
+    /// lock is held across the round trips.
+    async fn attachments_bucket(&self, target: &ResolvedAgentTarget) -> Result<AttachmentsBucket> {
+        ensure_frontend_nats_owner(target.cluster()).await?;
+        let jetstream = serve_nats_jetstream(&self.config, target.cluster()).await?;
+        let replicas = self.config.resolve_nats_replicas(target.cluster()).await?;
+        harnx_blob_store::media::ensure_attachments_bucket(&jetstream, replicas).await
+    }
+
     async fn upload_session_attachments<B>(&self, req: hyper::Request<B>) -> Result<AppResponse>
     where
         B: Body<Data = Bytes> + Send + Unpin,
         <B as Body>::Error: std::fmt::Display,
     {
-        if req.method() != Method::POST {
-            bail!("Method Not Allowed");
-        }
-        let path = req.uri().path().to_string();
-        let (agent_ref, session) =
-            parse_session_attachments_path(&path).ok_or_else(|| anyhow!("Not Found"))?;
-
-        if request_is_oversized(req.headers()) {
-            return json_response_with_status(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
-            );
-        }
-
-        let Some(boundary) = multer::parse_boundary(
-            req.headers()
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| anyhow!("Bad Request"))?,
-        )
-        .ok() else {
-            bail!("Bad Request");
-        };
+        let (agent_ref, session, boundary) = upload_route(&req)?;
         let (target, _) = self.resolve_request_agent(&req, &agent_ref).await?;
         let attachments_dir = Config::agent_data_dir(target.agent())
             .join("attachments")
             .join(&session);
         let attachment_session = SessionRef::new(Some(target.agent().to_string()), session.clone())
             .context("build attachment session identity")?;
+        // JetStream is taken lazily on the first accepted part, so validation
+        // failures below never need a broker and keep their 4xx.
+        let mut object_store = AttachmentObjectStore::new(self, &target);
 
-        // Stream body with size limit to prevent OOM
-        let body = req.into_body();
-        let mut cumulative: usize = 0;
-        let mut chunks: Vec<Bytes> = Vec::new();
-        let mut body_stream = body.into_data_stream();
+        // The headers must outlive the body, which consumes the request.
+        let headers = http::HeaderMap::clone(req.headers());
+        let body_bytes = match read_upload_body(&headers, req.into_body()).await {
+            Ok(bytes) => bytes,
+            Err((status, body)) => return json_response_with_status(status, body),
+        };
 
-        while let Some(chunk_result) = body_stream.next().await {
-            let chunk = chunk_result.map_err(|e| anyhow!("Failed to read body: {}", e))?;
-            cumulative += chunk.len();
-            if cumulative > MAX_UPLOAD_BYTES {
-                return json_response_with_status(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
-                );
-            }
-            chunks.push(chunk);
-        }
-
-        let body_bytes = chunks.into_iter().flatten().collect::<Vec<u8>>();
         let refs = match process_multipart_upload(
             body_bytes,
             boundary,
             &attachments_dir,
             &attachment_session,
+            &mut object_store,
         )
         .await?
         {
@@ -1419,6 +1401,68 @@ struct RerankReqBody {
     query: String,
     model: String,
     top_n: Option<usize>,
+}
+
+/// Method, path and multipart-boundary checks for the upload route. Body-size
+/// enforcement happens in `read_upload_body`, before the body is read.
+fn upload_route<B>(req: &hyper::Request<B>) -> Result<(String, String, String)> {
+    if req.method() != Method::POST {
+        bail!("Method Not Allowed");
+    }
+    let path = req.uri().path().to_string();
+    let (agent_ref, session) =
+        parse_session_attachments_path(&path).ok_or_else(|| anyhow!("Not Found"))?;
+    let boundary = multipart_boundary(req.headers())?;
+    Ok((agent_ref, session, boundary))
+}
+
+/// The multipart boundary of the request's Content-Type header.
+fn multipart_boundary(headers: &http::HeaderMap) -> Result<String> {
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow!("Bad Request"))?;
+    multer::parse_boundary(content_type).map_err(|_| anyhow!("Bad Request"))
+}
+
+/// Read the whole upload body, refusing anything over the size cap with the
+/// route's 413 response before any multipart parsing.
+async fn read_upload_body<B>(
+    headers: &http::HeaderMap,
+    body: B,
+) -> std::result::Result<Vec<u8>, AttachmentUploadError>
+where
+    B: Body<Data = Bytes> + Send + Unpin,
+    <B as Body>::Error: std::fmt::Display,
+{
+    if request_is_oversized(headers) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
+        ));
+    }
+    // Stream chunks with a running size limit to prevent OOM.
+    let mut cumulative: usize = 0;
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut body_stream = body.into_data_stream();
+
+    while let Some(chunk_result) = body_stream.next().await {
+        let chunk = chunk_result.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("Failed to read body: {e}")}),
+            )
+        })?;
+        cumulative += chunk.len();
+        if cumulative > MAX_UPLOAD_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
+            ));
+        }
+        chunks.push(chunk);
+    }
+    Ok(chunks.into_iter().flatten().collect())
 }
 
 fn set_cors_header(res: &mut AppResponse) {
@@ -3327,6 +3371,28 @@ mod tests {
         body
     }
 
+    const UPLOAD_BOUNDARY: &str = "boundary123";
+
+    /// PNG magic bytes, the fixture every positive upload test posts.
+    fn png_magic_bytes() -> Vec<u8> {
+        vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    }
+
+    /// A ready-to-post single-part multipart body and its boundary.
+    fn single_part_upload_body(
+        filename: &str,
+        content_type: &str,
+        data: &[u8],
+    ) -> (&'static str, Vec<u8>) {
+        (
+            UPLOAD_BOUNDARY,
+            build_multipart_body(
+                UPLOAD_BOUNDARY,
+                &[("attachment", filename, content_type, data)],
+            ),
+        )
+    }
+
     #[test]
     fn session_route_accepts_rpc_named_session_without_special_rpc_suffix_routing() {
         let sandbox = TestConfigSandbox::new();
@@ -3784,34 +3850,36 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn upload_attachments_success_returns_cid_refs() {
+    #[tokio::test]
+    async fn upload_attachments_success_returns_cid_refs() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let config = Arc::new(ConfigLock::new(sandbox.config()));
-        let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
+        let config = sandbox.config();
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
+        let server = Arc::new(Server::new(
+            &Arc::new(ConfigLock::new(config.clone())),
+            std::path::PathBuf::from("web-assets"),
+        ));
 
-        let boundary = "boundary123";
-        let image_data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]; // PNG magic bytes
-        let body = build_multipart_body(
+        let image_data = png_magic_bytes();
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &image_data);
+
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
             boundary,
-            &[("attachment", "test.png", "image/png", &image_data)],
-        );
-
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                None,
-            ))
-            .expect("handler response");
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body_bytes = rt
-            .block_on(http_body_util::BodyExt::collect(response.into_body()))
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
             .expect("collect body")
             .to_bytes();
         let json: Value = serde_json::from_slice(&body_bytes).expect("parse json");
@@ -3824,10 +3892,8 @@ mod tests {
             .as_array()
             .expect("refs array");
         assert_eq!(refs.len(), 1);
-        assert!(refs[0]
-            .as_str()
-            .unwrap()
-            .starts_with("cid:media:plain/test-session/"));
+        let ref_string = refs[0].as_str().expect("ref string");
+        assert!(ref_string.starts_with("cid:media:plain/test-session/"));
 
         // Verify the uploaded blob was stored in the attachment directory.
         let attachments_dir = Config::agent_data_dir("plain")
@@ -3838,12 +3904,30 @@ mod tests {
             "attachments dir should exist at {:?}",
             attachments_dir
         );
+
+        // The same blob must exist in the NATS object store with the exact
+        // bytes and MIME type, so any replica can serve the returned ref.
+        let url = CidUrl::parse(ref_string).expect("parse returned ref");
+        let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+        let bucket = harnx_blob_store::media::optional_attachments_bucket(&jetstream)
+            .await?
+            .context("attachments bucket exists")?;
+        let (bytes, mime) = harnx_blob_store::media::get_media(&bucket, &url)
+            .await?
+            .context("uploaded object exists in the object store")?;
+        assert_eq!(bytes, image_data);
+        assert_eq!(mime, "image/png");
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_malformed_multipart_returns_400() {
+    #[tokio::test]
+    async fn upload_attachments_malformed_multipart_returns_400() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
@@ -3851,14 +3935,14 @@ mod tests {
         let boundary = "boundary123";
         let invalid_body = b"--boundary123\r\nnot-a-valid-part\r\n--boundary123--\r\n".to_vec();
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt.block_on(call_upload_handler(
+        let response = call_upload_handler(
             server,
             "/v1/agents/plain/sessions/test-session/attachments",
             boundary,
             invalid_body,
             None,
-        ));
+        )
+        .await;
 
         // Handler returns Err for malformed multipart, which gets converted to BAD_REQUEST
         match response {
@@ -3869,12 +3953,17 @@ mod tests {
                 // Error case is acceptable - handler bubbles up "Bad Request" error
             }
         }
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_no_parts_returns_400() {
+    #[tokio::test]
+    async fn upload_attachments_no_parts_returns_400() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
@@ -3892,101 +3981,356 @@ mod tests {
             b
         };
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                None,
-            ))
-            .expect("handler response");
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_oversized_returns_413() {
+    #[tokio::test]
+    async fn upload_attachments_oversized_returns_413() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a multipart body that exceeds MAX_UPLOAD_BYTES
-        let boundary = "boundary123";
         let oversized_data = vec![0u8; MAX_UPLOAD_BYTES + 1024];
-        let body = build_multipart_body(
-            boundary,
-            &[("attachment", "test.png", "image/png", &oversized_data)],
-        );
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &oversized_data);
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                None,
-            ))
-            .expect("handler response");
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_oversized_content_length_header_returns_413_early() {
+    #[tokio::test]
+    async fn upload_attachments_oversized_content_length_header_returns_413_early() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a request with a Content-Length header that exceeds MAX_UPLOAD_BYTES
-        let boundary = "boundary123";
+        let boundary = UPLOAD_BOUNDARY;
         let body = vec![0u8; 100]; // Small body, but Content-Length header says it's huge
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                Some(MAX_UPLOAD_BYTES + 1), // Oversized Content-Length header
-            ))
-            .expect("handler response");
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
+            boundary,
+            body,
+            Some(MAX_UPLOAD_BYTES + 1), // Oversized Content-Length header
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_unsupported_content_type_returns_415() {
+    #[tokio::test]
+    async fn upload_attachments_unsupported_content_type_returns_415() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a multipart with an unsupported MIME type
-        let boundary = "boundary123";
         let data = b"some binary data".to_vec();
-        let body = build_multipart_body(
-            boundary,
-            &[("attachment", "test.exe", "application/octet-stream", &data)],
-        );
+        let (boundary, body) =
+            single_part_upload_body("test.exe", "application/octet-stream", &data);
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                None,
-            ))
-            .expect("handler response");
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        Ok(())
+    }
+
+    // ===== Upload object-store persistence tests (#2841) =====
+
+    const SEALED_ATTACHMENTS_CLUSTER: &str = "sealed-attachments";
+
+    struct SealedBucketFixture {
+        _sandbox: TestConfigSandbox,
+        _nats: harnx_test_bins::NatsServerHandle,
+        server: Arc<Server>,
+    }
+
+    /// An isolated broker whose `harnx_attachments` bucket is sealed: bucket
+    /// lookup succeeds, every object put fails deterministically (nats-server
+    /// rejects publishes to a sealed stream with a 400 error).
+    async fn sealed_bucket_server() -> Result<Option<SealedBucketFixture>> {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(None);
+        };
+        let jetstream = async_nats::jetstream::new(async_nats::connect(nats.url()).await?);
+        harnx_blob_store::media::ensure_attachments_bucket(&jetstream, 1).await?;
+        let mut raw_bucket = jetstream
+            .get_object_store(harnx_blob_store::media::ATTACHMENTS_BUCKET)
+            .await?;
+        raw_bucket.seal().await?;
+
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        sandbox.write_nats_server(
+            SEALED_ATTACHMENTS_CLUSTER,
+            &format!("url: {}\n", nats.url()),
+        );
+        let mut config = sandbox.config();
+        config.nats_routing =
+            harnx_runtime::config::NatsRouting::Cluster(SEALED_ATTACHMENTS_CLUSTER.to_string());
+        let server = Arc::new(Server::new(
+            &Arc::new(ConfigLock::new(config)),
+            std::path::PathBuf::from("web-assets"),
+        ));
+        Ok(Some(SealedBucketFixture {
+            _sandbox: sandbox,
+            _nats: nats,
+            server,
+        }))
+    }
+
+    async fn upload_response_json(response: AppResponse) -> Result<Value> {
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        Ok(serde_json::from_slice(&body).expect("parse json"))
+    }
+
+    fn assert_no_upload_refs(body: &Value) {
+        assert!(
+            body.get("attachment_refs").is_none(),
+            "failed upload response must not include refs: {body}"
+        );
+        assert!(
+            body.get("attachments").is_none(),
+            "failed upload response must not include attachments: {body}"
+        );
+        assert!(body.get("error").is_some(), "error body: {body}");
+    }
+
+    #[tokio::test]
+    async fn upload_attachments_object_store_failure_returns_500_without_refs() -> Result<()> {
+        let Some(fixture) = sealed_bucket_server().await? else {
+            return Ok(());
+        };
+        let image_data = png_magic_bytes();
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &image_data);
+
+        let response = call_upload_handler(
+            fixture.server,
+            "/v1/agents/plain/sessions/upload-store-fail/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        // A failing object store is a server-side fault, not a bad request.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = upload_response_json(response).await?;
+        assert_no_upload_refs(&body);
+        Ok(())
+    }
+
+    /// The first part is rejected by validation before any broker I/O, so its
+    /// 415 wins even though storing the second part would fail.
+    #[tokio::test]
+    async fn upload_attachments_invalid_first_part_returns_415_when_object_store_fails(
+    ) -> Result<()> {
+        let Some(fixture) = sealed_bucket_server().await? else {
+            return Ok(());
+        };
+        let image_data = png_magic_bytes();
+        let boundary = UPLOAD_BOUNDARY;
+        let body = build_multipart_body(
+            boundary,
+            &[
+                (
+                    "attachment",
+                    "test.exe",
+                    "application/octet-stream",
+                    b"not a png",
+                ),
+                ("attachment", "test.png", "image/png", &image_data),
+            ],
+        );
+
+        let response = call_upload_handler(
+            fixture.server,
+            "/v1/agents/plain/sessions/upload-order-invalid-first/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body = upload_response_json(response).await?;
+        assert_no_upload_refs(&body);
+        Ok(())
+    }
+
+    /// Parts are processed in order with the first error winning: a broker
+    /// failure while storing the first part wins over the later part's
+    /// unsupported MIME type.
+    #[tokio::test]
+    async fn upload_attachments_object_store_failure_precedes_later_invalid_part() -> Result<()> {
+        let Some(fixture) = sealed_bucket_server().await? else {
+            return Ok(());
+        };
+        let image_data = png_magic_bytes();
+        let boundary = UPLOAD_BOUNDARY;
+        let body = build_multipart_body(
+            boundary,
+            &[
+                ("attachment", "test.png", "image/png", &image_data),
+                (
+                    "attachment",
+                    "test.exe",
+                    "application/octet-stream",
+                    b"not a png",
+                ),
+            ],
+        );
+
+        let response = call_upload_handler(
+            fixture.server,
+            "/v1/agents/plain/sessions/upload-order-store-fail/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = upload_response_json(response).await?;
+        assert_no_upload_refs(&body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_attachments_writes_object_to_existing_bucket() -> Result<()> {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
+        // Pre-create the bucket so the upload exercises the open-existing path
+        // of the bucket ensure, not stream creation.
+        let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+        harnx_blob_store::media::ensure_attachments_bucket(&jetstream, 1).await?;
+        let server = Arc::new(Server::new(
+            &Arc::new(ConfigLock::new(config.clone())),
+            std::path::PathBuf::from("web-assets"),
+        ));
+
+        let image_data = b"existing bucket png bytes".to_vec();
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &image_data);
+
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/upload-existing-bucket/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = upload_response_json(response).await?;
+        let ref_string = json["attachment_refs"][0]
+            .as_str()
+            .expect("one ref")
+            .to_string();
+        let url = CidUrl::parse(&ref_string).expect("parse returned ref");
+        let bucket = harnx_blob_store::media::optional_attachments_bucket(&jetstream)
+            .await?
+            .context("attachments bucket exists")?;
+        let (bytes, mime) = harnx_blob_store::media::get_media(&bucket, &url)
+            .await?
+            .context("uploaded object exists in the object store")?;
+        assert_eq!(bytes, image_data);
+        assert_eq!(mime, "image/png");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_attachments_unreachable_cluster_returns_503_without_refs() -> Result<()> {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        sandbox.write_nats_server("down", "url: nats://127.0.0.1:1\n");
+        let mut config = sandbox.config();
+        config.nats_routing = harnx_runtime::config::NatsRouting::Cluster("down".to_string());
+        let server = Arc::new(Server::new(
+            &Arc::new(ConfigLock::new(config)),
+            std::path::PathBuf::from("web-assets"),
+        ));
+
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &png_magic_bytes());
+
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/upload-unreachable/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        // An unreachable broker is the store being unavailable, not a server
+        // fault and not a bad request.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = upload_response_json(response).await?;
+        assert_no_upload_refs(&body);
+        Ok(())
     }
 
     // ===== Web-ui static asset serving tests (#1006) =====

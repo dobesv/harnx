@@ -53,26 +53,39 @@ impl Drop for NatsServerHandle {
 /// Returns `None` when `nats-server` isn't installed so local test runs can
 /// skip broker coverage. CI installs the binary and always exercises it.
 pub async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
+    spawn_configured_nats_server("").await
+}
+
+/// Spawn an isolated broker with extra settings in a nats-server config file.
+/// The normal test server flags supply JetStream, a private store and a free port.
+// qual:test_helper
+pub async fn spawn_configured_nats_server(config: &str) -> Result<Option<NatsServerHandle>> {
     let Some(binary) = nats_server_binary() else {
         eprintln!("skipping NATS integration test: nats-server binary not found");
         return Ok(None);
     };
 
-    let mut last_error = None;
-    for _ in 0..5 {
-        match try_spawn_nats_server(&binary).await {
-            Ok(server) => return Ok(Some(server)),
-            Err(error) => last_error = Some(error),
+    const MAX_SPAWN_ATTEMPTS: usize = 5;
+    let mut result = try_spawn_nats_server(&binary, config).await;
+    for _ in 1..MAX_SPAWN_ATTEMPTS {
+        if result.is_ok() {
+            break;
         }
+        result = try_spawn_nats_server(&binary, config).await;
     }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to spawn nats-server")))
+    result.map(Some)
 }
 
-async fn try_spawn_nats_server(binary: &Path) -> Result<NatsServerHandle> {
+async fn try_spawn_nats_server(binary: &Path, config: &str) -> Result<NatsServerHandle> {
     let store_dir = tempfile::tempdir().context("create temporary NATS store directory")?;
     let ports_dir = tempfile::tempdir().context("create temporary NATS ports directory")?;
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    if !config.is_empty() {
+        let path = ports_dir.path().join("nats.conf");
+        std::fs::write(&path, config).context("write test NATS configuration")?;
+        command.arg("-c").arg(path);
+    }
+    let mut child = command
         .arg("-js")
         .arg("-sd")
         .arg(store_dir.path())
