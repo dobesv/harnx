@@ -10,6 +10,14 @@ on:
     branches:
     - main
 
+# A new push to a pull request cancels the run for the push before it, which
+# would otherwise keep holding runners, macOS ones especially, until it
+# finished. Other events each get a group of their own, so nothing on main or
+# in the merge queue is cancelled.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-{0}', github.ref) || github.run_id }}
+  cancel-in-progress: true
+
 defaults:
   run:
     shell: bash
@@ -17,7 +25,7 @@ defaults:
 jobs:
   # CI is a required merge gate (see .mergify.yml), so the `All (<os>)` checks
   # must always post a conclusion. A workflow-level `paths:` filter would skip
-  # the workflow and hang the merge queue; instead the steps below are gated on
+  # the workflow and hang the merge queue; instead the jobs below are gated on
   # this job, and a change with no Rust impact reports success in seconds. The
   # exclusions are paths no build step or test reads: packages, example_config,
   # and middleware examples in docs/demos are read by Rust tests, so they stay in.
@@ -60,223 +68,104 @@ jobs:
               - '!.github/workflows/release-prepare.yaml'
               - '!.github/workflows/publish-packages.yaml'
 
-  all:
-    name: All
+  # Each OS builds once and splits its tests between several jobs
+  # (ci-rust.yaml). The partition counts keep each OS near the same wall time:
+  # the full suite's tests add up to about 50 minutes on Linux and Windows,
+  # whose runners have 4 CPUs, and 77 on macOS, whose runners have 3. GitHub's
+  # free plan runs at most 5 macOS jobs at once across the account, so more
+  # macOS partitions mostly queue behind each other.
+  linux:
+    name: Linux
     needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    uses: ./.github/workflows/ci-rust.yaml
+    with:
+      os: ubuntu-latest
+      partitions: '[1, 2]'
 
-    # A failure on one OS must not cancel the others. On main, a cancelled job
-    # saves no cache, so after every red main run each pull request on that OS
-    # built its dependencies from scratch.
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-        - ubuntu-latest
-        - macos-latest
-        - windows-latest
+  macos:
+    name: macOS
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    uses: ./.github/workflows/ci-rust.yaml
+    with:
+      os: macos-latest
+      partitions: '[1, 2, 3]'
 
-    runs-on: ${{matrix.os}}
+  windows:
+    name: Windows
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    uses: ./.github/workflows/ci-rust.yaml
+    with:
+      os: windows-latest
+      partitions: '[1, 2]'
 
+  # Lints are platform-agnostic, so one runner is enough. Each OS's build
+  # still compiles with `--deny warnings`, which catches rustc warnings in
+  # platform-gated code that Linux clippy never sees. A job of its own keeps
+  # clippy's compile off the path to the Linux tests.
+  lint:
+    name: Lint
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
     env:
       RUSTFLAGS: --deny warnings
-      # Insta: update snapshots instead of failing (for PR review)
-      # Set to "no" for actual CI, developers can use "yes" locally
-      INSTA_UPDATE: "no"
-
     steps:
-    - name: Skip notice
-      if: needs.changes.outputs.rust != 'true'
-      run: echo "No Rust-affecting changes detected — skipping build and tests and reporting success."
-
     - uses: actions/checkout@v7
-      if: needs.changes.outputs.rust == 'true'
       with:
-        # A pull_request run checks out the PR merged into its base; the
-        # second commit is that base, which `cargo xtask affected` diffs against.
-        fetch-depth: 2
+        persist-credentials: false
 
     - name: Install Rust Toolchain Components
-      if: needs.changes.outputs.rust == 'true'
       uses: dtolnay/rust-toolchain@stable
 
-    # Only main saves. A pull request's cache is scoped to its own ref, so no
-    # other pull request can restore it; saving one cost each job minutes of
-    # upload and pushed the 10 GB repository quota into evicting main's caches.
-    # Main saves even when a test fails, since the dependencies it built are
-    # still good; it was red for weeks, leaving every run without a cache.
+    # See ci-rust.yaml for why only main saves.
     - uses: Swatinem/rust-cache@v2
-      if: needs.changes.outputs.rust == 'true'
       with:
         save-if: ${{ github.ref == 'refs/heads/main' }}
         cache-on-failure: true
 
-    - name: Install cargo-nextest
-      if: needs.changes.outputs.rust == 'true'
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-nextest
-
-    # Pull requests test only the packages their change can affect (see
-    # .config/affected.toml), and so does Mergify's merge queue, whose batches
-    # are pull requests too. Only main runs everything, so a missing edge in
-    # that file first fails there. Each OS computes its own list because
-    # target-specific dependencies differ.
-    - name: Select affected packages
-      id: affected
-      if: needs.changes.outputs.rust == 'true'
-      run: |
-        if [ "${{ github.event_name }}" = pull_request ]; then
-          args="$(cargo xtask affected --base HEAD^1)"
-        else
-          args="--workspace"
-        fi
-        echo "Testing: ${args:-nothing}"
-        echo "args=${args}" >> "${GITHUB_OUTPUT}"
-
-    # Tests spawn sibling bins by path (the worker, tool servers,
-    # harnx-mcp-repro249, ...) from crates they don't depend on, so testing a
-    # subset of packages still needs every bin. Tests themselves are built by
-    # nextest for just the selected packages; building bins first causes no
-    # rebuild because the feature sets match.
-    - name: Build workspace binaries
-      if: needs.changes.outputs.rust == 'true'
-      run: cargo build --workspace --bins
-
-    - name: Install nats-server (Linux)
-      if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
-      run: |
-        set -euo pipefail
-        VERSION="v2.11.6"
-        ASSET="nats-server-${VERSION}-linux-amd64.tar.gz"
-        # Pinned digest for the pinned VERSION. GitHub releases are mutable, so
-        # the tag alone does not pin the bytes, and the release's own SHA256SUMS
-        # is served from the same place as the tarball — fetching it would prove
-        # nothing an attacker who can replace one can't also replace.
-        SHA256="5e5272dd1bdb8da020aedc8cf883fb26c128441809a992f156e0b1ccb28ac5b7"
-        DOWNLOAD_URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${ASSET}"
-        BINDIR="${HOME}/.local/bin"
-        mkdir -p "${BINDIR}"
-        TMPDIR_DL="$(mktemp -d)"
-        # Download to a file rather than piping into tar. A retry can't resume a
-        # stream tar has already started reading, and an HTTP error body piped to
-        # tar surfaces as "tar: Error is not recoverable" instead of naming the
-        # failed download.
-        curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 2 \
-          --location --silent --show-error --fail --output "${TMPDIR_DL}/${ASSET}" "${DOWNLOAD_URL}"
-        echo "${SHA256}  ${TMPDIR_DL}/${ASSET}" | shasum -a 256 --check --status \
-          || { echo "::error::nats-server checksum mismatch for ${ASSET}"; exit 1; }
-        tar -xzf "${TMPDIR_DL}/${ASSET}" -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-linux-amd64/nats-server"
-        chmod +x "${BINDIR}/nats-server"
-        echo "${BINDIR}" >> "${GITHUB_PATH}"
-      shell: bash
-
-    # Every test runs inside a bubblewrap sandbox (scripts/nextest-sandbox).
-    # The sandbox can't reach the host's DNS stub, so RFC 6761 *.localhost
-    # names, which tracing_e2e connects to, resolve only through
-    # nss-myhostname.
-    - name: Install bubblewrap (Linux)
-      if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
-      run: |
-        set -euo pipefail
-        scripts/ci-install-bubblewrap libnss-myhostname
-        NEXTEST=1 NEXTEST_ATTEMPT_ID=ci scripts/nextest-sandbox getent hosts probe.localhost
-      shell: bash
-
-    # Local execution routes through a shared nats-server, so the one-shot / TUI
-    # e2e tests need the binary on every OS (they skip cleanly if it is absent,
-    # but we want real coverage here).
-    - name: Install nats-server (macOS)
-      if: needs.changes.outputs.rust == 'true' && runner.os == 'macOS'
-      run: |
-        set -euo pipefail
-        VERSION="v2.11.6"
-        ARCH="$(uname -m)"
-        # See the Linux step for why the digests are pinned here rather than fetched.
-        case "${ARCH}" in
-          arm64)
-            NATS_ARCH="arm64"
-            SHA256="1a78170526e18a41ca2a24e6eaa00e95d39c677e1d5bfc56d3f662a114324e17"
-            ;;
-          x86_64)
-            NATS_ARCH="amd64"
-            SHA256="6c8f0cf8bc879db372ce0edca34c0178845e92286fac47db1a6a0f5eff59daef"
-            ;;
-          *) echo "unsupported macOS arch: ${ARCH}" >&2; exit 1 ;;
-        esac
-        ASSET="nats-server-${VERSION}-darwin-${NATS_ARCH}.tar.gz"
-        DOWNLOAD_URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${ASSET}"
-        BINDIR="${HOME}/.local/bin"
-        mkdir -p "${BINDIR}"
-        TMPDIR_DL="$(mktemp -d)"
-        # See the Linux step for why this downloads to a file first.
-        curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 2 \
-          --location --silent --show-error --fail --output "${TMPDIR_DL}/${ASSET}" "${DOWNLOAD_URL}"
-        echo "${SHA256}  ${TMPDIR_DL}/${ASSET}" | shasum -a 256 --check --status \
-          || { echo "::error::nats-server checksum mismatch for ${ASSET}"; exit 1; }
-        tar -xzf "${TMPDIR_DL}/${ASSET}" -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-darwin-${NATS_ARCH}/nats-server"
-        chmod +x "${BINDIR}/nats-server"
-        echo "${BINDIR}" >> "${GITHUB_PATH}"
-      shell: bash
-
-    - name: Install nats-server (Windows)
-      if: needs.changes.outputs.rust == 'true' && runner.os == 'Windows'
-      shell: pwsh
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $version = 'v2.11.6'
-        $asset = "nats-server-$version-windows-amd64.zip"
-        $sha256 = '947aea642cc2b7b688a11a71c36c80a030cabb109167246ca1f8fbf30dc1c83b'
-        $downloadUrl = "https://github.com/nats-io/nats-server/releases/download/$version/$asset"
-        $downloadDir = Join-Path $env:RUNNER_TEMP 'nats-server-download'
-        $binDir = Join-Path $env:RUNNER_TEMP 'nats-server-bin'
-        New-Item -ItemType Directory -Force -Path $downloadDir, $binDir | Out-Null
-        $archive = Join-Path $downloadDir $asset
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $archive
-        $actualSha256 = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-        if ($actualSha256 -ne $sha256) {
-          throw "nats-server checksum mismatch for $asset"
-        }
-        Expand-Archive -Path $archive -DestinationPath $downloadDir -Force
-        $source = Join-Path $downloadDir "nats-server-$version-windows-amd64/nats-server.exe"
-        Copy-Item $source (Join-Path $binDir 'nats-server.exe')
-        $binDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        & (Join-Path $binDir 'nats-server.exe') --version
-        if ($LASTEXITCODE -ne 0) {
-          throw "nats-server.exe --version failed with exit code $LASTEXITCODE"
-        }
-
-    # The test sandbox runs tests offline, and xtask's `affected` tests run
-    # `cargo metadata`, which needs the crates of every target platform, not
-    # just the ones this host's build downloaded.
-    - name: Fetch crates for every platform
-      if: needs.changes.outputs.rust == 'true' && steps.affected.outputs.args != ''
-      run: cargo fetch --locked
-
-    - name: Test
-      # Use the `ci` nextest profile (.config/nextest.toml): retries transient
-      # timing flakes from the broker/worker/e2e tests and reports all failures
-      # per run (fail-fast = false) instead of aborting on the first.
-      if: needs.changes.outputs.rust == 'true' && steps.affected.outputs.args != ''
-      run: cargo nextest run ${{ steps.affected.outputs.args }} --profile ci
-
-    - name: Check for pending snapshot updates
-      if: needs.changes.outputs.rust == 'true' && failure()
-      run: |
-        if ls crates/harnx-tui/src/snapshots/*.snap.new 2>/dev/null; then
-          echo "::error::Snapshot updates pending. Run 'cargo insta review' locally to review and accept changes."
-          exit 1
-        fi
-
-    # Lints are platform-agnostic, so one runner is enough. The per-OS `Build
-    # workspace` step still compiles with `--deny warnings`, which catches rustc
-    # warnings in platform-gated code that Linux clippy never sees.
     - name: Clippy
-      if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
       run: cargo clippy --all --all-targets -- -D warnings
 
     - name: Format
-      if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
       run: cargo fmt --all --check
+
+  # The checks .mergify.yml and the main branch ruleset require. Each one
+  # passes when `changes` passed and either nothing Rust-affecting changed or
+  # its OS's workflow says it passed. They check that output rather than the
+  # call's result, which looked like a pass when GitHub cancelled a macOS
+  # build that no runner picked up.
+  all-linux:
+    name: All (ubuntu-latest)
+    needs: [changes, linux, lint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Require the Linux jobs to pass
+      if: needs.changes.result != 'success' || (needs.changes.outputs.rust == 'true' && needs.linux.outputs.passed != 'true') || (needs.changes.outputs.rust == 'true' && needs.lint.result != 'success')
+      run: exit 1
+
+  all-macos:
+    name: All (macos-latest)
+    needs: [changes, macos]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Require the macOS jobs to pass
+      if: needs.changes.result != 'success' || (needs.changes.outputs.rust == 'true' && needs.macos.outputs.passed != 'true')
+      run: exit 1
+
+  all-windows:
+    name: All (windows-latest)
+    needs: [changes, windows]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Require the Windows jobs to pass
+      if: needs.changes.result != 'success' || (needs.changes.outputs.rust == 'true' && needs.windows.outputs.passed != 'true')
+      run: exit 1
 
   # Fails a pull request that adds rustqual findings or makes existing ones
   # worse (`cargo xtask quality`; AGENTS.md, "Code quality gate"). It is
@@ -290,7 +179,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # As in `All`: the second commit is the pull request's base.
+          # As in ci-rust.yaml: the second commit is the pull request's base.
           fetch-depth: 2
           persist-credentials: false
 
