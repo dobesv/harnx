@@ -117,9 +117,10 @@ tmux/interrupt e2e and other timing-sensitive tests; a pure unit test needs no
 stress run. Some flakes only appear under full-suite load, so when a new test
 is timing-sensitive, also run it once alongside the rest of its crate.
 
-CI uses the same selection on pull requests and runs the whole suite in the
-merge queue and on `main`, so a missing edge is caught before merge rather than
-after. CI skips the build and tests entirely when every changed file is on the
+CI uses the same selection on pull requests and runs the whole suite on
+`main`. Mergify's merge queue tests its batches as ordinary pull requests, so
+it uses the selection too: a missing edge, or a test only the whole suite
+runs, first fails on `main`. CI skips the build and tests entirely when every changed file is on the
 exclusion list in `.github/workflows/ci.yaml` (web, changesets, READMEs,
 release workflows), which the first path rule in `.config/affected.toml`
 mirrors. A test that starts reading one of those paths must take it off both.
@@ -216,7 +217,11 @@ top-level `/tmp` entry that holds the checkout, the target directory or
 `HOME` is shared with the host. No DNS server is reachable inside, so a name
 resolves only through `/etc/hosts` and NSS modules: RFC 6761 `*.localhost`
 names need `myhostname` in `/etc/nsswitch.conf` (`libnss-myhostname` on
-Debian and Ubuntu, which CI installs). On macOS the test
+Debian and Ubuntu, which CI installs). Cargo runs offline there
+(`CARGO_NET_OFFLINE`), so a test that runs `cargo metadata`, as xtask's
+`affected` tests do, needs every target platform's crates in the registry,
+not just the host's that a build downloads; run `cargo fetch` first, as CI
+does. On macOS the test
 runs in its own process group, which is killed when the test ends, along with
 any process whose command line names the test's private home, such as its
 broker. A process that moved to its own group without naming the home, such
