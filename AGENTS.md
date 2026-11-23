@@ -1087,10 +1087,11 @@ three things a tool declares decide how well it works there.
   in a script.
 - **Structured results.** The `bash` tool's inner calls send the request
   capability `harnx:structured_result`
-  (`InnerCallExecutorConfig::structured_results`); direct model calls, a
-  custom script tool's run and a middleware's or hook's own `call_tool`
-  don't. A native tool that wants a shell form returns
-  script-style fields when `ToolInvocationContext::wants_structured_result()`
+  (`InnerCallExecutorConfig::structured_results`), and so does a custom
+  script tool's Bash body; direct model calls, a script tool's Python body
+  and a middleware's or hook's own `call_tool` don't. A native tool that
+  wants a shell form returns script-style fields when
+  `ToolInvocationContext::wants_structured_result()`
   (`text` for a file, `paths` or `matches` for a search), declares with
   `ToolSpec::with_script_output` which field is stdout, stderr and the exit
   status, and leaves its direct-call output byte-identical. It bounds the

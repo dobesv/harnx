@@ -431,8 +431,9 @@ mapping in the tool's `_meta` under `harnx:script_output`. The mapping has these
 The `bash` tool's inner calls send the request capability
 `harnx:structured_result` (`harnx_toolset::CAPABILITY_STRUCTURED_RESULT`), so
 the tool returns script-style fields. Direct model calls don't send it and keep
-their results. Neither does a [script tool](../../docs/script-tools.md)'s own
-run, or a middleware or hook on its own `call_tool`. A middleware or hook that
+their results. A [script tool](../../docs/script-tools.md)'s Bash body sends it
+too, but its Python body doesn't, and neither does a middleware or hook on its
+own `call_tool`. A middleware or hook that
 wraps a `bash` script's inner call does see the script-shaped result, so one
 that scans `content` text for the data won't find it. The mapping applies only
 when the result has an object `structuredContent` and is not an error;

@@ -51,6 +51,8 @@ pub mod session_history;
 pub mod session_meta_tool;
 pub mod session_stream_gc;
 pub mod session_stream_orphans;
+#[cfg(test)]
+mod structured_provider;
 pub mod surfaces;
 pub mod terminated_result;
 #[cfg(test)]

@@ -131,7 +131,7 @@ impl CommandBashInputs {
 }
 
 /// A mapping the script layer cannot read is treated as no mapping.
-fn output_mapping(
+pub(crate) fn output_mapping(
     output: &harnx_toolset::ScriptOutput,
 ) -> Option<harnx_script::commands::OutputMapping> {
     serde_json::from_value(serde_json::to_value(output).ok()?).ok()

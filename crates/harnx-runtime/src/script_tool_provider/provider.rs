@@ -41,6 +41,9 @@ pub struct ScriptToolProvider {
     backend: BashKitBackend,
     attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
+    /// Output mappings declared by tool servers, by agent-visible tool name.
+    /// Only Bash bodies read them; see `inner_run`.
+    script_outputs: BTreeMap<String, harnx_toolset::ScriptOutput>,
 }
 
 /// Inputs resolved before a round's evaluation context exists.
@@ -54,6 +57,8 @@ pub(crate) struct ScriptToolProviderConfig {
     pub payload_limit: Option<PayloadLimit>,
     pub attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     pub media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
+    /// Output mappings declared by tool servers, by agent-visible tool name.
+    pub script_outputs: BTreeMap<String, harnx_toolset::ScriptOutput>,
 }
 
 pub(super) struct ScriptToolInvocation<'a> {
@@ -85,42 +90,6 @@ fn python_script(body: &str) -> String {
     format!("python3 <<'{delimiter}'\n{body}\n{delimiter}\n")
 }
 
-/// Assemble the BashKit command set for one Bash run: the CLI commands
-/// for the resolved inner allowlist plus `tool_input`. Pure assembly
-/// around the reused `bash` script-mode machinery; no script logic lives
-/// here. Python runs pass no CLI commands — their `tool_input` and
-/// `call_tool` are Python host functions over the same run.
-fn bash_commands(
-    definition: &ScriptToolDefinition,
-    declarations: &[ToolDeclaration],
-    run: Arc<crate::bash_inner::InnerCallRun>,
-    arguments: Value,
-    invocation: &ScriptToolInvocation<'_>,
-) -> Result<Vec<Arc<dyn ScriptCommand>>, ToolError> {
-    let adapter = Arc::new(ScriptInnerExecutor::new(run, invocation.abort.clone()));
-    let specs = declarations
-        .iter()
-        .map(|declaration| ToolSpec {
-            name: declaration.name.clone(),
-            description: declaration.description.clone(),
-            schema: declaration.parameters.as_value().clone(),
-            // This run doesn't ask tools for structured results, so no
-            // tool's output mapping applies here.
-            output: None,
-        })
-        .collect();
-    let mut commands = tool_commands(specs, adapter).map_err(|error| {
-        ToolError::Recoverable(anyhow!(
-            "script tool '{}' failed to register its tool commands: {error}",
-            definition.name
-        ))
-    })?;
-    commands.push(Arc::new(super::tool_input::ToolInputCommand {
-        input: arguments,
-    }));
-    Ok(commands)
-}
-
 impl ScriptToolProvider {
     pub(crate) fn new(config: ScriptToolProviderConfig) -> Self {
         let ScriptToolProviderConfig {
@@ -131,6 +100,7 @@ impl ScriptToolProvider {
             payload_limit,
             attachment_fetcher,
             media_store,
+            script_outputs,
         } = config;
         Self {
             tools: tools
@@ -144,7 +114,48 @@ impl ScriptToolProvider {
             backend: BashKitBackend,
             attachment_fetcher,
             media_store,
+            script_outputs,
         }
+    }
+
+    /// Assemble the BashKit command set for one Bash run: the CLI commands
+    /// for the resolved inner allowlist plus `tool_input`. Pure assembly
+    /// around the reused `bash` script-mode machinery; no script logic lives
+    /// here. Python runs pass no CLI commands — their `tool_input` and
+    /// `call_tool` are Python host functions over the same run.
+    fn bash_commands(
+        &self,
+        definition: &ScriptToolDefinition,
+        declarations: &[ToolDeclaration],
+        run: Arc<crate::bash_inner::InnerCallRun>,
+        arguments: Value,
+        invocation: &ScriptToolInvocation<'_>,
+    ) -> Result<Vec<Arc<dyn ScriptCommand>>, ToolError> {
+        let adapter = Arc::new(ScriptInnerExecutor::new(run, invocation.abort.clone()));
+        let specs = declarations
+            .iter()
+            .map(|declaration| ToolSpec {
+                name: declaration.name.clone(),
+                description: declaration.description.clone(),
+                schema: declaration.parameters.as_value().clone(),
+                // The run asks for structured results, so a tool's declared
+                // output mapping decides what its command prints.
+                output: self
+                    .script_outputs
+                    .get(&declaration.name)
+                    .and_then(crate::bash_provider::output_mapping),
+            })
+            .collect();
+        let mut commands = tool_commands(specs, adapter).map_err(|error| {
+            ToolError::Recoverable(anyhow!(
+                "script tool '{}' failed to register its tool commands: {error}",
+                definition.name
+            ))
+        })?;
+        commands.push(Arc::new(super::tool_input::ToolInputCommand {
+            input: arguments,
+        }));
+        Ok(commands)
     }
 
     fn context_slot(&self, name: &str) -> Result<Arc<ToolEvalContext>, ToolError> {
@@ -175,9 +186,14 @@ impl ScriptToolProvider {
     /// The `InnerCallExecutor` run for one script-tool body: the same
     /// forked-context traversal, budgets and pre-flight the `bash` provider
     /// uses, so decision 11's parity holds by construction.
+    ///
+    /// A Bash body asks its inner calls for structured results because its
+    /// commands read each tool's output mapping. A Python body's `call_tool`
+    /// returns the model-style result, so it keeps the plain results.
     // qual:allow(iosp) — one optional-config branch over reused bash executor constructors; the branch is the whole logic and cannot live apart from the calls it configures
     fn inner_run(
         &self,
+        definition: &ScriptToolDefinition,
         declarations: &[ToolDeclaration],
         context: &ToolEvalContext,
         invocation: &ScriptToolInvocation<'_>,
@@ -188,6 +204,8 @@ impl ScriptToolProvider {
             .collect();
         let mut executor_config =
             InnerCallExecutorConfig::new(allowed, self.base_providers.clone());
+        executor_config.structured_results =
+            matches!(definition.source, ScriptToolSource::Bash { .. });
         if let Some(payload_limit) = &self.payload_limit {
             executor_config = executor_config.with_payload_limit(payload_limit.clone());
         }
@@ -217,7 +235,8 @@ impl ScriptToolProvider {
         let timeout_secs = definition.timeout.as_secs().max(1);
         match script_body(definition) {
             ScriptBody::Bash(script) => {
-                let commands = bash_commands(definition, declarations, run, arguments, invocation)?;
+                let commands =
+                    self.bash_commands(definition, declarations, run, arguments, invocation)?;
                 Ok((
                     self.run_backend(&script, timeout_secs, commands, None, invocation.abort)
                         .await,
@@ -314,7 +333,7 @@ impl ScriptToolProvider {
         // One inner run per body: the same allowlist resolution, forked
         // context, budgets and pre-flight for both languages (decision 11).
         let declarations = self.inner_declarations(definition, &context);
-        let run = self.inner_run(&declarations, &context, &invocation);
+        let run = self.inner_run(definition, &declarations, &context, &invocation);
         let (result, host_stop) = self
             .run_body(
                 definition,

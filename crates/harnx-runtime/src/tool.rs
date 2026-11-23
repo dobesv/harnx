@@ -858,7 +858,8 @@ fn script_mode_bash_provider(params: ScriptModeBashParams<'_>) -> Arc<dyn ToolPr
 struct BaseProviderStack {
     base_providers: Vec<Arc<dyn ToolProvider>>,
     payload_limit: Option<crate::bash_inner::PayloadLimit>,
-    /// Output mappings by tool name, for the `bash` tool's commands.
+    /// Output mappings by tool name, for the shell commands of the `bash`
+    /// tool and of Bash-bodied script tools.
     script_outputs: std::collections::BTreeMap<String, harnx_toolset::ScriptOutput>,
     attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
@@ -952,6 +953,7 @@ fn script_provider_for_round(
             payload_limit: stack.payload_limit.clone(),
             attachment_fetcher: stack.attachment_fetcher.clone(),
             media_store: stack.media_store.clone(),
+            script_outputs: stack.script_outputs.clone(),
         },
     )) as Arc<dyn ToolProvider>
 }
