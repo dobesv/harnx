@@ -41,7 +41,11 @@ fn fixture_environment_keeps_platform_keys_but_drops_ambient_credentials() {
     }
 }
 
-fn write_fixture_config(root: &std::path::Path, nats_url: Option<&str>) -> Result<()> {
+fn write_fixture_config(
+    root: &std::path::Path,
+    nats_url: Option<&str>,
+    remote_nats_url: Option<&str>,
+) -> Result<()> {
     for dir in [
         "config/agents",
         "config/packages/coding/agents",
@@ -72,11 +76,13 @@ fn write_fixture_config(root: &std::path::Path, nats_url: Option<&str>) -> Resul
         let url = if cluster == "default" {
             nats_url.unwrap_or("nats://127.0.0.1:1")
         } else {
-            "nats://127.0.0.1:1"
+            remote_nats_url.unwrap_or("nats://127.0.0.1:1")
         };
         fs::write(
             root.join(format!("config/nats_servers/{cluster}.yaml")),
-            format!("url: {url}\nagents:\n  - name: sisyphus\n    role: assistant\n    description: Remote agent\n  - name: allowed\n    role: assistant\n  - name: blocked\n    role: assistant\n"),
+            format!(
+                "url: {url}\nagents:\n  - name: sisyphus\n    role: assistant\n    description: Remote agent\n  - name: allowed\n    role: assistant\n  - name: blocked\n    role: assistant\n"
+            ),
         )?;
     }
     fs::write(root.join("assets/index.html"), "public SPA shell")?;
@@ -118,6 +124,7 @@ impl Fixture {
             },
             default_cluster,
             None,
+            None,
             MembershipSettings::default(),
         )
         .await
@@ -125,6 +132,26 @@ impl Fixture {
 
     pub(super) async fn start_with_nats(rules: Option<&str>, nats_url: &str) -> Result<Self> {
         Self::start_memberships(rules, Some(nats_url), MembershipSettings::default()).await
+    }
+
+    /// Fixture whose `remote` cluster points at a live broker too, for tests
+    /// that exercise `agent@remote` routes end to end.
+    pub(super) async fn start_with_nats_clusters(
+        rules: Option<&str>,
+        default_nats_url: &str,
+        remote_nats_url: &str,
+    ) -> Result<Self> {
+        Self::start_with_settings(
+            AccessSettings {
+                rules,
+                aliases: None,
+            },
+            Some("default"),
+            Some(default_nats_url),
+            Some(remote_nats_url),
+            MembershipSettings::default(),
+        )
+        .await
     }
 
     pub(super) async fn start_memberships(
@@ -145,6 +172,7 @@ impl Fixture {
             AccessSettings { rules, aliases },
             Some("default"),
             nats_url,
+            None,
             settings,
         )
         .await
@@ -158,11 +186,12 @@ impl Fixture {
         access: AccessSettings<'_>,
         default_cluster: Option<&str>,
         nats_url: Option<&str>,
+        remote_nats_url: Option<&str>,
         settings: MembershipSettings<'_>,
     ) -> Result<Self> {
         harnx_core::require_nextest();
         let root = tempfile::tempdir()?;
-        write_fixture_config(root.path(), nats_url)?;
+        write_fixture_config(root.path(), nats_url, remote_nats_url)?;
         if let Some(aliases) = access.aliases {
             fs::write(root.path().join("config/users.yaml"), aliases)?;
         }

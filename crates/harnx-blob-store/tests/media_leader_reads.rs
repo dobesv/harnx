@@ -4,8 +4,8 @@ use base64::{engine::general_purpose, Engine as _};
 use harnx_blob_store::{
     media::{
         delete_media_prefix, ensure_attachments_bucket, get_media, leader_media_info,
-        media_content_type, put_media, put_media_with_chunk_limit, read_media_from_leader,
-        AttachmentsBucket, MediaBlob, ATTACHMENTS_BUCKET,
+        media_content_type, purge_media_version, put_media, put_media_with_chunk_limit,
+        read_media_from_leader, AttachmentsBucket, MediaBlob, ATTACHMENTS_BUCKET,
     },
     media_cid_url,
 };
@@ -29,6 +29,11 @@ async fn attachment_bucket(
     let jetstream = jetstream::new(async_nats::connect(server.url()).await?);
     let store = ensure_attachments_bucket(&jetstream, 1).await?;
     Ok(Some((server, jetstream, store)))
+}
+
+/// The attachments object-store stream name, as harnx-blob-store builds it.
+fn object_store_stream_name() -> String {
+    format!("OBJ_{ATTACHMENTS_BUCKET}")
 }
 
 fn media_url(session: &SessionRef) -> CidUrl {
@@ -90,6 +95,38 @@ async fn put_media_restores_a_tombstoned_cid() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn put_media_writes_when_leader_dedup_probe_fails() -> Result<()> {
+    // A missing target stream returns a JetStream error rather than an object
+    // miss. Only raw gets are redirected; async-nats put uses a best-effort
+    // direct get for old metadata and publishes chunks and metadata normally.
+    let config = format!(
+        r#"mappings = {{
+  "$JS.API.STREAM.MSG.GET.OBJ_{ATTACHMENTS_BUCKET}": "$JS.API.STREAM.MSG.GET.MISSING_ATTACHMENTS"
+}}"#
+    );
+    let Some((_server, _, store)) = attachment_bucket(&config).await? else {
+        return Ok(());
+    };
+    let url = media_url(&SessionRef::new(None, "dedup-probe-failure".into())?);
+    let error = leader_media_info(&store, &url.kv_key()).await.unwrap_err();
+    let cause = error
+        .downcast_ref::<stream::LastRawMessageError>()
+        .context("expected a JetStream raw get error")?;
+    assert!(matches!(
+        cause.kind(),
+        stream::LastRawMessageErrorKind::JetStream(error)
+            if error.error_code() == jetstream::ErrorCode::STREAM_NOT_FOUND
+    ));
+
+    put_media(&store, &url, MEDIA, MIME).await?;
+    assert_eq!(
+        get_media(&store, &url).await?,
+        Some((MEDIA.to_vec(), MIME.to_owned()))
+    );
+    Ok(())
+}
+
 const STALE_REPLICA: &str = "STALE_ATTACHMENTS_REPLICA";
 const STALE_META: &str = "harnx.test.stale-meta";
 
@@ -114,7 +151,7 @@ async fn save_stale_metadata(jetstream: &jetstream::Context, key: &str) -> Resul
         })
         .await?;
     let stream = jetstream
-        .get_stream_no_info(format!("OBJ_{ATTACHMENTS_BUCKET}"))
+        .get_stream_no_info(object_store_stream_name())
         .await?;
     let encoded_key = general_purpose::URL_SAFE.encode(key);
     let metadata = stream
@@ -189,7 +226,7 @@ async fn read_media_from_leader_reads_all_chunks_and_rejects_shortfalls() -> Res
     info.size -= 1;
 
     let stream = jetstream
-        .get_stream_no_info(format!("OBJ_{ATTACHMENTS_BUCKET}"))
+        .get_stream_no_info(object_store_stream_name())
         .await?;
     let subject = format!("$O.{ATTACHMENTS_BUCKET}.C.{}", info.nuid);
     let first = stream.get_first_raw_message_by_subject(&subject, 0).await?;
@@ -199,5 +236,49 @@ async fn read_media_from_leader_reads_all_chunks_and_rejects_shortfalls() -> Res
         .downcast_ref::<stream::RawMessageError>()
         .context("expected a missing chunk error")?;
     assert_eq!(cause.kind(), stream::RawMessageErrorKind::NoMessageFound);
+    Ok(())
+}
+
+#[tokio::test]
+async fn purge_media_version_keeps_the_object_whole_when_the_metadata_delete_fails() -> Result<()> {
+    let Some((_server, jetstream, store)) = attachment_bucket("").await? else {
+        return Ok(());
+    };
+    let url = media_url(&SessionRef::new(None, "purgefail".into())?);
+    put_media(&store, &url, MEDIA, MIME).await?;
+    let info = leader_media_info(&store, &url.kv_key())
+        .await?
+        .context("written object info")?;
+    let nuid = info.nuid.clone();
+
+    // `deny_delete` rejects the metadata message delete — the purge's
+    // first step — while leaving chunk purges allowed, so the assertions
+    // below actually detect the ordering: a chunk-purge-first
+    // implementation would succeed at its first step and then strand live
+    // metadata pointing at purged chunks. (A sealed store, which the test
+    // used before, rejects both operations and detects nothing.)
+    let mut config = jetstream
+        .get_stream(object_store_stream_name())
+        .await?
+        .info()
+        .await?
+        .config
+        .clone();
+    config.deny_delete = true;
+    jetstream.update_stream(config).await?;
+
+    assert!(
+        purge_media_version(&store, &url, &nuid).await.is_err(),
+        "a delete-denying stream must fail the metadata delete"
+    );
+
+    // Partial failure must leave the object whole: metadata still names the
+    // version and the chunks read back. The chunk-purge-first order would
+    // have left live metadata pointing at purged chunks.
+    let info = leader_media_info(&store, &url.kv_key())
+        .await?
+        .context("metadata must survive a failed purge")?;
+    assert_eq!(info.nuid, nuid);
+    assert_eq!(read_media_from_leader(&store, &info).await?, MEDIA);
     Ok(())
 }

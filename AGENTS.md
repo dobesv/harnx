@@ -369,6 +369,13 @@ A probe must not skip on its own mistakes either. `harnx-sandbox-run`'s integrat
 
 ### Broker-backed tests and wall-clock margins
 
+Group membership is by test name, not by what the test does: the `broker-e2e` override in
+`.config/nextest.toml` filters names (a broad `test(/nats/)` plus explicit filters such as
+`^tests::upload_attachments_` and `^access_prompt_attachments::`), in both the default and
+`ci` profiles. A test that spawns a `nats-server` but matches no filter runs in the
+default group and can destabilize the rest of the run — give it a matching name or add
+the filter to both profiles. Verify with `cargo nextest show-config test-groups`.
+
 Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
 (`.config/nextest.toml`; local runs use `-local` copies with higher caps). On
 a contended GitHub runner that whole block has been measured running 6 to 40
@@ -409,7 +416,7 @@ tests verify the same bootstrap path that Windows executes unchanged.
 ### Error classification through typed causes, not strings
 
 When classifying broker/JetStream errors (such as size limits), use typed downcasts
-against async-nats 0.50 error causes rather than string matching. String matching on
+against async-nats 0.51 error causes rather than string matching. String matching on
 error messages creates false positives: permission-denied or connection errors may
 contain words like "size" or "exceeded" without actually being size limits.
 
@@ -444,6 +451,24 @@ source error: `config/session_persistence/append_status.rs` keeps the first appe
 across a batch, and `require_authoritative_appends` adds operation context with
 `.with_context`, never `bail!`. Regression coverage:
 `tests/it/nats_worker/activation_size_failure.rs`.
+
+async-nats 0.51's own wrappers sometimes destroy the typed cause before it reaches you.
+`ObjectStore::put` stringifies its chunk and metadata publish errors (`PutError` carries
+the message as its source, no inner `jetstream::Error` to downcast), so for a publish
+failure the surviving fallback signal is the client's `connection_state() != Connected`.
+`PutErrorKind::PurgeOldChunks` is the exception: it keeps a typed `PurgeError` source, and
+it only fires after the new version's metadata has been acknowledged — treat it as a
+committed version with a failed old-chunk cleanup, not as a publish failure (see
+`committed_after_failed_cleanup` in `crates/harnx-blob-store/src/media.rs`).
+Bucket-ensure round trips after connect surface the
+inner error wrapped in an outer typed kind instead (`context::RequestError` with
+`TimedOut`/`NoResponders`, or `GetStreamError`/`CreateStreamError`/`LastRawMessageError`
+kinds such as JetStream `CLUSTER_NOT_AVAILABLE`/`STREAM_OFFLINE`). Classify on those
+outer kinds, never on the message text: `is_nats_unavailable` in
+`crates/harnx-serve/src/nats_access.rs` is the reference implementation, and
+`nats_access_tests.rs` builds its fixtures from real error values (deserialized API
+payloads wrapped in async-nats's own constructors, live no-responders chains) rather than
+hand-built strings.
 
 ### Telling a flake from a regression
 
