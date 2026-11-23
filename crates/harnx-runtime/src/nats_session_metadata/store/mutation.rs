@@ -129,6 +129,30 @@ impl SessionMetadataStore {
             .await
     }
 
+    /// Patch the session metadata only while the patch consents to the
+    /// current record, returning whether anything was written.
+    ///
+    /// The closure returns `Ok(false)` to leave the current record
+    /// untouched. It runs inside the store's compare-and-set loop, so a
+    /// closure that re-checks a precondition sees the latest committed
+    /// metadata after every revision conflict and a skipped patch never
+    /// overwrites a concurrent writer's value. The returned flag reflects
+    /// the closure's decision on the record the loop settled on: a lost
+    /// revision conflict discards earlier attempts' decisions.
+    pub async fn patch_if<F>(&self, session_id: &str, mut patch: F) -> Result<bool>
+    where
+        F: FnMut(&mut SessionMetadata) -> Result<bool>,
+    {
+        let mut applied = false;
+        self.patch_guarded_if_changed(session_id, PatchGuard::default(), |metadata| {
+            let settled = patch(metadata)?;
+            applied = settled;
+            Ok(settled)
+        })
+        .await?;
+        Ok(applied)
+    }
+
     pub(super) async fn patch_guarded<F>(
         &self,
         session_id: &str,

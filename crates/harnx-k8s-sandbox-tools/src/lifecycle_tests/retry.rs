@@ -1,13 +1,19 @@
 use super::*;
 
+/// A manager whose backoff is deterministic (zero jitter) with the retry
+/// suite's fixed 1s/8s base and cap, so attempt counts pin down.
+fn zero_jitter_manager(api: Arc<MockApi>, max_attempts: usize) -> SandboxManager {
+    test_manager(api).with_backoff(
+        BackoffConfig::new(Duration::from_secs(1), Duration::from_secs(8), max_attempts)
+            .with_sampler(Arc::new(ZeroJitter)),
+    )
+}
+
 #[tokio::test(start_paused = true)]
 async fn transient_reads_use_exact_attempt_budget_and_preserve_last_cause() {
     let api = Arc::new(MockApi::default());
     api.state.lock().get_errors_remaining = usize::MAX;
-    let manager = test_manager(api.clone()).with_backoff(
-        BackoffConfig::new(Duration::from_secs(1), Duration::from_secs(8), 3)
-            .with_sampler(Arc::new(ZeroJitter)),
-    );
+    let manager = zero_jitter_manager(api.clone(), 3);
 
     let error = manager
         .ensure_active("exhausted", &CancellationToken::new())
@@ -63,6 +69,29 @@ async fn permanent_kubernetes_error_fails_after_one_attempt() {
     );
     assert_eq!(api.state.lock().get_calls, 1);
     assert_eq!(matching_metrics, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn typed_not_found_errors_fail_fast_without_retries() {
+    let api = Arc::new(MockApi::default());
+    api.state
+        .lock()
+        .scripted_get_errors
+        .push_back(anyhow::Error::new(SandboxNotFoundError::new("claim-gone")));
+    let manager = zero_jitter_manager(api.clone(), 5);
+
+    let error = manager
+        .ensure_active("claim-gone", &CancellationToken::new())
+        .await
+        .unwrap_err();
+    let terminal = error.downcast_ref::<TerminalError>().unwrap();
+
+    assert_eq!(
+        (terminal.end_reason, terminal.last_kind, terminal.attempts),
+        (EndReason::Failed, FailureKind::Permanent, 1)
+    );
+    assert!(is_sandbox_not_found(&error));
+    assert_eq!(api.state.lock().get_calls, 1);
 }
 
 #[tokio::test(start_paused = true)]
