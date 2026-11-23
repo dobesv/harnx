@@ -95,6 +95,34 @@ impl SessionMetadataStore {
             .await
     }
 
+    /// Replace a tool context value only while it still matches `expected`,
+    /// returning whether the replacement was applied.
+    ///
+    /// `expected: None` means the key must currently be absent. The
+    /// precondition and the write are one compare-and-set against the
+    /// metadata revision, so a concurrent writer that changes the value
+    /// between the caller's earlier read and this call makes this report
+    /// `Ok(false)` instead of overwriting the newer value.
+    pub async fn replace_tool_context_value_if(
+        &self,
+        entry: ToolContextEntry<'_>,
+        expected: Option<&Value>,
+        value: Value,
+    ) -> Result<bool> {
+        validate_tool_context_key(entry.key)?;
+        let key = entry.key.to_string();
+        self.patch_if(entry.session_id, move |metadata| {
+            let mut context = tool_context(metadata)?;
+            if context.values.get(&key) != expected {
+                return Ok(false);
+            }
+            context.values.insert(key.clone(), value.clone());
+            store_context(metadata, context)?;
+            Ok(true)
+        })
+        .await
+    }
+
     pub async fn remove_tool_context_value(
         &self,
         entry: ToolContextEntry<'_>,
@@ -119,17 +147,27 @@ impl SessionMetadataStore {
                     context.values.remove(entry.key);
                 }
             }
-            if context.is_empty() {
-                metadata.extensions.remove(TOOL_CONTEXT_NAMESPACE);
-            } else {
-                context.validate()?;
-                metadata.extensions.insert(
-                    TOOL_CONTEXT_NAMESPACE.to_string(),
-                    serde_json::to_value(context)?,
-                );
-            }
-            Ok(())
+            store_context(metadata, context)
         })
         .await
     }
+}
+
+/// Persist `context` back into the metadata's reserved tool-context
+/// extension, dropping the extension once it is empty.
+///
+/// Public so conditional writers built on [`SessionMetadataStore::patch_if`]
+/// with [`tool_context`] can persist their decoded context exactly the way
+/// the store's own tool-context helpers do.
+pub fn store_context(metadata: &mut SessionMetadata, context: ToolContext) -> Result<()> {
+    if context.is_empty() {
+        metadata.extensions.remove(TOOL_CONTEXT_NAMESPACE);
+    } else {
+        context.validate()?;
+        metadata.extensions.insert(
+            TOOL_CONTEXT_NAMESPACE.to_string(),
+            serde_json::to_value(context)?,
+        );
+    }
+    Ok(())
 }

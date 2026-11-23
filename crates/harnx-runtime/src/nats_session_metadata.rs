@@ -59,7 +59,8 @@ pub use store::{
     SessionMetadataStore, TaskIndex, TaskIndexEntry, TaskState,
 };
 pub use tool_context::{
-    tool_context, ToolContext, ToolContextEntry, TOOL_CONTEXT_NAMESPACE, TOOL_CONTEXT_VERSION,
+    store_context, tool_context, ToolContext, ToolContextEntry, TOOL_CONTEXT_NAMESPACE,
+    TOOL_CONTEXT_VERSION,
 };
 pub use view::{
     repository_contexts, ListedSession, MetadataRecord, RedactedAgentSource,
