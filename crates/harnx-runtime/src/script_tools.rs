@@ -91,6 +91,8 @@ impl ScriptTools {
             emit_tool_result_fn: Arc::new(|_, _| {}),
             emit_tool_blocked_fn: Arc::new(|_, _| {}),
             emit_tool_update_fn: Arc::new(|_, _| {}),
+            // Middleware and hook calls keep the results they always got.
+            structured_results: false,
         });
         // Only middleware helpers bypass the chain to avoid recursing into it.
         // Hooks must retain policy and credential middleware.
@@ -153,6 +155,7 @@ pub(crate) fn tool_commands(
             name: tool.name.clone(),
             description: tool.description.clone(),
             schema: tool.parameters.as_value().clone(),
+            output: None,
         })
         .collect();
     Ok(harnx_script::commands::tool_commands(specs, executor)?)

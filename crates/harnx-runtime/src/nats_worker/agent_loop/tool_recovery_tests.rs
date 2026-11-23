@@ -55,6 +55,7 @@ impl ToolProvider for MixedRecovery {
 
 fn mixed_context(scope: harnx_core::instance::ServerScope) -> crate::tool::ToolEvalContext {
     crate::tool::ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,

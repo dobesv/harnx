@@ -42,6 +42,8 @@ mod progress;
 pub use progress::*;
 mod partial_result;
 pub use partial_result::*;
+mod script_output;
+pub use script_output::*;
 pub mod cleanup;
 
 /// Schema and execution hints for one tool.
@@ -207,6 +209,24 @@ impl ToolSpec {
             .and_then(|meta| meta.get(Self::INPUT_REQUIRED_META_KEY))
             .and_then(Value::as_bool)
             .unwrap_or(false)
+    }
+
+    /// Declare how this tool's structured result reads in a script.
+    #[must_use]
+    pub fn with_script_output(mut self, output: ScriptOutput) -> Self {
+        if let Ok(value) = serde_json::to_value(output) {
+            self.meta
+                .get_or_insert_with(serde_json::Map::new)
+                .insert(SCRIPT_OUTPUT_META_KEY.to_string(), value);
+        }
+        self
+    }
+
+    /// The mapping declared with [`ToolSpec::with_script_output`]; `None`
+    /// when absent or malformed.
+    pub fn script_output(&self) -> Option<ScriptOutput> {
+        let value = self.meta.as_ref()?.get(SCRIPT_OUTPUT_META_KEY)?;
+        serde_json::from_value(value.clone()).ok()
     }
 
     /// Retrieve the static kind declaration from this tool spec.
@@ -579,6 +599,13 @@ pub struct ToolInvocationContext {
     /// model-authored arguments. `None` for older callers and anonymous
     /// (ownerless) sessions.
     pub user_id: Option<String>,
+}
+
+impl ToolInvocationContext {
+    /// Whether the caller sent [`CAPABILITY_STRUCTURED_RESULT`].
+    pub fn wants_structured_result(&self) -> bool {
+        self.capabilities.contains(CAPABILITY_STRUCTURED_RESULT)
+    }
 }
 
 /// Re-export SessionRef to allow harnx-toolset-server to pass it through
@@ -1189,6 +1216,61 @@ mod tests {
         let meta = spec.meta.as_ref().expect("meta map survives");
         assert_eq!(meta["vendor"], json!("harnx"));
         assert_eq!(meta["call_template"], json!("call"));
+    }
+
+    #[test]
+    fn script_output_round_trips_through_meta() {
+        let output = ScriptOutput {
+            stdout: Some("text".into()),
+            row: Some("{path}".into()),
+            error_exit_code: Some(2),
+            ..Default::default()
+        };
+        let spec = tool_spec().with_script_output(output.clone());
+        assert_eq!(spec.script_output(), Some(output));
+        let json = serde_json::to_value(&spec).expect("serialize spec");
+        assert_eq!(
+            json["meta"]["harnx:script_output"],
+            json!({"stdout": "text", "row": "{path}", "error_exit_code": 2})
+        );
+        let back: ToolSpec = serde_json::from_value(json).expect("deserialize spec");
+        assert_eq!(
+            back.script_output().unwrap().stdout.as_deref(),
+            Some("text")
+        );
+    }
+
+    #[test]
+    fn script_output_none_when_absent_or_malformed() {
+        assert!(tool_spec().script_output().is_none());
+        let mut spec = tool_spec();
+        spec.meta = Some(serde_json::Map::from_iter([(
+            SCRIPT_OUTPUT_META_KEY.to_string(),
+            json!("text"),
+        )]));
+        assert!(spec.script_output().is_none());
+    }
+
+    #[test]
+    fn script_output_preserves_other_meta_keys() {
+        let spec = tool_spec()
+            .with_call_template("call")
+            .with_script_output(ScriptOutput::default());
+        let meta = spec.meta.as_ref().expect("meta");
+        assert_eq!(meta["call_template"], json!("call"));
+        assert!(meta.contains_key(SCRIPT_OUTPUT_META_KEY));
+        assert_eq!(CAPABILITY_STRUCTURED_RESULT, "harnx:structured_result");
+        assert_eq!(SCRIPT_OUTPUT_META_KEY, "harnx:script_output");
+    }
+
+    #[test]
+    fn context_wants_structured_result_only_with_the_capability() {
+        let mut context = ToolInvocationContext::default();
+        assert!(!context.wants_structured_result());
+        context
+            .capabilities
+            .insert(CAPABILITY_STRUCTURED_RESULT.to_string());
+        assert!(context.wants_structured_result());
     }
 
     #[test]

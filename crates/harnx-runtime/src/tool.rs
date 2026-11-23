@@ -574,6 +574,7 @@ fn assemble_tool_eval_context(
     let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn, emit_tool_update_fn) =
         build_emit_fns(&decl_map);
     let mut ctx = ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,
@@ -844,6 +845,7 @@ fn script_mode_bash_provider(params: ScriptModeBashParams<'_>) -> Arc<dyn ToolPr
             slot,
             payload_limit: stack.payload_limit.clone(),
             full_payload,
+            script_outputs: stack.script_outputs.clone(),
         })
         .with_attachment_fetcher(stack.attachment_fetcher.clone())
         .with_media_store(stack.media_store.clone()),
@@ -856,6 +858,8 @@ fn script_mode_bash_provider(params: ScriptModeBashParams<'_>) -> Arc<dyn ToolPr
 struct BaseProviderStack {
     base_providers: Vec<Arc<dyn ToolProvider>>,
     payload_limit: Option<crate::bash_inner::PayloadLimit>,
+    /// Output mappings by tool name, for the `bash` tool's commands.
+    script_outputs: std::collections::BTreeMap<String, harnx_toolset::ScriptOutput>,
     attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
 }
@@ -871,6 +875,10 @@ fn base_provider_stack(
     let payload_limit = nats_provider
         .as_ref()
         .map(|nats| nats.script_payload_limit());
+    let script_outputs = nats_provider
+        .as_ref()
+        .map(|nats| nats.script_outputs())
+        .unwrap_or_default();
     let attachment_fetcher = nats_provider
         .as_ref()
         .map(|nats| nats.script_attachment_fetcher());
@@ -891,6 +899,7 @@ fn base_provider_stack(
     BaseProviderStack {
         base_providers,
         payload_limit,
+        script_outputs,
         attachment_fetcher,
         media_store,
     }
@@ -1807,6 +1816,7 @@ mod tests {
             make_decl_with_templates("bash_exec", None, Some("OK: {{ result.content[0].text }}")),
         );
         let eval_ctx = ToolEvalContext {
+            structured_results: false,
             on_tool_call_completed: None,
             on_interaction: None,
             middleware_fn: None,

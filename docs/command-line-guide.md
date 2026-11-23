@@ -595,15 +595,15 @@ Tool inference uses bounded static AST analysis via BashKit. It parses script st
 Scripts run under root operator consent:
 
 - **Operator inner call auto-approval**: When an operator runs `harnx call bash`, any confirmation requested by tool middleware (`confirm`) for an inner tool call is automatically approved. Unlike normal agent turns, the operator script does not prompt interactively for inner calls.
-- **Contrast with agent scripts**: Normal agent Bash scripts fail closed with exit code 3 (`needs approval: <tool>; call it directly instead of from bash`) when an inner tool requires confirmation.
-- **Middleware `deny` enforced**: A middleware that denies an inner tool call blocks it. The inner command exits with status 4 and writes the rejection reason to stderr (with empty stdout); it does not return a JSON object to the script. By default, BashKit enables `set -e`, so an unhandled denial stops the script and the CLI exits with status 4. Scripts can use `set +e` to handle the inner status; if a later command succeeds and the script finishes with status 0, the CLI exits 0.
+- **Contrast with agent scripts**: Normal agent Bash scripts fail closed with exit code 126 (`needs approval: <tool>; call it directly instead of from bash`) when an inner tool requires confirmation.
+- **Middleware `deny` enforced**: A middleware that denies an inner tool call blocks it. The inner command exits with status 126 and writes `blocked: <reason>` to stderr (with empty stdout); it does not return a JSON object to the script. By default, BashKit enables `set -e`, so an unhandled denial stops the script and the CLI exits with status 126. Scripts can use `set +e` to handle the inner status; if a later command succeeds and the script finishes with status 0, the CLI exits 0.
 - **Control tools excluded**: Control tools (`bash`, `switch_agent`, `ask_user`, and `*_session_handoff`) are excluded from the inner catalog and cannot be invoked from inside the script.
 - **Child agent isolation**: If an inner tool invokes a child agent or triggers delegated sub-agent turns, those child sessions retain their own normal confirmation policies and do not inherit operator auto-approval.
 
 #### Output Formatting and Process Exit Codes
 
 - **Process exit code**: Without `--json`, the CLI process exits with the script's exit status (see Default output above). With `--json`, it exits **0** when the script succeeds and **1** otherwise.
-- **Script exit status in payload**: The script's actual exit status is preserved in the tool result payload: successful runs expose `exit_code` at the top level (for example, `{"exit_code": 0, ...}`), while failed runs expose it under `partial_result.exit_code` (for example, `{"partial_result": {"exit_code": 3, ...}}`).
+- **Script exit status in payload**: The script's actual exit status is preserved in the tool result payload: successful runs expose `exit_code` at the top level (for example, `{"exit_code": 0, ...}`), while failed runs expose it under `partial_result.exit_code` (for example, `{"partial_result": {"exit_code": 7, ...}}`).
 - **`--json` format**: In `--json` mode, successful runs and runtime errors handled by the execution runner emit a single JSON object on stdout (including tool-reported errors and provider results). If an error occurs inside the runner before a result is produced (such as a tool reservation failure or worker connection error), stdout outputs `{"isError": true, "error": "<message>"}` with exit code 1. However, early script syntax analysis errors during CLI argument processing fail fast before the runner starts: these print an error message to stderr and exit with code 1, leaving stdout empty.
 
 #### Timeouts, Cancellation, and Budget Caveats

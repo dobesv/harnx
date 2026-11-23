@@ -1047,7 +1047,7 @@ matters.
 ### What script mode reads from a tool
 
 Inside a `bash` script every tool is a command (`crates/harnx-script`), and
-two things a tool declares decide how well it works there.
+three things a tool declares decide how well it works there.
 
 - **Parameter types.** A scalar, or an array of scalars, becomes a plain
   flag, and so does its nullable form (`Option<T>`: `type: [T, "null"]`,
@@ -1060,6 +1060,32 @@ two things a tool declares decide how well it works there.
   unannotated block, and the one-line summary for the person watching in a
   user-audience block. A tool that annotates its data `user` prints nothing
   in a script.
+- **Structured results.** The `bash` tool's inner calls send the request
+  capability `harnx:structured_result`
+  (`InnerCallExecutorConfig::structured_results`); direct model calls, a
+  custom script tool's run and a middleware's or hook's own `call_tool`
+  don't. A native tool that wants a shell form returns
+  script-style fields when `ToolInvocationContext::wants_structured_result()`
+  (`text` for a file, `paths` or `matches` for a search), declares with
+  `ToolSpec::with_script_output` which field is stdout, stderr and the exit
+  status, and leaves its direct-call output byte-identical. It bounds the
+  result itself, and puts a note about cut-off data in the field the mapping
+  names as `stderr`, never in the data. Paths it prints have to be usable as
+  arguments to the next command. Scripts run with `set -e`, so a non-zero
+  status for "nothing found" (`fs_grep` exits 1) ends a script that doesn't
+  guard the call. `harnx-fs-tools` is the reference (`script_result.rs`,
+  `script_search.rs`).
+
+  The request rides on the call context (`ToolCallOrigin::structured_result`,
+  set only by the fork the `bash` tool's inner calls use), not on a
+  task-local: a
+  script middleware runs on harnx-script's worker thread, and its `call_next`
+  dispatch would lose one. A middleware or hook that wraps a script's inner
+  call sees the script-shaped result, so one that scans `content` text misses
+  the data. MCP doesn't carry the request, so the mapping is stripped from
+  MCP listings (`harnx-toolset-server/src/mcp.rs`) and from the sandbox
+  gateway's proxied specs: a tool reached that way answers in model style
+  and advertises no shell form.
 
 The `bash` tool's own result has two shapes, chosen by
 `BashProviderConfig::full_payload`. A model round gets `status`, `exit_code`,

@@ -413,6 +413,42 @@ returns NAME, SYNOPSIS, DESCRIPTION and OPTIONS sections with type, default and
 enum metadata. Both use the parser's flag/type classification, including JSON
 fallbacks for real MCP schemas with `$ref`, `anyOf` or unions of several types.
 
+## Shell-style tool output
+
+A tool can declare how its structured result reads as a command. It sets
+`harnx_toolset::ToolSpec::with_script_output(ScriptOutput { .. })`, which stores the
+mapping in the tool's `_meta` under `harnx:script_output`. The mapping has these keys:
+
+| Key | Meaning |
+| --- | --- |
+| `stdout` | `structuredContent` field printed on stdout. A string is printed as is, an array of strings one item per line, an array of objects through `row`. |
+| `row` | Format for an object item of `stdout`, such as `{path}:{line}:{text}`. |
+| `stderr` | Field holding notes (string or array of strings). Each note is printed as `<tool>: <note>`. |
+| `exit_code` | Integer field used as the exit status. |
+| `error_exit_code` | Exit status when the tool returns an error. Default 1. |
+| `summary` | One line shown in the OUTPUT section of `help <tool>`. |
+
+The `bash` tool's inner calls send the request capability
+`harnx:structured_result` (`harnx_toolset::CAPABILITY_STRUCTURED_RESULT`), so
+the tool returns script-style fields. Direct model calls don't send it and keep
+their results. Neither does a [script tool](../../docs/script-tools.md)'s own
+run, or a middleware or hook on its own `call_tool`. A middleware or hook that
+wraps a `bash` script's inner call does see the script-shaped result, so one
+that scans `content` text for the data won't find it. The mapping applies only
+when the result has an object `structuredContent` and is not an error;
+otherwise the command renders as described above.
+
+```bash
+fs_grep --pattern TODO --path src | head -3   # src/lib.rs:12:// TODO tidy
+fs_grep --pattern no-such-text --path src || true   # prints nothing, exits 1; set -e would end the script without `|| true`
+fs_find --pattern '*.rs' --path src | head -1       # src/lib.rs, usable as fs_read --path
+fs_grep --pattern TODO --path src -o json | jq -r '.matches[0].path'
+```
+
+`-o json` prints the whole `structuredContent` on one line. Stderr and the exit
+status are the same in both formats. A mapped tool exits with its `exit_code` field
+on success. `help <tool>` shows an OUTPUT section built from the mapping.
+
 ## Generated `bash` description
 
 `description::bash_tool_description(tools, concurrent_cap, call_cap)` builds the
@@ -452,7 +488,7 @@ can still be set with `--help=VALUE` or `--json`. Unknown commands use BashKit's
 last-chance `CommandResolver` to return exit 127 with nearby-name suggestions.
 This resolver only reports errors; it never dispatches an unknown tool.
 
-Output defaults to JSON from MCP `structuredContent` when present, otherwise
+Without a declared mapping, output defaults to JSON from MCP `structuredContent` when present, otherwise
 concatenated MCP text blocks. Plain non-MCP strings are text; other raw values
 are JSON. Nonempty output ends with a newline. `-o text` selects content text
 instead of structured content, falling back to structured JSON if there's no
@@ -475,12 +511,12 @@ the transport succeeded; raw business JSON `is_error` keys aren't status flags.
 
 | Outcome | Exit | Streams |
 | --- | --- | --- |
-| success | 0 | rendered stdout |
-| tool error | 1 | error on stderr; available partial output on stdout |
+| success | 0, or the mapping's `exit_code` field (`fs_grep` exits 1 when nothing matched) | rendered stdout |
+| tool error | 1, or the mapping's `error_exit_code` | error on stderr; available partial output on stdout |
 | usage error | 2 | diagnostic on stderr, no dispatch |
-| approval required | 3 | `needs approval: <tool>; call it directly instead of from bash` |
-| blocked | 4 | reason on stderr |
-| rejected | 5 | reason on stderr |
+| approval required | 126 | `needs approval: <tool>; call it directly instead of from bash` |
+| blocked | 126 | `blocked: <reason>` on stderr |
+| rejected | 126 | `rejected: <reason>` on stderr |
 | unknown command | 127 | reason and suggestion on stderr |
 | fatal | abort run | error on stderr, even under `set +e` or in a background job |
 

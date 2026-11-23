@@ -18,6 +18,10 @@ pub struct ReadFileParams {
     pub tail_lines: Option<usize>,
     #[serde(default)]
     pub max_output_bytes: Option<usize>,
+    /// Prefix each line with its number. Defaults to true, and to false when
+    /// called from a bash script.
+    #[serde(default)]
+    pub line_numbers: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +129,7 @@ impl JsonSchema for ReadFileParams {
         let head_lines = generator.subschema_for::<Option<usize>>();
         let tail_lines = generator.subschema_for::<Option<usize>>();
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
+        let line_numbers = generator.subschema_for::<Option<bool>>();
         object_schema_with_desc(
             vec![
                 ("path", "Absolute path to the file to read. Prefer this tool over shell commands like sed, cat, head, tail for reading files. If the path is an image file (PNG/JPEG/GIF/WebP), it is returned as viewable image content.", path),
@@ -135,6 +140,7 @@ impl JsonSchema for ReadFileParams {
                 ("head_lines", "Return only the first N lines. Prefer this over piping through head.", head_lines),
                 ("tail_lines", "Return only the last N lines. Prefer this over piping through tail.", tail_lines),
                 ("max_output_bytes", "Truncate output to at most this many bytes.", max_output_bytes),
+                ("line_numbers", "Prefix each line with its number. Defaults to true, and to false when called from a bash script.", line_numbers),
             ],
             &["path"],
         )
@@ -280,7 +286,7 @@ impl JsonSchema for SearchFilesParams {
                 ),
                 (
                     "path",
-                    "Directory to search in. Defaults to project root.",
+                    "Directory or file to search in. Defaults to project root.",
                     path,
                 ),
                 (

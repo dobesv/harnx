@@ -388,6 +388,8 @@ mod adapter_wire_tests {
                 timeout_policy_spec("unadvertised", None),
                 timeout_policy_spec("with_template", None),
                 timeout_policy_spec("stops_on_new_message", None).with_stop_on_new_message(),
+                timeout_policy_spec("script_shaped", None)
+                    .with_script_output(harnx_toolset::ScriptOutput::default()),
             ]
         }
 
@@ -453,10 +455,8 @@ mod adapter_wire_tests {
         client.cancel().await.unwrap();
     }
 
-    /// MCP cannot deliver the new-message signal, so its listing never claims
-    /// a tool stops on one.
-    #[tokio::test]
-    async fn list_tools_drops_the_stop_on_new_message_opt_in() {
+    /// The `_meta` value a listing advertises for one tool, if any.
+    async fn listed_meta(tool_name: &str, key: &str) -> Option<serde_json::Value> {
         let (client, _server) = setup_client_server(Arc::new(TimeoutPolicyToolset)).await;
         let tools = client
             .peer()
@@ -464,16 +464,36 @@ mod adapter_wire_tests {
             .await
             .expect("list tools")
             .tools;
-        let tool = tools
+        let value = tools
             .iter()
-            .find(|tool| tool.name == "stops_on_new_message")
-            .expect("opted-in tool listed");
-        let opt_in = tool
+            .find(|tool| tool.name == tool_name)
+            .unwrap_or_else(|| panic!("tool '{tool_name}' listed"))
             .meta
             .as_ref()
-            .and_then(|meta| meta.0.get(harnx_toolset::STOP_ON_NEW_MESSAGE_META_KEY));
-        assert_eq!(opt_in, None);
+            .and_then(|meta| meta.0.get(key))
+            .cloned();
         client.cancel().await.unwrap();
+        value
+    }
+
+    /// MCP cannot deliver the new-message signal, so its listing never claims
+    /// a tool stops on one.
+    #[tokio::test]
+    async fn list_tools_drops_the_stop_on_new_message_opt_in() {
+        let opt_in = listed_meta(
+            "stops_on_new_message",
+            harnx_toolset::STOP_ON_NEW_MESSAGE_META_KEY,
+        )
+        .await;
+        assert_eq!(opt_in, None);
+    }
+
+    /// MCP cannot carry the request for a script-shaped result, so its listing
+    /// never advertises a mapping for one.
+    #[tokio::test]
+    async fn list_tools_drops_the_script_output_mapping() {
+        let mapping = listed_meta("script_shaped", harnx_toolset::SCRIPT_OUTPUT_META_KEY).await;
+        assert_eq!(mapping, None);
     }
 
     /// Records what a toolset observed on each invocation: the arguments,

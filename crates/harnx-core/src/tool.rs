@@ -243,6 +243,9 @@ pub struct ToolCallOrigin<'a> {
     /// invoked directly. A provider that journals calls keys its row by this,
     /// which is how recovery finds the row again.
     pub tool_round: Option<u64>,
+    /// The caller is a script that can take the tool's data as
+    /// `structuredContent`.
+    pub structured_result: bool,
 }
 
 pub enum ToolError {

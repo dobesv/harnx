@@ -210,14 +210,34 @@ fn build_harness(
     fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     full_payload: bool,
 ) -> Harness {
+    build_harness_with(
+        inner,
+        extra,
+        fetcher,
+        full_payload,
+        (inner_declarations(), Default::default()),
+    )
+}
+
+fn build_harness_with(
+    inner: Arc<dyn ToolProvider>,
+    extra: Vec<Arc<dyn ToolProvider>>,
+    fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
+    full_payload: bool,
+    (declarations, script_outputs): (
+        Vec<harnx_core::tool::ToolDeclaration>,
+        std::collections::BTreeMap<String, harnx_toolset::ScriptOutput>,
+    ),
+) -> Harness {
     let slot = Arc::new(BashEvalContextSlot::default());
     let bash = Arc::new(
         BashProvider::new(BashProviderConfig {
             active: true,
-            inner_declarations: inner_declarations(),
+            inner_declarations: declarations,
             base_providers: vec![inner.clone()],
             slot: Some(slot.clone()),
             payload_limit: None,
+            script_outputs,
             full_payload,
         })
         .with_attachment_fetcher(fetcher),
@@ -226,6 +246,7 @@ fn build_harness(
     providers.extend(extra);
     providers.push(inner);
     let ctx = Arc::new(ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,
@@ -262,6 +283,7 @@ async fn run(
             BASH_TOOL_NAME,
             bash_call(script),
             ToolCallOrigin {
+                structured_result: false,
                 tool_call_id: Some("outer-1"),
                 tool_round: Some(1),
             },
@@ -550,6 +572,7 @@ async fn missing_slot_fails_closed() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        script_outputs: Default::default(),
         full_payload: false,
     });
     let abort = create_abort_signal();
@@ -568,6 +591,7 @@ async fn inactive_provider_does_not_claim_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        script_outputs: Default::default(),
         full_payload: false,
     });
     assert!(!bash.has_tool(BASH_TOOL_NAME));
@@ -613,6 +637,7 @@ async fn replay_reports_interrupted_for_bash_only() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        script_outputs: Default::default(),
         full_payload: false,
     });
     let abort = create_abort_signal();
@@ -685,6 +710,7 @@ async fn inactive_provider_replay_falls_through_for_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        script_outputs: Default::default(),
         full_payload: false,
     });
     let abort = create_abort_signal();
@@ -799,11 +825,13 @@ async fn command_scoped_catalog_stays_active_and_fails_closed_without_tools() {
         base_providers: Vec::new(),
         slot: Some(slot.clone()),
         payload_limit: None,
+        script_outputs: Default::default(),
         full_payload: false,
     }));
     assert!(bash.has_tool(BASH_TOOL_NAME));
 
     let ctx = slot.install(ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,
@@ -856,3 +884,130 @@ async fn command_scoped_catalog_stays_active_and_fails_closed_without_tools() {
 }
 
 mod output;
+
+/// Records whether each call's origin asked for a structured result, and
+/// answers with a result a mapping can read.
+struct StructuredProvider {
+    origins: Mutex<Vec<bool>>,
+}
+
+#[async_trait::async_trait]
+impl ToolProvider for StructuredProvider {
+    fn name(&self) -> &str {
+        "structured"
+    }
+
+    fn has_tool(&self, tool_name: &str) -> bool {
+        tool_name == "faketool"
+    }
+
+    async fn call_tool(
+        &self,
+        _name: &str,
+        _args: Value,
+        _abort: &AbortSignal,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        Ok(ToolProviderOutput::new(json!({
+            "content": [{"type": "text", "text": "ignored"}],
+            "structuredContent": {"text": "one\ntwo\nthree\n", "notes": ["2 more lines"]},
+        })))
+    }
+
+    async fn call_tool_with_progress(
+        &self,
+        name: &str,
+        args: Value,
+        origin: ToolCallOrigin<'_>,
+        abort: &AbortSignal,
+        _progress: Arc<dyn ToolProgress>,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        self.origins.lock().unwrap().push(origin.structured_result);
+        self.call_tool(name, args, abort).await
+    }
+}
+
+fn faketool_declarations() -> Vec<harnx_core::tool::ToolDeclaration> {
+    let mut declarations = inner_declarations();
+    declarations.truncate(1);
+    declarations[0].name = "faketool".to_string();
+    declarations
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inner_calls_ask_for_structured_results() {
+    let provider = Arc::new(StructuredProvider {
+        origins: Mutex::new(Vec::new()),
+    });
+    let (bash, _slot, _ctx) = build_harness_with(
+        provider.clone(),
+        Vec::new(),
+        None,
+        true,
+        (faketool_declarations(), Default::default()),
+    );
+    let abort = create_abort_signal();
+    ok(run(&bash, "faketool --path a", &abort).await);
+    assert_eq!(*provider.origins.lock().unwrap(), vec![true]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mapped_tool_prints_idiomatic_output() {
+    let provider = Arc::new(StructuredProvider {
+        origins: Mutex::new(Vec::new()),
+    });
+    let outputs = std::collections::BTreeMap::from([(
+        "faketool".to_string(),
+        harnx_toolset::ScriptOutput {
+            stdout: Some("text".into()),
+            stderr: Some("notes".into()),
+            ..Default::default()
+        },
+    )]);
+    let (bash, _slot, _ctx) = build_harness_with(
+        provider,
+        Vec::new(),
+        None,
+        true,
+        (faketool_declarations(), outputs),
+    );
+    let abort = create_abort_signal();
+    let payload = ok(run(&bash, "faketool --path a | wc -l", &abort).await).value;
+    assert_eq!(
+        payload["stdout"].as_str().map(str::trim),
+        Some("3"),
+        "{payload}"
+    );
+    assert_eq!(payload["stderr"], "faketool: 2 more lines\n", "{payload}");
+}
+
+/// The two types are bridged by a serde round trip, which drops a field one
+/// side lacks without a word. Both sides are written out in full so adding a
+/// field to either breaks this test.
+#[test]
+fn script_output_converts_with_every_field() {
+    let output = harnx_toolset::ScriptOutput {
+        stdout: Some("out".into()),
+        row: Some("{a}:{b}".into()),
+        stderr: Some("notes".into()),
+        exit_code: Some("status".into()),
+        error_exit_code: Some(7),
+        summary: Some("like cat".into()),
+    };
+    let harnx_toolset::ScriptOutput {
+        stdout,
+        row,
+        stderr,
+        exit_code,
+        error_exit_code,
+        summary,
+    } = output.clone();
+    let expected = harnx_script::commands::OutputMapping {
+        stdout,
+        row,
+        stderr,
+        exit_code,
+        error_exit_code,
+        summary,
+    };
+    assert_eq!(super::output_mapping(&output), Some(expected));
+}

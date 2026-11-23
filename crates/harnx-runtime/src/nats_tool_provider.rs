@@ -14,7 +14,8 @@ use harnx_core::tool::{
 use harnx_toolset::{
     registration_kv_key, user_key_segment, ControlMessage, Registration, RegistrationAudience,
     ToolErrorPayload, ToolReply, ToolRequest, ToolSpec, CAPABILITY_NEW_MESSAGE_PENDING,
-    CAPABILITY_TOOL_PROGRESS, HDR_CALL_ID, HDR_CONTENT_TYPE, HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
+    CAPABILITY_STRUCTURED_RESULT, CAPABILITY_TOOL_PROGRESS, HDR_CALL_ID, HDR_CONTENT_TYPE,
+    HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
 };
 use harnx_toolset_server::TOOL_REGISTRY_BUCKET;
 use serde_json::Value;
@@ -125,6 +126,8 @@ struct RegisteredTool {
     /// Which sessions the registration is visible to (invariant (b): dispatch
     /// re-checks even though discovery already filtered by session owner).
     audience: RegistrationAudience,
+    /// How the tool's structured result reads inside a `bash` script.
+    script_output: Option<harnx_toolset::ScriptOutput>,
 }
 
 impl RegisteredTool {
@@ -309,6 +312,7 @@ impl NatsToolProvider {
                 name: tool_name,
                 arguments,
                 origin: ToolCallOrigin {
+                    structured_result: false,
                     tool_call_id: Some(tool_call_id),
                     tool_round: None,
                 },
@@ -505,12 +509,27 @@ impl NatsToolProvider {
                 requests_input: spec.requests_input(),
                 registration_key: registration_kv_key(self.instance_id.as_str(), registration),
                 audience: registration.audience(),
+                script_output: spec.script_output(),
             });
         }
 
         // Raw aliases keep persisted calls from before server-prefixed naming routable.
         self.tools.get(tool_name).cloned()
     }
+    /// Mappings by agent-visible tool name. Each declaration resolves to its
+    /// own route, so a raw-name alias never becomes a key.
+    pub(crate) fn script_outputs(
+        &self,
+    ) -> std::collections::BTreeMap<String, harnx_toolset::ScriptOutput> {
+        self.declarations
+            .iter()
+            .filter_map(|declaration| {
+                let route = self.resolve_route(&declaration.name)?;
+                Some((declaration.name.clone(), route.script_output?))
+            })
+            .collect()
+    }
+
     pub fn declarations(&self) -> &[ToolDeclaration] {
         &self.declarations
     }
@@ -837,6 +856,7 @@ fn registered_tool(
     let kind = spec.kind().map(|k| k.into());
     let stop_on_new_message = spec.stops_on_new_message();
     let requests_input = spec.requests_input();
+    let script_output = spec.script_output();
     let parameters = match JsonSchema::from_tool_schema(spec.input_schema) {
         Ok(parameters) => parameters,
         Err(error) => {
@@ -859,6 +879,7 @@ fn registered_tool(
         requests_input,
         registration_key: registration_kv_key(scope.as_str(), registration),
         audience: registration.audience(),
+        script_output,
     };
     let declaration = ToolDeclaration {
         name: name.clone(),
@@ -966,6 +987,7 @@ impl ToolProvider for NatsToolProvider {
                 name: tool_name,
                 arguments,
                 origin: ToolCallOrigin {
+                    structured_result: false,
                     tool_call_id,
                     tool_round: None,
                 },
@@ -1308,6 +1330,7 @@ mod tests {
     /// A dispatch of the transcript call `id`, made outside any recorded round.
     fn transcript_call(id: &str) -> harnx_core::tool::ToolCallOrigin<'_> {
         harnx_core::tool::ToolCallOrigin {
+            structured_result: false,
             tool_call_id: Some(id),
             tool_round: None,
         }
@@ -1550,6 +1573,92 @@ mod tests {
                 "traceparent {traceparent} did not carry trace ID {expected_trace_id}"
             );
         });
+    }
+
+    fn mapped_registration() -> Registration {
+        read_registration("fs", true)
+    }
+
+    fn read_registration(server: &str, mapped: bool) -> Registration {
+        let output = harnx_toolset::ScriptOutput {
+            stdout: Some("text".into()),
+            ..Default::default()
+        };
+        let mut spec = ToolSpec {
+            cancellation_guarantee: Default::default(),
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({ "type": "object" }),
+            idempotent_hint: true,
+            read_only_hint: true,
+            timeout_secs: None,
+            meta: None,
+        };
+        if mapped {
+            spec = spec.with_script_output(output);
+        }
+        global_registration(server, vec![spec])
+    }
+
+    #[test]
+    fn registered_tool_keeps_the_script_output() {
+        harnx_core::require_nextest();
+        let registration = mapped_registration();
+        let spec = registration.tools[0].clone();
+        let scope = ServerScope::from_string("provider-tests");
+        let (name, route, _) =
+            super::registered_tool(&scope, None, &registration, spec).expect("registers");
+        assert_eq!(name, "fs_read");
+        assert_eq!(
+            route.script_output.and_then(|output| output.stdout),
+            Some("text".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn script_outputs_are_keyed_by_visible_name() -> anyhow::Result<()> {
+        harnx_core::require_nextest();
+        let broker = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(broker.url()).await?;
+        let mut provider = make_test_provider(&client).await;
+        let registrations = vec![mapped_registration()];
+        (provider.tools, provider.declarations) = build_registered_tools(
+            &ServerScope::from_string("provider-tests"),
+            None,
+            registrations.clone(),
+        );
+        provider.registrations = registrations;
+        let outputs = provider.script_outputs();
+        assert_eq!(outputs["fs_read"].stdout.as_deref(), Some("text"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn script_outputs_ignore_raw_name_aliases() -> anyhow::Result<()> {
+        harnx_core::require_nextest();
+        let broker = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(broker.url()).await?;
+        let mut provider = make_test_provider(&client).await;
+        // Both servers expose a tool whose raw name is `read`; only `fs` maps it.
+        let registrations = vec![
+            read_registration("fs", true),
+            read_registration("other", false),
+        ];
+        (provider.tools, provider.declarations) = build_registered_tools(
+            &ServerScope::from_string("provider-tests"),
+            None,
+            registrations.clone(),
+        );
+        provider.registrations = registrations;
+        let outputs = provider.script_outputs();
+        assert_eq!(outputs.keys().collect::<Vec<_>>(), ["fs_read"]);
+        assert!(!outputs.contains_key("other_read"));
+        assert!(!outputs.contains_key("read"));
+        Ok(())
     }
 
     #[test]

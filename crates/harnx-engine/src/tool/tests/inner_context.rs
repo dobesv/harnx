@@ -5,6 +5,7 @@ fn silent_options(
     tool_round: Option<u64>,
 ) -> InnerToolEvalOptions {
     InnerToolEvalOptions {
+        structured_results: false,
         providers,
         tool_round,
         emit_tool_call_fn: Arc::new(|_, _| {}),
@@ -192,10 +193,12 @@ async fn fork_routes_lifecycle_and_progress_to_collectors_with_parent_round() {
     let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured_updates = Arc::clone(&updates);
     let origin = ToolCallOrigin {
+        structured_result: false,
         tool_call_id: Some("parent-call"),
         tool_round: Some(12),
     };
     let inner = outer.fork_for_inner_calls(InnerToolEvalOptions {
+        structured_results: false,
         providers: outer.providers.clone(),
         tool_round: origin.tool_round,
         emit_tool_call_fn: collector(&trace, "started"),
@@ -312,4 +315,13 @@ async fn fork_keeps_work_boundary_checks_and_parent_cancellation() {
         assert_eq!(error.to_string(), "interrupted during tool execution");
     }
     assert_eq!(boundaries.load(Ordering::SeqCst), boundary_count);
+}
+
+#[test]
+fn fork_takes_structured_results_from_options_not_the_parent() {
+    let mut outer = context_with_metadata();
+    outer.structured_results = true;
+    let mut options = silent_options(vec![], None);
+    options.structured_results = false;
+    assert!(!outer.fork_for_inner_calls(options).structured_results);
 }

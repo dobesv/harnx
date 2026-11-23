@@ -24,6 +24,7 @@ const PNG_BASE64: &str =
 fn provider(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> (BashProvider, Arc<ToolEvalContext>) {
     let slot = BashEvalContextSlot::new();
     let ctx = slot.install(ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,
@@ -48,6 +49,7 @@ fn provider(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> (BashProvider, Arc<T
         base_providers: vec![],
         slot: Some(slot),
         payload_limit: None,
+        script_outputs: Default::default(),
         full_payload: true,
     })
     .with_attachment_fetcher(fetcher);
