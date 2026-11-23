@@ -185,6 +185,16 @@ member once a group reaches three. A new `A => 0, B => 2, _ => 1` match on one
 enum joined two such matches on unrelated enums in test files, and all three
 were reported.
 
+The duplicate-fragment check (`dry, fragment`) clusters similar code across
+files the same way. A third e2e file repeating the standard
+broker/binary/env-guard preamble grew clusters whose other members sat in
+`bash_script_mode.rs` and `tool_supervisor.rs`, and the gate reported those
+pre-existing pairs as made worse. Suppressing your new copy changes nothing —
+the findings live at the other locations. Deduplicate the shared shape into a
+helper (the `start_time_server` helper in
+`crates/harnx-runtime/tests/it/bash_script_mode.rs` now serves three e2es), or
+`qual:allow(dry, fragment)` the pre-existing fragment with a written reason.
+
 The `Code quality` CI job runs the gate on pull requests and annotates the diff
 with what it finds. It is advisory: `.mergify.yml` doesn't require it.
 

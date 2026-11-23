@@ -17,7 +17,7 @@ pub(crate) fn fetcher(jetstream: async_nats::jetstream::Context) -> Arc<dyn Atta
     })
 }
 
-pub(super) fn mount(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> FsMount {
+pub(crate) fn mount(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> FsMount {
     AttachmentFs::new(fetcher.unwrap_or_else(|| Arc::new(Unavailable))).mount()
 }
 

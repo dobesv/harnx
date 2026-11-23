@@ -59,6 +59,7 @@ The `config.yaml` file contains global behavior and appearance settings.
 - **tool_use**: Set to `false` to disable all tool use globally.
 - **use_tools**: Which tools to enable by default (`*` for all).
 - **toolsets**: Group tools into named sets for easy assignment.
+- **script_tools**: Define custom in-process script tools backed by Bash or Python. See the [Script Tools Guide](script-tools.md).
 
 ## Clients (`clients/`)
 

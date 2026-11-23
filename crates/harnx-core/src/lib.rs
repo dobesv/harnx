@@ -43,6 +43,7 @@ pub mod provider_config;
 pub mod retry_config;
 pub mod runtime_note;
 pub mod safety;
+pub mod script_tool;
 pub mod session;
 pub mod session_identity;
 pub mod session_log;

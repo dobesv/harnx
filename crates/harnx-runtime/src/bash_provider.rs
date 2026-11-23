@@ -67,7 +67,7 @@ impl BashEvalContextSlot {
         context
     }
 
-    fn get(&self) -> Option<Arc<ToolEvalContext>> {
+    pub(crate) fn get(&self) -> Option<Arc<ToolEvalContext>> {
         self.0
             .lock()
             .expect("bash context slot lock")

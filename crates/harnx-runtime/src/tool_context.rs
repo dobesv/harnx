@@ -45,6 +45,11 @@ pub struct BuildToolEvalContextParams<'a> {
     /// declarations, operator-only inner consent. `None` keeps the ordinary
     /// config-driven provider.
     pub command_bash: Option<crate::bash_provider::CommandBashInputs>,
+    /// Additional base providers appended after the built-in ones, ahead of
+    /// the `bash` and script-tool wrappers, so inner calls from both can
+    /// dispatch to them. Embedders and integration tests use this to inject
+    /// in-process tools; ordinary rounds leave it empty.
+    pub extra_base_providers: Vec<Arc<dyn harnx_core::tool::ToolProvider>>,
 }
 
 impl<'a> BuildToolEvalContextParams<'a> {
@@ -60,6 +65,7 @@ impl<'a> BuildToolEvalContextParams<'a> {
             pending_async_context: None,
             bash_context_slot: None,
             command_bash: None,
+            extra_base_providers: Vec::new(),
         }
     }
 
@@ -399,8 +405,13 @@ fn refresh_nats_tool_declarations_now<'a>(
         )
         .await;
         log_discovery_report(provider.as_deref());
-        let declarations = declarations_for_all_tools(provider.as_deref());
+        let (declarations, served_names) = declarations_for_all_tools(provider.as_deref());
         *config.read().nats_tool_declarations.write() = declarations;
+        // Raw aliases never appear in a declaration list, so the script-tool
+        // collision view needs the full route-name set: the model-visible tool
+        // list and the round snapshot must agree that such a name is not a
+        // script tool's to claim.
+        *config.read().nats_served_tool_names.write() = served_names;
     })
 }
 
@@ -420,9 +431,17 @@ fn log_discovery_report(provider: Option<&NatsToolProvider>) {
 
 fn declarations_for_all_tools(
     provider: Option<&NatsToolProvider>,
-) -> Vec<harnx_core::tool::ToolDeclaration> {
+) -> (
+    Vec<harnx_core::tool::ToolDeclaration>,
+    std::collections::HashSet<String>,
+) {
     provider
-        .map(|provider| provider.declarations_for_use_tools(Some("*")))
+        .map(|provider| {
+            (
+                provider.declarations_for_use_tools(Some("*")),
+                provider.route_names().collect(),
+            )
+        })
         .unwrap_or_default()
 }
 
@@ -441,6 +460,13 @@ mod tests {
             let previous = std::env::var_os(key);
             // SAFETY: this test holds ENV_LOCK for the guard's lifetime.
             unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: this test holds ENV_LOCK for the guard's lifetime.
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
     }
@@ -494,6 +520,104 @@ mod tests {
         });
 
         assert!(config.read().nats_tool_declarations.read().is_empty());
+    }
+
+    /// 4659980786 follow-up: the refresh writes the served-name cache both
+    /// ways. A cached provider recording a raw alias hides the script tool
+    /// of that name from the model-visible `select_tools` list; a cached
+    /// absence clears the route names and the script tool comes back.
+    #[tokio::test]
+    // The broker-address env var must stay set across the awaited refreshes,
+    // and the lock keeps env-mutating tests from interleaving with it.
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_hides_provider_served_script_tools_and_clear_reinstates() -> anyhow::Result<()>
+    {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let server = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let _env = EnvGuard::set(HARNX_NATS_URL_ENV, server.url());
+        let client = async_nats::connect(server.url()).await?;
+
+        let mut config = Config::default();
+        let definition: harnx_core::script_tool::ScriptToolDefinition =
+            serde_json::from_value(serde_json::json!({
+                "name": "read",
+                "description": "Wrapper.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"number": {"type": "integer"}},
+                    "required": ["number"],
+                    "additionalProperties": false
+                },
+                "bash": "true"
+            }))?;
+        config.set_script_tool_definitions(&[definition])?;
+        let config = Arc::new(crate::config::ConfigLock::new(config));
+        let mut agent_config = harnx_core::agent_config::AgentConfig::from_prompt("test");
+        agent_config.set_use_tools(Some(vec!["*".to_string()]));
+
+        // The provider serves the raw alias `read`; its agent-visible name
+        // is `fs_read`, which no script tool claims.
+        let provider = Arc::new(
+            NatsToolProvider::snapshot_test_provider(
+                &client,
+                vec![("read", "fs", "read")],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await?,
+        );
+        let instance_id = ServerScope::from_string("refresh-served-names-test");
+        let cache = NATS_TOOL_DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let key = tool_discovery_key(
+            &config.read(),
+            &instance_id,
+            config.read().active_package().as_deref(),
+        );
+
+        // Cached provider: the refresh records its route names, and the raw
+        // alias hides the script tool from the model-visible list.
+        cache_discovery(
+            cache,
+            key.clone(),
+            Some(provider),
+            Instant::now(),
+            registry_epoch(),
+        );
+        refresh_nats_tool_declarations(&config, &instance_id).await;
+        assert!(
+            config.read().nats_served_tool_names.read().contains("read"),
+            "the refresh must record the raw alias in the served-name cache"
+        );
+        let functions = config.read().select_tools(&agent_config);
+        assert!(
+            functions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .all(|declaration| declaration.name != "read"),
+            "a cached provider must hide the raw-alias script tool"
+        );
+
+        // Cached absence: the refresh clears the cache and the script tool
+        // is selectable again.
+        cache_discovery(cache, key, None, Instant::now(), registry_epoch());
+        refresh_nats_tool_declarations(&config, &instance_id).await;
+        assert!(
+            config.read().nats_served_tool_names.read().is_empty(),
+            "a cached absence must clear the served-name cache"
+        );
+        let functions = config.read().select_tools(&agent_config);
+        assert!(
+            functions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|declaration| declaration.name == "read"),
+            "a cleared cache must restore the script tool"
+        );
+        Ok(())
     }
 
     #[test]

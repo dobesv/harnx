@@ -105,7 +105,9 @@ pub use daemon::{
     WorkerShutdownDeadlineExceeded, WORKER_SHUTDOWN_TIMEOUT,
 };
 #[doc(hidden)]
-pub use daemon_background::start_local_tool_servers_for_test;
+pub use daemon_background::{
+    configured_worker_services_for_test, start_local_tool_servers_for_test,
+};
 pub use daemon_runtime::MAX_ACTIVATION_DELIVERIES;
 pub use diagnostics::diagnose_tool_servers;
 pub use tool_supervisor::{ToolServerStartConfig, ToolServerSupervisor};

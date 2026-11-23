@@ -69,6 +69,7 @@ mod non_modal_surfaces;
 mod package_loading;
 mod package_tool_naming_e2e;
 mod scope_discovery;
+mod script_tools;
 mod session_deletion_markers;
 mod session_stream_gc;
 mod subagent_blocked;
