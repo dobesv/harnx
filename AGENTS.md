@@ -125,6 +125,19 @@ exclusion list in `.github/workflows/ci.yaml` (web, changesets, READMEs,
 release workflows), which the first path rule in `.config/affected.toml`
 mirrors. A test that starts reading one of those paths must take it off both.
 
+CI compiles each OS once, with `cargo nextest archive --workspace`, and
+splits the selected tests between several jobs that run them from the archive
+without a compiler (`.github/workflows/ci-rust.yaml`; a failure shows under
+`<OS> / Test (k/N)`). The test jobs unpack the test binaries and the
+workspace bins into the checkout's own `target/debug`, so the usual ways of
+finding a sibling binary still work: next to the test's own executable,
+through `env!("CARGO_BIN_EXE_...")`, or in `target/debug` under the workspace
+root. Nothing else from the build directory is there, so a test that reads
+another file under `target/` or runs cargo to build something passes locally
+and fails in CI. Only xtask's tests may run cargo, and the test jobs
+fetch crates for them alone; a new test that runs `cargo metadata` needs its
+package added to that step's condition.
+
 **Use `cargo nextest`, never `cargo test`.** Tests rely on nextest's per-test
 process isolation; `cargo test` shares one process and produces spurious
 failures. The tmux/interrupt e2e tests guard against this and will panic with a
@@ -221,7 +234,7 @@ Debian and Ubuntu, which CI installs). Cargo runs offline there
 (`CARGO_NET_OFFLINE`), so a test that runs `cargo metadata`, as xtask's
 `affected` tests do, needs every target platform's crates in the registry,
 not just the host's that a build downloads; run `cargo fetch` first, as CI
-does. On macOS the test
+does for them. On macOS the test
 runs in its own process group, which is killed when the test ends, along with
 any process whose command line names the test's private home, such as its
 broker. A process that moved to its own group without naming the home, such
@@ -2021,7 +2034,7 @@ Qualify non-`__local__` agent names with their cluster. Never call
 
 CI runs integration tests against an isolated `nats-server` per test via
 `spawn_nats_server` in `crates/harnx-runtime/tests/it/common/mod.rs`. The CI
-workflow installs `nats-server` on all platforms (`.github/workflows/ci.yaml`);
+workflow installs `nats-server` on all platforms (`.github/workflows/ci-rust.yaml`);
 tests that skip when the binary is absent still pass, but real coverage requires
 the installed binary.
 

@@ -1,0 +1,315 @@
+name: CI Rust
+
+# Builds the workspace and runs its tests on one OS for ci.yaml, which calls
+# this once per OS so that each OS's `All (<os>)` check can depend on its own
+# jobs alone.
+#
+# One job compiles the workspace and packs its tests with `cargo nextest
+# archive`. The test jobs split the archive's tests between them
+# (`--partition`) and compile nothing.
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: Runner label, such as macos-latest.
+        type: string
+        required: true
+      partitions:
+        description: >-
+          JSON list numbering the test jobs, such as [1, 2, 3]. Size it from
+          the full suite's summed test time on this OS divided by the runner's
+          CPUs, which is what one job alone would take.
+        type: string
+        required: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ inputs.os }}
+
+    env:
+      RUSTFLAGS: --deny warnings
+      # No debug info, even the line tables the dev profile keeps. CI never
+      # sets RUST_BACKTRACE, and a panic reports its file and line without
+      # them. Measured on Linux, this cut the test archive from 3.3 GB to
+      # 1.4 GB, which every test job downloads, and the compile by about a
+      # third. Stripping drops the standard library's own debug info as well.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_STRIP: debuginfo
+
+    outputs:
+      filter: ${{ steps.affected.outputs.filter }}
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        # A pull_request run checks out the PR merged into its base; the
+        # second commit is that base, which `cargo xtask affected` diffs against.
+        fetch-depth: 2
+        persist-credentials: false
+
+    - name: Install Rust Toolchain Components
+      uses: dtolnay/rust-toolchain@stable
+
+    # Only main saves. A pull request's cache is scoped to its own ref, so no
+    # other pull request can restore it; saving one cost each job minutes of
+    # upload and pushed the 10 GB repository quota into evicting main's caches.
+    # Main saves even when a test fails, since the dependencies it built are
+    # still good; it was red for weeks, leaving every run without a cache.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+        cache-on-failure: true
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+
+    # Pull requests test only the packages their change can affect (see
+    # .config/affected.toml), and so does Mergify's merge queue, whose batches
+    # are pull requests too. Only main runs everything, so a missing edge in
+    # that file first fails there. Each OS computes its own list because
+    # target-specific dependencies differ. The list becomes a nextest filter:
+    # the archive holds every package's tests, and `-p` can't select from an
+    # archive.
+    - name: Select affected packages
+      id: affected
+      run: |
+        set -euo pipefail
+        if [ "${{ github.event_name }}" = pull_request ]; then
+          args="$(cargo xtask affected --base HEAD^1)"
+        else
+          args="--workspace"
+        fi
+        filter=""
+        for word in ${args}; do
+          case "${word}" in
+            -p) ;;
+            --workspace) filter="all()" ;;
+            *) filter="${filter:+${filter} | }package(=${word})" ;;
+          esac
+        done
+        echo "Testing: ${filter:-nothing}"
+        echo "filter=${filter}" >> "${GITHUB_OUTPUT}"
+
+    # Tests spawn sibling bins by path (the worker, tool servers,
+    # harnx-mcp-repro249, ...) from crates they don't depend on, so every run
+    # builds every bin; with no tests to run, that still checks that every
+    # crate compiles without warnings on this OS. Building the tests then
+    # rebuilds the crates whose features the dev-dependencies change. The
+    # archive is always the whole workspace, since compiling only the selected
+    # packages' tests resolves features differently again and rebuilt about
+    # 140 dependencies.
+    - name: Build workspace binaries
+      run: cargo build --workspace --bins
+
+    - name: Build and archive the tests
+      if: steps.affected.outputs.filter != ''
+      run: cargo nextest archive --workspace --archive-file nextest-archive.tar.zst
+
+    # The archive holds the test binaries and only the bins an integration
+    # test names through `CARGO_BIN_EXE_...`; the rest, such as
+    # harnx-mock-mcp, tests find next to their own executable or under the
+    # workspace's target/debug. The test jobs unpack these into that same
+    # target/debug. Picking them out by mode, rather than listing them, keeps
+    # new bins working without an edit here.
+    - name: Pack the workspace binaries
+      if: steps.affected.outputs.filter != ''
+      run: |
+        set -euo pipefail
+        find target/debug -maxdepth 1 -type f \( -perm -u+x -o -name '*.exe' \) > bins.txt
+        echo "$(wc -l < bins.txt) binaries"
+        tar -cf workspace-bins.tar -T bins.txt
+
+    - name: Upload the test archive
+      if: steps.affected.outputs.filter != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: tests-${{ inputs.os }}
+        path: |
+          nextest-archive.tar.zst
+          workspace-bins.tar
+        if-no-files-found: error
+        retention-days: 1
+        # The nextest archive is already zstd-compressed; the fastest level
+        # still roughly quarters the bins' tar.
+        compression-level: 1
+
+  test:
+    name: Test (${{ matrix.partition }}/${{ strategy.job-total }})
+    needs: build
+    if: needs.build.outputs.filter != ''
+    runs-on: ${{ inputs.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ${{ fromJSON(inputs.partitions) }}
+
+    env:
+      # Insta: update snapshots instead of failing (for PR review)
+      # Set to "no" for actual CI, developers can use "yes" locally
+      INSTA_UPDATE: "no"
+
+    steps:
+    # Tests read files from the source tree at the absolute paths
+    # `env!("CARGO_MANIFEST_DIR")` compiled in, which match because every
+    # runner of an OS checks out to the same directory.
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    # The archive needs no compiler, but xtask's `affected` tests run cargo.
+    - name: Install Rust Toolchain Components
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+
+    - name: Install nats-server (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        set -euo pipefail
+        VERSION="v2.11.6"
+        ASSET="nats-server-${VERSION}-linux-amd64.tar.gz"
+        # Pinned digest for the pinned VERSION. GitHub releases are mutable, so
+        # the tag alone does not pin the bytes, and the release's own SHA256SUMS
+        # is served from the same place as the tarball — fetching it would prove
+        # nothing an attacker who can replace one can't also replace.
+        SHA256="5e5272dd1bdb8da020aedc8cf883fb26c128441809a992f156e0b1ccb28ac5b7"
+        DOWNLOAD_URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${ASSET}"
+        BINDIR="${HOME}/.local/bin"
+        mkdir -p "${BINDIR}"
+        TMPDIR_DL="$(mktemp -d)"
+        # Download to a file rather than piping into tar. A retry can't resume a
+        # stream tar has already started reading, and an HTTP error body piped to
+        # tar surfaces as "tar: Error is not recoverable" instead of naming the
+        # failed download.
+        curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 2 \
+          --location --silent --show-error --fail --output "${TMPDIR_DL}/${ASSET}" "${DOWNLOAD_URL}"
+        echo "${SHA256}  ${TMPDIR_DL}/${ASSET}" | shasum -a 256 --check --status \
+          || { echo "::error::nats-server checksum mismatch for ${ASSET}"; exit 1; }
+        tar -xzf "${TMPDIR_DL}/${ASSET}" -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-linux-amd64/nats-server"
+        chmod +x "${BINDIR}/nats-server"
+        echo "${BINDIR}" >> "${GITHUB_PATH}"
+
+    # Every test runs inside a bubblewrap sandbox (scripts/nextest-sandbox).
+    # The sandbox can't reach the host's DNS stub, so RFC 6761 *.localhost
+    # names, which tracing_e2e connects to, resolve only through
+    # nss-myhostname.
+    - name: Install bubblewrap (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        set -euo pipefail
+        scripts/ci-install-bubblewrap libnss-myhostname
+        NEXTEST=1 NEXTEST_ATTEMPT_ID=ci scripts/nextest-sandbox getent hosts probe.localhost
+
+    # Local execution routes through a shared nats-server, so the one-shot / TUI
+    # e2e tests need the binary on every OS (they skip cleanly if it is absent,
+    # but we want real coverage here).
+    - name: Install nats-server (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        set -euo pipefail
+        VERSION="v2.11.6"
+        ARCH="$(uname -m)"
+        # See the Linux step for why the digests are pinned here rather than fetched.
+        case "${ARCH}" in
+          arm64)
+            NATS_ARCH="arm64"
+            SHA256="1a78170526e18a41ca2a24e6eaa00e95d39c677e1d5bfc56d3f662a114324e17"
+            ;;
+          x86_64)
+            NATS_ARCH="amd64"
+            SHA256="6c8f0cf8bc879db372ce0edca34c0178845e92286fac47db1a6a0f5eff59daef"
+            ;;
+          *) echo "unsupported macOS arch: ${ARCH}" >&2; exit 1 ;;
+        esac
+        ASSET="nats-server-${VERSION}-darwin-${NATS_ARCH}.tar.gz"
+        DOWNLOAD_URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${ASSET}"
+        BINDIR="${HOME}/.local/bin"
+        mkdir -p "${BINDIR}"
+        TMPDIR_DL="$(mktemp -d)"
+        # See the Linux step for why this downloads to a file first.
+        curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 2 \
+          --location --silent --show-error --fail --output "${TMPDIR_DL}/${ASSET}" "${DOWNLOAD_URL}"
+        echo "${SHA256}  ${TMPDIR_DL}/${ASSET}" | shasum -a 256 --check --status \
+          || { echo "::error::nats-server checksum mismatch for ${ASSET}"; exit 1; }
+        tar -xzf "${TMPDIR_DL}/${ASSET}" -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-darwin-${NATS_ARCH}/nats-server"
+        chmod +x "${BINDIR}/nats-server"
+        echo "${BINDIR}" >> "${GITHUB_PATH}"
+
+    - name: Install nats-server (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $version = 'v2.11.6'
+        $asset = "nats-server-$version-windows-amd64.zip"
+        $sha256 = '947aea642cc2b7b688a11a71c36c80a030cabb109167246ca1f8fbf30dc1c83b'
+        $downloadUrl = "https://github.com/nats-io/nats-server/releases/download/$version/$asset"
+        $downloadDir = Join-Path $env:RUNNER_TEMP 'nats-server-download'
+        $binDir = Join-Path $env:RUNNER_TEMP 'nats-server-bin'
+        New-Item -ItemType Directory -Force -Path $downloadDir, $binDir | Out-Null
+        $archive = Join-Path $downloadDir $asset
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $archive
+        $actualSha256 = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+        if ($actualSha256 -ne $sha256) {
+          throw "nats-server checksum mismatch for $asset"
+        }
+        Expand-Archive -Path $archive -DestinationPath $downloadDir -Force
+        $source = Join-Path $downloadDir "nats-server-$version-windows-amd64/nats-server.exe"
+        Copy-Item $source (Join-Path $binDir 'nats-server.exe')
+        $binDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        & (Join-Path $binDir 'nats-server.exe') --version
+        if ($LASTEXITCODE -ne 0) {
+          throw "nats-server.exe --version failed with exit code $LASTEXITCODE"
+        }
+
+    # The test sandbox runs tests offline, and xtask's `affected` tests run
+    # `cargo metadata`, which needs the crates of every target platform. No
+    # other test reads the registry, and this job restores no cargo cache, so
+    # it fetches only for those.
+    - name: Fetch crates for every platform
+      if: needs.build.outputs.filter == 'all()' || contains(needs.build.outputs.filter, '(=xtask)')
+      run: cargo fetch --locked
+
+    - name: Download the test archive
+      uses: actions/download-artifact@v8
+      with:
+        name: tests-${{ inputs.os }}
+
+    - name: Unpack the workspace binaries
+      run: tar -xf workspace-bins.tar
+
+    # Unpacking into the checkout, rather than nextest's default temporary
+    # directory, puts the test binaries in target/ where the paths compiled
+    # into them point.
+    - name: Test
+      # Use the `ci` nextest profile (.config/nextest.toml): retries transient
+      # timing flakes from the broker/worker/e2e tests and reports all failures
+      # per run (fail-fast = false) instead of aborting on the first.
+      env:
+        FILTER: ${{ needs.build.outputs.filter }}
+      run: >-
+        cargo nextest run --profile ci
+        --archive-file nextest-archive.tar.zst
+        --workspace-remap . --extract-to . --extract-overwrite
+        --partition "slice:${{ matrix.partition }}/${{ strategy.job-total }}"
+        -E "${FILTER}"
+
+    - name: Check for pending snapshot updates
+      if: failure()
+      run: |
+        if ls crates/harnx-tui/src/snapshots/*.snap.new 2>/dev/null; then
+          echo "::error::Snapshot updates pending. Run 'cargo insta review' locally to review and accept changes."
+          exit 1
+        fi
