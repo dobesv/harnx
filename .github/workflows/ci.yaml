@@ -64,7 +64,11 @@ jobs:
     name: All
     needs: changes
 
+    # A failure on one OS must not cancel the others. On main, a cancelled job
+    # saves no cache, so after every red main run each pull request on that OS
+    # built its dependencies from scratch.
     strategy:
+      fail-fast: false
       matrix:
         os:
         - ubuntu-latest
@@ -95,8 +99,16 @@ jobs:
       if: needs.changes.outputs.rust == 'true'
       uses: dtolnay/rust-toolchain@stable
 
+    # Only main saves. A pull request's cache is scoped to its own ref, so no
+    # other pull request can restore it; saving one cost each job minutes of
+    # upload and pushed the 10 GB repository quota into evicting main's caches.
+    # Main saves even when a test fails, since the dependencies it built are
+    # still good; it was red for weeks, leaving every run without a cache.
     - uses: Swatinem/rust-cache@v2
       if: needs.changes.outputs.rust == 'true'
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+        cache-on-failure: true
 
     - name: Install cargo-nextest
       if: needs.changes.outputs.rust == 'true'
@@ -105,9 +117,10 @@ jobs:
         tool: cargo-nextest
 
     # Pull requests test only the packages their change can affect (see
-    # .config/affected.toml). The merge queue and main always run everything,
-    # so a missing edge in that file cannot let a break reach main. Each OS
-    # computes its own list because target-specific dependencies differ.
+    # .config/affected.toml), and so does Mergify's merge queue, whose batches
+    # are pull requests too. Only main runs everything, so a missing edge in
+    # that file first fails there. Each OS computes its own list because
+    # target-specific dependencies differ.
     - name: Select affected packages
       id: affected
       if: needs.changes.outputs.rust == 'true'
@@ -231,6 +244,13 @@ jobs:
         if ($LASTEXITCODE -ne 0) {
           throw "nats-server.exe --version failed with exit code $LASTEXITCODE"
         }
+
+    # The test sandbox runs tests offline, and xtask's `affected` tests run
+    # `cargo metadata`, which needs the crates of every target platform, not
+    # just the ones this host's build downloaded.
+    - name: Fetch crates for every platform
+      if: needs.changes.outputs.rust == 'true' && steps.affected.outputs.args != ''
+      run: cargo fetch --locked
 
     - name: Test
       # Use the `ci` nextest profile (.config/nextest.toml): retries transient

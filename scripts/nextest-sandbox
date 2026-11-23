@@ -61,7 +61,20 @@ if [ -r /proc/self/environ ]; then
         allowed "${entry%%=*}" && pairs+=("$entry")
     done </proc/self/environ
 else
+    # Without /proc (macOS), read every variable bash can hold from bash
+    # itself. A command substitution per variable forked twice for each of the
+    # ~60 that pass, which cost every test about 0.3s on GitHub's macOS
+    # runners, half an hour of CPU time across the suite.
     while IFS= read -r name; do
+        allowed "$name" && pairs+=("$name=${!name}")
+    done < <(compgen -e)
+    # The rest, such as CARGO_BIN_EXE_harnx-bash-tools, aren't valid shell
+    # names, so only printenv can read them.
+    while IFS= read -r name; do
+        case "$name" in
+            [0-9]* | *[!A-Za-z0-9_]*) ;;
+            *) continue ;;
+        esac
         allowed "$name" || continue
         # The `.` stops the command substitution from stripping the value's
         # own trailing newlines; then drop it and the newline printenv adds.
