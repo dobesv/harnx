@@ -720,3 +720,31 @@ async fn grep_skips_an_unreadable_file_inside_a_searched_directory() {
     assert_eq!(fields["matches"].as_array().map(Vec::len), Some(1));
     assert_eq!(fields["exit_code"], json!(0));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_on_a_special_file_is_an_error() {
+    // A character device stands in for a FIFO: it is neither a regular file
+    // nor a directory, and the crate has no direct dependency that creates a
+    // FIFO.
+    let temp_dir = TestDir::new();
+    let server = FsServer::new(rwx_allowlist([PathBuf::from("/dev")]));
+    for style in [ResultStyle::Model, ResultStyle::Script] {
+        let params = SearchFilesParams {
+            pattern: "needle".to_string(),
+            path: Some("/dev/null".to_string()),
+            include: None,
+            context_lines: Some(0),
+            ignore_case: Some(false),
+            max_results: None,
+        };
+        let err = server.search_files_impl(params, style).await.unwrap_err();
+        assert!(err.message.contains("/dev/null"), "{}", err.message);
+        assert!(
+            err.message.contains("not a regular file"),
+            "{}",
+            err.message
+        );
+    }
+    drop(temp_dir);
+}

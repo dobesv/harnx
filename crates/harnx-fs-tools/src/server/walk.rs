@@ -114,26 +114,23 @@ pub(crate) fn walk_dir_recursive(
     }
 }
 
+/// What `grep` searches with, whether `path` names a directory or one file.
+pub(crate) struct GrepSearch<'a> {
+    pub(crate) regex: &'a Regex,
+    pub(crate) include_glob: Option<&'a glob::Pattern>,
+    pub(crate) context_lines: usize,
+    pub(crate) max_results: usize,
+}
+
+/// Walk a directory that is already open.
 pub(crate) fn search_recursive(
+    search: &GrepSearch<'_>,
     base: &Path,
-    dir: &Path,
-    regex: &Regex,
-    context_lines: usize,
-    max_results: usize,
-    include_glob: Option<&glob::Pattern>,
+    read_dir: std::fs::ReadDir,
     results: &mut Vec<SearchLine>,
 ) {
-    if results.len() >= max_results {
-        return;
-    }
-
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(read_dir) => read_dir,
-        Err(_) => return,
-    };
-
     for entry in read_dir {
-        if results.len() >= max_results {
+        if results.len() >= search.max_results {
             return;
         }
 
@@ -155,15 +152,7 @@ pub(crate) fn search_recursive(
 
         if file_type.is_dir() {
             if !SKIP_DIRS.contains(&name.as_str()) {
-                search_recursive(
-                    base,
-                    &path,
-                    regex,
-                    context_lines,
-                    max_results,
-                    include_glob,
-                    results,
-                );
+                search_subdir(search, base, &path, results);
             }
             continue;
         }
@@ -172,43 +161,51 @@ pub(crate) fn search_recursive(
             continue;
         }
 
-        if let Some(glob) = include_glob {
-            if !glob.matches(&name) {
-                continue;
-            }
+        if search.include_glob.is_some_and(|glob| !glob.matches(&name)) {
+            continue;
         }
 
-        search_file(base, &path, regex, context_lines, max_results, results);
+        if let Some(content) = load_walked_file(&path) {
+            search_file(search, base, &path, &content, results);
+        }
     }
 }
 
+/// Descend into a directory met while walking; one that can't be opened is
+/// skipped.
+fn search_subdir(search: &GrepSearch<'_>, base: &Path, dir: &Path, results: &mut Vec<SearchLine>) {
+    let opened = std::fs::read_dir(dir);
+    opened
+        .into_iter()
+        .for_each(|read_dir| search_recursive(search, base, read_dir, results));
+}
+
+/// Read a file met while walking a directory. One that is unreadable, over
+/// the size limit or binary is skipped, as `grep -rs` does.
+fn load_walked_file(file: &Path) -> Option<Vec<u8>> {
+    let metadata = std::fs::metadata(file).ok()?;
+    if metadata.len() > SEARCH_FILE_MAX_BYTES {
+        return None;
+    }
+    let content = std::fs::read(file).ok()?;
+    (!is_binary_content(&content)).then_some(content)
+}
+
+/// Search the loaded content of `file`, naming rows relative to `base`.
 pub(crate) fn search_file(
+    search: &GrepSearch<'_>,
     base: &Path,
     file: &Path,
-    regex: &Regex,
-    context_lines: usize,
-    max_results: usize,
+    content: &[u8],
     results: &mut Vec<SearchLine>,
 ) {
+    let (regex, context_lines, max_results) =
+        (search.regex, search.context_lines, search.max_results);
     if results.len() >= max_results {
         return;
     }
 
-    let _metadata = match std::fs::metadata(file) {
-        Ok(metadata) if metadata.len() <= SEARCH_FILE_MAX_BYTES => metadata,
-        _ => return,
-    };
-
-    let content = match std::fs::read(file) {
-        Ok(content) => content,
-        Err(_) => return,
-    };
-
-    if is_binary_content(&content) {
-        return;
-    }
-
-    let text = String::from_utf8_lossy(&content);
+    let text = String::from_utf8_lossy(content);
     let lines = text.lines().collect::<Vec<_>>();
     let relative = file
         .strip_prefix(base)
@@ -216,32 +213,14 @@ pub(crate) fn search_file(
         .display()
         .to_string();
 
-    let mut match_indices = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        if results.len() + match_indices.len() >= max_results {
-            break;
-        }
-        if let Ok(true) = regex.is_match(line) {
-            match_indices.push(index);
-        }
-    }
+    let room = max_results.saturating_sub(results.len());
+    let match_indices = matching_lines(regex, &lines, room);
 
     if match_indices.is_empty() {
         return;
     }
 
-    let mut blocks = Vec::<(usize, usize)>::new();
-    for &index in &match_indices {
-        let start = index.saturating_sub(context_lines);
-        let end = (index + context_lines).min(lines.len().saturating_sub(1));
-        if let Some(last) = blocks.last_mut() {
-            if start <= last.1 + 1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
-        }
-        blocks.push((start, end));
-    }
+    let blocks = context_blocks(&match_indices, context_lines, lines.len());
 
     for (block_index, (start, end)) in blocks.iter().enumerate() {
         if block_index > 0 {
@@ -262,4 +241,34 @@ pub(crate) fn search_file(
             }
         }
     }
+}
+
+/// Merge the context windows around each match into inclusive line ranges.
+fn context_blocks(
+    matches: &[usize],
+    context_lines: usize,
+    line_count: usize,
+) -> Vec<(usize, usize)> {
+    let mut blocks = Vec::<(usize, usize)>::new();
+    for &index in matches {
+        let start = index.saturating_sub(context_lines);
+        let end = (index + context_lines).min(line_count.saturating_sub(1));
+        if let Some(last) = blocks.last_mut() {
+            if start <= last.1 + 1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        blocks.push((start, end));
+    }
+    blocks
+}
+
+/// Indices of the first `room` lines the regex matches.
+fn matching_lines(regex: &Regex, lines: &[&str], room: usize) -> Vec<usize> {
+    let matching = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| matches!(regex.is_match(line), Ok(true)));
+    matching.map(|(index, _)| index).take(room).collect()
 }

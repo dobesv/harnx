@@ -891,20 +891,21 @@ impl FsServer {
             None => default_search_path(&self.allowlist)?,
         };
 
-        check_search_target(&search_path, params.path.as_deref().unwrap_or("workspace"))?;
+        let target =
+            open_search_target(&search_path, params.path.as_deref().unwrap_or("workspace"))?;
         let (regex, include_glob) = Self::compile_search(&params)?;
 
         let context_lines = params.context_lines.unwrap_or(0);
         let max_results = params.max_results.unwrap_or(DEFAULT_GREP_LIMIT);
         let mut results = Vec::new();
-        let single_file = search_path.is_file();
+        let single_file = matches!(target, SearchTarget::File(_));
         let search = GrepSearch {
             regex: &regex,
             include_glob: include_glob.as_ref(),
             context_lines,
             max_results: max_results + 1,
         };
-        search.run(&search_path, &mut results);
+        search.run(&search_path, target, &mut results);
 
         // Decided before the cap: a zero limit still found something. Rows
         // are only collected around a match, so any row means a match.
@@ -1045,42 +1046,48 @@ impl FsServer {
     }
 }
 
-/// What `grep` searches with, whether `path` names a directory or one file.
-struct GrepSearch<'a> {
-    regex: &'a Regex,
-    include_glob: Option<&'a glob::Pattern>,
-    context_lines: usize,
-    max_results: usize,
-}
-
 impl GrepSearch<'_> {
-    // qual:allow(iosp) — one branch choosing between two searches
-    fn run(&self, search_path: &Path, results: &mut Vec<SearchLine>) {
-        let (regex, context, max) = (self.regex, self.context_lines, self.max_results);
-        if search_path.is_file() {
+    fn run(&self, search_path: &Path, target: SearchTarget, results: &mut Vec<SearchLine>) {
+        match target {
             // `grep PATTERN FILE` searches that file; `include` only filters
             // files found by walking a directory.
-            let base = search_path.parent().unwrap_or(search_path);
-            search_file(base, search_path, regex, context, max, results);
-        } else {
-            let glob = self.include_glob;
-            search_recursive(search_path, search_path, regex, context, max, glob, results);
+            SearchTarget::File(content) => {
+                let base = search_path.parent().unwrap_or(search_path);
+                search_file(self, base, search_path, &content, results);
+            }
+            SearchTarget::Dir(read_dir) => {
+                search_recursive(self, search_path, read_dir, results);
+            }
         }
     }
 }
 
-/// Fail when the path the caller named can't be searched.
+/// What a search target holds once it is open.
+enum SearchTarget {
+    Dir(std::fs::ReadDir),
+    File(Vec<u8>),
+}
+
+/// Open the path the caller named, once, and report why it can't be searched.
 ///
 /// Entries met while walking a directory are skipped when unreadable, too
 /// large or binary, as `grep -rs` does. The path the caller named is
 /// different: skipping it would return no rows, which a script reads as
 /// "nothing matched" and a model as "No matches found", although nothing was
-/// searched.
-fn check_search_target(search_path: &Path, given: &str) -> Result<(), ErrorData> {
+/// searched. Anything that is neither a directory nor a regular file is
+/// refused unopened, since reading a FIFO blocks until a writer appears.
+fn open_search_target(search_path: &Path, given: &str) -> Result<SearchTarget, ErrorData> {
     let cannot = |err: std::io::Error| internal_error(format!("cannot search '{given}': {err}"));
     let metadata = std::fs::metadata(search_path).map_err(cannot)?;
     if metadata.is_dir() {
-        return std::fs::read_dir(search_path).map(drop).map_err(cannot);
+        return std::fs::read_dir(search_path)
+            .map(SearchTarget::Dir)
+            .map_err(cannot);
+    }
+    if !metadata.is_file() {
+        return Err(internal_error(format!(
+            "'{given}' is not a regular file or directory"
+        )));
     }
     if metadata.len() > SEARCH_FILE_MAX_BYTES {
         return Err(internal_error(format!(
@@ -1095,7 +1102,7 @@ fn check_search_target(search_path: &Path, given: &str) -> Result<(), ErrorData>
             "'{given}' appears to be a binary file."
         )));
     }
-    Ok(())
+    Ok(SearchTarget::File(content))
 }
 
 /// Name the searched file by the argument exactly as the caller gave it. The
