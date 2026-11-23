@@ -5,6 +5,8 @@ use base64::Engine;
 use harnx_core::{attachments::cid_for_data_url_with_session, cid_url::SessionRef};
 use harnx_toolset::{ToolErrorPayload, ToolReply, ToolRequest};
 
+mod images;
+
 /// Keep the original until a bounded completion wins its journal CAS. A retry
 /// can have less room after a concurrent checkpoint/partial-result update.
 pub(crate) struct PendingReply {
@@ -12,6 +14,13 @@ pub(crate) struct PendingReply {
     original_bytes: Vec<u8>,
     wire_bytes: usize,
     retained: Option<Option<String>>,
+    /// Cached image-projection plan: outer `None` = not planned yet, inner
+    /// `None` = not applicable. Planning decodes base64, so run it at most
+    /// once per completion, across CAS and typed-size retries.
+    offload: Option<Option<images::ImageOffload>>,
+    /// Uploads the object store has acknowledged. CAS retries reuse them
+    /// instead of re-putting the same content-addressed blobs.
+    uploaded: std::collections::HashSet<String>,
 }
 
 impl PendingReply {
@@ -22,22 +31,75 @@ impl PendingReply {
             original_bytes,
             wire_bytes,
             retained: None,
+            offload: None,
+            uploaded: std::collections::HashSet::new(),
         })
     }
 
+    /// Fit the reply within `budget`: inline when it fits, then (when
+    /// `allow_images` is set) the image projection, then a retained size
+    /// error. The error keeps the original outcome's category — only a
+    /// successful reply becomes Recoverable. `allow_images` is `true` only
+    /// on the `complete_for_delivery` path; raw `InvocationJournal::complete`
+    /// still bounds and may size-error-swap, but keeps the existing
+    /// metadata contract — no `finalize_journal_reply` attestation, no
+    /// image offload — so recovery callers such as deadline_recovery
+    /// (`harnx-runtime/src/nats_worker/agent_loop/deadline_recovery.rs`)
+    /// commit reconstructed replies without session-owned links.
     pub(crate) async fn bounded(
         &mut self,
         attachments: &ReplyAttachments<'_>,
         budget: usize,
         force_size_error: bool,
+        allow_images: bool,
     ) -> Result<ToolReply> {
         if !force_size_error && self.wire_bytes <= budget {
             return Ok(self.candidate.clone());
+        }
+        if allow_images {
+            if let Some(reply) = self.offload(attachments, budget).await? {
+                return Ok(reply);
+            }
         }
         if self.retained.is_none() {
             self.retained = Some(attachments.retain(&self.original_bytes).await?);
         }
         self.size_error_within(budget)
+    }
+
+    /// Project eligible image blocks into session attachments when the
+    /// projected reply fits `budget`. Uploads happen only after the fit is
+    /// known: a failed upload is fatal and never degrades into a link without
+    /// a stored blob behind it, nor into an oversized inline reply.
+    async fn offload(
+        &mut self,
+        attachments: &ReplyAttachments<'_>,
+        budget: usize,
+    ) -> Result<Option<ToolReply>> {
+        if self.offload.is_none() {
+            self.offload = Some(images::plan_image_offload(
+                &self.candidate,
+                attachments.owner(),
+            ));
+        }
+        let Some(plan) = self.offload.as_ref().and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        if encoded_len(&plan.reply)? > budget {
+            return Ok(None);
+        }
+        let pending: Vec<&images::ImageUpload> = plan
+            .uploads
+            .iter()
+            .filter(|upload| !self.uploaded.contains(&upload.id))
+            .collect();
+        if !pending.is_empty() {
+            attachments.store_image_uploads(&pending).await?;
+            for upload in pending {
+                self.uploaded.insert(upload.id.clone());
+            }
+        }
+        Ok(Some(plan.reply.clone()))
     }
 
     fn size_error_within(&self, budget: usize) -> Result<ToolReply> {
@@ -110,6 +172,38 @@ impl<'a> SessionAttachments<'a> {
             js,
             replicas,
         }
+    }
+
+    /// The trusted owner attachments are stored under, if any.
+    pub fn owner(&self) -> Option<&SessionRef> {
+        self.owner.as_ref()
+    }
+
+    /// Store decoded image bytes for an offloaded block at their content CID.
+    /// Unlike [`Self::retain`] this requires a trusted owner: the caller emits
+    /// a `resource_link` pointing at the blob, so there is no silent no-op.
+    pub(crate) async fn store_image_uploads(&self, uploads: &[&images::ImageUpload]) -> Result<()> {
+        let Some(session) = &self.owner else {
+            bail!("image offload requires a trusted attachment owner");
+        };
+        let store = harnx_blob_store::create_or_open_attachments_bucket(self.js, self.replicas)
+            .await
+            .context("open tool reply attachment storage")?;
+        for upload in uploads {
+            harnx_blob_store::media::put_media_with_chunk_limit(
+                &store,
+                harnx_blob_store::media::MediaBlob {
+                    url: &upload.url,
+                    bytes: &upload.bytes,
+                    mime_type: &upload.mime_type,
+                },
+                self.js.client().server_info().max_payload,
+            )
+            .await
+            .context("store oversized tool image")?;
+        }
+        let _ = harnx_blob_store::touch_activity(self.js, &session.owner()).await;
+        Ok(())
     }
 
     /// Retain `original_bytes` as a `cid:media:` attachment and return its URL.
@@ -186,6 +280,14 @@ impl<'a> ReplyAttachments<'a> {
         Self {
             attachments: SessionAttachments::for_owner(attachment_owner(request), js, replicas),
         }
+    }
+
+    fn owner(&self) -> Option<&SessionRef> {
+        self.attachments.owner()
+    }
+
+    async fn store_image_uploads(&self, uploads: &[&images::ImageUpload]) -> Result<()> {
+        self.attachments.store_image_uploads(uploads).await
     }
 
     async fn retain(&self, original_bytes: &[u8]) -> Result<Option<String>> {

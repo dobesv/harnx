@@ -1740,6 +1740,19 @@ after the limit is raised, and lowering the limit below a message's delivery
 count drops it without the max-deliveries advisory. See "Delivery limits" in
 `docs/nats-ha.md`.
 
+### `kv::Store::status()` serves cached stream info
+
+`kv::Store::status()` clones the stream's cached info, so a `max_message_size`
+or other limit changed after the handle was opened stays invisible to it.
+When a size-rejection retry must plan against the limit that actually rejected
+the write, read the config fresh with `jetstream.get_stream(...).info()`.
+`InvocationJournal::complete_bounded` hit this: its typed-size retry re-planned
+an image offload against a stale ~1 MiB budget, and the real 8192-byte row cap
+turned the single retry into a fatal completion
+(`crates/harnx-toolset-server/src/invocation_journal/completion.rs`).
+Reading a config just to modify and update it in one step is fine with
+`status()`, which is why several test helpers still use it.
+
 ### Interrupt acceptance
 
 Interruption is established by one durable `Cancel` entry in the session log and

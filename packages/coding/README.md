@@ -114,7 +114,7 @@ The package includes ready-to-use tool server configs in `tool_servers/`. Bundle
 | `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Opts into repository and development-tool allow batches. |
 | `plans.yaml` | `plans_*` | None (bundled binary) | NATS-backed plan/task tracking using canonical `cid:plan:` URLs. |
 | `time.yaml` | `time_*` | None (bundled binary) | Current time and wait utilities. |
-| `fetch.yaml` | `fetch_*` | None (bundled binary) | Fetches URLs as markdown or text. No API key. |
+| `fetch.yaml` | `fetch_*` | None (bundled binary) | Fetches URLs as markdown, text, or JSON, and PNG, JPEG, GIF, or WebP images up to 5 MiB. No API key. |
 | `exa.yaml` | `exa_*` | None (bundled binary) | Web search via Exa. Requires `EXA_API_KEY`. |
 | `context7.yaml` | `context7_*` | Node.js / npx | Library docs lookup. No API key. |
 | `grep.yaml` | `grep_*` | None (bundled binary) | GitHub code search via grep.app. No API key. |

@@ -107,7 +107,7 @@ impl McpBridge {
     }
 }
 
-fn binary(name: &str) -> Result<PathBuf> {
+pub(in super::super) fn binary(name: &str) -> Result<PathBuf> {
     let mut path = std::env::current_exe()?;
     path.pop();
     if path.ends_with("deps") {

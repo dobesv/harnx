@@ -5205,6 +5205,7 @@ dependencies = [
  "bitflags 2.13.2",
  "bytes",
  "chrono",
+ "crc32fast",
  "crossterm",
  "dirs 7.0.0",
  "duct",
@@ -5276,6 +5277,7 @@ dependencies = [
  "unicode-width 0.2.3",
  "uuid",
  "which",
+ "wiremock",
 ]
 
 [[package]]
