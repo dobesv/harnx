@@ -133,9 +133,10 @@ jobs:
       run: cargo fmt --all --check
 
   # The checks .mergify.yml and the main branch ruleset require. Each one
-  # passes when its OS's jobs passed or were skipped because nothing
-  # Rust-affecting changed, and fails when any failed or was cancelled,
-  # including `changes` itself, whose failure skips everything after it.
+  # passes when `changes` passed and either nothing Rust-affecting changed or
+  # its OS's workflow says it passed. They check that output rather than the
+  # call's result, which looked like a pass when GitHub cancelled a macOS
+  # build that no runner picked up.
   all-linux:
     name: All (ubuntu-latest)
     needs: [changes, linux, lint]
@@ -143,7 +144,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Require the Linux jobs to pass
-      if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+      if: needs.changes.result != 'success' || (needs.changes.outputs.rust == 'true' && needs.linux.outputs.passed != 'true') || (needs.changes.outputs.rust == 'true' && needs.lint.result != 'success')
       run: exit 1
 
   all-macos:
@@ -153,7 +154,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Require the macOS jobs to pass
-      if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+      if: needs.changes.result != 'success' || (needs.changes.outputs.rust == 'true' && needs.macos.outputs.passed != 'true')
       run: exit 1
 
   all-windows:
@@ -163,7 +164,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Require the Windows jobs to pass
-      if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+      if: needs.changes.result != 'success' || (needs.changes.outputs.rust == 'true' && needs.windows.outputs.passed != 'true')
       run: exit 1
 
   # Fails a pull request that adds rustqual findings or makes existing ones

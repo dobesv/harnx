@@ -22,6 +22,14 @@ on:
           CPUs, which is what one job alone would take.
         type: string
         required: true
+    outputs:
+      passed:
+        description: >-
+          "true" only when the build passed and so did every test job, or
+          there were no tests to run. The caller's result for this workflow
+          isn't enough: a build GitHub cancelled because no macOS runner
+          picked it up left that result looking like a pass.
+        value: ${{ jobs.result.outputs.passed }}
 
 defaults:
   run:
@@ -311,5 +319,29 @@ jobs:
       run: |
         if ls crates/harnx-tui/src/snapshots/*.snap.new 2>/dev/null; then
           echo "::error::Snapshot updates pending. Run 'cargo insta review' locally to review and accept changes."
+          exit 1
+        fi
+
+  # Runs whatever happened above, including a cancelled build, and fails
+  # unless everything it needs passed.
+  result:
+    name: Result
+    needs: [build, test]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+    steps:
+    - name: Require the build and every test job to pass
+      id: check
+      env:
+        BUILD: ${{ needs.build.result }}
+        TEST: ${{ needs.test.result }}
+        FILTER: ${{ needs.build.outputs.filter }}
+      run: |
+        echo "Build: ${BUILD}; tests: ${TEST}; selection: ${FILTER:-nothing}"
+        if [ "${BUILD}" = success ] && { [ "${TEST}" = success ] || { [ "${TEST}" = skipped ] && [ -z "${FILTER}" ]; }; }; then
+          echo "passed=true" >> "${GITHUB_OUTPUT}"
+        else
           exit 1
         fi
