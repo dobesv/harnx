@@ -207,6 +207,26 @@ enum DiscoveryPolicy<'a> {
     Strict(Option<&'a str>),
 }
 
+/// The registry revision evidence a discovery scan captured.
+///
+/// `Sequence(0)` is a proof, not an absence: the stream did not exist when
+/// the scan started. `Unread` means the pre-scan revision read failed and
+/// the scan's snapshot carries no revision proof — the discovery cache must
+/// not store a fabricated 0 in its place, or a later bucket deletion would
+/// probe `Some(0)`, match, and serve removed tools until the TTL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegistryRevision {
+    /// The registry stream's sequence when the scan started.
+    Sequence(u64),
+    /// The pre-scan revision read failed; no proof exists.
+    Unread,
+}
+
+/// Upper bound on a cached lookup's freshness probe. A partitioned broker
+/// must not stall every completion for the client's default 10 s request
+/// timeout; the probe degrades to the watch-epoch fallback after this.
+const REGISTRY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl<'a> DiscoveryPolicy<'a> {
     /// The package the snapshot is scoped to, and whether discovery must
     /// fail (`Strict`) instead of degrading when the registry is not
@@ -307,8 +327,11 @@ impl NatsToolProvider {
         in_flight: NatsInFlightCalls,
         active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let policy = DiscoveryPolicy::BestEffort(active_package);
-        Self::discover_inner(config, instance_id, in_flight, policy).await
+        Ok(
+            Self::discover_with_registry_revision(config, instance_id, in_flight, active_package)
+                .await?
+                .0,
+        )
     }
 
     /// Operator discovery must distinguish an empty catalog from a failed scan.
@@ -319,7 +342,56 @@ impl NatsToolProvider {
         active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
         let policy = DiscoveryPolicy::Strict(active_package);
+        Self::discover_inner(config, instance_id, in_flight, policy)
+            .await
+            .map(|(provider, _)| provider)
+    }
+
+    /// Like [`Self::discover`], but also returns the registry revision
+    /// evidence the scan captured (decision 5b), so the discovery cache can
+    /// prove freshness without a second connection: both the revision read
+    /// and the scan run on this discovery's own transport.
+    pub(crate) async fn discover_with_registry_revision(
+        config: &Config,
+        instance_id: ServerScope,
+        in_flight: NatsInFlightCalls,
+        active_package: Option<&str>,
+    ) -> anyhow::Result<(Self, RegistryRevision)> {
+        let policy = DiscoveryPolicy::BestEffort(active_package);
         Self::discover_inner(config, instance_id, in_flight, policy).await
+    }
+
+    /// The registry stream sequence as seen through this snapshot's own
+    /// connection, or `None` when the probe cannot reach the broker. Used by
+    /// the discovery cache's freshness check: probing through the snapshot's
+    /// client avoids the per-call connection cost of `Config::nats_client`
+    /// (PR #2835 macOS CI latency).
+    ///
+    /// A missing registry stream is sequence 0, not a failure: deleting the
+    /// whole bucket must invalidate a snapshot cached with a later revision
+    /// (decision 5b), or the removed tools stay advertised until the TTL.
+    /// Only a transport/API error maps to `None`, where the watch epoch
+    /// alone vouches for the snapshot — the pre-change best-effort behavior.
+    // Type-erased box for the same reason as the discovery transport: the
+    // JetStream get_stream chain must not appear as a concrete type in
+    // dependent crates' future trees.
+    pub(crate) fn registry_revision_probe(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send + '_>> {
+        // Bound the probe's reply wait: a partitioned broker must not stall
+        // every cached lookup for the client's default 10 s request timeout.
+        let jetstream = async_nats::jetstream::context::ContextBuilder::new()
+            .timeout(REGISTRY_PROBE_TIMEOUT)
+            .build(self.client.clone());
+        Box::pin(async move {
+            match crate::tool_registry_watch::registry_state_revision(&jetstream).await {
+                Ok(revision) => Some(revision.unwrap_or(0)),
+                Err(error) => {
+                    log::debug!("tool registry freshness check failed: {error:#}");
+                    None
+                }
+            }
+        })
     }
 
     async fn discover_inner(
@@ -327,7 +399,7 @@ impl NatsToolProvider {
         instance_id: ServerScope,
         in_flight: NatsInFlightCalls,
         policy: DiscoveryPolicy<'_>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, RegistryRevision)> {
         let (active_package, strict) = policy.parts();
         let (client, control_subscription, journal_replicas) =
             Self::open_discovery_transport(config, &instance_id).await?;
@@ -342,6 +414,12 @@ impl NatsToolProvider {
             .filter(|owner| !owner.trim().is_empty());
 
         let jetstream = async_nats::jetstream::new(client.clone());
+        // Decision 5b: read the registry sequence *before* the scan, on this
+        // same connection (`scan_start_revision` — a write the broker acked
+        // before that read is in both the scan and the sequence; a write
+        // acked after it bumps the sequence past the stored value, so the
+        // next completion's comparison catches it and rescans).
+        let revision = scan_start_revision(&jetstream).await;
         let (registry, registrations) =
             discover_registrations(&jetstream, &instance_id, session_owner.as_deref(), strict)
                 .await?;
@@ -351,24 +429,27 @@ impl NatsToolProvider {
         let (parent_session_id, parent_agent, parent_local_session_id) =
             resolve_parent_identity(config);
 
-        Ok(Self {
-            run_context: config.run_context.clone(),
-            client,
-            instance_id,
-            parent_session_id,
-            parent_agent,
-            parent_local_session_id,
-            session_owner,
-            tools,
-            registrations,
-            active_package: active_package.map(str::to_string),
-            declarations,
-            registry,
-            journal_replicas,
-            journal: Default::default(),
-            progress_dispatcher: ProgressDispatcher::new(control_subscription),
-            in_flight,
-        })
+        Ok((
+            Self {
+                run_context: config.run_context.clone(),
+                client,
+                instance_id,
+                parent_session_id,
+                parent_agent,
+                parent_local_session_id,
+                session_owner,
+                tools,
+                registrations,
+                active_package: active_package.map(str::to_string),
+                declarations,
+                registry,
+                journal_replicas,
+                journal: Default::default(),
+                progress_dispatcher: ProgressDispatcher::new(control_subscription),
+                in_flight,
+            },
+            revision,
+        ))
     }
 
     /// The broker pieces a discovery snapshot needs: the shared client, the
@@ -915,6 +996,22 @@ impl ToolProvider for NatsToolProvider {
             Some(progress),
         ))
         .await
+    }
+}
+
+/// The registry sequence a scan starts under, or why none exists.
+///
+/// Read strictly before the scan on the same connection (decision 5b).
+/// A failed read is not a fabricated sequence: the scan's snapshot must
+/// carry no revision proof, or a later bucket deletion (probe `Some(0)`)
+/// would match a cached 0 and stay stale until the TTL.
+async fn scan_start_revision(jetstream: &async_nats::jetstream::Context) -> RegistryRevision {
+    match crate::tool_registry_watch::registry_state_revision(jetstream).await {
+        Ok(sequence) => RegistryRevision::Sequence(sequence.unwrap_or(0)),
+        Err(error) => {
+            log::debug!("tool registry revision read failed before scan: {error:#}");
+            RegistryRevision::Unread
+        }
     }
 }
 

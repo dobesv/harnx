@@ -346,6 +346,106 @@ async fn saved_reply_provider(client: async_nats::Client) -> anyhow::Result<Nats
     })
 }
 
+/// The cached-lookup freshness probe's mapping (F1): a present registry stream
+/// maps to its sequence, an absent or deleted bucket to `Some(0)` — never to
+/// `None`, which is reserved for transport failure and the epoch-only
+/// fallback. A wrong mapping here lets a deleted bucket's removed tools stay
+/// advertised until the TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nats_registry_revision_probe_maps_absent_bucket_to_zero() -> anyhow::Result<()> {
+    harnx_core::require_nextest();
+    let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+        .await
+        .context("nats-server required")?;
+    let client = async_nats::connect(&url).await?;
+    let provider = saved_reply_provider(client.clone()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+
+    // No registry stream exists yet: sequence 0, not "unreachable".
+    assert_eq!(
+        provider.registry_revision_probe().await,
+        Some(0),
+        "an absent registry stream is sequence 0"
+    );
+
+    let bucket = jetstream
+        .create_key_value(async_nats::jetstream::kv::Config {
+            bucket: harnx_toolset_server::TOOL_REGISTRY_BUCKET.to_string(),
+            ..Default::default()
+        })
+        .await?;
+    bucket
+        .put("scope/server/tool", "registration".into())
+        .await?;
+    assert!(
+        provider
+            .registry_revision_probe()
+            .await
+            .is_some_and(|sequence| sequence >= 1),
+        "a written registration moves the probed sequence past 0"
+    );
+
+    // Deleting the whole bucket reads as sequence 0 again — the mapping that
+    // invalidates a snapshot cached with a later revision (decision 5b).
+    jetstream
+        .delete_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
+        .await?;
+    assert_eq!(
+        provider.registry_revision_probe().await,
+        Some(0),
+        "a deleted bucket must not read as unreachable"
+    );
+
+    // Only a transport failure maps to None, within the probe's 2 s timeout.
+    nats.kill()?;
+    let _ = nats.wait();
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.registry_revision_probe()
+        )
+        .await
+        .context("the probe is bounded by its context timeout")?,
+        None,
+        "a dead broker degrades to the epoch-only fallback"
+    );
+    Ok(())
+}
+
+/// The pre-scan revision read maps a transport failure to `Unread`, never
+/// to a fabricated sequence (G3/H2): the scan's snapshot must carry no
+/// revision proof, or a later bucket deletion would probe `Some(0)`, match
+/// a cached 0, and serve removed tools until the TTL. Mutating the `Err`
+/// arm to `Sequence(0)` fails this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nats_scan_start_revision_maps_dead_broker_read_to_unread() -> anyhow::Result<()> {
+    harnx_core::require_nextest();
+    let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+        .await
+        .context("nats-server required")?;
+    let client = async_nats::connect(&url).await?;
+    nats.kill()?;
+    let _ = nats.wait();
+    // The client buffers JetStream requests while it waits to reconnect, so
+    // bound the read's context the same way the probe does (1 s is enough
+    // here; only the error mapping is under test).
+    let jetstream = async_nats::jetstream::context::ContextBuilder::new()
+        .timeout(std::time::Duration::from_secs(1))
+        .build(client);
+    let revision = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        super::scan_start_revision(&jetstream),
+    )
+    .await
+    .context("the pre-scan read fails within its context timeout")?;
+    assert_eq!(
+        revision,
+        super::RegistryRevision::Unread,
+        "a dead broker's read error must become Unread, not a sequence"
+    );
+    Ok(())
+}
+
 /// Dispatch creates the invocation journal's bucket as often as any other
 /// writer does, and whichever writer gets there first fixes the bucket's
 /// replica count for all of them. It must therefore use the cluster's

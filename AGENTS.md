@@ -1796,8 +1796,8 @@ tool binary can fail decoding even when a per-crate build succeeds.
 
 ### Future size and type erasure in harnx-runtime
 
-harnx-runtime's async chains are deep enough that large futures fail in two
-distinct ways, and the two need different fixes:
+harnx-runtime's async chains are deep enough that large futures fail in three
+distinct ways, and the three need different fixes:
 
 - **Test stack overflows.** Nextest's test processes use the default 8 MiB
   stack, and a large inline future (tool discovery, tool-context construction)
@@ -1818,6 +1818,15 @@ distinct ways, and the two need different fixes:
   `Config::nats_client` (`config/nats_split.rs`),
   `NatsToolProvider::open_discovery_transport` and `round_nats_provider`
   (`tool.rs`) do. A plain `Box::pin` there is not enough.
+- **Query-depth overflow on layout (harnx-tui).** rustc lays out one `async fn`'s
+  future as a single cumulative walk through every nested future across its
+  `.await` chains, so one wide event loop can overflow even when auto-trait
+  evaluation is fine — harnx-tui's `run_loop_inner` failed Windows CI with
+  `queries overflow the depth limit` (PR #2835) while Linux still built.
+  Fix: `Pin<Box<dyn Future>>` seams between the loop and its deep subchains
+  (`*_erased` wrappers; no `Send` — the futures borrow `!Sync` `Tui` state),
+  documented on `run_loop_inner` (`harnx-tui/src/lifecycle.rs`). Not a
+  `recursion_limit` bump.
 
 ### TUI transcript items are TUI-local
 
