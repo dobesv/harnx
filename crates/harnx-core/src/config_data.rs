@@ -277,6 +277,11 @@ pub struct ConfigData {
     )]
     pub middleware: crate::middleware::MiddlewareConfig,
 
+    /// Agent-facing tools backed by in-process scripts. Package definitions are
+    /// kept in the runtime's resolved catalog, not merged into this source data.
+    #[serde(default)]
+    pub script_tools: Vec<crate::script_tool::ScriptToolDefinition>,
+
     /// Enable terminal/OS agent protocol emission. When false, the emitter
     /// suppresses all terminal-agent protocol output. Defaults to true.
     #[serde(default = "default_terminal_status")]
@@ -312,7 +317,7 @@ impl ConfigData {
     }
 }
 impl Default for ConfigData {
-    // qual:allow(complexity, max_function_lines=61) reason: "Keep exhaustive config field defaults together; this initializer has no control flow."
+    // qual:allow(complexity, max_function_lines=62) reason: "Keep exhaustive config field defaults together; this initializer has no control flow."
     fn default() -> Self {
         Self {
             model_id: Default::default(),
@@ -362,6 +367,7 @@ impl Default for ConfigData {
 
             hooks: None,
             middleware: Default::default(),
+            script_tools: Vec::new(),
 
             terminal_status: default_terminal_status(),
 

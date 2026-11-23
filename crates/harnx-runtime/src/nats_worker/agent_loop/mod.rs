@@ -1473,6 +1473,7 @@ async fn build_orphan_tool_eval_context(
         // mode's `bash` must fail closed there rather than redispatch.
         bash_context_slot: None,
         command_bash: None,
+        extra_base_providers: Vec::new(),
     })
     .await
 }

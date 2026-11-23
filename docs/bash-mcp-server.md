@@ -174,7 +174,7 @@ Finished processes stay tracked, so `status` and repeated `wait` calls keep retu
 
 ## Shell command templates
 
-Command templates define custom fixed shell command shapes in YAML files discovered in `$HARNX_PACKAGE_DIR/bash_tools/*.yaml` or specified via `--tool`/`--tools-dir`. Each template registers as a distinct tool with a typed input schema.
+Command templates define custom fixed shell command shapes in YAML files discovered in `$HARNX_PACKAGE_DIR/bash_tools/*.yaml` or specified via `--tool`/`--tools-dir`. Each template registers as a distinct tool with a typed input schema. For in-process custom tools that run BashKit or Monty Python scripts and can call other allowlisted tools, see the [Script Tools Guide](script-tools.md).
 
 ### Reserved template parameters
 

@@ -434,6 +434,29 @@ impl NatsToolProvider {
         &self.declarations
     }
 
+    /// Every name this provider can route. The route-map keys cover the
+    /// agent-visible names and the raw aliases kept through the naming
+    /// transition; `has_tool` additionally accepts the per-registration
+    /// agent-visible name (`parse_agent_tool_name`'s bare-name fallback,
+    /// `server_identity.rs`), which cross-package registrations resolve
+    /// under without appearing as a map key — so yield it too. The
+    /// config-level collision view records these names so the
+    /// model-visible tool list cannot advertise a script tool whose name
+    /// the provider serves.
+    pub fn route_names(&self) -> impl Iterator<Item = String> {
+        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        for registration in &self.registrations {
+            for spec in &registration.tools {
+                names.push(ServerIdentity::agent_visible_name(
+                    registration.package.as_deref(),
+                    registration,
+                    &spec.name,
+                ));
+            }
+        }
+        names.into_iter()
+    }
+
     pub fn declarations_for_use_tools(&self, use_tools: Option<&str>) -> Vec<ToolDeclaration> {
         let Some(use_tools) = use_tools else {
             return Vec::new();
@@ -501,6 +524,53 @@ impl NatsToolProvider {
 
     pub fn in_flight_calls(&self) -> NatsInFlightCalls {
         self.in_flight.clone()
+    }
+
+    /// A provider for tool-round snapshot tests: direct control over the
+    /// route map (raw aliases included), the declaration list, and the
+    /// registrations whose names `parse_agent_tool_name` can fall back to,
+    /// without registration plumbing. Only `has_tool`, `route_names`, and
+    /// `declarations_for_use_tools` consult those fields in that context.
+    #[cfg(test)]
+    pub(crate) async fn snapshot_test_provider(
+        client: &async_nats::Client,
+        routes: Vec<(&str, &str, &str)>,
+        declarations: Vec<ToolDeclaration>,
+        registrations: Vec<Registration>,
+    ) -> anyhow::Result<NatsToolProvider> {
+        let instance_id = ServerScope::new();
+        let control_subscription = client.subscribe(instance_id.control_subject()).await?;
+        Ok(NatsToolProvider {
+            run_context: None,
+            client: client.clone(),
+            instance_id,
+            session_owner: None,
+            parent_session_id: None,
+            parent_agent: None,
+            parent_local_session_id: None,
+            tools: routes
+                .into_iter()
+                .map(|(name, server, raw_name)| {
+                    (
+                        name.to_string(),
+                        RegisteredTool {
+                            server: server.into(),
+                            selector_server: server.into(),
+                            raw_name: raw_name.into(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            registrations,
+            active_package: None,
+            declarations,
+            registry: None,
+            journal_replicas: 1,
+            journal: Default::default(),
+            progress_dispatcher: ProgressDispatcher::new(control_subscription),
+            in_flight: NatsInFlightCalls::default(),
+        })
     }
 
     /// Describe this snapshot's discovery for the zero-registration guard.

@@ -30,10 +30,10 @@ use serde_json::json;
 
 const TOKEN: &str = "bash-script-mode-test-token";
 
-struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+pub(crate) struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
 impl EnvGuard {
-    fn install(values: &[(&'static str, &str)]) -> Self {
+    pub(crate) fn install(values: &[(&'static str, &str)]) -> Self {
         let old = values
             .iter()
             .map(|(name, _)| (*name, std::env::var_os(name)))
@@ -61,7 +61,7 @@ impl Drop for EnvGuard {
     }
 }
 
-fn time_server_config(command: &str) -> ToolServerConfig {
+pub(crate) fn time_server_config(command: &str) -> ToolServerConfig {
     ToolServerConfig {
         middleware: Default::default(),
         name: "time".to_string(),
@@ -75,7 +75,7 @@ fn time_server_config(command: &str) -> ToolServerConfig {
     }
 }
 
-fn time_server_binary() -> Result<PathBuf> {
+pub(crate) fn time_server_binary() -> Result<PathBuf> {
     if let Some(path) = option_env!("CARGO_BIN_EXE_harnx-time-tools") {
         return Ok(PathBuf::from(path));
     }
@@ -113,6 +113,28 @@ fn time_server_binary() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Start `servers` under `instance_id` against a token-authenticated broker
+/// and wait for the time tool's registration. Both script-mode e2es and the
+/// script-tools cold-start e2e need this exact sequence; one copy keeps the
+/// fixtures identical.
+pub(crate) async fn start_time_server(
+    server_url: &str,
+    token: &str,
+    instance_id: &ServerScope,
+    servers: &[ToolServerConfig],
+) -> Result<ToolServerSupervisor> {
+    let client = async_nats::ConnectOptions::new()
+        .token(token.to_string())
+        .connect(server_url)
+        .await?;
+    let start = ToolServerStartConfig::new(client.clone(), instance_id.clone(), server_url, token);
+    let supervisor =
+        ToolServerSupervisor::start_local_with_timeout(start, servers, Duration::from_secs(5))
+            .await?;
+    wait_for_time_registration(&client, instance_id).await?;
+    Ok(supervisor)
+}
+
 /// Bash-only agent: `bash_tools: time_*` and no `use_tools`.
 fn script_mode_config() -> Arc<ConfigLock> {
     let mut agent = AgentConfig::from_prompt("test");
@@ -124,7 +146,7 @@ fn script_mode_config() -> Arc<ConfigLock> {
     Arc::new(ConfigLock::new(config))
 }
 
-async fn wait_for_time_registration(
+pub(crate) async fn wait_for_time_registration(
     client: &async_nats::Client,
     instance_id: &ServerScope,
 ) -> Result<()> {
@@ -175,18 +197,14 @@ async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
         (HARNX_NATS_URL_ENV, server.url()),
         (HARNX_NATS_TOKEN_ENV, TOKEN),
     ]);
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(server.url())
-        .await?;
     let instance_id = ServerScope::new();
-    let start =
-        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
-    let servers = [time_server_config(&binary)];
-    let supervisor =
-        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_secs(5))
-            .await?;
-    wait_for_time_registration(&client, &instance_id).await?;
+    let supervisor = start_time_server(
+        server.url(),
+        TOKEN,
+        &instance_id,
+        &[time_server_config(&binary)],
+    )
+    .await?;
 
     let config = script_mode_config();
     // The declaration cache is what bash_tools resolution reads; the agent
@@ -256,18 +274,14 @@ async fn interrupted_bash_replays_as_reported_not_rerun() -> Result<()> {
         (HARNX_NATS_URL_ENV, server.url()),
         (HARNX_NATS_TOKEN_ENV, TOKEN),
     ]);
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(server.url())
-        .await?;
     let instance_id = ServerScope::new();
-    let start =
-        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
-    let servers = [time_server_config(&binary)];
-    let supervisor =
-        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_secs(5))
-            .await?;
-    wait_for_time_registration(&client, &instance_id).await?;
+    let supervisor = start_time_server(
+        server.url(),
+        TOKEN,
+        &instance_id,
+        &[time_server_config(&binary)],
+    )
+    .await?;
 
     let config = script_mode_config();
     harnx_runtime::tool_context::refresh_nats_tool_declarations(&config, &instance_id).await;
@@ -398,6 +412,7 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
     let instance_id = ServerScope::new();
     let mut params = BuildToolEvalContextParams::new(&config, &instance_id);
     params.bash_context_slot = Some(slot.clone());
+    // qual:allow(dry, fragment) reason: "the replay e2es share the ctx-build + ToolCall fixture by design and diverge in what they assert about replay; deduplicating it would hide the replay policy under a fixture"
     let ctx = Arc::new(harnx_runtime::tool::build_tool_eval_context(params).await);
     slot.set(&ctx);
     let call = ToolCall::new(

@@ -44,6 +44,7 @@ pub mod nats_tool_provider;
 pub mod nats_worker;
 pub mod operator_tools;
 pub mod remote_session_cleanup;
+pub mod script_tool_provider;
 mod script_tools;
 pub mod server_identity;
 pub mod session_history;

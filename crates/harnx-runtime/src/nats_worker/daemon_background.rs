@@ -126,6 +126,16 @@ pub async fn start_local_tool_servers_for_test(
     start_local_tool_servers(daemon, client, &instance_id, &servers).await
 }
 
+/// Test entry point for [`configured_worker_services`]: the same selection
+/// worker startup and session reconciliation apply, without standing up a
+/// worker daemon. Not part of the crate's real API — production code always
+/// goes through the daemon paths.
+// qual:test_helper — same selection as worker startup/reconciliation, exposed for the script-tools cold-start e2e.
+#[doc(hidden)]
+pub fn configured_worker_services_for_test(config: &GlobalConfig) -> Vec<ToolServerConfig> {
+    configured_worker_services(config)
+}
+
 fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
     match result {
         Ok(supervisor) => Some(supervisor),
@@ -269,8 +279,12 @@ pub(super) fn configured_worker_services(config: &GlobalConfig) -> Vec<ToolServe
     // needs the tool servers behind its bash_tools selectors, or the
     // inner set resolves to nothing on the worker.
     if let Some(bash_tools) = config.agent.as_ref().and_then(|agent| agent.bash_tools()) {
-        selectors.extend(bash_tools);
+        selectors.extend(bash_tools.clone());
     }
+    // Script tools (#2813, decision 13): a selected script tool wraps tools
+    // resolved through its own `tools:` selectors, so the servers behind
+    // those must start too. Unselected script tools contribute nothing.
+    selectors.extend(config.script_tool_inner_selectors_for(&selectors));
     // #2796: middleware helper tools resolve with the same package context as
     // the agent's own selectors (see middleware/wiring.rs), so their servers
     // join the same selection instead of failing as not allowlisted.

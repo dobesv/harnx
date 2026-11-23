@@ -351,6 +351,19 @@ async fn execute_claimed(
         .await
 }
 
+/// Record one discovered provider into the config caches: the declaration
+/// list and the route-name set the script-tool collision view treats as
+/// owned by the provider — the same captures
+/// `refresh_nats_tool_declarations` performs for agent rounds, so the
+/// collision view does not depend on which path discovered the tools.
+fn record_provider_inventory(
+    config: &crate::config::GlobalConfig,
+    provider: &crate::nats_tool_provider::NatsToolProvider,
+) {
+    *config.read().nats_tool_declarations.write() = provider.declarations().to_vec();
+    *config.read().nats_served_tool_names.write() = provider.route_names().collect();
+}
+
 impl OperatorExecution<'_> {
     async fn execute_discovered(
         &self,
@@ -378,7 +391,7 @@ impl OperatorExecution<'_> {
         )
         .await
         .context("Operator tool discovery failed")?;
-        *config.read().nats_tool_declarations.write() = provider.declarations().to_vec();
+        record_provider_inventory(config, &provider);
         let provider = Arc::new(provider);
         // #2630: Bash evaluates on a command-scoped context whose catalog,
         // executor allowlist and allowed names all derive from one admitted
@@ -510,3 +523,38 @@ mod admission_tests;
 #[cfg(test)]
 #[path = "operator_tools/reserved_identity_tests.rs"]
 mod reserved_identity_tests;
+#[cfg(test)]
+mod served_names_tests {
+    use super::*;
+
+    /// 4659980786 follow-up: the operator discovery path fills both config
+    /// caches — the declaration list and the served-name set, raw aliases
+    /// included — so the model-visible collision view matches the round's.
+    #[tokio::test]
+    async fn record_provider_inventory_populates_served_names_with_raw_aliases(
+    ) -> anyhow::Result<()> {
+        let server = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(server.url()).await?;
+        let provider = crate::nats_tool_provider::NatsToolProvider::snapshot_test_provider(
+            &client,
+            vec![("read", "fs", "read")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await?;
+
+        let config = crate::config::GlobalConfig::default();
+        record_provider_inventory(&config, &provider);
+        assert!(
+            config.read().nats_served_tool_names.read().contains("read"),
+            "the operator path must record the raw alias in the served-name cache"
+        );
+        assert!(
+            config.read().nats_tool_declarations.read().is_empty(),
+            "the test provider declares nothing; only the route name matters"
+        );
+        Ok(())
+    }
+}

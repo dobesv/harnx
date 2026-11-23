@@ -16,6 +16,9 @@ pub const MACROS_DIR_NAME: &str = "macros";
 /// Subdirectory holding installed packages.
 pub const PACKAGES_DIR_NAME: &str = "packages";
 
+/// Package subdirectory holding one script tool definition per YAML file.
+pub const SCRIPT_TOOLS_DIR_NAME: &str = "script_tools";
+
 /// Subdirectory holding per-registry credential configuration files.
 pub const PACKAGE_REPOS_DIR_NAME: &str = "package_repos";
 

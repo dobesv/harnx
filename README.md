@@ -275,6 +275,7 @@ Harnx supports custom dark and light themes, which highlight response text and c
 - [Prometheus Metrics](docs/metrics.md)
 - [Health & Readiness Endpoint](docs/healthz.md)
 - [Configuration Guide](docs/configuration-guide.md)
+- [Script Tools Guide](docs/script-tools.md)
 - [Tool Confirmation Guide](docs/tool-confirmation-guide.md)
 - [Custom Theme](docs/custom-theme.md)
 - [FAQ](docs/faq.md)
