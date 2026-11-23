@@ -891,6 +891,7 @@ impl FsServer {
             None => default_search_path(&self.allowlist)?,
         };
 
+        check_search_target(&search_path, params.path.as_deref().unwrap_or("workspace"))?;
         let (regex, include_glob) = Self::compile_search(&params)?;
 
         let context_lines = params.context_lines.unwrap_or(0);
@@ -1066,6 +1067,35 @@ impl GrepSearch<'_> {
             search_recursive(search_path, search_path, regex, context, max, glob, results);
         }
     }
+}
+
+/// Fail when the path the caller named can't be searched.
+///
+/// Entries met while walking a directory are skipped when unreadable, too
+/// large or binary, as `grep -rs` does. The path the caller named is
+/// different: skipping it would return no rows, which a script reads as
+/// "nothing matched" and a model as "No matches found", although nothing was
+/// searched.
+fn check_search_target(search_path: &Path, given: &str) -> Result<(), ErrorData> {
+    let cannot = |err: std::io::Error| internal_error(format!("cannot search '{given}': {err}"));
+    let metadata = std::fs::metadata(search_path).map_err(cannot)?;
+    if metadata.is_dir() {
+        return std::fs::read_dir(search_path).map(drop).map_err(cannot);
+    }
+    if metadata.len() > SEARCH_FILE_MAX_BYTES {
+        return Err(internal_error(format!(
+            "'{given}' is too large to search ({} bytes, max {})",
+            metadata.len(),
+            format_size(SEARCH_FILE_MAX_BYTES as usize)
+        )));
+    }
+    let content = std::fs::read(search_path).map_err(cannot)?;
+    if is_binary_content(&content) {
+        return Err(internal_error(format!(
+            "'{given}' appears to be a binary file."
+        )));
+    }
+    Ok(())
 }
 
 /// Name the searched file by the argument exactly as the caller gave it. The

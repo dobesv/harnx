@@ -564,6 +564,14 @@ async fn script_find_without_a_path_prefixes_a_directory_that_is_not_the_cwd() {
 }
 
 async fn grep_file_arg(temp_dir: &TestDir, given: &str, style: ResultStyle) -> CallToolResult {
+    try_grep_file_arg(temp_dir, given, style).await.unwrap()
+}
+
+async fn try_grep_file_arg(
+    temp_dir: &TestDir,
+    given: &str,
+    style: ResultStyle,
+) -> Result<CallToolResult, ErrorData> {
     let params = SearchFilesParams {
         pattern: "needle".to_string(),
         path: Some(given.to_string()),
@@ -575,7 +583,6 @@ async fn grep_file_arg(temp_dir: &TestDir, given: &str, style: ResultStyle) -> C
     make_server(temp_dir.path())
         .search_files_impl(params, style)
         .await
-        .unwrap()
 }
 
 #[tokio::test]
@@ -623,5 +630,93 @@ async fn script_grep_on_a_symlinked_file_prints_the_given_path() {
     let fields = result.structured_content.unwrap();
     assert_eq!(fields["matches"][0]["path"].as_str(), Some(given.as_str()));
     assert_eq!(fields["matches"][0]["text"], json!("needle in target"));
+    assert_eq!(fields["exit_code"], json!(0));
+}
+
+async fn assert_grep_errors(temp_dir: &TestDir, given: &str, expected: &str) {
+    for style in [ResultStyle::Model, ResultStyle::Script] {
+        let err = try_grep_file_arg(temp_dir, given, style).await.unwrap_err();
+        assert!(err.message.contains(given), "{}", err.message);
+        assert!(err.message.contains(expected), "{}", err.message);
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_on_an_unreadable_file_is_an_error() {
+    let temp_dir = TestDir::new();
+    let file = write_fixture(&temp_dir, "secret.log", "needle\n");
+    set_mode(&file, 0o000);
+    if std::fs::File::open(&file).is_ok() {
+        set_mode(&file, 0o644);
+        return;
+    }
+    let given = path_string(&file);
+    assert_grep_errors(&temp_dir, &given, "cannot search").await;
+    set_mode(&file, 0o644);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_on_an_unreadable_directory_is_an_error() {
+    let temp_dir = TestDir::new();
+    let dir = temp_dir.path().join("locked");
+    std::fs::create_dir_all(&dir).unwrap();
+    set_mode(&dir, 0o000);
+    if std::fs::read_dir(&dir).is_ok() {
+        set_mode(&dir, 0o755);
+        return;
+    }
+    let given = path_string(&dir);
+    assert_grep_errors(&temp_dir, &given, "cannot search").await;
+    set_mode(&dir, 0o755);
+}
+
+#[tokio::test]
+async fn grep_on_a_file_over_the_search_limit_is_an_error() {
+    let temp_dir = TestDir::new();
+    let file = temp_dir.path().join("huge.log");
+    let handle = std::fs::File::create(&file).unwrap();
+    handle.set_len(SEARCH_FILE_MAX_BYTES + 1).unwrap();
+    drop(handle);
+    assert_grep_errors(&temp_dir, &path_string(&file), "too large to search").await;
+}
+
+#[tokio::test]
+async fn grep_on_a_binary_file_is_an_error() {
+    let temp_dir = TestDir::new();
+    let file = write_fixture(&temp_dir, "blob.bin", b"needle\0\0\x01");
+    assert_grep_errors(
+        &temp_dir,
+        &path_string(&file),
+        "appears to be a binary file",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_skips_an_unreadable_file_inside_a_searched_directory() {
+    let temp_dir = TestDir::new();
+    let dir = temp_dir.path().join("logs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let locked = dir.join("locked.log");
+    std::fs::write(&locked, "needle\n").unwrap();
+    std::fs::write(dir.join("ok.log"), "needle\n").unwrap();
+    set_mode(&locked, 0o000);
+    if std::fs::File::open(&locked).is_ok() {
+        set_mode(&locked, 0o644);
+        return;
+    }
+    let result = grep_file_arg(&temp_dir, &path_string(&dir), ResultStyle::Script).await;
+    set_mode(&locked, 0o644);
+    let fields = result.structured_content.unwrap();
+    assert_eq!(fields["matches"].as_array().map(Vec::len), Some(1));
     assert_eq!(fields["exit_code"], json!(0));
 }
