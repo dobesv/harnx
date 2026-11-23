@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest::{Client, Proxy, Url};
 
 use crate::net::{check_url, redirect_policy, GuardedResolver, Lookup};
@@ -15,11 +15,16 @@ const USER_AGENT: &str = "curl/8.6.0";
 
 #[derive(Debug)]
 pub struct FetchedPage {
-    pub body: String,
+    pub body: Vec<u8>,
+    pub content_type: Option<HeaderValue>,
     pub final_url: Url,
 }
 
-/// Only HTTP entry point used by fetch tools and extractors.
+/// Only HTTP entry point used by fetch tools and extractors. Returns raw
+/// capped bytes plus the declared `Content-Type`; keep it shape-agnostic.
+/// Image classification lives in the five page-fetcher handlers
+/// (`server::image`) only — `fetch_youtube_transcript` shares this path
+/// and always converts the body to text.
 #[derive(Clone)]
 pub struct FetchClient {
     client: Client,
@@ -135,6 +140,7 @@ async fn fetch_inner(client: &Client, url: Url, headers: HeaderMap) -> Result<Fe
         return Err(format!("request failed with HTTP status {status}"));
     }
 
+    let content_type = response.headers().get(CONTENT_TYPE).cloned();
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -150,7 +156,8 @@ async fn fetch_inner(client: &Client, url: Url, headers: HeaderMap) -> Result<Fe
     }
 
     Ok(FetchedPage {
-        body: String::from_utf8_lossy(&body).into_owned(),
+        body,
+        content_type,
         final_url,
     })
 }

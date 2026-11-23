@@ -1,12 +1,11 @@
 //! Real broker coverage for output-only bounds and identical stored/live replies.
 mod failures;
 mod fixture;
+mod images;
 
 use anyhow::{Context, Result};
 use fixture::*;
-use futures_util::StreamExt;
 use harnx_toolset::{ReplayAttempt, ToolErrorPayload, ToolReply};
-use harnx_toolset_server::invocation_journal::RecordedInvocation;
 use serde_json::json;
 use std::{sync::atomic::Ordering, time::Duration};
 
@@ -162,32 +161,7 @@ async fn changed_kv_limit_recovers_real_10054_by_committing_terminal_without_ree
     // Server journal handle predates the changed limit. Observe the actual
     // rejected terminal publish and the bounded CAS retry, not helper estimates.
     let request = request("changed-limit", 32 * 1024, true);
-    let mut writes = fixture
-        .client
-        .subscribe(format!(
-            "$KV.{}.{}",
-            harnx_toolset_server::invocation_journal::BUCKET,
-            key(&request)
-        ))
-        .await?;
-    crate::common::round_trip(&fixture.client).await?;
-    let message = fixture.call(&request).await?;
-    let mut terminal_sizes = Vec::new();
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let write = writes.next().await.context("journal writes closed")?;
-            let row: RecordedInvocation = serde_json::from_slice(&write.payload)?;
-            if let Some(reply) = row.reply {
-                terminal_sizes.push(write.payload.len());
-                if serde_json::to_vec(&reply)? == message.payload {
-                    break;
-                }
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("observe terminal journal writes")??;
+    let (message, terminal_sizes) = call_observing_terminal_writes(&fixture, &request).await?;
     assert_eq!(
         terminal_sizes.len(),
         2,

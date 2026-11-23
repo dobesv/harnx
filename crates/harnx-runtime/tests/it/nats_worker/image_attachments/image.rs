@@ -113,7 +113,7 @@ impl ImageAttachment {
     }
 }
 
-fn request_images(request: &Value) -> Vec<&str> {
+pub(super) fn request_images(request: &Value) -> Vec<&str> {
     request["messages"]
         .as_array()
         .unwrap()

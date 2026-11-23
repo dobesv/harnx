@@ -1,4 +1,4 @@
-# Fetches web pages as markdown, plain text, or JSON.
+# Fetches web pages as markdown, plain text, or JSON, plus PNG, JPEG, GIF, and WebP images.
 command: harnx-fetch-tools
 enabled: true
-description: "Fetch URLs as markdown, text, or JSON. SSRF protection enabled by default."
+description: "Fetch URLs as markdown, text, or JSON, and PNG, JPEG, GIF, or WebP images up to 5 MiB. SSRF protection enabled by default."

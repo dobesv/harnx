@@ -90,6 +90,7 @@ arboard = { workspace = true, features = ["wayland-data-control"] }
 arboard = { workspace = true }
 
 [dev-dependencies]
+crc32fast = "1"
 harnx-claude-hook-tools = { path = "../harnx-claude-hook-tools" }
 harnx-attachment-tools = { path = "../harnx-attachment-tools" }
 harnx-test-bins = { path = "../harnx-test-bins" }
@@ -106,3 +107,4 @@ tempfile = "3"
 tokio-test = "0.4"
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
+wiremock = { workspace = true }

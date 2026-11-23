@@ -1,14 +1,42 @@
 mod handler;
+mod image;
 pub mod model;
 mod params;
 
 use std::sync::Arc;
 
-pub(crate) use handler::{tool_schema, TOOL_DESCRIPTIONS};
+pub(crate) use handler::tool_schema;
 pub use params::{FetchParams, YoutubeTranscriptParams};
 
 use crate::client::FetchClient;
 use crate::net::Lookup;
+
+pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 6] = [
+    (
+        "fetch_html",
+        "Fetch a URL and return its raw HTML, or return a PNG, JPEG, GIF, or WebP image up to 5 MiB.",
+    ),
+    (
+        "fetch_markdown",
+        "Fetch a URL and convert its HTML content to Markdown, or return a PNG, JPEG, GIF, or WebP image up to 5 MiB.",
+    ),
+    (
+        "fetch_txt",
+        "Fetch a URL and return plain DOM text with scripts and styles removed, or return a PNG, JPEG, GIF, or WebP image up to 5 MiB.",
+    ),
+    (
+        "fetch_json",
+        "Fetch a URL and return validated, pretty-printed JSON, or return a PNG, JPEG, GIF, or WebP image up to 5 MiB.",
+    ),
+    (
+        "fetch_readable",
+        "Fetch a URL and extract its main readable article as Markdown, or return a PNG, JPEG, GIF, or WebP image up to 5 MiB.",
+    ),
+    (
+        "fetch_youtube_transcript",
+        "Fetch a YouTube watch page and return its timestamped caption transcript.",
+    ),
+];
 
 #[derive(Clone)]
 pub struct FetchServer {

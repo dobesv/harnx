@@ -175,7 +175,8 @@ backfill a legacy local-only blob, but fails the turn if the blob exists in
 neither place. HTTP(S) attachment URLs remain external references and are
 intentionally not copied into the object store.
 
-Bridge-offloaded image `resource_link` parts use canonical `cid:media:` URLs.
+Offloaded image `resource_link` parts (from native NATS tool replies or
+`harnx-mcp-bridge`) use canonical `cid:media:` URLs.
 Workers hydrate missing image blobs before each agent model call, including the next
 call in the same turn, and when replaying a session on another worker. Cached
 and downloaded blobs are checked against the SHA-256 of the full data URI,
@@ -1708,11 +1709,25 @@ and final reply metadata. This is a per-record/message limit, not a whole-sessio
 limit. Native results that fit aren't subject to the MCP bridge's 128 KiB
 presentation cap.
 
-An oversized terminal reply is stored as an `application/json` attachment under
-the trusted invoking session, then replaced by an explicit recoverable size error
-with its `cid:media:` reference. Without trusted ownership, the error says the
-original wasn't retained. Read retained output with `attachment_read` byte paging;
-don't blindly retry side-effecting tools. The first bounded completion committed
+When a successful reply exceeds that budget because of inline `image/*` blocks
+and has a trusted invoking session owner, the server stores those decoded
+images in `harnx_attachments` and replaces them in place with `resource_link`
+blocks (`cid:media:...`, `mimeType`, byte `size`, and original `annotations` and
+`_meta`) if the projected reply fits the budget. This lets `fs_read`, `fetch_*`,
+`attachment_read`, and the Kubernetes sandbox gateway deliver large images
+without hitting the 1 MiB default `max_payload` ceiling. Image uploads are
+checked against the budget before writing and must succeed before the link is
+committed; a failed upload stays fatal rather than falling back to an oversized
+reply or a dangling link.
+
+Replies that fit stay inline with no bucket access. Otherwise (when there is no
+trusted owner, the reply is an error, no eligible image blocks are present, or
+the projected reply still exceeds the budget), an oversized terminal reply is
+stored as an `application/json` attachment under the trusted invoking session,
+then replaced by an explicit recoverable size error with its `cid:media:`
+reference. Without trusted ownership, the error says the original wasn't retained.
+Read retained output with `attachment_read` byte paging; don't blindly retry
+side-effecting tools. The first bounded completion committed
 by journal CAS is delivered unchanged and reused on replay, without rerunning the
 tool or hydrating the large original into the reply. Fatal and interrupted
 outcomes keep their categories. Attachment outages and other non-size storage or

@@ -24,6 +24,12 @@ harnx-fetch-tools --mcp-http --host 127.0.0.1 --port 3006
 
 Private, loopback, link-local, multicast, and other special-purpose IP addresses are blocked by default. Protection applies to URL literals, all DNS answers, and every redirect. Environment proxies are disabled while protection is active. Use `--allow-private-ip` only in a trusted network; it also permits each tool's `proxy` argument.
 
+## Image responses
+
+Use any of the five page fetchers to fetch PNG, JPEG, GIF (including animated GIF), or WebP images up to 5 MiB. They return an MCP image block and a text summary with the final URL, detected format, and byte count. Text truncation parameters do not apply to images. `fetch_youtube_transcript` returns text only.
+
+For `image/*` responses, the file signature determines the format. An unsupported signature returns an error (including for SVG and AVIF). A response without a `Content-Type`, or with `application/octet-stream`, is also checked for a supported image signature. Other content types keep their usual text handling.
+
 ## Parameters
 
 Every tool accepts `url`, `headers`, `proxy`, `max_length`, `start_index`, `head_lines`, `tail_lines`, and `max_output_bytes`. `fetch_youtube_transcript` also accepts `lang` (default `en`).

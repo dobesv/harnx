@@ -18,6 +18,7 @@ use_tools:
 - fs_ls
 - fs_grep
 - fs_find
+- fetch_fetch_markdown
 - plans_add_note
 - plans_get_note
 - plans_get_plan
@@ -53,6 +54,9 @@ variables:
 ---
 
 {{erato_core}}
+
+## Fetching public images
+Use `fetch_fetch_markdown` to inspect screenshots or images at public URLs (PNG, JPEG, GIF, and WebP up to 5 MiB) directly without a sandbox.
 
 {{repo_docs}}
 
