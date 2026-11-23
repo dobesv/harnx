@@ -911,7 +911,14 @@ impl FsServer {
         let limit_reached = results.len() > max_results;
         results.truncate(max_results);
         if style == ResultStyle::Script {
-            let prefix = grep_path_prefix(params.path.as_deref(), &search_path, single_file);
+            let given = params.path.as_deref();
+            let prefix = match (single_file, given) {
+                (true, Some(given)) => {
+                    relabel_rows(&mut results, given);
+                    None
+                }
+                _ => path_prefix(given, &search_path),
+            };
             let cut = GrepCut {
                 location: params.path.as_deref().unwrap_or("workspace"),
                 max_results,
@@ -1061,14 +1068,14 @@ impl GrepSearch<'_> {
     }
 }
 
-/// The prefix script-style `grep` puts before each row's path. Rows of a
-/// single-file search carry the file name, so the prefix is the directory part
-/// of the argument and the printed path equals the argument.
-fn grep_path_prefix(given: Option<&str>, searched: &Path, single_file: bool) -> Option<String> {
-    if !single_file {
-        return path_prefix(given, searched);
+/// Name the searched file by the argument exactly as the caller gave it. The
+/// rows carry the canonical file name, which differs from the argument for a
+/// symlink and has other separators on Windows, so rebuilding the path from
+/// parts would not name the file the caller passed.
+fn relabel_rows(results: &mut [SearchLine], given: &str) {
+    for line in results {
+        if let SearchLine::Row { path, .. } = line {
+            *path = given.to_string();
+        }
     }
-    given
-        .and_then(|given| Path::new(given).parent())
-        .map(|dir| dir.display().to_string())
 }

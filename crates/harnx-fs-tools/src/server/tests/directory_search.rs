@@ -595,7 +595,7 @@ async fn script_grep_on_a_file_prints_the_given_path() {
     let given = path_string(&file);
     let result = grep_file_arg(&temp_dir, &given, ResultStyle::Script).await;
     let fields = result.structured_content.unwrap();
-    assert_eq!(fields["matches"][0]["path"], json!(given));
+    assert_eq!(fields["matches"][0]["path"].as_str(), Some(given.as_str()));
     assert_eq!(fields["matches"][0]["line"], json!(2));
     assert_eq!(fields["exit_code"], json!(0));
 }
@@ -608,4 +608,20 @@ async fn script_grep_on_a_file_without_a_match_exits_one() {
     let fields = result.structured_content.unwrap();
     assert_eq!(fields["matches"], json!([]));
     assert_eq!(fields["exit_code"], json!(1));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn script_grep_on_a_symlinked_file_prints_the_given_path() {
+    let temp_dir = TestDir::new();
+    std::fs::create_dir_all(temp_dir.path().join("data")).unwrap();
+    let target = write_fixture(&temp_dir, "data/real.txt", "x\nneedle in target\n");
+    let link = temp_dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let given = path_string(&link);
+    let result = grep_file_arg(&temp_dir, &given, ResultStyle::Script).await;
+    let fields = result.structured_content.unwrap();
+    assert_eq!(fields["matches"][0]["path"].as_str(), Some(given.as_str()));
+    assert_eq!(fields["matches"][0]["text"], json!("needle in target"));
+    assert_eq!(fields["exit_code"], json!(0));
 }

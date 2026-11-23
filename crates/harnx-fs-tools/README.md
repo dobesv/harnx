@@ -51,7 +51,7 @@ This applies when the `bash` tool calls a natively registered `harnx-fs-tools`, 
 
 When a `bash` script calls these tools in that mode, they behave like the shell commands of the same name. Data goes to stdout, notes go to stderr as `fs_<tool>: <note>`, and the exit status says whether anything was found.
 
-- `fs_read` prints the selected lines as they are in the file, with no line-number prefix unless you pass `--line-numbers`, and adds no final newline to a file that has none, so `fs_read --path f > copy` matches `f` byte for byte. A line cap or byte cap prints a note naming the `offset` to continue from, and a single line longer than the byte cap is cut with a note.
+- `fs_read` prints the selected lines as they are in the file, with no line-number prefix unless you pass `--line-numbers`, and adds no final newline to a file that has none, so `fs_read --path f > copy` matches `f` byte for byte when no limit cuts the output. A line cap or byte cap truncates the output and prints a note on stderr naming the `offset` to continue from, and a single line longer than the byte cap is cut with a note.
 - `fs_ls` prints one entry name per line. `fs_find` prints one path per line, and `fs_grep` prints `path:line:text` rows; their paths start with the `--path` you gave, so they can be passed straight to `fs_read --path`. `fs_grep --path` accepts a file as well as a directory; for a file the printed path is the argument itself.
 - `fs_grep` exits 1 when nothing matched. Scripts run with `set -e`, so a bare no-match `fs_grep` ends the script: use it in `if` or `||`, or add `|| true`.
 - `fs_find` and `fs_grep` stop at `max_results`, `fs_ls` at 500 entries, and all three at 128 KiB of output, each with a note on stderr.
