@@ -329,9 +329,11 @@ impl NatsEndpoint {
             // A `nats://` server can demand a TLS upgrade in its INFO even when
             // the endpoint has no TLS settings. Give async-nats an explicit
             // provider for that path too, but don't make platform-root loading
-            // a prerequisite for a broker that remains plaintext.
+            // a prerequisite for a broker that remains plaintext. Since
+            // async-nats 0.53 a TLS config means the server must offer TLS,
+            // so mark it optional: the config is used only if the server asks.
             match self.build_tls_client_config(client_certificate.as_ref()) {
-                Ok(config) => options = options.tls_client_config(config),
+                Ok(config) => options = options.tls_client_config(config).tls_optional(),
                 // Non-fatal on purpose: a plaintext connection never uses this
                 // config, so a broken trust store must not fail startup. Log it
                 // so a server that then demands a TLS upgrade — which would fail
