@@ -19,11 +19,7 @@ struct Fixture {
 }
 
 fn fs_tools_binary() -> Result<std::path::PathBuf> {
-    let binary = std::env::current_exe()?
-        .parent()
-        .context("test binary dir")?
-        .parent()
-        .context("target debug dir")?
+    let binary = harnx_core::bin_dir_of_exe(&std::env::current_exe()?)
         .join(format!("harnx-fs-tools{}", std::env::consts::EXE_SUFFIX));
     ensure!(
         binary.is_file(),

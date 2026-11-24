@@ -47,10 +47,7 @@ fn hook_config_with_command(event: &str, child_argv: &[&str]) -> HooksConfig {
 
 fn ensure_hook_server_binary() -> Result<PathBuf> {
     let mut path = std::env::current_exe().context("resolve test executable")?;
-    path.pop();
-    if path.file_name().is_some_and(|name| name == "deps") {
-        path.pop();
-    }
+    path = harnx_core::bin_dir_of_exe(&path);
     path.push(if cfg!(windows) {
         "harnx-claude-compatible-hook-server.exe"
     } else {

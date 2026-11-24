@@ -109,10 +109,7 @@ impl McpBridge {
 
 fn binary(name: &str) -> Result<PathBuf> {
     let mut path = std::env::current_exe()?;
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
+    path = harnx_core::bin_dir_of_exe(&path);
     path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     anyhow::ensure!(
         path.is_file(),

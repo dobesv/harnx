@@ -41,10 +41,7 @@ async fn require_nats_server() -> Result<Option<common::NatsServerHandle>> {
 /// place it next to the test executables.
 async fn ensure_hook_server_binary() -> Result<()> {
     let mut path = std::env::current_exe()?;
-    path.pop();
-    if path.file_name().is_some_and(|name| name == "deps") {
-        path.pop();
-    }
+    path = harnx_core::bin_dir_of_exe(&path);
     path.push(if cfg!(windows) {
         "harnx-claude-compatible-hook-server.exe"
     } else {

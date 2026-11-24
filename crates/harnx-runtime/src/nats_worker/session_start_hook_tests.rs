@@ -17,10 +17,7 @@ use std::time::Duration;
 /// package-scoped test run has not produced it yet.
 fn hook_server_binary() -> PathBuf {
     let mut path = std::env::current_exe().expect("resolve test executable");
-    path.pop();
-    if path.file_name().is_some_and(|name| name == "deps") {
-        path.pop();
-    }
+    path = harnx_core::bin_dir_of_exe(&path);
     path.push(if cfg!(windows) {
         "harnx-claude-compatible-hook-server.exe"
     } else {

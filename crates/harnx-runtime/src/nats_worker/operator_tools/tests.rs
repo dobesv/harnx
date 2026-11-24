@@ -815,15 +815,10 @@ async fn managed_operator_invocation_starts_active_agent_hooks_and_cleans_regist
 }
 
 fn install_managed_operator_policy(config_dir: &std::path::Path) -> Result<()> {
-    let bin = std::env::current_exe()?
-        .parent()
-        .context("test binary dir")?
-        .parent()
-        .context("target dir")?
-        .join(format!(
-            "harnx-claude-compatible-hook-server{}",
-            std::env::consts::EXE_SUFFIX
-        ));
+    let bin = harnx_core::bin_dir_of_exe(&std::env::current_exe()?).join(format!(
+        "harnx-claude-compatible-hook-server{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     ensure!(
         bin.is_file(),
         "build workspace first: {} missing",

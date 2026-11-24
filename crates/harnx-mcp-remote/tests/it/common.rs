@@ -277,12 +277,7 @@ fn find_binary(env_path: Option<&str>, name: &str) -> Option<PathBuf> {
 }
 
 fn target_dir() -> PathBuf {
-    let mut exe = std::env::current_exe().expect("current_exe");
-    exe.pop();
-    if exe.ends_with("deps") {
-        exe.pop();
-    }
-    exe
+    harnx_core::bin_dir_of_exe(&std::env::current_exe().expect("current_exe"))
 }
 
 fn binary_name(base: &str) -> String {
