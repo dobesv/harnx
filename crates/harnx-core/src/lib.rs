@@ -87,6 +87,34 @@ pub fn require_nextest() {
     }
 }
 
+/// The directory that holds the workspace's binaries, found from the path of an
+/// executable that runs out of the target directory (usually
+/// `std::env::current_exe()`).
+///
+/// Workspace binaries are copied to `<target>/<profile>/`. Test executables
+/// are not: before Cargo 1.100 they sat in `<profile>/deps/`, and since then
+/// they sit in the build directory, at `<profile>/build/<package>/<hash>/out/`.
+/// Looking for a sibling binary next to a test executable therefore has to
+/// climb out of either place. A binary already in `<profile>/` is its own
+/// answer.
+pub fn bin_dir_of_exe(exe: &std::path::Path) -> std::path::PathBuf {
+    let dir = exe.parent().unwrap_or(exe);
+    let named = |path: &std::path::Path, name: &str| path.file_name().is_some_and(|n| n == name);
+    if named(dir, "deps") {
+        return dir.parent().unwrap_or(dir).to_path_buf();
+    }
+    if named(dir, "out") {
+        // out, <hash>, <package>, build, <profile>
+        let mut ancestors = dir.ancestors().skip(3);
+        if let (Some(build), Some(profile)) = (ancestors.next(), ancestors.next()) {
+            if named(build, "build") {
+                return profile.to_path_buf();
+            }
+        }
+    }
+    dir.to_path_buf()
+}
+
 /// Whether this process is refused permission to create Unix domain sockets.
 /// Claude Code's sandbox refuses them on Linux, through a seccomp filter its
 /// `sandbox.network.allowAllUnixSockets` setting turns off. A test that needs
@@ -102,5 +130,40 @@ pub fn unix_sockets_blocked() -> bool {
     #[cfg(not(unix))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod bin_dir_of_exe_tests {
+    use super::bin_dir_of_exe;
+    use std::path::Path;
+
+    #[test]
+    fn binary_in_the_profile_directory_is_its_own_answer() {
+        let exe = Path::new("/w/target/debug/harnx");
+        assert_eq!(bin_dir_of_exe(exe), Path::new("/w/target/debug"));
+    }
+
+    #[test]
+    fn test_executable_in_deps_resolves_to_the_profile_directory() {
+        let exe = Path::new("/w/target/debug/deps/it-0123abcd");
+        assert_eq!(bin_dir_of_exe(exe), Path::new("/w/target/debug"));
+    }
+
+    #[test]
+    fn test_executable_in_the_build_directory_resolves_to_the_profile_directory() {
+        let exe = Path::new("/w/target/debug/build/harnx-runtime/5f9cb5a22f7d7d94/out/it-5f9cb5a2");
+        assert_eq!(bin_dir_of_exe(exe), Path::new("/w/target/debug"));
+        let cross = Path::new("/w/target/x86_64-pc-windows-gnu/release/build/p/h/out/it");
+        assert_eq!(
+            bin_dir_of_exe(cross),
+            Path::new("/w/target/x86_64-pc-windows-gnu/release")
+        );
+    }
+
+    #[test]
+    fn an_out_directory_outside_the_build_layout_is_left_alone() {
+        let exe = Path::new("/somewhere/out/tool");
+        assert_eq!(bin_dir_of_exe(exe), Path::new("/somewhere/out"));
     }
 }

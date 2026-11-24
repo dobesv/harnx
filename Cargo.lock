@@ -2431,9 +2431,9 @@ dependencies = [
 
 [[package]]
 name = "dom_query"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498c698ac51127148a3984450e51fca7f01805a91d7a1f7a24af0a5f761e3385"
+checksum = "b35b4f772a1a8b88e5545a67c2d3a62a93d4edccc5a68f2145fe52e39c96d275"
 dependencies = [
  "bit-set 0.11.1",
  "cssparser",
@@ -2448,9 +2448,9 @@ dependencies = [
 
 [[package]]
 name = "dom_smoothie"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22343bf0885f3841bc1cc4cdfad8d3d1dd1658f4718bd1b17092f0bb9436d893"
+checksum = "62881cc91e0aa9ba2cf6105b05af584e1914be593b7013925a1e2fbf586fa33e"
 dependencies = [
  "dom_query",
  "flagset",
@@ -4430,7 +4430,7 @@ dependencies = [
  "harnx-runtime",
  "http-body-util",
  "jsonwebtoken",
- "lru",
+ "lru 0.19.2",
  "metrics",
  "metrics-util",
  "parking_lot 0.13.0",
@@ -6894,6 +6894,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4e2a1b977b42ee8b53a2a4adbd1183431c493f1d1960b7ccd893e2f0b9407ba"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9032,7 +9041,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.14.0",
  "kasuari",
- "lru",
+ "lru 0.18.5",
  "palette",
  "serde",
  "strum 0.28.0",

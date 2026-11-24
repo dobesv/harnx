@@ -713,11 +713,7 @@ impl Harness {
     }
 }
 pub fn binary(name: &str) -> Result<PathBuf> {
-    let path = std::env::current_exe()?
-        .parent()
-        .context("test executable directory")?
-        .parent()
-        .context("target directory")?
+    let path = harnx_core::bin_dir_of_exe(&std::env::current_exe()?)
         .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     anyhow::ensure!(
         path.is_file(),

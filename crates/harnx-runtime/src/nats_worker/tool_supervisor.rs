@@ -402,16 +402,7 @@ impl Drop for ToolServerSupervisor {
 
 fn resolve_tool_binary(server: &ToolServerConfig) -> Result<PathBuf> {
     let current = std::env::current_exe().context("resolve current worker executable")?;
-    let directory = current
-        .parent()
-        .context("current worker executable has no parent directory")?;
-    let directory = if directory.file_name().is_some_and(|name| name == "deps") {
-        directory
-            .parent()
-            .context("test executable deps directory has no parent")?
-    } else {
-        directory
-    };
+    let directory = harnx_core::bin_dir_of_exe(&current);
     let next_to_worker = directory.join(&server.command);
     #[cfg(windows)]
     let next_to_worker = if next_to_worker.extension().is_none() {
