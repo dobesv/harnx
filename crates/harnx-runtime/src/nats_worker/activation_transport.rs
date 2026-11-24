@@ -294,7 +294,7 @@ async fn publish_activation(
     message_id: String,
 ) -> Result<u64> {
     let payload = serde_json::to_vec(activation).context("serialize SessionActivate")?;
-    let headers = activation_headers(HeaderValue::from(message_id));
+    let headers = activation_headers(HeaderValue::from_lossy(&message_id));
     let started = std::time::Instant::now();
     let ack = harnx_metrics::time_nats_operation("activation_publish", async {
         jetstream
