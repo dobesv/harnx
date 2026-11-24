@@ -248,6 +248,15 @@ impl NatsSessionLog {
     /// The log's last entry, or `None` for an empty log. One request: the tail
     /// is all a fenced append needs, and all an interrupt request looks at
     /// before deciding, so neither pays for the transcript above it.
+    ///
+    /// Goes through `ensure_stream`: a creation-capable handle (with a
+    /// configured replica count) creates the stream when missing, and a
+    /// read-only handle errors with stream-not-found instead of reporting
+    /// absence — either way wrong for a read-only probe of a session that may
+    /// have no metadata. Probe existence with `jetstream::Context::get_stream`;
+    /// a stream whose metadata write never landed is invisible forever to the
+    /// retention GC that enumerates KV metadata (`remote_session_cleanup.rs`)
+    /// (GH #2650).
     pub async fn last_entry_async(&self) -> Result<Option<(u64, SessionLogEntry)>> {
         let stream = self.ensure_stream().await?;
         let Some(raw) = self.last_raw_message(&stream).await? else {

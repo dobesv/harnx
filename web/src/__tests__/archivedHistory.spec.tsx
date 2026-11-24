@@ -687,7 +687,7 @@ describe('CompactionMarker action integration with ArchivedHistoryProvider', () 
     );
   });
 
-  it('renders thinking blocks for assistant messages with think tags in archived history', async () => {
+  it('renders thinking blocks for assistant messages with think tags in archived history (legacy fallback)', async () => {
     mockGetSessionHistory.mockResolvedValueOnce({
       history_snapshot: [
         {
@@ -720,5 +720,99 @@ describe('CompactionMarker action integration with ArchivedHistoryProvider', () 
     expect(screen.getByText('Result summary')).toBeInTheDocument();
     expect(screen.queryByText('<think>')).not.toBeInTheDocument();
     expect(screen.queryByText('</think>')).not.toBeInTheDocument();
+  });
+
+  it('renders collapsed thinking blocks from history_reasoning alongside answer-only assistant rows', async () => {
+    mockGetSessionHistory.mockResolvedValueOnce({
+      history_snapshot: [
+        {
+          role: 'user',
+          id: 'user-literal-think',
+          content: 'Please ignore <think>user literal</think> tags',
+        },
+        {
+          role: 'assistant',
+          id: 'msg-with-reasoning',
+          content: 'Result summary',
+        },
+        {
+          role: 'assistant',
+          id: 'msg-thought-only',
+          content: '',
+        },
+      ],
+      history_reasoning: {
+        'msg-with-reasoning': ['First thought', 'Second thought'],
+        'msg-thought-only': ['Thought-only trace'],
+      },
+      next_cursor: null,
+      prev_cursor: null,
+      earlier_compaction: null,
+    });
+
+    const { container } = render(
+      <ArchivedHistoryViewer
+        initialTarget={{
+          agent: 'test-agent',
+          session: 'test-session',
+          beforeCompaction: 15,
+        }}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Result summary')).toBeInTheDocument();
+    });
+
+    const blocks = container.querySelectorAll('.aui-thinking-block');
+    expect(blocks).toHaveLength(3);
+    blocks.forEach((block) => {
+      expect(block).not.toHaveAttribute('open');
+    });
+
+    expect(screen.getByText('First thought')).toBeInTheDocument();
+    expect(screen.getByText('Second thought')).toBeInTheDocument();
+    expect(screen.getByText('Thought-only trace')).toBeInTheDocument();
+    // User row with literal <think> tags is never segmented into a ThinkingBlock.
+    const userRow = screen.getByTestId('archived-msg-user');
+    expect(userRow.querySelector('.aui-thinking-block')).toBeNull();
+    expect(userRow).toHaveTextContent('<think>user literal</think>');
+  });
+
+  it('does not strip inline think tags on assistant rows when history_reasoning map is present', async () => {
+    mockGetSessionHistory.mockResolvedValueOnce({
+      history_snapshot: [
+        {
+          role: 'assistant',
+          id: 'msg-literal-think',
+          content: 'Literal <think>example</think> in answer',
+        },
+      ],
+      history_reasoning: {},
+      next_cursor: null,
+      prev_cursor: null,
+      earlier_compaction: null,
+    });
+
+    const { container } = render(
+      <ArchivedHistoryViewer
+        initialTarget={{
+          agent: 'test-agent',
+          session: 'test-session',
+          beforeCompaction: 15,
+        }}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('archived-msg-assistant')).toBeInTheDocument();
+    });
+
+    expect(container.querySelectorAll('.aui-thinking-block')).toHaveLength(0);
+    expect(screen.getByTestId('archived-msg-assistant')).toHaveTextContent(
+      'Literal <think>example</think> in answer',
+    );
   });
 });

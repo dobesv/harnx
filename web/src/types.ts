@@ -19,6 +19,8 @@ export interface SessionRef {
   [key: string]: unknown;
 }
 
+export type HistoryReasoningMap = Record<string, string[]>;
+
 export interface HistoryMessage {
   id: string;
   role: string;
@@ -98,6 +100,7 @@ export interface SessionInfo {
   canPrompt?: boolean;
   canCancel?: boolean;
   history_snapshot?: HistoryMessage[];
+  history_reasoning?: HistoryReasoningMap;
   compaction?: CompactionMetadata;
   history_warnings?: unknown[];
   capabilities?: Record<string, unknown>;
@@ -106,6 +109,7 @@ export interface SessionInfo {
 
 export interface SessionHistoryResult {
   history_snapshot: HistoryMessage[];
+  history_reasoning?: HistoryReasoningMap;
   compaction?: CompactionMetadata;
   next_cursor: string | null;
   prev_cursor: string | null;

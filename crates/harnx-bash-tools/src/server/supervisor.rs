@@ -6,6 +6,7 @@
 //! can't make the process unreachable, and any number of waits can watch the
 //! same exit.
 use super::foreground_cleanup::ProcessIdentity;
+use super::script_result;
 use process_wrap::tokio::ChildWrapper;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
@@ -24,6 +25,8 @@ const MAX_WAIT_FAILURES: u32 = 5;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProcessExit {
     pub(crate) code: Option<i32>,
+    /// The signal that ended the process, when one did.
+    pub(crate) signal: Option<i32>,
     /// When the supervisor reaped the process, not when a caller first waited.
     /// None if waiting failed and the process's fate is unknown.
     pub(crate) exited_at: Option<Instant>,
@@ -102,6 +105,7 @@ impl Supervisor {
         match status {
             Ok(status) => Some(ProcessExit {
                 code: status.code(),
+                signal: script_result::signal_of(status),
                 exited_at: Some(Instant::now()),
                 timed_out: self.timed_out,
                 wait_error: None,
@@ -116,6 +120,7 @@ impl Supervisor {
             log::warn!("waiting on a spawned process keeps failing; giving up: {error}");
             return Some(ProcessExit {
                 code: None,
+                signal: None,
                 exited_at: None,
                 timed_out: false,
                 wait_error: Some(error.to_string()),

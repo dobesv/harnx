@@ -71,7 +71,11 @@ impl ResultLimits {
             return Ok(original);
         }
         let (Some(session), Some(storage)) = (session, &self.storage) else {
-            return Ok(error("MCP result exceeds max-result-bytes; original was not retained because trusted session attachment storage is unavailable. Tool side effects may already have occurred. Narrow the tool request before retrying."));
+            let advice = match paging_advice(&original) {
+                Some(advice) => format!(": a script {advice}"),
+                None => ".".to_owned(),
+            };
+            return Ok(error(&format!("MCP result exceeds max-result-bytes; original was not retained because trusted session attachment storage is unavailable. Tool side effects may already have occurred. Narrow the tool request before retrying{advice}")));
         };
         StoredResult {
             original: &original,
@@ -192,7 +196,10 @@ impl StoredResult<'_> {
             return Ok(aggregate);
         }
         // Never substitute arbitrary objects into structuredContent or _meta.
-        let result = error(&format!("{marker} Original structuredContent, metadata or content cannot be represented within the limit; this is an explicit size error, not a replacement output schema. Tool side effects may already have occurred."));
+        let advice = paging_advice(self.original)
+            .map(|advice| format!(" A script {advice}"))
+            .unwrap_or_default();
+        let result = error(&format!("{marker} Original structuredContent, metadata or content cannot be represented within the limit; this is an explicit size error, not a replacement output schema. Tool side effects may already have occurred.{advice}"));
         if serialized_len(&result) <= max_bytes {
             Ok(result)
         } else {
@@ -200,6 +207,15 @@ impl StoredResult<'_> {
             Ok(error("MCP result exceeds max-result-bytes. Original retained in session attachment storage, but its reference cannot fit within this limit. Increase max-result-bytes. Tool side effects may already have occurred."))
         }
     }
+}
+
+/// What a script can do about an oversized result, as the words after "a script". Only results with
+/// `structuredContent` come from tools whose flags a script can change; a
+/// direct call to another server has no such flags to suggest.
+fn paging_advice(original: &Value) -> Option<&'static str> {
+    original.get("structuredContent").map(|_| {
+        "can page with a smaller --max-output-bytes or --limit, or the operator can raise the bridge's --max-result-bytes."
+    })
 }
 
 fn serialized_len(value: &Value) -> usize {

@@ -261,8 +261,7 @@ mod identity_tests {
     }
 }
 pub struct SubscribeResult {
-    pub snapshot: Vec<AgUiMessage>,
-    pub compaction: Option<SessionCompaction>,
+    pub(crate) snapshot: crate::transcript_snapshot::HistorySnapshot,
     pub history_warnings: Vec<String>,
     pub state: SessionState,
     pub events: broadcast::Receiver<Event>,
@@ -305,6 +304,7 @@ pub struct SessionInfo {
     /// even when `state` has no run this server started.
     pub worker_active: bool,
     pub history_snapshot: Vec<AgUiMessage>,
+    pub history_reasoning: crate::history_projection::HistoryReasoning,
     pub compaction: Option<SessionCompaction>,
     pub history_warnings: Vec<String>,
     pub capabilities: SessionCapabilities,

@@ -92,6 +92,34 @@ async fn session_without_storage_is_bounded_and_honest() -> Result<()> {
     Ok(())
 }
 
+const SCRIPT_ADVICE: &str = "a script can page";
+
+fn oversized_with(field: &str) -> Value {
+    let mut result = text("small");
+    result[field] = json!({"data": "x".repeat(2048)});
+    result
+}
+
+#[tokio::test]
+async fn paging_advice_is_for_results_that_carry_structured_content() -> Result<()> {
+    let limits = ResultLimits::new(1024)?;
+    let structured = limits
+        .normalize(oversized_with("structuredContent"), Some(&session()))
+        .await?;
+    assert!(
+        structured.to_string().contains(SCRIPT_ADVICE),
+        "{structured}"
+    );
+    let plain = limits
+        .normalize(text(&"x".repeat(2048)), Some(&session()))
+        .await?;
+    assert!(!plain.to_string().contains(SCRIPT_ADVICE), "{plain}");
+    assert!(plain
+        .to_string()
+        .ends_with("Narrow the tool request before retrying.\"}],\"isError\":true}"));
+    Ok(())
+}
+
 #[cfg(unix)]
 mod stored {
     use super::*;
@@ -127,6 +155,29 @@ mod stored {
 
     mod mixed_parts;
     mod process;
+
+    #[tokio::test]
+    async fn aggregate_size_error_advises_paging_only_for_structured_content() -> Result<()> {
+        let Some((_server, js)) = setup().await? else {
+            return Ok(());
+        };
+        let limits = ResultLimits::new(1024)?.with_storage(js, 1);
+        for (field, advised) in [("structuredContent", true), ("_meta", false)] {
+            let result = limits
+                .normalize(oversized_with(field), Some(&session()))
+                .await?;
+            bounded(&result, 1024);
+            let message = result["content"][0]["text"].as_str().unwrap();
+            assert_eq!(result["isError"], true, "{result}");
+            assert!(message.contains("explicit size error"), "{message}");
+            assert_eq!(
+                message.to_lowercase().contains(SCRIPT_ADVICE),
+                advised,
+                "{message}"
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn mixed_parts_preserve_exact_originals_mime_and_siblings() -> Result<()> {

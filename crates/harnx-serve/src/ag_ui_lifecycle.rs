@@ -293,7 +293,9 @@ impl LiveStreamGuard {
         Some(frame)
     }
 
-    fn frame_messages_snapshot(&mut self, event: MessagesSnapshotEvent) -> Option<Bytes> {
+    fn frame_messages_snapshot(&mut self, mut event: MessagesSnapshotEvent) -> Option<Bytes> {
+        // Snapshot reasoning belongs only in the negotiated companion frame.
+        event.base.raw_event = None;
         let mut frames = self.reset_after_snapshot().to_vec();
         frames.extend_from_slice(
             frame_event(&Event::MessagesSnapshot(event))

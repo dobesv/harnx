@@ -220,7 +220,7 @@ fn run() -> Result<i32, String> {
         .wait()
         .map_err(|error| format!("sandbox-exec: failed to wait for child: {error}"))?;
 
-    Ok(status.code().unwrap_or(1))
+    Ok(exit_code(status))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -291,7 +291,15 @@ fn run() -> Result<i32, String> {
         .wait()
         .map_err(|error| format!("sandbox-exec: failed to wait for child: {error}"))?;
 
-    Ok(status.code().unwrap_or(1))
+    Ok(exit_code(status))
+}
+
+/// The child's code, or 128 + N when signal N ended it, as a shell reports it.
+#[cfg(unix)]
+fn exit_code(status: process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    let signalled = status.signal().map(|signal| 128 + signal);
+    status.code().or(signalled).unwrap_or(1)
 }
 
 #[cfg(unix)]
@@ -368,5 +376,27 @@ mod tests {
         // must have taken the early-return path (the Ok(()) branch).
         // The test above verifies that the function returns Ok without erroring,
         // which is the correct post-fix behavior (previously it would walk to $HOME).
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod exit_code_tests {
+    use super::exit_code;
+    use std::process::Command;
+
+    fn status_of(script: &str) -> std::process::ExitStatus {
+        Command::new("sh").args(["-c", script]).status().unwrap()
+    }
+
+    #[test]
+    fn a_normal_exit_keeps_its_code() {
+        assert_eq!(exit_code(status_of("exit 3")), 3);
+    }
+
+    #[test]
+    fn a_signal_death_is_128_plus_the_signal() {
+        assert_eq!(exit_code(status_of("kill -9 $$")), 137);
+        assert_eq!(exit_code(status_of("kill -15 $$")), 143);
     }
 }

@@ -33,6 +33,7 @@ fn info(snapshot: HistorySnapshot) -> SessionInfo {
         state: SessionState::Idle,
         worker_active: false,
         history_snapshot: snapshot.messages,
+        history_reasoning: snapshot.reasoning,
         compaction: snapshot.compaction,
         history_warnings: Vec::new(),
         capabilities: SessionCapabilities {
@@ -162,7 +163,7 @@ fn live_snapshot_carries_same_metadata_and_messages_as_session_get() {
     for through in [3, 6, 23] {
         let snapshot = snapshot(through);
         let result = crate::ag_ui_rpc::session_get_result(&info(snapshot.clone()), "nats");
-        let events = snapshot.events();
+        let events = snapshot.events_for(SnapshotFeatures::WITH_HISTORY_REASONING);
         assert_eq!(
             serde_json::to_value(&events[0]).unwrap(),
             json!({
@@ -181,8 +182,13 @@ fn live_snapshot_carries_same_metadata_and_messages_as_session_get() {
 #[test]
 fn initial_attach_frames_carry_metadata_before_snapshot() {
     let snapshot = snapshot(6);
-    let frames =
-        crate::ag_ui_attach::initial_attach_frame(snapshot.clone(), Vec::new(), true).unwrap();
+    let frames = crate::ag_ui_attach::initial_attach_frame(
+        snapshot.clone(),
+        Vec::new(),
+        true,
+        SnapshotFeatures::WITH_HISTORY_REASONING,
+    )
+    .unwrap();
     let events: Vec<Value> = std::str::from_utf8(&frames)
         .unwrap()
         .lines()
@@ -192,7 +198,7 @@ fn initial_attach_frames_carry_metadata_before_snapshot() {
     assert_eq!(
         events,
         snapshot
-            .events()
+            .events_for(SnapshotFeatures::WITH_HISTORY_REASONING)
             .iter()
             .map(|event| serde_json::to_value(event).unwrap())
             .collect::<Vec<_>>()
@@ -200,8 +206,41 @@ fn initial_attach_frames_carry_metadata_before_snapshot() {
 }
 
 #[test]
+fn queued_snapshot_expands_reasoning_only_for_opted_in_clients() {
+    let message = harnx_core::message::Message::new(
+        harnx_core::message::MessageRole::Assistant,
+        harnx_core::message::MessageContent::Text(
+            "<think>\ninspect state\n</think>\nanswer".into(),
+        ),
+    )
+    .with_id("with-thought");
+    let snapshot = HistorySnapshot::from_messages(&[message]);
+    for snapshot in [snapshot, HistorySnapshot::default()] {
+        for features in [
+            SnapshotFeatures::default(),
+            SnapshotFeatures::WITH_HISTORY_REASONING,
+        ] {
+            let expected = snapshot.clone().events_for(features);
+            let live = snapshot
+                .clone()
+                .live_events()
+                .into_iter()
+                .flat_map(|event| features.expand_live_event(event))
+                .collect::<Vec<_>>();
+            assert_eq!(live, expected);
+        }
+    }
+}
+
+#[test]
 fn prompted_attach_still_omits_snapshot_and_metadata() {
-    assert!(crate::ag_ui_attach::initial_attach_frame(snapshot(23), Vec::new(), false).is_none());
+    assert!(crate::ag_ui_attach::initial_attach_frame(
+        snapshot(23),
+        Vec::new(),
+        false,
+        SnapshotFeatures::WITH_HISTORY_REASONING
+    )
+    .is_none());
 }
 
 #[test]
@@ -227,7 +266,7 @@ fn completed_event_adds_optional_fields_and_then_matching_snapshot() {
         })
     );
     let remaining: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    assert_eq!(remaining, snapshot.events());
+    assert_eq!(remaining, snapshot.live_events());
 }
 
 #[test]

@@ -60,12 +60,39 @@ The proxy is configured to be **SSE-safe**. It disables buffering for `text/even
   - Tool approval and session handoff confirmations (approve/deny responses and reconnect replay).
   - Middleware interactions: `confirm` approve/deny dialogs and `a2ui` modal forms (Text, Button, ChoicePicker, TextField, Card, Column) with interactive editing, canonical response mapping, server rejection display, and deny dismissal.
   - Non-modal A2UI surfaces: inline interactive surfaces attached to tool-call cards or rendered directly in the thread without blocking the composer or conversation flow. Operators submit actions via `session/surface_action` with pending, resolved, and error states; resolved surfaces hydrate from durable log events.
-  - Thinking rendering: live reasoning (AG-UI THINKING_* events) and hydrated
-    `<think>`/`<thinking>` blocks from session history render as collapsible
-    "Thinking" `<details>` blocks (`web/src/components/ThinkingBlock.tsx`), open
-    while streaming, collapsed when done or on reload, never with literal tags.
-    Text segments of a tagged message render through `MessageTextPart.tsx`
-    using the same markdown setup as untagged messages.
+  - Thinking rendering: live reasoning (AG-UI `THINKING_*` / `REASONING_*`
+    events) and hydrated reasoning render as collapsible "Thinking" `<details>`
+    blocks (`web/src/components/ThinkingBlock.tsx`), open while streaming and
+    collapsed when done or on reload. Two hydration wire formats are supported:
+    - **Structured `history_reasoning` (current)**: `ChatProvider.tsx` sends
+      `x-harnx-snapshot-features: history-reasoning` on same-origin requests
+      (omitted on cross-origin URLs to avoid CORS preflight failures against
+      older servers) so SSE streams emit a companion `CUSTOM` event
+      (`name: "history_reasoning"`, `value: Record<string, string[]>`)
+      immediately after each `MESSAGES_SNAPSHOT`. `HarnxHttpAgent` consumes this
+      control metadata and injects synthetic `role: "reasoning"` messages
+      (`id: "<ownerId>:reasoning-<index>"`) immediately before each owning
+      assistant message so `@assistant-ui/react-ag-ui` hydrates reasoning parts
+      without exposing the raw custom event. Each `history_reasoning` map
+      replaces the previous map (including `{}`). RPC/HTTP history responses
+      (`session/get`, `session/history`, `GET .../history`) include the same
+      sibling `history_reasoning` map for `ArchivedHistoryMessages.tsx`.
+    - **Legacy inline `<think>`/`<thinking>` tags (fallback)**: older servers
+      without `history_reasoning` emit inline tags inside assistant message
+      content. Both `MessageTextPart.tsx` and `ArchivedHistoryMessages.tsx`
+      parse inline tags only for `assistant` messages and only when
+      `history_reasoning` has not been received on the session or history
+      response, so literal `<think>`/`<thinking>` tags in user/system rows or
+      modern assistant answers render verbatim in both views.
+    - **Upgrade / cross-origin note**: servers strip inline `<think>` tags from
+      assistant snapshot text unconditionally and deliver reasoning via
+      `history_reasoning` only when requested by `x-harnx-snapshot-features:
+      history-reasoning`. Because that header is sent only on same-origin
+      requests, cross-origin web deployments do not receive structured
+      reasoning in the main transcript (archived history still displays it via
+      RPC/HTTP). Old web builds paired with a new server also lose thinking in
+      hydrated reloads because they do not send the opt-in header; deploy
+      matching web assets alongside the server (server-first for cross-origin).
 - **Out of Scope** (Deferred to `harnx-webui-parity` backlog):
   - General transcript message editing and history rewinding.
   - File attachments.
