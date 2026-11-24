@@ -274,8 +274,11 @@ async fn explicit_agent_controls_completion_and_info_even_with_other_active_agen
     }
     let mut cfg = admin_config(server.url());
     cfg.set_remote_agent("unrelated".into(), "unreachable-cluster".into());
+    // Completion gives each lookup 500 ms and answers `[]` when that runs out,
+    // so a slow runner can miss several in a row. Keep asking: the deadline is
+    // a backstop for a listing that never shows the session, not a timing bound.
     async fn poll_sessions(cfg: &harnx_runtime::config::Config, agent: &str) -> Vec<String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let sessions = cfg.list_sessions_for_completion(agent).await;
             if !sessions.is_empty() || std::time::Instant::now() >= deadline {
