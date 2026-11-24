@@ -1,7 +1,7 @@
 //! Dump and model-request coverage from a real worker's persisted parent transcript.
 
 use super::*;
-use anyhow::{ensure, Context};
+use anyhow::ensure;
 use harnx_client::{
     claude::claude_build_chat_completions_body, openai::openai_build_chat_completions_body,
     ChatCompletionsData, Model,
@@ -42,11 +42,7 @@ async fn parent_handoff_text_dump_prints_target_once() -> Result<()> {
     let (agent, session_id) = committed_target(&entries);
     let expected = format!("Handing off to {agent}; target session: {session_id}.");
 
-    let binary = std::env::current_exe()?
-        .parent()
-        .context("test executable directory")?
-        .parent()
-        .context("workspace binary directory")?
+    let binary = harnx_core::bin_dir_of_exe(&std::env::current_exe()?)
         .join(format!("harnx{}", std::env::consts::EXE_SUFFIX));
     ensure!(
         binary.is_file(),

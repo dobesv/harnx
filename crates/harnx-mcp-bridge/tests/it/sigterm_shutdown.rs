@@ -126,10 +126,7 @@ fn workspace_binary(name: &str, cargo_path: Option<&str>) -> Result<PathBuf> {
         (PathBuf::from(path), "CARGO_BIN_EXE")
     } else {
         let mut path = std::env::current_exe().context("locate current test executable")?;
-        path.pop();
-        if path.ends_with("deps") {
-            path.pop();
-        }
+        path = harnx_core::bin_dir_of_exe(&path);
         (path.join(name), "test executable sibling")
     };
     anyhow::ensure!(

@@ -110,11 +110,7 @@ impl TestEnv {
         )?;
 
         let current_exe = std::env::current_exe().context("resolve current test executable")?;
-        let binary_dir = current_exe
-            .parent()
-            .and_then(Path::parent)
-            .context("derive Cargo profile directory from test executable")?;
-        let mut paths = vec![binary_dir.to_path_buf()];
+        let mut paths = vec![harnx_core::bin_dir_of_exe(&current_exe)];
         paths.extend(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
         ));

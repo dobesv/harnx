@@ -1022,10 +1022,7 @@ mod tests {
 
     #[cfg(unix)]
     fn plans_tools_binary() -> Option<std::path::PathBuf> {
-        let mut dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        if dir.file_name().is_some_and(|name| name == "deps") {
-            dir.pop();
-        }
+        let dir = harnx_core::bin_dir_of_exe(&std::env::current_exe().ok()?);
         let binary = dir.join("harnx-plans-tools");
         binary.is_file().then_some(binary)
     }
@@ -1218,10 +1215,7 @@ mod tests {
 
     #[cfg(unix)]
     fn bash_tools_binary() -> Option<std::path::PathBuf> {
-        let mut dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        if dir.file_name().is_some_and(|name| name == "deps") {
-            dir.pop();
-        }
+        let dir = harnx_core::bin_dir_of_exe(&std::env::current_exe().ok()?);
         let binary = dir.join("harnx-bash-tools");
         binary.is_file().then_some(binary)
     }
@@ -1233,10 +1227,7 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 let mut path = std::env::current_exe().expect("locate current test executable");
-                path.pop();
-                if path.ends_with("deps") {
-                    path.pop();
-                }
+                path = harnx_core::bin_dir_of_exe(&path);
                 path.join("harnx-plans-tools")
             });
         assert!(
@@ -1271,10 +1262,7 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 let mut path = std::env::current_exe().expect("locate current test executable");
-                path.pop();
-                if path.ends_with("deps") {
-                    path.pop();
-                }
+                path = harnx_core::bin_dir_of_exe(&path);
                 path.join("harnx-plans-tools")
             });
         assert!(
