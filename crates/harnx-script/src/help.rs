@@ -86,17 +86,19 @@ fn output_section(text: &mut String, mapping: &OutputMapping) {
     if let Some(summary) = &mapping.summary {
         indent(text, summary.trim(), 2);
     }
+    let stderr = match (&mapping.stderr_text, &mapping.stderr) {
+        (Some(text), Some(notes)) => Some(format!("the `{text}` field, then notes from `{notes}`")),
+        (Some(field), None) | (None, Some(field)) => Some(format!("the `{field}` field")),
+        (None, None) => None,
+    };
+    let field = |field: &Option<String>| field.as_ref().map(|f| format!("the `{f}` field"));
     let parts: Vec<String> = [
-        ("stdout", &mapping.stdout),
-        ("stderr", &mapping.stderr),
-        ("exit status", &mapping.exit_code),
+        ("stdout", field(&mapping.stdout)),
+        ("stderr", stderr),
+        ("exit status", field(&mapping.exit_code)),
     ]
     .into_iter()
-    .filter_map(|(stream, field)| {
-        field
-            .as_ref()
-            .map(|field| format!("{stream}: the `{field}` field"))
-    })
+    .filter_map(|(stream, text)| text.map(|text| format!("{stream}: {text}")))
     .collect();
     if !parts.is_empty() {
         text.push_str(&format!("  {}\n", parts.join("    ")));

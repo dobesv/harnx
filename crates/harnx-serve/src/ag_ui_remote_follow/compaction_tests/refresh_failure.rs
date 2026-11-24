@@ -134,7 +134,7 @@ fn assert_cached_history(
     assert_eq!(completed["name"], "session_compacting_completed");
     let expected =
         HistorySnapshot::from_entries(stream.history(), &Session::default(), true).unwrap();
-    for event in expected.events() {
+    for event in expected.live_events() {
         assert_eq!(rx.try_recv().unwrap().event, event);
     }
     assert!(

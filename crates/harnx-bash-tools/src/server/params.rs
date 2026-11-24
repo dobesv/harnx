@@ -71,6 +71,8 @@ pub(crate) struct ReadExecLogParams {
     pub(crate) tail_lines: Option<usize>,
     #[serde(default)]
     pub(crate) max_output_bytes: Option<usize>,
+    #[serde(default)]
+    pub(crate) line_numbers: Option<bool>,
 }
 
 impl JsonSchema for ReadExecLogParams {
@@ -88,6 +90,7 @@ impl JsonSchema for ReadExecLogParams {
         let head_lines = generator.subschema_for::<Option<usize>>();
         let tail_lines = generator.subschema_for::<Option<usize>>();
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
+        let line_numbers = generator.subschema_for::<Option<bool>>();
         object_schema_with_desc(
             vec![
                 (
@@ -110,6 +113,11 @@ impl JsonSchema for ReadExecLogParams {
                     "max_output_bytes",
                     "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window.",
                     max_output_bytes,
+                ),
+                (
+                    "line_numbers",
+                    "Prefix each line with its line number as 'N: '. Defaults to true; a script's result defaults to plain lines.",
+                    line_numbers,
                 ),
             ],
             &["execution_id", "stream"],

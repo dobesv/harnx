@@ -1812,21 +1812,42 @@ For summarizer retention priorities, research, and evaluation guidance, see
 
 Session logs, leases, canonical metadata, attachment blobs, and plan documents
 persist in JetStream until explicitly deleted or collected. Manual deletion
-purges:
-- Transcript stream: `SESSION_<sha256(id)>`
-- Leases: `harnx_leases`
-- Metadata keys: `sessions/{id}/*` in `harnx_sessions` (including read and unread tracking)
-- Invocation journal: `harnx_tool_invocations`
-- Media objects: `media/<owner>/` in `harnx_attachments`
-- Plans KV: `plan/<owner>/` in `harnx_plans`
-(where `<owner>` is `session_key(agent, id)`).
+and worker retention GC run the same cascade (where `<owner>` is
+`session_key(agent, id)`):
+1. Capture the canonical metadata KV revision (`sessions/<owner>/meta`, if present) and acquire the A2A deletion fence if A2A state exists (purging `sessions/<owner>/a2a/context`).
+2. Delete the transcript stream: `SESSION_<sha256(owner)>` (first for `harnx delete session` and retention GC; last for orphan-stream GC so an interrupted orphan cleanup still leaves the stream discoverable).
+3. Delete the worker lease in `harnx_leases`.
+4. Purge invocation journal entries in `harnx_tool_invocations` (leaving a 1-hour deletion tombstone).
+5. Purge non-canonical metadata keys (`sessions/<owner>/*` in `harnx_sessions`, including activity, read/unread tracking, tasks, and remaining A2A keys), keeping `sessions/<owner>/meta`.
+6. Purge private interaction checkpoints in `harnx_interaction_checkpoints`.
+7. Delete media objects (`media/<owner>/` in `harnx_attachments`) and plans (`plan/<owner>/` in `harnx_plans`).
+8. Finish A2A cleanup (`a2a.tasks.<owner>.*`, `a2a/first-messages/<hash>`, `a2a.registry.<hash>`, and release the A2A scoped lease).
+9. Purge the canonical metadata key `sessions/<owner>/meta` last, conditioned on the revision captured at start (a no-op if no live canonical record existed at start).
 
 ```bash
 harnx delete session <session_id> --agent <agent> --cluster local
 ```
 
+Because `sessions/<owner>/meta` is purged last, any failure earlier in the
+cascade leaves the canonical record in place with its old owner. Other
+prompt-only users cannot claim the ID while partial state remains, and
+re-running `harnx delete session` or waiting for the next eligible retention GC
+pass finishes cleanup. If the canonical record's revision changed between the
+start of deletion and the final purge, the final purge is skipped rather than
+removing the newer record: `harnx delete session` prints the error
+`Incomplete deletion of remote session '<session>' on cluster '<cluster>' (canonical metadata purge skipped because its revision changed; ...)`
+including `metadata_keys_deleted` to stderr and exits `1`, while retention GC increments `skipped_metadata_changed`
+instead of `deleted`. Once the canonical record is gone, anyone with `prompt`
+scope can reuse the ID.
+
 There is no separate control-plane state to reap: interruption leaves nothing
 behind but log entries, which the same deletion removes.
+
+**Upgrade order, rollback, and limitations:**
+- On clusters with access rules, upgrade every component that deletes sessions (`harnx` CLI, and `harnx-worker` instances running retention or orphan GC) and let in-flight old cleanup runs finish **before** upgrading `harnx-serve`. Older deleters purge canonical metadata before media and plans, which can leave claimable partial deletions.
+- **Rollback:** Roll back `harnx-serve` **before** rolling back the deleters (`harnx` CLI and `harnx-worker`), so older deleters that purge canonical metadata first do not run alongside a server that allows client-chosen ID creation under access rules.
+- Deletions run by older versions before canonical-last ordering purge metadata before media and leftovers, so failed runs can leave media or plans behind after the stream and metadata are gone. After upgrading, another user could claim such an ID and reach those leftovers via `/v1/cid/*`, and a later retry could delete the new session. Finish retrying any incomplete deletions with `harnx delete session <session_id> --agent <agent> --cluster <cluster>` before enabling or upgrading to a `harnx-serve` with client-chosen claims.
+- Reusing a deleted ID within one hour can cause journaled tool calls to fail against the invocation journal's 1-hour tombstone, and retrying deletion rewrites that tombstone for another hour (without delaying the claim itself). Active SSE streams on another `harnx-serve` process or in-flight workers at deletion time are not fenced by session incarnations.
 
 ### Automatic Session Garbage Collection
 
@@ -1843,17 +1864,13 @@ Each worker only collects expired sessions in its own cluster
 with zero workers deployed, no automatic garbage collection runs for that
 cluster until at least one worker joins.
 
-Automatic collection uses the exact same deletion path as manual cleanup. In
-the normal case it removes:
-- Transcript stream: `SESSION_<sha256(id)>`
-- Leases: `harnx_leases`
-- Metadata keys: `sessions/{id}/*` in `harnx_sessions` (including read and unread tracking)
-- Invocation journal: `harnx_tool_invocations`
-- Media objects: `media/<owner>/` in `harnx_attachments`
-- Plans KV: `plan/<owner>/` in `harnx_plans`
-(where `<owner>` is `session_key(agent, id)`).
-Workers also verify that candidate sessions are inactive before deletion,
-skipping any session with an active or reactivated lease.
+Automatic collection uses the exact same deletion cascade as manual cleanup,
+deleting the transcript stream first and purging canonical `sessions/<owner>/meta`
+last. Because canonical metadata stays present until every earlier step
+succeeds, a session whose deletion failed partway remains selectable by the
+next eligible retention pass. Workers also verify that candidate sessions are
+inactive before deletion, skipping any session with an active or reactivated
+lease.
 
 Retention is controlled by `cleanup_remote_sessions_days` in `config.yaml` or
 the `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS` environment variable. Configure the

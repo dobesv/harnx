@@ -8,12 +8,12 @@ import { AssistantRuntimeProvider } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
 import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
 import { HttpAgent } from '@ag-ui/client';
-import type { AgentSubscriber, Message } from '@ag-ui/client';
+import type { AgentStateMutation, AgentSubscriber, Message } from '@ag-ui/client';
 import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
 import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
-import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type MessageAttachmentMeta, type CompactionOutcome, type PendingInteraction } from './harnxCustomEvents';
+import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, parseHistoryReasoning, type HistoryReasoningMap, type MessageAttachmentMeta, type CompactionOutcome, type PendingInteraction } from './harnxCustomEvents';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
 import { SessionNavigationContext } from './SessionNavigationContext';
@@ -30,6 +30,7 @@ import {
 import { isAbortError, observedFetch } from './httpClient';
 import { connection } from './connection';
 import { formatUnchangedReason } from './compactionApi';
+import { HistoryReasoningSupportContext } from './historyReasoningSupport';
 
 export interface ChatProviderProps {
   agentName: string;
@@ -104,6 +105,63 @@ export function toAgUiMessages(messages: readonly Message[]): Message[] {
     });
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
+export function augmentSnapshotMessagesWithReasoning(
+  messages: readonly unknown[],
+  reasoningMap: HistoryReasoningMap,
+): unknown[] {
+  if (Object.keys(reasoningMap).length === 0) {
+    return [...messages];
+  }
+  const nextMessages: unknown[] = [];
+  for (const rawMessage of messages) {
+    if (
+      rawMessage !== null &&
+      typeof rawMessage === 'object' &&
+      (rawMessage as Record<string, unknown>).role === 'assistant'
+    ) {
+      const msgId = (rawMessage as Record<string, unknown>).id;
+      if (typeof msgId === 'string' && msgId.trim().length > 0 && Object.hasOwn(reasoningMap, msgId)) {
+        const thoughts = reasoningMap[msgId];
+        if (Array.isArray(thoughts)) {
+          thoughts.forEach((thought, idx) => {
+            if (typeof thought === 'string' && thought.trim().length > 0) {
+              nextMessages.push({
+                id: `${msgId}:reasoning-${idx}`,
+                role: 'reasoning',
+                content: thought,
+              });
+            }
+          });
+        }
+      }
+    }
+    nextMessages.push(rawMessage);
+  }
+  return nextMessages;
+}
+
+function augmentSnapshotPayloadWithReasoning(
+  payload: AgUiSnapshotPayload,
+  reasoningMap: HistoryReasoningMap,
+): AgUiSnapshotPayload {
+  const messages = payload?.event?.messages;
+  if (!Array.isArray(messages) || Object.keys(reasoningMap).length === 0) {
+    return payload;
+  }
+  const nextMessages = augmentSnapshotMessagesWithReasoning(messages, reasoningMap);
+  if (nextMessages.length === messages.length) {
+    return payload;
+  }
+  return {
+    ...payload,
+    event: {
+      ...payload.event,
+      messages: nextMessages as Message[],
+    },
+  };
+}
+
 export interface HarnxHttpAgentOptions {
   url: string;
   onStatus: (text: string | null) => void;
@@ -121,9 +179,23 @@ export interface HarnxHttpAgentOptions {
   onCompactingFailed?: (error: string, compactionId?: string) => void;
   onSessionCompaction?: (compaction: CompactionMetadata | null) => void;
   onToolUpdate?: (patch: import('./toolUpdates').ToolCallUpdatePatch) => void;
+  onHistoryReasoning?: (reasoning: HistoryReasoningMap) => void;
   onRunTerminal?: () => void;
   onTurnInterrupted?: () => void;
   isForeground?: boolean;
+}
+
+type AgUiSnapshotPayload = Parameters<NonNullable<AgentSubscriber['onMessagesSnapshotEvent']>>[0];
+
+function isSameOriginUrl(url: string): boolean {
+  if (typeof window === 'undefined' || !window.location?.origin) {
+    return url.startsWith('/') && !url.startsWith('//');
+  }
+  try {
+    return new URL(url, window.location.href).origin === window.location.origin;
+  } catch {
+    return false;
+  }
 }
 
 const TRANSPORT_ERROR_PATTERN =
@@ -143,6 +215,8 @@ function isTransportFailure(error: unknown, message: string): boolean {
   return TRANSPORT_ERROR_PATTERN.test(message);
 }
 
+const SNAPSHOT_REASONING_FLUSH_MS = 50;
+
 // eslint-disable-next-line react-refresh/only-export-components
 export class HarnxHttpAgent extends HttpAgent {
   private readonly onStatus: (text: string | null) => void;
@@ -160,13 +234,24 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onCompactingFailed?: (error: string, compactionId?: string) => void;
   private readonly onSessionCompaction?: (compaction: CompactionMetadata | null) => void;
   private readonly onToolUpdate?: (patch: import('./toolUpdates').ToolCallUpdatePatch) => void;
+  private readonly onHistoryReasoning?: (reasoning: HistoryReasoningMap) => void;
   private readonly onRunTerminalCb?: () => void;
   private readonly onTurnInterruptedCb?: () => void;
   private readonly isForeground: boolean;
   private handoffBoundarySeq?: number;
 
   constructor(options: HarnxHttpAgentOptions) {
-    super({ url: options.url, fetch: observedFetch });
+    super({
+      url: options.url,
+      fetch: observedFetch,
+      ...(isSameOriginUrl(options.url)
+        ? {
+            headers: {
+              'x-harnx-snapshot-features': 'history-reasoning',
+            },
+          }
+        : {}),
+    });
     this.onStatus = options.onStatus;
     this.onRunFailedCb = options.onRunFailed;
     this.onUsageCb = options.onUsage;
@@ -182,6 +267,7 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onCompactingFailed = options.onCompactingFailed;
     this.onSessionCompaction = options.onSessionCompaction;
     this.onToolUpdate = options.onToolUpdate;
+    this.onHistoryReasoning = options.onHistoryReasoning;
     this.onRunTerminalCb = options.onRunTerminal;
     this.onTurnInterruptedCb = options.onTurnInterrupted;
     this.isForeground = options.isForeground !== false;
@@ -211,6 +297,7 @@ export class HarnxHttpAgent extends HttpAgent {
       onCompactingFailed: this.onCompactingFailed,
       onSessionCompaction: this.onSessionCompaction,
       onToolUpdate: this.onToolUpdate,
+      onHistoryReasoning: this.onHistoryReasoning,
       onTurnInterrupted: () => {
         this.onTurnInterruptedCb?.();
         this.onRunTerminalCb?.();
@@ -260,26 +347,182 @@ export class HarnxHttpAgent extends HttpAgent {
     );
   }
 
-  private wrapSubscriber(subscriber?: AgentSubscriber): AgentSubscriber {
+  private wrapSubscriber(subscriber?: AgentSubscriber): {
+    subscriber: AgentSubscriber;
+    cleanup: () => void;
+  } {
+    let pendingSnapshotPayload: AgUiSnapshotPayload | null = null;
+    let lastFlushedIdleSnapshot: AgUiSnapshotPayload | null = null;
+    let pendingIdleMessagesSync: Message[] | undefined;
+    let snapshotReasoning: HistoryReasoningMap = {};
+    let fallbackFlushTimer: ReturnType<typeof setTimeout> | undefined;
+    let runEnded = false;
+
+    const clearFallbackTimer = () => {
+      if (fallbackFlushTimer !== undefined) {
+        clearTimeout(fallbackFlushTimer);
+        fallbackFlushTimer = undefined;
+      }
+    };
+
+    const syncAgentMessages = (messages: Message[] | undefined) => {
+      if (messages !== undefined) {
+        this.setMessages(messages);
+      }
+    };
+
+    const dispatchSnapshot = async (
+      payload: AgUiSnapshotPayload,
+      reasoning: HistoryReasoningMap,
+    ): Promise<Message[] | undefined> => {
+      const nextPayload = augmentSnapshotPayloadWithReasoning(payload, reasoning);
+      const nextMessages = Array.isArray(nextPayload?.event?.messages)
+        ? nextPayload.event.messages
+        : undefined;
+      try {
+        await subscriber?.onMessagesSnapshotEvent?.(nextPayload);
+      } catch (err) {
+        console.error('[HarnxHttpAgent] Failed to deliver snapshot event:', err);
+      }
+      return nextMessages;
+    };
+
+    const flushPendingSnapshot = async (
+      keepForLateReasoning = false,
+    ): Promise<Message[] | undefined> => {
+      clearFallbackTimer();
+      if (!pendingSnapshotPayload) return undefined;
+      const payload = pendingSnapshotPayload;
+      pendingSnapshotPayload = null;
+      const reasoning = snapshotReasoning;
+      snapshotReasoning = {};
+      lastFlushedIdleSnapshot = keepForLateReasoning ? payload : null;
+      return await dispatchSnapshot(payload, reasoning);
+    };
+
+    const consumeFlushedMessages = async (): Promise<Message[] | undefined> => {
+      lastFlushedIdleSnapshot = null;
+      const flushedMessages = await flushPendingSnapshot(false);
+      if (flushedMessages !== undefined) {
+        pendingIdleMessagesSync = undefined;
+        return flushedMessages;
+      }
+      const idleSync = pendingIdleMessagesSync;
+      pendingIdleMessagesSync = undefined;
+      return idleSync;
+    };
+
+    const withFlushedMessages = <T extends AgentStateMutation | void>(
+      result: T,
+      flushedMessages: Message[] | undefined,
+    ): T | { messages: Message[] } => {
+      if (flushedMessages === undefined) return result;
+      if (result && typeof result === 'object' && 'messages' in result) {
+        return result;
+      }
+      return result && typeof result === 'object'
+        ? { ...result, messages: flushedMessages }
+        : { messages: flushedMessages };
+    };
+
+    const finishRun = async <TPayload, TResult extends AgentStateMutation | void>(
+      downstream?: (payload: TPayload) => TResult | Promise<TResult>,
+      payload?: TPayload,
+    ): Promise<TResult | { messages: Message[] }> => {
+      runEnded = true;
+      const flushedMessages = await consumeFlushedMessages();
+      const result = payload !== undefined ? await downstream?.(payload) : undefined;
+      return withFlushedMessages(result as TResult, flushedMessages);
+    };
+
     return {
-      ...subscriber,
-      onEvent: async (payload) => {
-        this.handleAgentEvent(payload.event);
-        return subscriber?.onEvent?.(payload as any);
+      cleanup: () => {
+        runEnded = true;
+        clearFallbackTimer();
+        pendingIdleMessagesSync = undefined;
       },
-      onCustomEvent: async (payload) => {
-        if (!this.forwardsCustomEvent((payload?.event as any)?.name)) return;
-        return subscriber?.onCustomEvent?.(payload as any);
-      },
-      onRunFailed: async (payload) => {
-        this.handleRunFailure(payload.error.message, payload.error);
-        return subscriber?.onRunFailed?.(payload as any);
+      subscriber: {
+        ...subscriber,
+        onEvent: async (payload) => {
+          const event = payload?.event as { type?: unknown; name?: unknown } | undefined;
+          const isHistoryReasoning =
+            event?.type === 'CUSTOM' && event?.name === 'history_reasoning';
+          let flushedMessages: Message[] | undefined;
+          if (event?.type !== 'MESSAGES_SNAPSHOT' && !isHistoryReasoning) {
+            flushedMessages = await consumeFlushedMessages();
+          }
+          this.handleAgentEvent(event);
+          const result = await subscriber?.onEvent?.(payload);
+          return withFlushedMessages(result, flushedMessages);
+        },
+        onMessagesSnapshotEvent: async (payload) => {
+          pendingIdleMessagesSync = undefined;
+          await consumeFlushedMessages();
+          snapshotReasoning = {};
+          pendingSnapshotPayload = payload;
+          if (runEnded) {
+            const flushedMessages = await flushPendingSnapshot(false);
+            return withFlushedMessages(undefined, flushedMessages);
+          }
+          fallbackFlushTimer = setTimeout(() => {
+            fallbackFlushTimer = undefined;
+            if (!runEnded && pendingSnapshotPayload) {
+              void flushPendingSnapshot(true)
+                .then((flushedMessages) => {
+                  pendingIdleMessagesSync = flushedMessages;
+                  syncAgentMessages(flushedMessages);
+                })
+                .catch((err) => {
+                  console.error('[HarnxHttpAgent] Failed in fallback snapshot flush:', err);
+                });
+            }
+          }, SNAPSHOT_REASONING_FLUSH_MS);
+        },
+        onCustomEvent: async (payload) => {
+          const event = payload?.event as { name?: unknown; value?: unknown } | undefined;
+          if (event?.name === 'history_reasoning') {
+            const parsed = parseHistoryReasoning(event?.value) ?? {};
+            const idleSync = pendingIdleMessagesSync;
+            pendingIdleMessagesSync = undefined;
+            if (pendingSnapshotPayload) {
+              snapshotReasoning = parsed;
+              const flushedMessages = await flushPendingSnapshot(false);
+              return withFlushedMessages(undefined, flushedMessages);
+            }
+            if (lastFlushedIdleSnapshot) {
+              const idlePayload = lastFlushedIdleSnapshot;
+              lastFlushedIdleSnapshot = null;
+              if (Object.keys(parsed).length > 0) {
+                const nextMessages = await dispatchSnapshot(idlePayload, parsed);
+                return withFlushedMessages(undefined, nextMessages);
+              }
+              return withFlushedMessages(undefined, idleSync);
+            }
+            return;
+          }
+          const flushedMessages = await consumeFlushedMessages();
+          if (!this.forwardsCustomEvent(event?.name)) {
+            return withFlushedMessages(undefined, flushedMessages);
+          }
+          const result = await subscriber?.onCustomEvent?.(payload);
+          return withFlushedMessages(result, flushedMessages);
+        },
+        onRunFinishedEvent: async (payload) => finishRun(subscriber?.onRunFinishedEvent, payload),
+        onRunErrorEvent: async (payload) => finishRun(subscriber?.onRunErrorEvent, payload),
+        onRunFinalized: async (payload) => finishRun(subscriber?.onRunFinalized, payload),
+        onRunFailed: async (payload) => {
+          runEnded = true;
+          const flushedMessages = await consumeFlushedMessages();
+          syncAgentMessages(flushedMessages);
+          this.handleRunFailure(payload.error.message, payload.error);
+          return subscriber?.onRunFailed?.(payload);
+        },
       },
     };
   }
 
   override async runAgent(params: any, subscriber?: AgentSubscriber) {
-    const wrappedSubscriber = this.wrapSubscriber(subscriber);
+    const { subscriber: wrappedSubscriber, cleanup } = this.wrapSubscriber(subscriber);
 
     const nextParams = {
       ...params,
@@ -292,6 +535,8 @@ export class HarnxHttpAgent extends HttpAgent {
     } catch (err: any) {
       this.handleRunFailure(err.message, err);
       throw err;
+    } finally {
+      cleanup();
     }
   }
 }
@@ -341,6 +586,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   // Hydrated HITL pending approvals from durable log (hitl_pending_approval CUSTOM events)
   const [hydratedApprovals, setHydratedApprovals] = useState<HydratedPendingApproval[]>([]);
   const [pendingInteraction, setPendingInteraction] = useState<PendingInteraction | null>(null);
+  const [hasHistoryReasoning, setHasHistoryReasoning] = useState(false);
 
   const clearPendingInteraction = useCallback(() => {
     setPendingInteraction(null);
@@ -502,6 +748,16 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
       onToolUpdate: (patch: ToolCallUpdatePatch) => {
         dispatchToolUpdate({ type: 'TOOL_UPDATE', patch });
       },
+      onHistoryReasoning: () => {
+        if (
+          currentAgentRef.current !== agentInstance ||
+          currentSessionRef.current.agentName !== boundAgentName ||
+          currentSessionRef.current.sessionId !== boundSessionId
+        ) {
+          return;
+        }
+        setHasHistoryReasoning(true);
+      },
     });
     currentAgentRef.current = agentInstance;
     return agentInstance;
@@ -535,6 +791,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     dispatchSurfaces({ type: 'RESET' });
     clearHydratedApprovals();
     clearPendingInteraction();
+    setHasHistoryReasoning(false);
   }, [agentName, sessionId, clearHydratedApprovals, clearPendingInteraction]);
 
   const subAgentContext = useMemo(() => ({
@@ -584,6 +841,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
   }, [agentName, sessionId, surfacesState]);
 
   return (
+    <HistoryReasoningSupportContext.Provider value={hasHistoryReasoning}>
     <CancellationContext.Provider value={cancellation}>
     <CompactionContext.Provider value={compactionPhase}>
     <CompactionMetadataContext.Provider value={compactionMetadataContextValue}>
@@ -618,5 +876,6 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     </CompactionMetadataContext.Provider>
     </CompactionContext.Provider>
     </CancellationContext.Provider>
+    </HistoryReasoningSupportContext.Provider>
   );
 };

@@ -61,7 +61,7 @@ fn actor_after_load(loaded: crate::LoadedNatsSession) -> SessionActor {
 }
 
 fn assert_presentation_warning(actor: &SessionActor) {
-    assert!(actor.history_snapshot.is_empty() && actor.compaction.is_none());
+    assert!(actor.history_snapshot == HistorySnapshot::default());
     assert_eq!(actor.history_warnings[0], "existing replay warning");
     assert!(actor.history_warnings[1].starts_with("Failed to build session transcript:"));
 }
@@ -285,7 +285,7 @@ fn failed_follow_keeps_derived_state_and_broadcasts_run_error() {
             MessageId::random(),
             SessionEventContext::new(
                 Arc::new(ConfigLock::new(actor.actor_config.base_config.clone())),
-                Vec::new(),
+                HistorySnapshot::default(),
             ),
         )),
         thread_id: derive_thread_id(&actor.key.session),

@@ -488,12 +488,69 @@ mod adapter_wire_tests {
         assert_eq!(opt_in, None);
     }
 
-    /// MCP cannot carry the request for a script-shaped result, so its listing
-    /// never advertises a mapping for one.
+    /// A script-shaped tool's mapping is advertised over MCP, because the
+    /// request that makes the tool answer that way now travels too.
     #[tokio::test]
-    async fn list_tools_drops_the_script_output_mapping() {
+    async fn list_tools_keeps_the_script_output_mapping() {
         let mapping = listed_meta("script_shaped", harnx_toolset::SCRIPT_OUTPUT_META_KEY).await;
-        assert_eq!(mapping, None);
+        assert!(mapping.is_some_and(|value| value.is_object()));
+    }
+
+    /// Records whether each invocation asked for a script-shaped result.
+    #[derive(Default)]
+    struct StructuredResultProbe {
+        seen: std::sync::Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Toolset for StructuredResultProbe {
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn tools(&self) -> Vec<harnx_toolset::ToolSpec> {
+            vec![timeout_policy_spec("probe", None)]
+        }
+
+        async fn invoke(
+            &self,
+            _tool: &str,
+            _args: Value,
+            _cancel: CancellationToken,
+        ) -> Result<Value, ToolInvokeError> {
+            unreachable!("the probe is invoked with a context")
+        }
+
+        async fn invoke_with_context(
+            &self,
+            invocation: ToolInvocation,
+        ) -> Result<Value, ToolInvokeError> {
+            self.seen
+                .lock()
+                .expect("probe log")
+                .push(invocation.context.wants_structured_result());
+            Ok(serde_json::json!({"content": [], "isError": false}))
+        }
+    }
+
+    /// Only a `_meta` entry that is exactly `true` requests a structured result.
+    #[tokio::test]
+    async fn call_tool_meta_requests_a_structured_result() {
+        let probe = Arc::new(StructuredResultProbe::default());
+        let (client, _server) = setup_client_server(probe.clone()).await;
+        let key = harnx_toolset::CAPABILITY_STRUCTURED_RESULT;
+        for entry in [Some(true), None, Some(false)] {
+            let mut params = CallToolRequestParams::new("probe");
+            if let Some(flag) = entry {
+                params
+                    .meta_mut()
+                    .get_or_insert_with(rmcp::model::RequestMetaObject::new)
+                    .insert(key.to_owned(), Value::Bool(flag));
+            }
+            client.peer().call_tool(params).await.expect("probe call");
+        }
+        assert_eq!(*probe.seen.lock().expect("probe log"), [true, false, false]);
+        client.cancel().await.unwrap();
     }
 
     /// Records what a toolset observed on each invocation: the arguments,

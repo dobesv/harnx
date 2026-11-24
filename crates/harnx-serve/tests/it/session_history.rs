@@ -1,4 +1,5 @@
 //! Backend browse-back contract through real HTTP dispatch and JetStream.
+mod reasoning;
 mod support;
 
 use anyhow::Result;

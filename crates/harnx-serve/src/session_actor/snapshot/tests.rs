@@ -75,7 +75,7 @@ fn relay(
     let sink = Arc::new(BroadcastEventSender::new(
         tx,
         MessageId::random(),
-        SessionEventContext::new(config.clone(), Vec::new()),
+        SessionEventContext::new(config.clone(), HistorySnapshot::default()),
     ));
     let (tx, rx) = mpsc::unbounded_channel();
     (
@@ -123,7 +123,7 @@ async fn relay_refreshes_compaction_before_later_events_and_turn_return() {
 fn assert_relay_events(events: &mut broadcast::Receiver<Event>) {
     let completed = serde_json::to_value(events.try_recv().unwrap()).unwrap();
     assert_eq!(completed["value"]["compaction_seq"], 5);
-    for expected in expected(6).events() {
+    for expected in expected(6).live_events() {
         assert_eq!(events.try_recv().unwrap(), expected);
     }
     let later = serde_json::to_value(events.try_recv().unwrap()).unwrap();
@@ -146,9 +146,15 @@ async fn broadcast_lag_recovers_compaction_metadata_before_snapshot() {
         .unwrap();
     tx.send(crate::transcript_snapshot::compaction_event(None))
         .unwrap();
-    let events = crate::ag_ui_events::live_subscription_events(&handle, rx);
+    let events = crate::ag_ui_events::live_subscription_events(
+        &handle,
+        rx,
+        crate::transcript_snapshot::SnapshotFeatures::WITH_HISTORY_REASONING,
+    );
     futures_util::pin_mut!(events);
-    for expected in expected(6).events() {
+    for expected in
+        expected(6).events_for(crate::transcript_snapshot::SnapshotFeatures::WITH_HISTORY_REASONING)
+    {
         assert_eq!(
             futures_util::StreamExt::next(&mut events).await.unwrap(),
             expected

@@ -4,4 +4,5 @@
 
 mod mcp_http_client;
 mod pr_waiter;
+mod script_results;
 mod tool_templates;

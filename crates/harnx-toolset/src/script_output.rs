@@ -22,6 +22,10 @@ pub struct ScriptOutput {
     /// Format for an object item of the stdout field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row: Option<String>,
+    /// structuredContent string field printed on stderr exactly as stored,
+    /// before the notes. For a command's own stderr.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_text: Option<String>,
     /// structuredContent field printed on stderr.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
@@ -34,4 +38,14 @@ pub struct ScriptOutput {
     /// One line for `help <tool>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+}
+
+/// Notes for `head_lines` and `tail_lines` passed to a tool in a script, where
+/// the tool cannot apply them and a pipe to `head` or `tail` does the job.
+pub fn line_cap_notes(head: Option<usize>, tail: Option<usize>) -> Vec<String> {
+    [("head_lines", "head", head), ("tail_lines", "tail", tail)]
+        .into_iter()
+        .filter(|(_, _, value)| value.is_some())
+        .map(|(name, command, _)| format!("{name} is ignored in a script; pipe to {command}"))
+        .collect()
 }

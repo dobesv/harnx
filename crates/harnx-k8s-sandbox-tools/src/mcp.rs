@@ -468,13 +468,7 @@ impl McpCaller for StreamableHttpMcpCaller {
         };
         let service = self.session_with_retry(&connect).await?;
 
-        let mut request = CallToolRequestParams::new(tool.to_string()).with_arguments(args);
-        if capabilities.contains(harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE) {
-            request.meta.get_or_insert_default().insert(
-                harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE.to_string(),
-                Value::Bool(true),
-            );
-        }
+        let mut request = call_request(tool, args, &capabilities);
         harnx_telemetry::propagate::inject_current_into_mcp(&mut request);
         let peer = service.peer().clone();
         let submission = peer.send_cancellable_request(
@@ -596,6 +590,28 @@ impl McpCaller for StreamableHttpMcpCaller {
             }
         }
     }
+}
+
+/// The `tools/call` parameters for one pod call. Each capability the pod
+/// understands rides in the request `_meta` as a `true` entry.
+fn call_request(
+    tool: &str,
+    args: Map<String, Value>,
+    capabilities: &BTreeSet<String>,
+) -> CallToolRequestParams {
+    let mut request = CallToolRequestParams::new(tool.to_string()).with_arguments(args);
+    for capability in [
+        harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE,
+        harnx_toolset::CAPABILITY_STRUCTURED_RESULT,
+    ] {
+        if capabilities.contains(capability) {
+            request
+                .meta
+                .get_or_insert_default()
+                .insert(capability.to_string(), Value::Bool(true));
+        }
+    }
+    request
 }
 
 fn service_error(phase: &'static str, tool: &str, error: ServiceError) -> McpCallError {

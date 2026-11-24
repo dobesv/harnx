@@ -57,7 +57,7 @@ pub struct RequestAccess<'a> {
 }
 
 /// What a `cid:media` reference check decided for a prompt.
-enum AttachmentGuard {
+pub(crate) enum AttachmentGuard {
     /// No rules, or every source passed the owner check.
     Allow,
     /// The reference does not parse; the prompt is rejected like an
@@ -136,7 +136,7 @@ fn dedupe_sources(sources: Vec<CidUrl>) -> Vec<CidUrl> {
 
 /// Parse and authorize a prompt's `cid:media` references against their source
 /// session owners, in the cluster the destination prompt will resolve them.
-async fn check_prompt_attachments(
+pub(crate) async fn check_prompt_attachments(
     access: &RequestAccess<'_>,
     params: &PromptParams,
     cluster: &str,
@@ -301,7 +301,7 @@ pub struct RpcContext<'a> {
 }
 
 #[derive(Debug, Deserialize)]
-struct PromptParams {
+pub(crate) struct PromptParams {
     text: String,
     #[serde(default)]
     working_dir: Option<std::path::PathBuf>,
@@ -348,7 +348,7 @@ pub async fn handle_ag_ui_rpc(
         session,
         body: body.collect().await?.to_bytes(),
     };
-    handle_ag_ui_rpc_bytes_for_target(request, context).await
+    handle_ag_ui_rpc_bytes_for_target(request, context, false).await
 }
 
 pub async fn handle_ag_ui_rpc_bytes(
@@ -378,20 +378,26 @@ pub async fn handle_ag_ui_rpc_bytes(
         user_principals: None,
         attachment_access: None,
     };
-    handle_ag_ui_rpc_bytes_for_target(request, context).await
+    handle_ag_ui_rpc_bytes_for_target(request, context, false).await
 }
 
 /// One JSON-RPC request addressed to a session.
-struct RpcRequest<'a> {
-    method: Method,
-    target: &'a ResolvedAgentTarget,
-    session: &'a str,
-    body: Bytes,
+pub(crate) struct RpcRequest<'a> {
+    pub(crate) method: Method,
+    pub(crate) target: &'a ResolvedAgentTarget,
+    pub(crate) session: &'a str,
+    pub(crate) body: Bytes,
 }
 
-async fn handle_ag_ui_rpc_bytes_for_target(
+/// `attachments_preflight_passed` is an internal parameter, not part of
+/// [`RpcContext`] (review C-new-2): a deferred session claim already ran
+/// the attachment preflight before reservation (design step 3, row g), and
+/// its Allow verdict travels here so `handle_prompt` does not re-check the
+/// same refs. Every other caller passes `false`.
+pub(crate) async fn handle_ag_ui_rpc_bytes_for_target(
     request: RpcRequest<'_>,
     context: RpcContext<'_>,
+    attachments_preflight_passed: bool,
 ) -> anyhow::Result<AppResponse> {
     let RpcRequest {
         method,
@@ -434,7 +440,7 @@ async fn handle_ag_ui_rpc_bytes_for_target(
     }
 
     let key = SessionKey::new(target.clone(), session);
-    dispatch_rpc(rpc, context, key).await
+    dispatch_rpc(rpc, context, key, attachments_preflight_passed).await
 }
 
 // qual:allow(complexity, max_cyclomatic=11) reason: "the match is the RPC dispatch table: one arm per session method; merging or splitting arms would obscure the method map, and every arm is a one-line delegation."
@@ -442,6 +448,7 @@ async fn dispatch_rpc(
     rpc: JsonRpcRequest,
     context: RpcContext<'_>,
     key: SessionKey,
+    attachments_preflight_passed: bool,
 ) -> anyhow::Result<AppResponse> {
     let RpcContext {
         config,
@@ -455,7 +462,16 @@ async fn dispatch_rpc(
         "session/history" => {
             crate::session_history::rpc(rpc.id, rpc.params, (config, registry, key)).await
         }
-        "session/prompt" => handle_prompt(rpc.id, rpc.params, &context, key).await,
+        "session/prompt" => {
+            handle_prompt(
+                rpc.id,
+                rpc.params,
+                &context,
+                key,
+                attachments_preflight_passed,
+            )
+            .await
+        }
         "session/hitl_decision" => {
             handle_hitl_decision(rpc.id, rpc.params, config, registry, key).await
         }
@@ -525,6 +541,7 @@ pub(crate) fn session_get_result(info: &SessionInfo, persistence: &str) -> Value
         "canPrompt": info.capabilities.can_prompt,
         "canCancel": info.capabilities.can_cancel,
         "history_snapshot": info.history_snapshot,
+        "history_reasoning": info.history_reasoning,
         "history_warnings": info.history_warnings,
         "capabilities": { "multiClient": true, "persistence": persistence },
     });
@@ -564,11 +581,34 @@ fn prompt_params(
     Ok(params)
 }
 
+/// Classify a JSON-RPC body as a creating `session/prompt` for a deferred
+/// session claim (plan design step 3, rows b-e): the body must parse as a
+/// valid JSON-RPC envelope, the method must be exactly `session/prompt`,
+/// the prompt must carry content (`prompt_params` already refuses an
+/// empty one), and resume entries disqualify — nothing can be pending on
+/// a missing session, decision D6. Anything that does not qualify stays
+/// hidden behind the guard's 404.
+pub(crate) fn rpc_prompt_claim(body: &[u8]) -> Option<PromptParams> {
+    let rpc: JsonRpcRequest = serde_json::from_slice(body).ok()?;
+    if rpc.jsonrpc != "2.0" || rpc.method.trim().is_empty() {
+        return None;
+    }
+    if rpc.method != "session/prompt" {
+        return None;
+    }
+    let params = prompt_params(&rpc.id, rpc.params).ok()?;
+    if !params.resume.is_empty() {
+        return None;
+    }
+    Some(params)
+}
+
 async fn handle_prompt(
     id: Value,
     params: Option<Value>,
     context: &RpcContext<'_>,
     key: SessionKey,
+    attachments_preflight_passed: bool,
 ) -> anyhow::Result<AppResponse> {
     let registry = context.registry;
     let mut params = match prompt_params(&id, params) {
@@ -579,8 +619,13 @@ async fn handle_prompt(
 
     // Attachment authorization precedes the actor spawn, any resume decision
     // routing, and any attachment lookup: a denial leaves no durable trace.
-    if let Some(response) = prompt_attachment_denial(&id, &params, context, key.cluster()).await {
-        return response;
+    // A deferred claim already ran this check before reserving the session;
+    // the carried verdict means the same refs are not re-checked here.
+    if !attachments_preflight_passed {
+        if let Some(response) = prompt_attachment_denial(&id, &params, context, key.cluster()).await
+        {
+            return response;
+        }
     }
 
     let handle = registry.get_or_spawn(key);

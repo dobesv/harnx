@@ -8,6 +8,8 @@ pub(crate) struct ExecPipelineParams<'a> {
     pub(crate) timeout_secs: Option<u64>,
     pub(crate) truncate_opts: TruncateOpts,
     pub(crate) include_log_hints: bool,
+    /// Notes a script-style result carries for line caps it cannot apply.
+    pub(crate) line_cap_notes: Vec<String>,
     pub(crate) template_sandbox: Option<TemplateSandbox<'a>>,
     pub(crate) on_user_message: OnUserMessage,
     /// Set for protocol templates: their stdout carries progress messages and

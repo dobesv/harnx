@@ -61,12 +61,69 @@ function CompactionMarkerRow({
 
 interface MessageRowProps {
   msg: HistoryMessage;
+  reasoning?: string[];
+  hasHistoryReasoning: boolean;
   markdownComponents: Components;
 }
 
-function MessageRow({ msg, markdownComponents }: MessageRowProps) {
+function MessageRow({ msg, reasoning, hasHistoryReasoning, markdownComponents }: MessageRowProps) {
   const roleClass = msg.role || 'assistant';
   const content = msg.content || '';
+
+  if (msg.role !== 'assistant') {
+    return (
+      <article
+        className={`archived-history-message ${roleClass}`}
+        data-testid={`archived-msg-${roleClass}`}
+      >
+        <span className="archived-history-message-role">{msg.role}</span>
+        <div className="archived-history-message-body">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            urlTransform={markdownUrlTransform}
+            components={markdownComponents}
+          >
+            {content}
+          </ReactMarkdown>
+        </div>
+      </article>
+    );
+  }
+
+  if (hasHistoryReasoning) {
+    const thoughts = Array.isArray(reasoning)
+      ? reasoning.filter((thought): thought is string => typeof thought === 'string' && thought.trim().length > 0)
+      : [];
+
+    return (
+      <article
+        className={`archived-history-message ${roleClass}`}
+        data-testid={`archived-msg-${roleClass}`}
+      >
+        <span className="archived-history-message-role">{msg.role}</span>
+        <div className="archived-history-message-body">
+          {thoughts.map((thought, idx) => (
+            <ThinkingBlock
+              key={`thought-${idx}`}
+              text={thought}
+              isStreaming={false}
+            />
+          ))}
+          {content.length > 0 && (
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              urlTransform={markdownUrlTransform}
+              components={markdownComponents}
+            >
+              {content}
+            </ReactMarkdown>
+          )}
+        </div>
+      </article>
+    );
+  }
+
+  // Legacy fallback for older servers that do not include history_reasoning.
   const segments = splitThinkBlocks(content);
 
   return (
@@ -110,6 +167,13 @@ interface MessagesListProps {
 
 export function MessagesList({ data, onShowEarlier, markdownComponents }: MessagesListProps) {
   const compaction = data.compaction;
+  const historyReasoning =
+    data.history_reasoning !== null &&
+    typeof data.history_reasoning === 'object' &&
+    !Array.isArray(data.history_reasoning)
+      ? data.history_reasoning
+      : undefined;
+
   return (
     <div className="archived-history-messages" data-testid="archived-messages">
       {data.history_snapshot.map((msg: HistoryMessage) => {
@@ -124,10 +188,16 @@ export function MessagesList({ data, onShowEarlier, markdownComponents }: Messag
             />
           );
         }
+        const reasoning =
+          historyReasoning && typeof msg.id === 'string' && Object.hasOwn(historyReasoning, msg.id)
+            ? historyReasoning[msg.id]
+            : undefined;
         return (
           <MessageRow
             key={msg.id}
             msg={msg}
+            reasoning={reasoning}
+            hasHistoryReasoning={historyReasoning !== undefined}
             markdownComponents={markdownComponents}
           />
         );

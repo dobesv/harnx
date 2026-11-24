@@ -92,6 +92,14 @@ impl TestConfigSandbox {
         self.write_agent_with_front_matter(name, "model: openai:gpt-4o", prompt);
     }
 
+    /// Write the `users.yaml` the server loads user aliases from at build
+    /// time. Only meaningful before `Server` is built: the alias snapshot is
+    /// immutable after startup.
+    // qual:test_helper — only the in-crate session-claim race tests use it.
+    pub fn write_user_aliases(&self, body: &str) {
+        fs::write(self.root.join("users.yaml"), body).expect("write users.yaml");
+    }
+
     pub fn write_agent_with_front_matter(&self, name: &str, front_matter: &str, prompt: &str) {
         let body = format!("---\n{front_matter}\n---\n{prompt}\n");
         fs::write(self.root.join("agents").join(format!("{name}.md")), body).expect("write agent");

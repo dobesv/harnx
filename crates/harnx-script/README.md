@@ -423,8 +423,9 @@ mapping in the tool's `_meta` under `harnx:script_output`. The mapping has these
 | --- | --- |
 | `stdout` | `structuredContent` field printed on stdout. A string is printed as is, an array of strings one item per line, an array of objects through `row`. |
 | `row` | Format for an object item of `stdout`, such as `{path}:{line}:{text}`. |
+| `stderr_text` | String field printed on stderr exactly as stored, before the notes, with no prefix. For a command's own stderr. A newline is added before the first note only when the text is non-empty, doesn't end in a newline and a note follows. |
 | `stderr` | Field holding notes (string or array of strings). Each note is printed as `<tool>: <note>`. |
-| `exit_code` | Integer field used as the exit status. |
+| `exit_code` | Integer field used as the exit status. A value outside 0 to 255 is reported as 255. |
 | `error_exit_code` | Exit status when the tool returns an error. Default 1. |
 | `summary` | One line shown in the OUTPUT section of `help <tool>`. |
 
@@ -433,11 +434,13 @@ The `bash` tool's inner calls send the request capability
 the tool returns script-style fields. Direct model calls don't send it and keep
 their results. A [script tool](../../docs/script-tools.md)'s Bash body sends it
 too, but its Python body doesn't, and neither does a middleware or hook on its
-own `call_tool`. A middleware or hook that
-wraps a `bash` script's inner call does see the script-shaped result, so one
-that scans `content` text for the data won't find it. The mapping applies only
-when the result has an object `structuredContent` and is not an error;
-otherwise the command renders as described above.
+own `call_tool`. Over MCP the request travels in the call's `_meta` as
+`"harnx:structured_result": true`, and the mapping stays in the tool listing, so
+a tool behind `harnx-mcp-bridge` or in the k8s sandbox gets its shell form too.
+A middleware or hook that wraps a `bash` script's inner call does see the
+script-shaped result, so one that scans `content` text for the data won't find
+it. The mapping applies only when the result has an object `structuredContent`
+and is not an error; otherwise the command renders as described above.
 
 ```bash
 fs_grep --pattern TODO --path src | head -3   # src/lib.rs:12:// TODO tidy

@@ -23,6 +23,7 @@ impl BashServer {
                 params.max_output_bytes,
             ),
             include_log_hints: true,
+            line_cap_notes: harnx_toolset::line_cap_notes(params.head_lines, params.tail_lines),
             template_sandbox: None,
             on_user_message: OnUserMessage::Ignore,
             protocol: None,
@@ -80,6 +81,10 @@ impl BashServer {
                 bound.output.max_output_bytes,
             ),
             include_log_hints: false,
+            line_cap_notes: harnx_toolset::line_cap_notes(
+                bound.output.head_lines,
+                bound.output.tail_lines,
+            ),
             template_sandbox: Some(TemplateSandbox {
                 enabled: registered.sandbox_enabled,
                 read_paths: &registered.read_paths,
@@ -136,13 +141,79 @@ impl BashServer {
             )
             .await?;
 
+        let finish = ExecFinish {
+            execution_id: &execution_id,
+            working_dir: &working_dir,
+            stdout_log_path: &stdout_log_path,
+            stderr_log_path: &stderr_log_path,
+            before_snaps: &before_snaps,
+            snapshot_decision: &snapshot_decision,
+        };
+        if params.protocol.is_none() && crate::toolset::invocation_wants_structured_result() {
+            return Ok(self.script_exec_result(&params, outcome, finish).await);
+        }
+        self.model_exec_result(&params, outcome, finish).await
+    }
+
+    /// The result a `bash` script reads: separate stdout and stderr and the
+    /// exit status, with the same one-line summary a model-style result has.
+    /// A timeout is a normal result here so the partial output reaches the pipe.
+    async fn script_exec_result(
+        &self,
+        params: &ExecPipelineParams<'_>,
+        outcome: RunOutcome,
+        finish: ExecFinish<'_>,
+    ) -> CallToolResult {
+        // The snapshot is taken even after a timeout: the command may have
+        // changed files before it was stopped. A script gets no diff of it.
+        if !finish.before_snaps.is_empty() {
+            self.take_snapshots(finish.snapshot_decision, finish.working_dir, "after exec")
+                .await;
+        }
+        let mut ended = script_result::ended(outcome.kind, outcome.status);
+        ended.notes.extend(params.line_cap_notes.iter().cloned());
+        let lines = outcome.stdout_str.lines().count() + outcome.stderr_str.lines().count();
+        let bytes = outcome.stdout_str.len() + outcome.stderr_str.len();
+        let prefix = match outcome.kind {
+            ExitKind::Interrupted => "stopped_by: new_message".to_owned(),
+            ExitKind::TimedOut { .. } | ExitKind::Exited => {
+                format!("exit_code: {}", ended.exit_code)
+            }
+        };
+        script_result::command_result(
+            script_result::CommandReport {
+                execution_id: finish.execution_id,
+                status: ended.status,
+                exit_code: ended.exit_code,
+                stdout: &outcome.stdout_str,
+                stderr: &outcome.stderr_str,
+                stdout_log_path: &finish.stdout_log_path.to_string_lossy(),
+                stderr_log_path: &finish.stderr_log_path.to_string_lossy(),
+                max_output_bytes: params.truncate_opts.max_output_bytes,
+                log_command: params
+                    .include_log_hints
+                    .then(script_result::read_log_command),
+                log_unfiltered: true,
+                notes: ended.notes,
+            },
+            format!("{prefix}, {lines} lines, {}", format_size(bytes)),
+        )
+    }
+
+    // qual:allow(iosp) — a timeout answers with an error built from the rendered output and an exit with the success report, so the function branches between two builders.
+    async fn model_exec_result(
+        &self,
+        params: &ExecPipelineParams<'_>,
+        outcome: RunOutcome,
+        finish: ExecFinish<'_>,
+    ) -> Result<CallToolResult, ErrorData> {
         let (streams_block, total_lines, total_bytes) = render_run_output(
-            &params,
+            params,
             &outcome,
             StreamLogHints {
-                execution_id: &execution_id,
-                stdout_log_path: &stdout_log_path,
-                stderr_log_path: &stderr_log_path,
+                execution_id: finish.execution_id,
+                stdout_log_path: finish.stdout_log_path,
+                stderr_log_path: finish.stderr_log_path,
             },
         );
         let RunOutcome { status, kind, .. } = outcome;
@@ -150,30 +221,30 @@ impl BashServer {
         if let ExitKind::TimedOut { deadline_secs } = kind {
             return self.build_timeout_result(TimeoutResultCtx {
                 command: params.command,
-                working_dir: &working_dir,
-                execution_id: &execution_id,
+                working_dir: finish.working_dir,
+                execution_id: finish.execution_id,
                 timeout_secs: deadline_secs,
                 total_lines,
                 total_bytes,
                 streams_block: &streams_block,
-                stdout_log_path: &stdout_log_path,
-                stderr_log_path: &stderr_log_path,
+                stdout_log_path: finish.stdout_log_path,
+                stderr_log_path: finish.stderr_log_path,
             });
         }
 
         self.build_exec_success_result(
             ExitResultCtx {
-                execution_id: &execution_id,
+                execution_id: finish.execution_id,
                 command: params.command,
-                working_dir: &working_dir,
-                stdout_log_path: &stdout_log_path,
-                stderr_log_path: &stderr_log_path,
+                working_dir: finish.working_dir,
+                stdout_log_path: finish.stdout_log_path,
+                stderr_log_path: finish.stderr_log_path,
                 total_lines,
                 total_bytes,
                 exit_code: status.code().unwrap_or(-1),
                 streams_block,
-                before_snaps: &before_snaps,
-                snapshot_decision: &snapshot_decision,
+                before_snaps: finish.before_snaps,
+                snapshot_decision: finish.snapshot_decision,
             },
             kind,
         )
@@ -400,6 +471,16 @@ impl BashServer {
         }
         CallToolResult::success(contents)
     }
+}
+
+/// What a finished foreground run needs to build its result.
+struct ExecFinish<'a> {
+    execution_id: &'a str,
+    working_dir: &'a Path,
+    stdout_log_path: &'a Path,
+    stderr_log_path: &'a Path,
+    before_snaps: &'a [(PathBuf, gix::ObjectId)],
+    snapshot_decision: &'a SnapshotDecision,
 }
 
 /// The result's output block with its line and byte totals. A protocol

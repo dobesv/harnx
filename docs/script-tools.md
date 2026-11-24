@@ -169,7 +169,10 @@ same CLI flags, output and exit codes as in the `bash` tool's script mode:
   `path:line:text` rows. Data goes to stdout and notes go to stderr. `-o json`
   prints the tool's fields instead. See
   [Output in `bash` scripts](../crates/harnx-fs-tools/README.md#output-in-bash-scripts)
-  for the file tools in detail.
+  for the file tools in detail, and the same section of the
+  [bash tools](../crates/harnx-bash-tools/README.md#output-in-bash-scripts) and
+  [fetch tools](../crates/harnx-fetch-tools/README.md#output-in-bash-scripts) READMEs
+  for `bash_exec` and the fetchers. Bash bodies get these shell forms too.
 - A tool without a shell form prints JSON from `structuredContent` when present,
   or text otherwise. Use `-o json` or `-o text` to override. Text output omits
   content blocks not addressed to the assistant.
@@ -182,6 +185,13 @@ same CLI flags, output and exit codes as in the `bash` tool's script mode:
   exit `1`, any `partial_result` is rendered to stdout with the same output
   format as a successful result.
 - `fs_grep` exits `1` when nothing matches.
+- `bash_exec` and plain command templates exit with the command's own status,
+  so `1` there is the command's and not a tool error: 128 plus the signal
+  number for a signal, `124` for the command's own timeout, `130` when a new
+  message stopped it, and `125` for a tool error such as a command that could
+  not start. `bash_spawn`, `bash_wait` and `bash_status` report a finished
+  command the same way. See
+  [Output in `bash` scripts](../crates/harnx-bash-tools/README.md#output-in-bash-scripts).
 
 Under BashKit's default `set -e`, a non-zero exit from an inner tool will halt
 the script unless handled with `set +e` or conditional checks (`if`, `||`). For
