@@ -120,6 +120,11 @@ async fn bridge_over(
 ) -> (BridgeToolset, Arc<Mutex<Vec<RecordedCall>>>) {
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let server = FakeMrtrServer::new(recorded.clone(), script);
+    (bridge_over_server(server).await, recorded)
+}
+
+/// Wire any fake server to a bridge over an in-memory MCP hop.
+pub(super) async fn bridge_over_server(server: impl ServerHandler + 'static) -> BridgeToolset {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(server_io);
     let (client_read, client_write) = tokio::io::split(client_io);
@@ -157,10 +162,9 @@ async fn bridge_over(
     )
     .await
     .expect("bridge client initializes against the fake server");
-    let bridge = BridgeToolset::from_service(client, "fake")
+    BridgeToolset::from_service(client, "fake")
         .await
-        .expect("bridge lists tools over the in-memory hop");
-    (bridge, recorded)
+        .expect("bridge lists tools over the in-memory hop")
 }
 
 fn rerun_context(

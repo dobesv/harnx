@@ -1,5 +1,6 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
 use super::exec::resolve_command_timeout;
+use super::script_pending::{pending_result, PendingReport, ScriptStateCtx};
 use super::*;
 use tokio_util::sync::CancellationToken;
 
@@ -84,6 +85,34 @@ struct StateReport<'a> {
     grep_regex: Option<Regex>,
 }
 
+/// The one-line summary of a wait that left the process running.
+fn running_summary(execution_id: &str, waited: Option<WaitEnd>, running_for: &str) -> String {
+    match waited {
+        Some(WaitEnd::Elapsed(seconds)) => format!(
+            "execution_id '{execution_id}' still running after {seconds}s ({running_for} total)"
+        ),
+        Some(WaitEnd::NewMessage) => format!(
+            "execution_id '{execution_id}' still running; a new message arrived ({running_for} total)"
+        ),
+        Some(WaitEnd::CallerDeadline) => format!(
+            "execution_id '{execution_id}' still running; the run deadline is near ({running_for} total)"
+        ),
+        None => format!("execution_id '{execution_id}' still running ({running_for} total)"),
+    }
+}
+
+/// The one-line summary of a wait that saw the process exit.
+fn exit_summary(execution_id: &str, kind: ExitKind, exit_code: i32) -> String {
+    match kind {
+        // Background wait paths cannot be interrupted by a new message.
+        ExitKind::Interrupted => "stopped_by: new_message".to_string(),
+        ExitKind::TimedOut { deadline_secs } => {
+            format!("execution_id '{execution_id}' killed after its {deadline_secs}s deadline")
+        }
+        ExitKind::Exited => format!("execution_id '{execution_id}' exited with code {exit_code}"),
+    }
+}
+
 struct WaitOutput {
     streams_block: String,
     total_lines: usize,
@@ -137,6 +166,20 @@ impl BashServer {
             return self.wait_for_process(request, grep_regex).await;
         }
 
+        if crate::toolset::invocation_wants_structured_result() {
+            return Ok(pending_result(
+                PendingReport {
+                    execution_id: &execution_id,
+                    status: "spawned",
+                    running_for_secs: None,
+                    stopped_by: None,
+                    stdout_log_path: &entry.stdout_log_path.to_string_lossy(),
+                    stderr_log_path: &entry.stderr_log_path.to_string_lossy(),
+                    extra_notes: vec![],
+                },
+                format!("spawned {execution_id}"),
+            ));
+        }
         Ok(Self::build_spawn_result(SpawnResultCtx {
             execution_id: &execution_id,
             command: &entry.command,
@@ -272,7 +315,11 @@ impl BashServer {
 
     /// The running or finished result shared by `wait` and `status`. `waited`
     /// is why the wait that just ended stopped, when there was one.
+    // qual:allow(iosp) — picks the script or model-facing report before building either.
     async fn report_state(&self, report: StateReport<'_>) -> Result<CallToolResult, ErrorData> {
+        if crate::toolset::invocation_wants_structured_result() {
+            return Ok(self.script_state_result(report).await);
+        }
         let StateReport {
             execution_id,
             entry,
@@ -405,6 +452,57 @@ impl BashServer {
         Self::build_success_result(output, summary, vec![])
     }
 
+    /// What a script reads for a tracked process: its final state like a
+    /// finished `exec`, or its status as JSON while it runs.
+    async fn script_state_result(&self, report: StateReport<'_>) -> CallToolResult {
+        let StateReport {
+            execution_id,
+            entry,
+            exit,
+            waited,
+            options,
+            grep_regex,
+        } = report;
+        let ctx = ScriptStateCtx {
+            execution_id,
+            entry,
+            max_output_bytes: options.max_output_bytes,
+            grep: grep_regex.as_ref(),
+            line_cap_notes: harnx_toolset::line_cap_notes(options.head_lines, options.tail_lines),
+        };
+        match exit {
+            Some(exit) => {
+                self.script_finished(ctx, &exit, |kind, code| {
+                    exit_summary(execution_id, kind, code)
+                })
+                .await
+            }
+            None => Self::script_running_result(execution_id, entry, waited, ctx.line_cap_notes),
+        }
+    }
+
+    /// What a script reads for a command that is still running.
+    fn script_running_result(
+        execution_id: &str,
+        entry: &SpawnedProcess,
+        waited: Option<WaitEnd>,
+        extra_notes: Vec<String>,
+    ) -> CallToolResult {
+        let running_for = entry.started_at.elapsed();
+        pending_result(
+            PendingReport {
+                execution_id,
+                status: "running",
+                running_for_secs: Some(running_for.as_secs()),
+                stopped_by: waited.and_then(WaitEnd::stopped_by),
+                stdout_log_path: &entry.stdout_log_path.to_string_lossy(),
+                stderr_log_path: &entry.stderr_log_path.to_string_lossy(),
+                extra_notes,
+            },
+            running_summary(execution_id, waited, &format_elapsed(running_for)),
+        )
+    }
+
     fn build_wait_running_result(
         execution_id: &str,
         entry: &SpawnedProcess,
@@ -430,18 +528,7 @@ impl BashServer {
             },
         );
         let _ = write!(output, "\n{}", wait_output.streams_block);
-        let summary = match waited {
-            Some(WaitEnd::Elapsed(seconds)) => format!(
-                "execution_id '{execution_id}' still running after {seconds}s ({running_for} total)"
-            ),
-            Some(WaitEnd::NewMessage) => format!(
-                "execution_id '{execution_id}' still running; a new message arrived ({running_for} total)"
-            ),
-            Some(WaitEnd::CallerDeadline) => format!(
-                "execution_id '{execution_id}' still running; the run deadline is near ({running_for} total)"
-            ),
-            None => format!("execution_id '{execution_id}' still running ({running_for} total)"),
-        };
+        let summary = running_summary(execution_id, waited, &running_for);
         Self::build_success_result(output, summary, vec![])
     }
 
@@ -453,18 +540,7 @@ impl BashServer {
         kind: ExitKind,
         exit_diff: &OnceCell<Vec<String>>,
     ) -> CallToolResult {
-        let summary = match kind {
-            // Background wait paths cannot be interrupted by a new message.
-            ExitKind::Interrupted => "stopped_by: new_message".to_string(),
-            ExitKind::TimedOut { deadline_secs } => format!(
-                "execution_id '{}' killed after its {deadline_secs}s deadline",
-                ctx.execution_id
-            ),
-            ExitKind::Exited => format!(
-                "execution_id '{}' exited with code {}",
-                ctx.execution_id, ctx.exit_code
-            ),
-        };
+        let summary = exit_summary(ctx.execution_id, kind, ctx.exit_code);
         let diff_parts = exit_diff
             .get_or_init(|| {
                 self.diff_snapshots(
@@ -591,7 +667,7 @@ impl SpawnedProcess {
     }
 
     /// Whether `exit` was the supervisor enforcing this process's deadline.
-    fn exit_kind(&self, exit: &ProcessExit) -> ExitKind {
+    pub(super) fn exit_kind(&self, exit: &ProcessExit) -> ExitKind {
         if exit.timed_out {
             ExitKind::TimedOut {
                 deadline_secs: self.deadline_secs,
