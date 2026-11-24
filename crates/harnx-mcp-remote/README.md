@@ -79,7 +79,9 @@ Supplying `--credentials-key-file` switches the binary from stdio proxying
 to a native harnx tool server with **per-user credentials**: each user
 connects their own account through `<server>_connect`, and their upstream
 tools appear only in their sessions. The stdio proxy mode is unchanged and
-remains the default.
+remains the default. Native mode registers each upstream tool's `outputSchema`
+as a summary of its top-level properties in `harnx:output_schema`, so
+`help <tool>` in a `bash` script lists the result fields.
 
 ```sh
 harnx-mcp-remote \

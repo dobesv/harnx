@@ -90,9 +90,13 @@ fn proxied_bash_waits_do_not_advertise_stop_on_new_message() {
 fn proxied_file_tools_advertise_the_native_script_output_mapping() {
     let native = harnx_fs_tools::builtin_tool_specs();
     assert!(native.iter().any(|spec| spec.script_output().is_some()));
+    assert!(native.iter().any(|spec| spec.output_schema().is_some()));
     for spec in native {
         let expected = spec.script_output();
-        assert_eq!(proxy_spec(spec).script_output(), expected);
+        let schema = spec.output_schema().cloned();
+        let proxied = proxy_spec(spec);
+        assert_eq!(proxied.script_output(), expected);
+        assert_eq!(proxied.output_schema().cloned(), schema);
     }
 }
 

@@ -221,3 +221,36 @@ async fn script_fetch_notes_that_line_caps_are_ignored() {
         json!(["tail_lines is ignored in a script; pipe to tail"])
     );
 }
+
+fn declared_properties(tool: &harnx_toolset::ToolSpec) -> Vec<String> {
+    tool.output_schema()
+        .unwrap_or_else(|| panic!("{} declares no output schema", tool.name))["properties"]
+        .as_object()
+        .expect("schema properties")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn mapped_tools_declare_their_fields() {
+    for tool in FetchToolset::with_allow_private_ip(false).tools() {
+        let output = tool.script_output().expect("mapping");
+        let names = declared_properties(&tool);
+        for named in [&output.stdout, &output.stderr].into_iter().flatten() {
+            assert!(names.contains(named), "{} lacks {named}", tool.name);
+        }
+    }
+}
+
+#[tokio::test]
+async fn script_result_fields_match_the_declared_schema() {
+    let (_mock, url) = page("/page", "hello world", "text/plain").await;
+    let fields = script("fetch_txt", json!({"url": url, "max_length": 5})).await;
+    let tools = FetchToolset::with_allow_private_ip(false).tools();
+    let tool = tools.iter().find(|t| t.name == "fetch_txt").unwrap();
+    let names = declared_properties(tool);
+    for key in fields.as_object().unwrap().keys() {
+        assert!(names.contains(key), "fetch_txt emits undeclared {key}");
+    }
+}

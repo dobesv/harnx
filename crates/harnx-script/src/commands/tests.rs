@@ -64,6 +64,7 @@ impl InnerExecutor for FakeExecutor {
 fn spec(name: &str) -> ToolSpec {
     ToolSpec {
         output: None,
+        output_schema: None,
         name: name.into(),
         description: format!("Run {name}. More detail."),
         schema: json!({"type":"object","properties":{}}),
@@ -102,6 +103,7 @@ fn specs() -> Vec<ToolSpec> {
     }
     specs.push(ToolSpec {
         output: None,
+        output_schema: None,
         name: "fs_read".into(),
         description: "Read a file. Return contents.".into(),
         schema: json!({"properties":{"path":{"type":"string"}},"required":["path"]}),

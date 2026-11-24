@@ -347,7 +347,7 @@ async fn replay_answers_interrupted_for_owned_names_only() {
         payload_limit: None,
         attachment_fetcher: None,
         media_store: None,
-        script_outputs: BTreeMap::new(),
+        script_shapes: BTreeMap::new(),
     });
     let abort = harnx_core::abort::create_abort_signal();
 
@@ -389,10 +389,7 @@ async fn replay_answers_interrupted_for_owned_names_only() {
 /// A script tool wrapping `faketool` with the given body, a provider over a
 /// recording fake, and a round context wired through the slot the way the
 /// runtime does it.
-fn faketool_harness(
-    body: Value,
-    outputs: BTreeMap<String, harnx_toolset::ScriptOutput>,
-) -> FakeToolHarness {
+fn faketool_harness(body: Value, outputs: BTreeMap<String, crate::ScriptShape>) -> FakeToolHarness {
     let mut definition = json!({
         "name": "wrap",
         "description": "Wrapper.",
@@ -427,7 +424,7 @@ fn faketool_harness(
         payload_limit: None,
         attachment_fetcher: None,
         media_store: None,
-        script_outputs: outputs,
+        script_shapes: outputs,
     });
     let context = Arc::new(ToolEvalContext {
         structured_results: false,
@@ -486,9 +483,12 @@ async fn bash_body_inner_calls_ask_for_structured_results() {
 async fn bash_body_prints_a_mapped_tool_like_a_command() {
     let outputs = BTreeMap::from([(
         "faketool".to_string(),
-        harnx_toolset::ScriptOutput {
-            stdout: Some("text".into()),
-            stderr: Some("notes".into()),
+        crate::ScriptShape {
+            output: Some(harnx_toolset::ScriptOutput {
+                stdout: Some("text".into()),
+                stderr: Some("notes".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         },
     )]);

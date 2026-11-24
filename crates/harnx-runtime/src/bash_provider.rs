@@ -102,8 +102,8 @@ pub struct BashProviderConfig {
     pub base_providers: Vec<Arc<dyn ToolProvider>>,
     pub slot: Option<Arc<BashEvalContextSlot>>,
     pub payload_limit: Option<PayloadLimit>,
-    /// Output mappings declared by tool servers, by agent-visible tool name.
-    pub script_outputs: std::collections::BTreeMap<String, harnx_toolset::ScriptOutput>,
+    /// Script-facing declarations of tool servers, by agent-visible tool name.
+    pub script_shapes: std::collections::BTreeMap<String, crate::ScriptShape>,
     /// Operator commands read `stdout`, `stderr` and `trace` as fields; a
     /// model round gets them once, in the rendered report.
     pub full_payload: bool,
@@ -151,7 +151,7 @@ impl BashProvider {
             base_providers,
             slot,
             payload_limit,
-            script_outputs,
+            script_shapes,
             full_payload,
         } = config;
         let allowed = inner_declarations
@@ -169,9 +169,13 @@ impl BashProvider {
                 name: declaration.name.clone(),
                 description: declaration.description.clone(),
                 schema: declaration.parameters.as_value().clone(),
-                output: script_outputs
+                output: script_shapes
                     .get(&declaration.name)
+                    .and_then(|shape| shape.output.as_ref())
                     .and_then(output_mapping),
+                output_schema: script_shapes
+                    .get(&declaration.name)
+                    .and_then(|shape| shape.output_schema.clone()),
             })
             .collect();
         Self {

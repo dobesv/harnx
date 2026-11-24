@@ -69,6 +69,7 @@ fn bash_tool_description(inner_tools: &[ToolDeclaration]) -> String {
             description: tool.description.clone(),
             schema: tool.parameters.as_value().clone(),
             output: None,
+            output_schema: None,
         })
         .collect();
     harnx_script::description::bash_tool_description(
