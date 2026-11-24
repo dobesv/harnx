@@ -69,11 +69,12 @@ fn log_cleanup_stats(stats: &RemoteCleanupStats, cluster: &str) {
     if cleanup_has_activity(stats) {
         log::info!(
             "session GC completed for cluster='{cluster}': scanned={} deleted={} \
-             skipped_active={} orphan_streams={} orphan_deleted={} orphan_kept={} \
-             orphan_unmapped={} errors={}",
+             skipped_active={} skipped_metadata_changed={} orphan_streams={} \
+             orphan_deleted={} orphan_kept={} orphan_unmapped={} errors={}",
             stats.scanned,
             stats.deleted,
             stats.skipped_active,
+            stats.skipped_metadata_changed,
             stats.orphan_streams,
             stats.orphan_deleted,
             stats.orphan_kept,
@@ -83,18 +84,19 @@ fn log_cleanup_stats(stats: &RemoteCleanupStats, cluster: &str) {
     } else {
         log::debug!(
             "session GC completed for cluster='{cluster}': scanned={} deleted=0 \
-             skipped_active={} errors=0",
+             skipped_active={} skipped_metadata_changed=0 errors=0",
             stats.scanned,
             stats.skipped_active
         );
     }
 }
 
-/// A pass that deleted something, kept an idle orphan (a backlog the batch
-/// limit deferred among them) or hit an error is worth an info line.
+/// A pass that deleted something, hit a revision conflict or error, or kept
+/// an idle orphan (including those deferred by the batch limit) logs at info.
 fn cleanup_has_activity(stats: &RemoteCleanupStats) -> bool {
     [
         stats.deleted,
+        stats.skipped_metadata_changed,
         stats.orphan_deleted,
         stats.orphan_kept,
         stats.errors,
@@ -108,10 +110,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deletions_kept_orphans_and_errors_raise_gc_log_level() {
+    fn deletions_revision_conflicts_kept_orphans_and_errors_raise_gc_log_level() {
         for stats in [
             RemoteCleanupStats {
                 deleted: 1,
+                ..Default::default()
+            },
+            RemoteCleanupStats {
+                skipped_metadata_changed: 1,
                 ..Default::default()
             },
             RemoteCleanupStats {

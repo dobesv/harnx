@@ -465,6 +465,30 @@ fn test_injection_channel(
         (None, None)
     }
 }
+
+/// The identity stamp every serve-side path that creates session metadata
+/// applies before any cluster default fills an absent owner (review C13):
+/// the agent config's initializer, then the trusted request user id, then
+/// its caller principals. One shared precedence, so the claim path's owner
+/// stamp and the actor's admission cannot drift apart.
+pub(crate) fn identity_stamped_initializer(
+    agent: &str,
+    config_snapshot: &harnx_runtime::config::Config,
+    user_id: Option<&str>,
+    user_principals: Option<&harnx_core::user_principals::UserPrincipals>,
+) -> harnx_runtime::SessionInitializer {
+    let initializer =
+        harnx_runtime::SessionInitializer::named_from_config(agent.to_string(), config_snapshot);
+    let initializer = match user_id {
+        Some(user_id) => initializer.with_user_id(user_id),
+        None => initializer,
+    };
+    match user_principals {
+        Some(principals) => initializer.with_user_principals(principals),
+        None => initializer,
+    }
+}
+
 impl SessionActor {
     async fn prompt_config(&self) -> GlobalConfig {
         prompt_config_for_agent_session_from_global(

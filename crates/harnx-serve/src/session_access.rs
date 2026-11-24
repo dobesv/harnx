@@ -4,7 +4,7 @@ use harnx_core::cid_url::CidUrl;
 use harnx_runtime::config::Config;
 use harnx_runtime::nats_admin::kv_bucket_missing;
 use harnx_runtime::nats_session_metadata::{
-    session_properties, SessionMetadataStore, SESSION_METADATA_BUCKET,
+    session_properties, MetadataRecord, SessionMetadataStore, SESSION_METADATA_BUCKET,
 };
 use http::Method;
 use hyper::Request;
@@ -12,16 +12,18 @@ use hyper::Request;
 use crate::{
     ensure_frontend_nats_owner, is_safe_path_segment, percent_decode, sanitize_nats_cluster_error,
     serve_nats_jetstream, session_actor::ResolvedAgentTarget, session_recency_ordering, Server,
-    ERROR_STATUS_MARKER,
 };
 
 impl Server {
     pub(crate) async fn guard_session_request<B>(
         &self,
-        req: &Request<B>,
+        req: &mut Request<B>,
         target: &ResolvedAgentTarget,
         access: (&AccessRules, CallerView<'_>),
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: http_body::Body<Data = bytes::Bytes> + Unpin,
+    {
         let (rules, caller) = access;
         let mut segments = req
             .uri()
@@ -36,21 +38,36 @@ impl Server {
         let agent_ref = self.display_ref(target);
         let Some(session) = segments.next() else {
             if req.method() == Method::POST && !rules.can_create_session(&agent_ref, caller) {
-                bail!("session creation requires prompt scope{ERROR_STATUS_MARKER}403");
+                return Err(crate::session_claim::creation_scope_denied());
             }
             return Ok(());
         };
+        let deeper_route = segments.next().is_some();
         let session = percent_decode(session);
         ensure!(is_safe_path_segment(&session), "Not Found");
         let key = harnx_core::session_identity::session_key(Some(target.agent()), &session);
-        let owner = self
-            .read_session_owner(target.cluster(), &key)
-            .await?
-            .context("Not Found")?;
-        ensure!(
-            rules.can_access_session(&agent_ref, caller, owner.as_deref()),
-            "Not Found"
-        );
+        let owner = self.read_session_owner(target.cluster(), &key).await?;
+        let candidate = req.method() == Method::POST
+            && !deeper_route
+            && crate::session_claim::claimable_session_id(&session);
+        let accessible = owner
+            .as_ref()
+            .is_some_and(|owner| rules.can_access_session(&agent_ref, caller, owner.as_deref()));
+        if !accessible && candidate {
+            // Reviews C1/C3 and D3: the shared candidate step refuses the
+            // over-cap declared length, then runs the same bounded read for
+            // a missing and a foreign owner; only a missing owner with a
+            // readable body defers, and everything else is the guard's 404.
+            match crate::session_claim::defer_or_refuse_candidate(req, owner.is_none()).await {
+                Some(body) => {
+                    req.extensions_mut()
+                        .insert(crate::session_claim::DeferredSessionClaim { session, body });
+                    return Ok(());
+                }
+                None => bail!("Not Found"),
+            }
+        }
+        ensure!(accessible, "Not Found");
         Ok(())
     }
 
@@ -62,6 +79,17 @@ impl Server {
         owner_key: &str,
     ) -> Result<Option<Option<String>>> {
         read_session_owner(&self.config, cluster, owner_key).await
+    }
+
+    /// The canonical record itself, for the claim rows, which decode the
+    /// owner stamp with their own fail-closed decoder (review C4/C8) rather
+    /// than the owner read the guard uses.
+    pub(crate) async fn read_session_record(
+        &self,
+        cluster: &str,
+        owner_key: &str,
+    ) -> Result<Option<MetadataRecord>> {
+        read_session_record(&self.config, cluster, owner_key).await
     }
 }
 
@@ -84,6 +112,20 @@ pub(crate) async fn read_session_owner(
             .text("user_id")
             .map(str::to_string),
     ))
+}
+
+/// Read a session's whole metadata record in `cluster`: the claim rows use
+/// this to decode the owner stamp with their own fail-closed rules instead
+/// of the guard's owner-only read.
+pub(crate) async fn read_session_record(
+    config: &Config,
+    cluster: &str,
+    owner_key: &str,
+) -> Result<Option<MetadataRecord>> {
+    let Some(store) = open_session_metadata_readonly(config, cluster).await? else {
+        return Ok(None);
+    };
+    store.get(owner_key).await
 }
 
 /// Open the session metadata bucket in `cluster` read-only, without

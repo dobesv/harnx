@@ -147,9 +147,13 @@ unallocated winning reservations and unresolved admission, stop, cancellation,
 projection or outbox work. An expired A2A lease alone isn't proof of safe deletion.
 Periodic GC skips such work even when the worker execution lease has disappeared.
 
-After fencing, deletion removes the session prefix, task event subject,
-first-message winner, recovery registry and scoped lease, alongside the existing
-transcript/journal/blob cleanup. Registry goes last so partial cleanup can retry.
+After fencing (capturing the canonical metadata revision and purging `sessions/<key>/a2a/context`),
+deletion removes the transcript stream (first on normal deletion and retention GC; last on orphan-stream GC),
+worker lease, invocation journal, non-canonical session-prefix keys, private interaction checkpoints,
+media/plan blobs, task event subject, first-message winner, recovery registry, and scoped lease,
+then purges the canonical `sessions/<key>/meta` record last. Registry goes last among A2A keys (and
+canonical metadata last overall) so partial cleanup keeps the session owner and
+can retry.
 KV purge markers retain fencing evidence without retained message payloads. A delayed
 first event (predecessor zero) can land after whole-subject GC and broker dedup
 expiry; the bounded event sweep removes it only with a leader-confirmed authority

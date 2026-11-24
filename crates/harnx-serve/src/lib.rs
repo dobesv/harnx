@@ -21,11 +21,14 @@ mod last_turn;
 mod models_catalog;
 mod nats_access;
 mod nats_redaction;
+mod parking_gate;
 mod request_identity;
 mod serve_shutdown;
 mod session_access;
 pub mod session_actor;
 mod session_actor_types;
+mod session_claim;
+mod session_claim_reservation;
 mod session_history;
 pub(crate) mod session_pagination;
 pub mod session_routes;
@@ -47,6 +50,8 @@ mod access_tests;
 mod cid_route_tests;
 #[cfg(test)]
 mod nats_access_tests;
+#[cfg(test)]
+mod nats_session_claim_tests;
 #[cfg(test)]
 mod nats_user_identity_tests;
 #[cfg(test)]
@@ -391,7 +396,12 @@ pub struct Server {
     /// F6 test seam: parks an acknowledged upload part between its put and
     /// the session incarnation recheck when a test arms it. Unarmed it is
     /// a no-op; production never arms it.
-    upload_recheck_gate: upload_storage::UploadRecheckGate,
+    upload_recheck_gate: parking_gate::ParkingGate,
+    /// T2 test seam: parks a deferred session claim between the guard's
+    /// missing-owner read and the leader reread and reservation when a test
+    /// arms it, so creation races can be forced deterministically. Unarmed
+    /// it is a no-op; production never arms it.
+    session_claim_gate: parking_gate::ParkingGate,
     /// How long a cached bucket serves before the next upload re-ensures it,
     /// bounding the retry rate of a failed best-effort replica raise.
     upload_bucket_recheck: Duration,
@@ -410,6 +420,35 @@ impl Server {
     fn display_ref(&self, target: &ResolvedAgentTarget) -> String {
         target.display_ref_with_default_cluster(self.default_cluster_for_display())
     }
+}
+
+/// Escape a request-derived agent or session value for an HTML **text
+/// node**. That is all this helper guarantees — it is not sufficient for
+/// URLs, JavaScript, CSS or unquoted attributes. `is_safe_path_segment`
+/// accepts markup: it rejects only empty values, non-`Normal` path
+/// components, and `/` or `\` (leading/trailing whitespace is rejected
+/// separately, by `claimable_session_id`, which also enforces the
+/// runtime's ID alphabet for deferred claims). The page still renders
+/// request-derived values whose provenance has no such contract — rules-
+/// off session IDs and agent names can be arbitrary markup — so an
+/// unescaped sink is stored XSS against any admin who opens the page
+/// (#2855).
+fn escape_html_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        escaped.push_str(match character {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            _ => {
+                escaped.push(character);
+                continue;
+            }
+        });
+    }
+    escaped
 }
 
 type RouteMatch = (String, Option<String>, AgentsRoute);
@@ -514,7 +553,8 @@ impl Server {
             session_registry,
             web_assets,
             upload_storage: upload_storage::UploadStorage::default(),
-            upload_recheck_gate: upload_storage::UploadRecheckGate::default(),
+            upload_recheck_gate: parking_gate::ParkingGate::default(),
+            session_claim_gate: parking_gate::ParkingGate::default(),
             upload_bucket_recheck: upload_storage::DEFAULT_BUCKET_RECHECK_INTERVAL,
             shutdown: serve_shutdown::ServeShutdown::new(stream_drain),
         })
@@ -972,6 +1012,7 @@ impl Server {
                     req,
                     &target,
                     session_name.as_deref().expect("session route has a name"),
+                    &scoped,
                 )
                 .await
             }
@@ -1011,7 +1052,18 @@ impl Server {
         req: hyper::Request<Incoming>,
         target: &ResolvedAgentTarget,
         session: &str,
+        scoped: &harnx_runtime::config::GlobalConfig,
     ) -> Result<AppResponse> {
+        // A deferred claim means the guard found no owner record and this
+        // POST may create the session; classification, reservation and
+        // authorization run before any dispatch (plan design steps 3-5).
+        if let Some(claim) = req
+            .extensions()
+            .get::<crate::session_claim::DeferredSessionClaim>()
+            .cloned()
+        {
+            return self.handle_deferred_claim(req, target, claim, scoped).await;
+        }
         match negotiate_agents_route(req.method(), req.headers(), AgentsRoute::Session)? {
             AgentsRepresentation::Html => {
                 self.session_html_page(&self.display_ref(target), session)
@@ -1023,7 +1075,7 @@ impl Server {
     }
 
     fn agent_html_page(&self, agent: &str) -> Result<AppResponse> {
-        let html = format!("<h1>agent: {agent}</h1>");
+        let html = format!("<h1>agent: {}</h1>", escape_html_text(agent));
         let res = Response::builder()
             .header("Content-Type", "text/html; charset=utf-8")
             .body(Full::new(Bytes::from(html)).boxed())?;
@@ -1031,7 +1083,7 @@ impl Server {
     }
 
     fn session_html_page(&self, _agent: &str, session: &str) -> Result<AppResponse> {
-        let html = format!("<h1>session: {session}</h1>");
+        let html = format!("<h1>session: {}</h1>", escape_html_text(session));
         let res = Response::builder()
             .header("Content-Type", "text/html; charset=utf-8")
             .body(Full::new(Bytes::from(html)).boxed())?;
@@ -2633,7 +2685,7 @@ fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
 /// failures get the 503 the guarded route would answer itself; guard
 /// denials keep the 404 their message already carries. The original chain
 /// stays intact for the dispatch log line.
-fn guard_error_status(err: anyhow::Error) -> anyhow::Error {
+pub(crate) fn guard_error_status(err: anyhow::Error) -> anyhow::Error {
     if crate::nats_access::is_nats_unavailable(&err) {
         let message = format!(
             "{err}{ERROR_STATUS_MARKER}{}",
@@ -6227,6 +6279,38 @@ mod tests {
         Server::new(&config, assets_dir)
     }
 
+    #[tokio::test]
+    async fn html_pages_escape_request_derived_agent_and_session_values() {
+        let server = asset_server(PathBuf::from("web-assets"));
+        let markup = "<img src=x onerror=alert(1)>";
+
+        let session = server
+            .session_html_page("plain", markup)
+            .expect("render session page");
+        assert_eq!(
+            asset_body(session).await,
+            b"<h1>session: &lt;img src=x onerror=alert(1)&gt;</h1>"
+        );
+
+        let agent = server.agent_html_page(markup).expect("render agent page");
+        assert_eq!(
+            asset_body(agent).await,
+            b"<h1>agent: &lt;img src=x onerror=alert(1)&gt;</h1>"
+        );
+
+        // Review D5: the C2 regression guard covers all five
+        // HTML-significant characters, not only the angle brackets.
+        let quotes = "&\"'";
+        let session = server
+            .session_html_page("plain", quotes)
+            .expect("render session page");
+        assert_eq!(
+            asset_body(session).await,
+            b"<h1>session: &amp;&quot;&#39;</h1>"
+        );
+        let agent = server.agent_html_page(quotes).expect("render agent page");
+        assert_eq!(asset_body(agent).await, b"<h1>agent: &amp;&quot;&#39;</h1>");
+    }
     async fn asset_body(response: AppResponse) -> Vec<u8> {
         response
             .into_body()

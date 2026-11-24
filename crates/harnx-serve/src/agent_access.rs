@@ -26,7 +26,10 @@ impl Server {
 
     /// Run before dispatch so attachments and metadata can't bypass agent checks.
     /// Session ownership checks belong here too, before any route reads its body.
-    pub(crate) async fn guard_agent_request<B>(&self, req: &mut Request<B>) -> Result<()> {
+    pub(crate) async fn guard_agent_request<B>(&self, req: &mut Request<B>) -> Result<()>
+    where
+        B: http_body::Body<Data = bytes::Bytes> + Unpin,
+    {
         let Some((rules, identities)) = self.access(req) else {
             return Ok(());
         };

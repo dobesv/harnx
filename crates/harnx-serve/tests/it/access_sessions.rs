@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 
 use crate::{access_agents::Fixture as HttpFixture, common};
 
+mod claim_matrix;
 mod exact_hitl;
 
 const RULES: &str = "rules:\n  - agents: [allowed, blocked]\n    scopes: [prompt]\n    users: [alice, bob]\n  - agents: [allowed, blocked]\n    scopes: [admin]\n    users: [admin]\n";
@@ -167,8 +168,16 @@ impl SessionClient<'_> {
             "session/mark_read",
             "session/mark_unread",
         ] {
+            // A valid first prompt on a missing ID now creates the session
+            // (R1), so the hidden comparison sends a blank prompt instead:
+            // still the guard's 404, being a non-creating request (R4).
+            let text = if method == "session/prompt" {
+                "  "
+            } else {
+                "hello"
+            };
             let rpc =
-                json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": {"text": "hello"}});
+                json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": {"text": text}});
             let hidden = self.request(Method::POST, "").json(&rpc).send().await?;
             let unknown = unknown.request(Method::POST, "").json(&rpc).send().await?;
             assert_hidden_response(hidden, unknown)
@@ -238,6 +247,10 @@ async fn assert_hidden_response(
     assert_eq!(hidden.headers()["content-type"], "application/json");
     assert_eq!(hidden.headers()["access-control-allow-origin"], "*");
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND, "{}", unknown.url());
+    // Review C10: compare the stable headers on both responses, so the
+    // unknown/baseline side cannot silently drift either.
+    assert_eq!(unknown.headers()["content-type"], "application/json");
+    assert_eq!(unknown.headers()["access-control-allow-origin"], "*");
     assert_eq!(hidden.text().await?, unknown.text().await?);
     Ok(())
 }
@@ -392,12 +405,54 @@ async fn access_nats_admin_reads_operates_foreign_and_legacy_sessions_but_cannot
             "session creation requires prompt scope"
         );
     }
-    for user in ["alice", "admin"] {
-        let implicit = f.session("new-id", user).request(Method::POST, "")
-            .json(&json!({"jsonrpc":"2.0", "id":1, "method":"session/prompt", "params":{"text":"hello"}})).send().await?;
-        assert_eq!(implicit.status(), StatusCode::NOT_FOUND);
-    }
-    assert!(f.store.get_for_agent("new-id", "allowed").await?.is_none());
+    // A valid first prompt on an unseen client-chosen ID now creates the
+    // session for a prompt-scope caller (R1), while an admin-only caller
+    // keeps the collection route's 403 and creates nothing (R5).
+    let implicit = f
+        .session("new-id", "alice")
+        .request(Method::POST, "")
+        .json(
+            &json!({"jsonrpc":"2.0", "id":1, "method":"session/prompt", "params":{"text":"hello"}}),
+        )
+        .send()
+        .await?;
+    assert_eq!(implicit.status(), StatusCode::OK);
+    let created: Value = implicit.json().await?;
+    assert!(
+        matches!(
+            created["result"]["status"].as_str(),
+            Some("accepted" | "enqueued")
+        ),
+        "{created}"
+    );
+    let record = f
+        .store
+        .get_for_agent("new-id", "allowed")
+        .await?
+        .expect("canonical metadata");
+    assert_eq!(
+        session_properties(&record.metadata)?.text("user_id"),
+        Some("alice")
+    );
+    let denied = f
+        .session("admin-only-id", "admin")
+        .request(Method::POST, "")
+        .json(
+            &json!({"jsonrpc":"2.0", "id":1, "method":"session/prompt", "params":{"text":"hello"}}),
+        )
+        .send()
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let body: Value = denied.json().await?;
+    assert_eq!(
+        body["error"]["message"],
+        "session creation requires prompt scope"
+    );
+    assert!(f
+        .store
+        .get_for_agent("admin-only-id", "allowed")
+        .await?
+        .is_none());
     Ok(())
 }
 
@@ -485,6 +540,151 @@ async fn access_nats_rules_off_preserve_foreign_legacy_and_implicit_session_beha
             Some("accepted" | "enqueued")
         ),
         "{implicit}"
+    );
+    Ok(())
+}
+
+/// Review D5: the C2 escaping fix, exercised through the real route. A
+/// rules-off server serves the session HTML page for an id containing all
+/// five HTML-significant characters, and every one arrives escaped.
+#[tokio::test]
+async fn access_nats_session_html_page_escapes_all_html_metacharacters() -> Result<()> {
+    let Some(f) = fixture(false).await? else {
+        return Ok(());
+    };
+    let response = f
+        .request(
+            Method::GET,
+            "/v1/agents/allowed/sessions/x%26%22%27%3C%3E",
+            "alice",
+        )
+        .header("accept", "text/html")
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-type"]
+        .to_str()?
+        .starts_with("text/html"));
+    assert_eq!(
+        response.text().await?,
+        "<h1>session: x&amp;&quot;&#39;&lt;&gt;</h1>"
+    );
+    Ok(())
+}
+
+/// Read the SSE response until `marker` shows up in the buffered bytes, then
+/// return what was read.
+async fn read_sse_until(response: &mut reqwest::Response, marker: &str) -> Result<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut buffer: Vec<u8> = Vec::new();
+    while !buffer
+        .windows(marker.len())
+        .any(|window| window == marker.as_bytes())
+    {
+        let chunk = tokio::time::timeout_at(deadline.into(), response.chunk())
+            .await
+            .context("SSE read timed out")?
+            .context("SSE read failed")?;
+        match chunk {
+            Some(bytes) => buffer.extend_from_slice(&bytes),
+            None => break,
+        }
+    }
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// The issue's reproduction: under access rules, a first prompt to an unseen
+/// client-chosen session ID creates the session with that exact ID, owned by
+/// the caller, and a follow-up prompt on it works as on any own session
+/// (R1).
+#[tokio::test]
+async fn access_nats_first_prompt_creates_session_with_client_chosen_id() -> Result<()> {
+    let Some(f) = fixture(true).await? else {
+        return Ok(());
+    };
+    let first = f
+        .session("thread-1", "alice")
+        .request(Method::POST, "")
+        .json(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "session/prompt",
+                "params": {"text": "hello thread"}}),
+        )
+        .send()
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    let created: Value = first.json().await?;
+    assert!(
+        matches!(
+            created["result"]["status"].as_str(),
+            Some("accepted" | "enqueued")
+        ),
+        "{created}"
+    );
+    let record = f
+        .store
+        .get_for_agent("thread-1", "allowed")
+        .await?
+        .expect("canonical metadata for the claimed id");
+    assert_eq!(
+        session_properties(&record.metadata)?.text("user_id"),
+        Some("alice")
+    );
+    // The claimed session behaves like any own session from here on.
+    let follow_up = f.session("thread-1", "alice").rpc("session/prompt").await?;
+    assert!(
+        matches!(
+            follow_up["result"]["status"].as_str(),
+            Some("accepted" | "enqueued")
+        ),
+        "{follow_up}"
+    );
+    // Another prompt-scope caller still cannot see the claimed ID: the
+    // guard's 404, indistinguishable from a missing session (R4).
+    let hidden = f
+        .session("thread-1", "bob")
+        .request(Method::POST, "")
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "session/get",
+                "params": {"text": "hello"}}))
+        .send()
+        .await?;
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// An AG-UI SSE run that qualifies as a creating prompt creates the session
+/// with the client-chosen ID, owned by the caller, and the run proceeds as
+/// with rules off (R2).
+#[tokio::test]
+async fn access_nats_sse_prompt_creates_session_with_client_chosen_id() -> Result<()> {
+    let Some(f) = fixture(true).await? else {
+        return Ok(());
+    };
+    let mut run = f
+        .session("thread-sse", "alice")
+        .request(Method::POST, "")
+        .header("accept", "text/event-stream")
+        .json(&json!({
+            "messages": [{"role": "user", "content": "hello sse"}],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {}
+        }))
+        .send()
+        .await?;
+    assert_eq!(run.status(), StatusCode::OK);
+    assert_eq!(run.headers()["content-type"], "text/event-stream");
+    // The 200 arrives after admission; the prompted run opens with
+    // RUN_STARTED.
+    let events = read_sse_until(&mut run, "RUN_STARTED").await?;
+    assert!(events.contains("RUN_STARTED"), "{events}");
+    let record = f
+        .store
+        .get_for_agent("thread-sse", "allowed")
+        .await?
+        .expect("canonical metadata for the claimed id");
+    assert_eq!(
+        session_properties(&record.metadata)?.text("user_id"),
+        Some("alice")
     );
     Ok(())
 }

@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use crate::nats_event_sink::SessionEventStream;
 use crate::nats_session_log::NatsSessionLog;
-use crate::nats_session_metadata::{SessionInitializer, SessionMetadata, SessionMetadataStore};
+use crate::nats_session_metadata::{SessionInitializer, SessionMetadataStore};
 use crate::nats_worker::{
     publish_control_command, publish_session_activate, publish_targeted_session_activate,
     ControlCommand, LocalWorkerTarget, SessionActivate, SessionActivationRoute,
@@ -64,9 +64,12 @@ pub use follow::{FollowBoundary, FollowBoundaryOptions};
 mod hitl;
 mod hitl_decision;
 mod interaction_decision;
+mod metadata;
 pub use hitl::{
     ApprovalRef, HitlDecisionOutcome, HitlDecisionReceipt, PendingHitlApproval, PromptProgress,
 };
+use metadata::ensure_session_metadata;
+pub use metadata::{create_or_read_session_metadata, SessionMetadataClaim};
 pub mod interrupt;
 mod prompt_append;
 mod steering;
@@ -320,52 +323,6 @@ pub struct NatsSessionConfig {
 pub(crate) enum RequestedSeqStatus {
     Pending,
     Covered,
-}
-
-async fn ensure_session_metadata(
-    store: &SessionMetadataStore,
-    transcript: &NatsSessionLog,
-    session_id: &str,
-    initializer: &SessionInitializer,
-) -> Result<()> {
-    let key = initializer.session_key(session_id);
-    if let Some(record) = store.get(&key).await? {
-        record.metadata.validate_initializer(initializer)?;
-        store.ensure_reserved_activity(&key).await?;
-        return Ok(());
-    }
-
-    // Inspect read-only: a failed metadata reservation must not leave a new
-    // SESSION_ stream behind. Only after metadata and activity are reserved may
-    // a handle with the resolved replica count create the stream.
-    let existing_entries = transcript
-        .load_events_async()
-        .await
-        .context("failed to inspect transcript before creating session metadata")?;
-    if !existing_entries.is_empty() {
-        // A racing creator may already have reserved metadata and appended its
-        // first row while we inspected the transcript.
-        if let Some(record) = store.get(&key).await? {
-            record.metadata.validate_initializer(initializer)?;
-            return store.ensure_reserved_activity(&key).await;
-        }
-        anyhow::bail!(
-            "session '{session_id}' has transcript entries but no canonical metadata; legacy or inconsistent sessions are not supported"
-        );
-    }
-
-    let metadata = SessionMetadata::new(session_id, initializer.clone());
-    if store.create(&metadata).await?.is_some() {
-        return Ok(());
-    }
-
-    // Another client won the create race. Its immutable identity must agree
-    // with ours before either client is allowed to append a first message.
-    let winner = store.get(&key).await?.with_context(|| {
-        format!("session metadata creation race for '{session_id}' had no winner")
-    })?;
-    winner.metadata.validate_initializer(initializer)?;
-    store.ensure_reserved_activity(&key).await
 }
 
 /// Determine whether a durable request still needs worker execution.

@@ -276,20 +276,44 @@ impl SessionMetadataStore {
     /// that expires. A2A records keep a permanent one: they are created with
     /// a strict create (`update(key, value, 0)`) so a deleted document can't
     /// be revived, which only a marker that stays prevents.
+    // qual:api — full-prefix purge for callers outside the deletion cascade.
     pub async fn purge_session_prefix(&self, session_id: &str) -> Result<usize> {
+        self.purge_session_prefix_except(session_id, None).await
+    }
+
+    /// The deletion cascade keeps the owner record until all other state is gone.
+    pub(crate) async fn purge_session_prefix_except_metadata(
+        &self,
+        session_id: &str,
+    ) -> Result<usize> {
+        self.purge_session_prefix_except(session_id, Some(&metadata_key(session_id)))
+            .await
+    }
+
+    async fn purge_session_prefix_except(
+        &self,
+        session_id: &str,
+        excluded_key: Option<&str>,
+    ) -> Result<usize> {
         let prefix = session_prefix(session_id);
+        let descendants = format!("{prefix}/");
         let a2a_prefix = format!("{prefix}/a2a/");
         let mut keys = self.store.keys().await.map_err(anyhow::Error::from)?;
         let mut deleted = 0;
         while let Some(key) = keys.next().await {
             let key = key.map_err(anyhow::Error::from)?;
-            if key.starts_with(&a2a_prefix) {
-                self.store.purge(&key).await?;
-                deleted += 1;
-            } else if key == prefix || key.starts_with(&format!("{prefix}/")) {
-                harnx_nats_common::markers::purge(&self.store, &key, None).await?;
-                deleted += 1;
+            if excluded_key == Some(key.as_str())
+                || (key != prefix && !key.starts_with(&descendants))
+            {
+                continue;
             }
+            let purged = if key.starts_with(&a2a_prefix) {
+                self.store.purge(&key).await
+            } else {
+                harnx_nats_common::markers::purge(&self.store, &key, None).await
+            };
+            purged.with_context(|| format!("Failed to purge session metadata key '{key}'"))?;
+            deleted += 1;
         }
         Ok(deleted)
     }
