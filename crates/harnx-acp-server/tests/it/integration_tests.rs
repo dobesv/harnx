@@ -288,6 +288,16 @@ mod tests {
         Ok(root)
     }
 
+    /// `harnx-worker` belongs to another package, so Cargo sets no
+    /// `CARGO_BIN_EXE_` for it, and assert_cmd's fallback does not know where
+    /// Cargo 1.100 puts the test executable. Resolve it next to the workspace
+    /// binaries instead.
+    fn worker_binary() -> std::path::PathBuf {
+        let exe = std::env::current_exe().expect("locate current test executable");
+        harnx_core::bin_dir_of_exe(&exe)
+            .join(format!("harnx-worker{}", std::env::consts::EXE_SUFFIX))
+    }
+
     fn server_command(root: &TempDir) -> Command {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("harnx-acp-server"));
         // Preserve OS/PATH and NATS_SERVER_BIN, but don't inherit operator routing,
@@ -306,10 +316,7 @@ mod tests {
             .env("HARNX_CONFIG_DIR", root.path().join("config"))
             .env("HARNX_DATA_DIR", root.path().join("data"))
             .env("HARNX_STATE_DIR", root.path().join("state"))
-            .env(
-                "HARNX_WORKER_BIN",
-                assert_cmd::cargo::cargo_bin("harnx-worker"),
-            )
+            .env("HARNX_WORKER_BIN", worker_binary())
             .env("RUST_LOG", "error")
             .current_dir(root.path().join("work"))
             .stdin(Stdio::piped())

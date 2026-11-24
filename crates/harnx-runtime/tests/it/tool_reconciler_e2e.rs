@@ -73,10 +73,7 @@ impl Drop for EnvGuard {
 /// `fs_server_binary` in `package_tool_naming_e2e.rs`.
 fn resolve_binary(name: &str) -> anyhow::Result<PathBuf> {
     let mut path = std::env::current_exe()?;
-    path.pop();
-    if path.file_name().is_some_and(|dir| dir == "deps") {
-        path.pop();
-    }
+    path = harnx_core::bin_dir_of_exe(&path);
     path.push(if cfg!(windows) {
         format!("{name}.exe")
     } else {

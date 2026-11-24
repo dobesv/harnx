@@ -163,7 +163,7 @@ struct FileSlot<'a> {
 impl FileSlot<'_> {
     fn reserve(fs: &AttachmentFs) -> io::Result<FileSlot<'_>> {
         fs.slots
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 (current < fs.limits.max_file_count).then(|| current + 1)
             })
             .map_err(|_| io::Error::other("attachment cache file-count limit exceeded"))?;

@@ -369,10 +369,7 @@ fn proxy_binary_path() -> PathBuf {
     }
 
     let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
+    path = harnx_core::bin_dir_of_exe(&path);
 
     let binary_name = if cfg!(windows) {
         "harnx-proxy-auth.exe"
