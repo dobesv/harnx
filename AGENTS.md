@@ -970,23 +970,28 @@ of failure, and a probe on one client type says nothing about the other.
 To verify reasoning summaries, streaming, and tool replay across providers,
 run the live probe script (`scripts/probe_reasoning_summaries.*`).
 
-### Think-tag rendering contract (issues #2437, #2488)
+### Think-tag rendering contract (issues #2437, #2488, #2858)
 
 Thinking text is persisted and streamed wrapped in literal `<think>\n…\n</think>`
-tags: session persistence (`harnx-runtime/src/config/session.rs` ~L860 and
-`harnx-serve/src/lib.rs` ~L1953 for tool-call turns), the streaming bracket
+tags: session persistence (`harnx-runtime/src/config/session.rs::add_assistant_text`;
+the legacy REST view `harnx-serve/src/lib.rs::history_message_content` folds
+tool-call thoughts the same way), the streaming bracket
 helpers in `harnx-client` (`SseHandler::thought`, `claude_transition_reasoning`,
 `openai_transition_reasoning`), the non-streaming `format!`s in `claude.rs`,
 `openai.rs`, and `bedrock.rs`, and inline-thinking models emitting tags inside
-normal text. The tags are the wire format; frontends split them out for display
-rather than persistence changing what it writes.
+normal text. Persistence and the live stream keep the tags as the wire format
+(issue #2858 changed only what history snapshots emit): the server strips
+leading wrappers from snapshot assistant content and returns the reasoning in
+a side-channel `history_reasoning` map; frontends split live inline tags for
+display.
 
 - Display splitting uses `harnx_core::text::THINK_TAG_PAIRS` (`<think>` and
   `<thinking>`; case-sensitive, no nesting, no code-fence special-casing).
   Consumers: the TUI (`assistant_render.rs`), the CLI
   (`streaming_think_segmenter.rs`, which must run at the `cli_event_sink`
   boundary because the sink's partial-line raw writes bypass `MarkdownRender`),
-  and the web port `web/src/lib/thinkBlocks.ts`. The TS port must stay
+  and the web port `web/src/lib/thinkBlocks.ts` (legacy fallback only — see the
+  history-snapshot bullet below). The TS port must stay
   semantically identical to `split_think_blocks` — its vitest cases mirror the
   Rust unit tests, including the single-newline trim at tag boundaries.
 - `strip_think_tag` (`harnx-core/src/text.rs`) is LLM-facing: it removes a
@@ -999,7 +1004,31 @@ rather than persistence changing what it writes.
   authoritative — only `None` (failed/timed-out read) may fall back to the raw
   live sink (`sanitized_empty_durable_progress_does_not_expose_later_live_reasoning`).
   `split_think_blocks` is display-facing (any position, ordered
-  segments). Keep the two contracts separate.
+  segments). Keep the contracts separate.
+- History snapshots strip thinking server-side (issue #2858).
+  `crates/harnx-serve/src/history_projection.rs::split_history_reasoning` is
+  snapshot-facing and has its own semantics: it removes only *leading,
+  writer-shaped* wrappers — `<think>\n…\n</think>` followed by `\n\n` (model
+  adapters), one `\n` (session storage) or end-of-string — looping over
+  consecutive wrappers and coalescing adjacent duplicates. Mid-text, fenced,
+  `<thinking>` and unclosed tags stay verbatim, and the answer is never
+  trimmed. It runs on assistant `Text` and `ToolCalls.text` (tool-call turns
+  can be stored with role `Tool`) only; user/system/tool-result rows are
+  untouched and a reasoning-only row keeps `content: ""`. Callers:
+  `history_projection::project_message`, which feeds `HistorySnapshot`
+  (`transcript_snapshot.rs`: the MESSAGES_SNAPSHOT payload and `session/get`)
+  and `session_history/{groups,projection}.rs` (`session/history` and HTTP
+  history pages). The `ModelEvent::Final` fallback
+  `ag_ui.rs::emit_final_content` calls `split_history_reasoning` directly
+  (thoughts re-emitted only when none were streamed as THINKING events). Stripped reasoning is returned as a
+  `history_reasoning` map keyed by the emitted assistant row ID: a sibling of
+  `history_snapshot` in RPC/HTTP responses, and — only when an SSE request
+  opts in via `x-harnx-snapshot-features: history-reasoning` — a
+  `CUSTOM history_reasoning` event immediately after each MESSAGES_SNAPSHOT
+  (`transcript_snapshot.rs::SnapshotFeatures`). The web client consumes the
+  structured map (`ChatProvider.tsx` injects synthetic `role: "reasoning"`
+  rows; `historyReasoningSupport.ts` flags support), so `thinkBlocks.ts`
+  inline splitting is an assistant-only legacy fallback for older servers.
 - CLI raw/non-TTY output keeps literal tags byte-for-byte — scripts may parse it
   (`raw_and_non_tty_output_remain_byte_identical` in `cli_thought_tests.rs`).
   TTY output instead prints a dim `Thinking` label plus DarkGray DIM+ITALIC

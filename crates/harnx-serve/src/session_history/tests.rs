@@ -401,6 +401,7 @@ fn terminal_archive_json_matches_documented_wire_contract() {
                 {"role":"user","id":"f184b0f4-5008-5705-8979-31bf8cc66c05","content":"Inspect the session log format."},
                 {"role":"assistant","id":"ac5ec19d-b65e-5eca-92af-74349ef65e1f","content":"Tool calls and results are separate log entries."}
             ],
+            "history_reasoning": {},
             "next_cursor":null, "prev_cursor":null, "earlier_compaction":null
         })
     );

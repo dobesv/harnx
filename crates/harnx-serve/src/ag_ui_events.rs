@@ -1,15 +1,9 @@
 //! AG-UI event serialization, stream framing, and history formatting.
 #![allow(dead_code)]
 
-use ag_ui_core::{
-    event::Event,
-    types::{
-        ids::ToolCallId,
-        message::{Message as AgUiMessage, Role},
-    },
-};
+use ag_ui_core::{event::Event, types::message::Role};
 use bytes::Bytes;
-use harnx_core::message::{Message as HistoryMsg, MessageContent, MessageRole};
+use harnx_core::message::MessageRole;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -17,6 +11,7 @@ use crate::ag_ui::{AgUiError, SharedLiveStreamGuard};
 use crate::ag_ui_lifecycle::LiveStreamGuard;
 use crate::ag_ui_sync::frame_run_error_event;
 use crate::session_actor::{SessionCommand, SessionHandle};
+use crate::transcript_snapshot::{HistorySnapshot, SnapshotFeatures};
 
 #[derive(Clone, Copy)]
 pub(crate) struct LiveEventContext<'a> {
@@ -46,13 +41,14 @@ pub(crate) fn append_event_frames(initial: Option<Bytes>, events: Vec<Event>) ->
 pub(crate) fn live_subscription_events(
     handle: &SessionHandle,
     events: broadcast::Receiver<Event>,
+    features: SnapshotFeatures,
 ) -> impl tokio_stream::Stream<Item = Event> {
     let handle = handle.clone();
     let events = tokio_stream::StreamExt::then(BroadcastStream::new(events), move |item| {
         let handle = handle.clone();
         async move {
             match item {
-                Ok(event) => vec![event],
+                Ok(event) => features.expand_live_event(event).collect(),
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => {
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                     handle
@@ -61,10 +57,12 @@ pub(crate) fn live_subscription_events(
                         .await
                         .expect("send get");
                     let info = reply_rx.await.expect("recv get");
-                    crate::transcript_snapshot::snapshot_events(
-                        info.history_snapshot,
-                        info.compaction.as_ref(),
-                    )
+                    HistorySnapshot {
+                        messages: info.history_snapshot,
+                        reasoning: info.history_reasoning,
+                        compaction: info.compaction,
+                    }
+                    .events_for(features)
                 }
             }
         }
@@ -230,81 +228,11 @@ pub(crate) fn build_live_event_body(
     tokio_stream::StreamExt::chain(tokio_stream::iter(snapshot_frame), live_stream)
 }
 
-pub(crate) fn client_matches_history(client: &AgUiMessage, history: &HistoryMsg) -> bool {
-    client_role(client) == ag_ui_role_for_history(history.role)
-        && normalize_visible_text(&client_content(client).unwrap_or_default())
-            == normalize_visible_text(&history_content_text(&history.content))
-}
-
-pub(crate) fn normalize_visible_text(text: &str) -> String {
-    let trimmed = text.trim();
-    if let Some(stripped) = trimmed
-        .strip_prefix("<think>")
-        .and_then(|rest| rest.strip_suffix("</think>"))
-    {
-        stripped.trim().to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 pub(crate) fn ag_ui_role_for_history(role: MessageRole) -> Role {
     match role {
         MessageRole::System => Role::System,
         MessageRole::Assistant => Role::Assistant,
         MessageRole::User => Role::User,
         MessageRole::Tool => Role::Tool,
-    }
-}
-
-pub(crate) fn client_role(message: &AgUiMessage) -> Role {
-    match message {
-        AgUiMessage::Developer { .. } => Role::Developer,
-        AgUiMessage::System { .. } => Role::System,
-        AgUiMessage::Assistant { .. } => Role::Assistant,
-        AgUiMessage::User { .. } => Role::User,
-        AgUiMessage::Tool { .. } => Role::Tool,
-    }
-}
-
-pub(crate) fn client_content(message: &AgUiMessage) -> Option<String> {
-    match message {
-        AgUiMessage::Developer { content, .. }
-        | AgUiMessage::System { content, .. }
-        | AgUiMessage::User { content, .. }
-        | AgUiMessage::Tool { content, .. } => Some(content.clone()),
-        AgUiMessage::Assistant { content, .. } => content.clone(),
-    }
-}
-
-pub(crate) fn history_content_text(content: &MessageContent) -> String {
-    match content {
-        MessageContent::ToolCalls(tool_calls) => tool_calls.text.clone(),
-        _ => content.to_text(),
-    }
-}
-
-pub(crate) fn history_tool_call_id(
-    stable_base: &str,
-    index: usize,
-    persisted_id: Option<&str>,
-) -> ToolCallId {
-    // Prefer the persisted tool-call id. When absent, derive a deterministic id
-    // from a stable per-message base so reloads preserve tool result attachment.
-    let raw_id = persisted_id
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("{stable_base}-tool-{index}"));
-    serde_json::from_value(serde_json::Value::String(raw_id))
-        .expect("tool call id should deserialize from string")
-}
-
-/// Stable message key used to synthesize tool-call ids when no persisted id exists.
-pub(crate) fn history_stable_base(message: &HistoryMsg, ordinal: usize) -> String {
-    if let Some(id) = message.id.as_deref().filter(|id| !id.is_empty()) {
-        return id.to_string();
-    }
-    match message.log_seq {
-        Some(seq) => format!("seq:{seq}"),
-        None => format!("ord:{ordinal}"),
     }
 }

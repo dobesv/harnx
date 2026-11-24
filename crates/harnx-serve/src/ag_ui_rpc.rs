@@ -541,6 +541,7 @@ pub(crate) fn session_get_result(info: &SessionInfo, persistence: &str) -> Value
         "canPrompt": info.capabilities.can_prompt,
         "canCancel": info.capabilities.can_cancel,
         "history_snapshot": info.history_snapshot,
+        "history_reasoning": info.history_reasoning,
         "history_warnings": info.history_warnings,
         "capabilities": { "multiClient": true, "persistence": persistence },
     });

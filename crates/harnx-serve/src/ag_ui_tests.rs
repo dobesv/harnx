@@ -1602,8 +1602,7 @@ async fn ag_ui_run_returns_conflict_when_prompt_is_rejected() {
         let (_event_tx, event_rx) = tokio::sync::broadcast::channel(1);
         assert!(reply
             .send(SubscribeResult {
-                snapshot: vec![],
-                compaction: None,
+                snapshot: HistorySnapshot::default(),
                 history_warnings: vec![],
                 state: SessionState::Idle,
                 events: event_rx,

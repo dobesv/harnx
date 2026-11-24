@@ -16,7 +16,12 @@ type Callback = (payload: { event: WireEvent }) => unknown;
 const callbacks: Record<string, string> = {
   RUN_STARTED: 'onRunStartedEvent', RUN_FINISHED: 'onRunFinishedEvent',
   TEXT_MESSAGE_START: 'onTextMessageStartEvent', TEXT_MESSAGE_CONTENT: 'onTextMessageContentEvent',
-  TEXT_MESSAGE_END: 'onTextMessageEndEvent', TOOL_CALL_START: 'onToolCallStartEvent',
+  TEXT_MESSAGE_END: 'onTextMessageEndEvent',
+  REASONING_START: 'onReasoningStartEvent', REASONING_END: 'onReasoningEndEvent',
+  REASONING_MESSAGE_START: 'onReasoningMessageStartEvent',
+  REASONING_MESSAGE_CONTENT: 'onReasoningMessageContentEvent',
+  REASONING_MESSAGE_END: 'onReasoningMessageEndEvent',
+  TOOL_CALL_START: 'onToolCallStartEvent',
   TOOL_CALL_ARGS: 'onToolCallArgsEvent', TOOL_CALL_END: 'onToolCallEndEvent',
   TOOL_CALL_RESULT: 'onToolCallResultEvent', CUSTOM: 'onCustomEvent',
   MESSAGES_SNAPSHOT: 'onMessagesSnapshotEvent',
@@ -110,4 +115,69 @@ it('zero-kept compaction followed by turn end leaves only the summary', async ()
   await compact(stream, false);
   await stream.done();
   expect(stream.messages().map((m) => m.id)).toEqual(['summary']);
+});
+
+it('hydrates history_reasoning into assistant reasoning parts and clears on empty map', async () => {
+  const stream = await streamHarness();
+  await stream.send({
+    type: 'MESSAGES_SNAPSHOT',
+    messages: [
+      { id: 'u1', role: 'user', content: 'Solve it' },
+      { id: 'a1', role: 'assistant', content: 'Final answer.' },
+    ],
+  });
+  await stream.send({
+    type: 'CUSTOM',
+    name: 'history_reasoning',
+    value: { a1: ['Step one', 'Step two'] },
+  });
+
+  const hydrated = stream.messages().find((m) => m.id === 'a1');
+  expect(hydrated?.content).toMatchObject([
+    { type: 'reasoning', text: 'Step one' },
+    { type: 'reasoning', text: 'Step two' },
+    { type: 'text', text: 'Final answer.' },
+  ]);
+
+  // A subsequent snapshot paired with {} removes stale reasoning.
+  await stream.send({
+    type: 'MESSAGES_SNAPSHOT',
+    messages: [
+      { id: 'u1', role: 'user', content: 'Solve it' },
+      { id: 'a1', role: 'assistant', content: 'Final answer.' },
+    ],
+  });
+  await stream.send({
+    type: 'CUSTOM',
+    name: 'history_reasoning',
+    value: {},
+  });
+  await stream.done();
+
+  const refreshed = stream.messages().find((m) => m.id === 'a1');
+  expect(refreshed?.content).toEqual([{ type: 'text', text: 'Final answer.' }]);
+});
+
+it('drops live-streamed reasoning when compaction snapshot emits history_reasoning: {}', async () => {
+  const stream = await streamHarness();
+  await stream.send({ type: 'REASONING_START', messageId: 'r1' });
+  await stream.send({ type: 'REASONING_MESSAGE_START', messageId: 'r1', role: 'reasoning' });
+  await stream.send({ type: 'REASONING_MESSAGE_CONTENT', messageId: 'r1', delta: 'Live thought' });
+  await stream.send({ type: 'REASONING_MESSAGE_END', messageId: 'r1' });
+  await stream.send({ type: 'REASONING_END', messageId: 'r1' });
+  await text(stream, 'a1', 'Turn answer');
+  await stream.send({ type: 'TEXT_MESSAGE_END', messageId: 'a1' });
+
+  expect(stream.messages().some((m) => m.role === 'assistant' && m.content.some((p) => p.type === 'reasoning'))).toBe(true);
+
+  await compact(stream, false);
+  await stream.send({
+    type: 'CUSTOM',
+    name: 'history_reasoning',
+    value: {},
+  });
+  await stream.done();
+
+  expect(stream.messages().map((m) => m.id)).toEqual(['summary']);
+  expect(stream.messages().flatMap((m) => [...m.content]).some((p) => p.type === 'reasoning')).toBe(false);
 });

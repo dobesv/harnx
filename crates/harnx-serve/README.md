@@ -263,7 +263,9 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 1, "method": "session/get" }
   ```
-  **Result:** `{ "state": { … }, "history_snapshot": [...], "compaction": { … }, "last_turn": { … }, "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }`
+  **Result:** `{ "state": { … }, "history_snapshot": [...], "history_reasoning": { … }, "compaction": { … }, "last_turn": { … }, "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }`
+  `history_reasoning` maps assistant row IDs to the reasoning removed from their
+  `content`, or is `{}`. See [Snapshot reasoning](#snapshot-reasoning).
   `compaction` is optional and omitted until the session has been compacted. See
   [Compacted history snapshots](#compacted-history-snapshots) for its shape.
 
@@ -435,6 +437,7 @@ Example result for `before_compaction: 15, limit: 2` using the shared fixture:
   "jsonrpc": "2.0",
   "id": 8,
   "result": {
+    "history_reasoning": {},
     "history_snapshot": [
       {
         "role": "assistant",
@@ -501,6 +504,45 @@ invalid/wrong-session cursors (HTTP 400). Missing sessions use `-32001` (HTTP 40
 and unavailable history storage uses `-32003` (HTTP 503). Access rules can hide
 unauthorized or missing sessions behind the existing HTTP 404 response before
 RPC dispatch. Unauthenticated requests retain the server's HTTP 401 behavior.
+
+### Snapshot reasoning
+
+`session/get`, `session/history`, and `GET /v1/agents/{agent}/sessions/{session}/history`
+return `history_reasoning` beside `history_snapshot`. It maps IDs of assistant
+rows in that response to arrays of reasoning strings, in transcript order.
+`session/history` only includes entries for the requested page. A response
+with no reasoning includes `"history_reasoning": {}`.
+
+Example result (other fields omitted):
+
+```json
+{
+  "history_snapshot": [
+    {"role":"assistant","id":"d951259d-1bb5-4ea1-824f-85d5dfd28d13","content":"The tests passed."}
+  ],
+  "history_reasoning": {"d951259d-1bb5-4ea1-824f-85d5dfd28d13":["Check the test results."]}
+}
+```
+
+On an AG-UI SSE `POST` to the session URL, send
+`x-harnx-snapshot-features: history-reasoning` to opt in. The header accepts
+comma-separated feature tokens. An opted-in stream sends this companion
+immediately after each `MESSAGES_SNAPSHOT`:
+
+```text
+data: {"type":"CUSTOM","name":"history_reasoning","value":{"d951259d-1bb5-4ea1-824f-85d5dfd28d13":["Check the test results."]}}
+
+```
+
+`value` is the map itself. Replace prior snapshot reasoning with the new map,
+including `value: {}` when the snapshot has no reasoning. Match keys to IDs in
+the immediately preceding snapshot, not to IDs from another request or page.
+The companion is omitted without the header.
+
+In both cases, assistant snapshot `content` contains the answer without leading
+reasoning wrappers written by the server or model adapters. An assistant row
+with only reasoning keeps `content: ""`. Reasoning does not add snapshot rows
+or affect cursors. Live `THINKING_*` events remain separate.
 
 ### Client Implementation Flow
 
@@ -630,8 +672,9 @@ are omitted.
 
 | harnx `AgentEvent` | AG-UI event(s) | Notes |
 | :--- | :--- | :--- |
-| `Model::MessageChunk` / `Model::Final` | `TEXT_MESSAGE_CONTENT` | `TEXT_MESSAGE_START` / `TEXT_MESSAGE_END` still come from session actor lifecycle. |
-| `Model::ThoughtChunk` | `THINKING_START`, `THINKING_TEXT_MESSAGE_START`, `THINKING_TEXT_MESSAGE_CONTENT`, `THINKING_TEXT_MESSAGE_END`, `THINKING_END` | Sink keeps per-run thinking state so multi-chunk reasoning stays one segment. |
+| `Model::MessageChunk` | `TEXT_MESSAGE_CONTENT` | `TEXT_MESSAGE_START` / `TEXT_MESSAGE_END` follow the assistant message lifecycle. |
+| `Model::Final` | `THINKING_*` (when needed), then `TEXT_MESSAGE_CONTENT` | If no text streamed for this model call, split leading writer-shaped `<think>` wrappers from the answer. Emit their reasoning only if no thought chunks streamed for that call. |
+| `Model::ThoughtChunk` | `THINKING_START`, `THINKING_TEXT_MESSAGE_START`, `THINKING_TEXT_MESSAGE_CONTENT`, `THINKING_TEXT_MESSAGE_END`, `THINKING_END` | Consecutive thought chunks share a segment. |
 | `Tool::*` | `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END`, `TOOL_CALL_RESULT` | Progress/update still dropped as too noisy. |
 | `Turn::Started` / `Turn::Ended` | `STEP_STARTED` / `STEP_FINISHED` | Step names use `turn-N`. |
 | `Turn::SubAgentProgress` | `CUSTOM` | Name: `sub_agent_progress`. The invocation ID correlates reused child sessions, and `tool_call_id`, when present, names the parent tool call that started the child; progress carries running/done/failed status, elapsed milliseconds, direct token usage, direct tool-call count, and optional `title` (present when the sub-agent reported a session title). |

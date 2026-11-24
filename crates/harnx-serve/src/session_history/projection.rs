@@ -2,7 +2,7 @@ use super::{
     groups::{message_groups, Group},
     params::{Cursor, Selector, Window},
 };
-use crate::transcript_snapshot::SessionCompaction;
+use crate::{history_projection::HistoryReasoning, transcript_snapshot::SessionCompaction};
 use ag_ui_core::types::message::Message as AgUiMessage;
 use anyhow::{ensure, Result};
 use harnx_core::{
@@ -14,6 +14,7 @@ use serde::Serialize;
 #[derive(Serialize)]
 pub(crate) struct HistoryPage {
     pub history_snapshot: Vec<AgUiMessage>,
+    pub history_reasoning: HistoryReasoning,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<SessionCompaction>,
     pub next_cursor: Option<String>,
@@ -50,6 +51,7 @@ impl Projection {
                     from: marker.compaction_seq,
                     to: marker.compaction_seq,
                     messages: vec![marker.message()],
+                    reasoning: None,
                     marker: true,
                 },
             );
@@ -79,6 +81,10 @@ impl Projection {
                 .iter()
                 .flat_map(|group| group.messages.clone())
                 .collect(),
+            history_reasoning: groups
+                .iter()
+                .filter_map(|group| group.reasoning.clone())
+                .collect(),
             compaction: groups
                 .iter()
                 .any(|group| group.marker)
@@ -96,6 +102,9 @@ impl Projection {
             .iter()
             .map(|group| {
                 serde_json::to_vec(&group.messages).map_or(0, |bytes| bytes.len())
+                    + group.reasoning.as_ref().map_or(0, |reasoning| {
+                        serde_json::to_vec(reasoning).map_or(0, |bytes| bytes.len())
+                    })
                     + std::mem::size_of::<Group>()
             })
             .sum();

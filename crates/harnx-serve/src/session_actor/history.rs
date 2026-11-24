@@ -1,5 +1,4 @@
 use super::*;
-use crate::transcript_snapshot::HistorySnapshot;
 
 impl LoadedHistorySnapshot {
     fn from_loaded(loaded: crate::LoadedNatsSession) -> Self {
@@ -15,8 +14,7 @@ impl LoadedHistorySnapshot {
         });
         // A presentation failure must not discard durable control state or lease status.
         Self {
-            messages: snapshot.messages,
-            compaction: snapshot.compaction,
+            snapshot,
             tokens_usage: Some(crate::ag_ui::UsageContextSnapshot::from_session(
                 &loaded.session,
             )),
@@ -34,7 +32,6 @@ impl SessionActor {
     pub(super) fn subscription(&self) -> SubscribeResult {
         SubscribeResult {
             snapshot: self.history_snapshot.clone(),
-            compaction: self.compaction.clone(),
             history_warnings: self.history_warnings.clone(),
             state: self.state.clone(),
             events: self.broadcast_tx.subscribe(),
@@ -67,8 +64,7 @@ impl SessionActor {
                 Utc::now(),
             );
         }
-        self.history_snapshot = loaded.messages;
-        self.compaction = loaded.compaction;
+        self.history_snapshot = loaded.snapshot;
         self.history_warnings = loaded.warnings;
         self.log_entries = loaded.entries;
         self.tokens_usage = loaded.tokens_usage;
@@ -110,15 +106,15 @@ impl SessionActor {
             true,
         )
         .await;
-        let messages = prompt_config
+        let snapshot = prompt_config
             .read()
             .session
             .as_ref()
-            .map(|session| crate::ag_ui::history_messages_for_snapshot(&session.messages))
+            .map(|session| HistorySnapshot::from_messages(&session.messages))
             .unwrap_or_default();
         // The test executor has no durable NATS log or metadata base.
         LoadedHistorySnapshot {
-            messages,
+            snapshot,
             ..Default::default()
         }
     }
