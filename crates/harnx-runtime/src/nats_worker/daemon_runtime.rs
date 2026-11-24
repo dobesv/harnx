@@ -1404,7 +1404,7 @@ mod tests {
             let headers = {
                 let _entered = publisher_span.enter();
                 super::super::activation_transport::activation_headers(
-                    async_nats::header::HeaderValue::from("message-id"),
+                    async_nats::header::HeaderValue::from_lossy("message-id"),
                 )
             };
             assert_eq!(
