@@ -16,6 +16,7 @@ mod agent_access;
 mod agent_resolve;
 mod attachments;
 mod cid;
+mod history_projection;
 mod interrupt_resume;
 mod last_turn;
 mod models_catalog;
@@ -1552,11 +1553,13 @@ impl Server {
         let user_id = RequestIdentity::user_id(&req);
         let user_principals = RequestIdentity::of(&req).stampable_principals();
         let web_base_url = web_url::inferred_base_url(req.headers(), req.uri());
+        let snapshot_features = transcript_snapshot::SnapshotFeatures::from_headers(req.headers());
         let body = req.collect().await?.to_bytes();
         let request = ag_ui::AgUiRunRequest {
             target,
             session,
             body: &body,
+            snapshot_features,
             web_base_url,
             user_id,
             user_principals,
@@ -1860,7 +1863,9 @@ fn set_cors_header(res: &mut AppResponse) {
     );
     res.headers_mut().insert(
         hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
-        hyper::header::HeaderValue::from_static("Content-Type,Authorization"),
+        hyper::header::HeaderValue::from_static(
+            "Content-Type,Authorization,x-harnx-snapshot-features",
+        ),
     );
 }
 
@@ -3954,7 +3959,7 @@ mod tests {
 
     fn assert_snapshot_attachment_event(content: &MessageContent, cid: &str) {
         let history = [Message::new(MessageRole::User, content.clone()).with_id("user-msg-1")];
-        let snapshot = crate::ag_ui::history_messages_for_snapshot(&history);
+        let snapshot = crate::transcript_snapshot::history_messages_for_snapshot(&history);
         let durable_entries = vec![(
             1,
             SessionLogEntry::Message {

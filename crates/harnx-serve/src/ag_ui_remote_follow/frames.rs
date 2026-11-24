@@ -6,9 +6,10 @@ use harnx_runtime::nats_event_sink::{AdvisoryEnvelope, LiveEventState};
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
 
-#[cfg(test)]
-use crate::ag_ui_lifecycle::LiveStreamGuard;
-use crate::{ag_ui::SharedLiveStreamGuard, ag_ui_events::frame_guarded_live_event};
+use crate::{
+    ag_ui::SharedLiveStreamGuard, ag_ui_events::frame_guarded_live_event,
+    ag_ui_lifecycle::LiveStreamGuard, transcript_snapshot::SnapshotFeatures,
+};
 
 pub(crate) struct QueuedEvent {
     /// The `after_seq` of the advisory this event was mapped from: where the
@@ -23,6 +24,7 @@ struct FrameQueue {
     live: LiveEventState,
     last_durable_seq: u64,
     guard: SharedLiveStreamGuard,
+    features: SnapshotFeatures,
 }
 
 /// `should_render` reads only the envelope's sequence, and a queued event has
@@ -48,6 +50,7 @@ pub(crate) fn event_frames(
         live,
         last_durable_seq,
         std::sync::Arc::new(std::sync::Mutex::new(LiveStreamGuard::default())),
+        SnapshotFeatures::default(),
     )
 }
 
@@ -56,19 +59,22 @@ pub(crate) fn event_frames_with_guard(
     live: LiveEventState,
     last_durable_seq: u64,
     guard: SharedLiveStreamGuard,
+    features: SnapshotFeatures,
 ) -> impl Stream<Item = Bytes> + Send + Sync {
     let queue = FrameQueue {
         rx,
         live,
         last_durable_seq,
         guard,
+        features,
     };
     futures_util::stream::unfold(queue, |mut queue| async move {
         while let Some(queued) = queue.rx.recv().await {
             let fence = fence_probe(queued.after_seq);
             if queue.live.should_render(&fence, queue.last_durable_seq) {
-                let frame = frame_guarded_live_event(
+                let frame = frame_live_batch(
                     queued.event,
+                    queue.features,
                     &mut queue.guard.lock().expect("live stream guard"),
                 );
                 if let Some(frame) = frame {
@@ -82,5 +88,20 @@ pub(crate) fn event_frames_with_guard(
             .expect("live stream guard")
             .finalize_open_lifecycles();
         (!closes.is_empty()).then_some((closes, queue))
+    })
+}
+
+fn frame_live_batch(
+    event: Event,
+    features: SnapshotFeatures,
+    guard: &mut LiveStreamGuard,
+) -> Option<Bytes> {
+    let mut frames = features
+        .expand_live_event(event)
+        .filter_map(|event| frame_guarded_live_event(event, guard));
+    // One sequence-fence decision for both snapshot frames.
+    frames.next().map(|first| match frames.next() {
+        Some(second) => Bytes::from([first.as_ref(), second.as_ref()].concat()),
+        None => first,
     })
 }

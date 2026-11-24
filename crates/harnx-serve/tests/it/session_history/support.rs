@@ -25,6 +25,13 @@ pub(super) fn entries() -> Vec<(u64, SessionLogEntry)> {
 }
 
 pub(super) async fn fixture(rules_on: bool) -> Result<Option<Fixture>> {
+    fixture_with_entries(rules_on, entries()).await
+}
+
+pub(super) async fn fixture_with_entries(
+    rules_on: bool,
+    entries: Vec<(u64, SessionLogEntry)>,
+) -> Result<Option<Fixture>> {
     harnx_core::require_nextest();
     let Some(nats) = common::spawn_nats_server().await? else {
         return Ok(None);
@@ -42,7 +49,7 @@ pub(super) async fn fixture(rules_on: bool) -> Result<Option<Fixture>> {
         .create(&SessionMetadata::new("other", initializer))
         .await?;
     let log = NatsSessionLog::new(jetstream, storage_key("history")).with_replicas(1);
-    for (seq, entry) in entries() {
+    for (seq, entry) in entries {
         assert_eq!(log.append_event_async(&entry).await?, seq);
     }
     Ok(Some(Fixture {

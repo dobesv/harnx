@@ -23,12 +23,10 @@ pub use registry::SessionRegistry;
 pub use test_log::load_test_session_messages;
 
 use crate::ag_ui::{derive_thread_id, message_attachment_snapshot_events, AgUiSink};
+use crate::transcript_snapshot::HistorySnapshot;
 use ag_ui_core::{
     event::{BaseEvent, Event, RunErrorEvent, RunFinishedEvent, RunStartedEvent},
-    types::{
-        ids::{MessageId, RunId, ThreadId},
-        message::Message as AgUiMessage,
-    },
+    types::ids::{MessageId, RunId, ThreadId},
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -127,8 +125,7 @@ struct SessionActor {
     run_done_task: Option<AbortOnDropHandle<()>>,
     reap_ttl: Duration,
     reap_deadline: Option<Instant>,
-    history_snapshot: Vec<AgUiMessage>,
-    compaction: Option<SessionCompaction>,
+    history_snapshot: HistorySnapshot,
     history_warnings: Vec<String>,
     /// Cached durable log entries for control-state hydration on promptless subscribe.
     /// Set by `refresh_history_snapshot` when loading from NATS.
@@ -147,8 +144,7 @@ struct SessionActor {
 
 #[derive(Default)]
 struct LoadedHistorySnapshot {
-    messages: Vec<AgUiMessage>,
-    compaction: Option<SessionCompaction>,
+    snapshot: HistorySnapshot,
     warnings: Vec<String>,
     entries: Option<Vec<(u64, harnx_core::session::SessionLogEntry)>>,
     tokens_usage: Option<crate::ag_ui::UsageContextSnapshot>,
@@ -290,8 +286,7 @@ fn make_session_actor(
         run_done_task: None,
         reap_ttl,
         reap_deadline: None,
-        history_snapshot: Vec::new(),
-        compaction: None,
+        history_snapshot: HistorySnapshot::default(),
         history_warnings: Vec::new(),
         log_entries: None,
         tokens_usage: None,
@@ -685,7 +680,9 @@ impl SessionActor {
     async fn broadcast_attachment_metadata(&mut self) {
         self.refresh_history_snapshot().await;
         if let Some(entries) = self.log_entries.as_deref() {
-            for event in message_attachment_snapshot_events(&self.history_snapshot, entries) {
+            for event in
+                message_attachment_snapshot_events(&self.history_snapshot.messages, entries)
+            {
                 let _ = self.broadcast_tx.send(event);
             }
         }
@@ -908,8 +905,9 @@ impl SessionActor {
             // lease sampled by the last durable read is what says it is
             // running anyway.
             worker_active: self.worker_active,
-            history_snapshot: self.history_snapshot.clone(),
-            compaction: self.compaction.clone(),
+            history_snapshot: self.history_snapshot.messages.clone(),
+            history_reasoning: self.history_snapshot.reasoning.clone(),
+            compaction: self.history_snapshot.compaction.clone(),
             history_warnings: self.history_warnings.clone(),
             capabilities: SessionCapabilities {
                 // A prompt is always admissible: the session log orders it
@@ -1004,18 +1002,18 @@ struct BroadcastEventSender {
 #[derive(Clone)]
 struct SessionEventContext {
     prompt_config: GlobalConfig,
-    history_snapshot: Vec<AgUiMessage>,
+    history_snapshot: HistorySnapshot,
 }
 
 impl SessionEventContext {
-    fn new(prompt_config: GlobalConfig, history_snapshot: Vec<AgUiMessage>) -> Self {
+    fn new(prompt_config: GlobalConfig, history_snapshot: HistorySnapshot) -> Self {
         Self {
             prompt_config,
             history_snapshot,
         }
     }
 
-    fn history_snapshot(&self) -> Vec<AgUiMessage> {
+    fn history_snapshot(&self) -> HistorySnapshot {
         self.history_snapshot.clone()
     }
 

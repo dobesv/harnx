@@ -1,11 +1,14 @@
 #![allow(dead_code)]
 #[cfg(test)]
 use crate::ag_ui_attach::snapshot_event;
-use crate::transcript_snapshot::HistorySnapshot;
+use crate::history_projection::split_history_reasoning;
+#[cfg(test)]
+use crate::transcript_snapshot::history_messages_for_snapshot;
+use crate::transcript_snapshot::{HistorySnapshot, SnapshotFeatures};
 
-use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use std::time::Duration;
+use std::{collections::HashMap, convert::Infallible};
 
 use serde_json::json;
 
@@ -13,8 +16,7 @@ use crate::ag_ui_attach::{initial_attach_frame, keep_alive_frame, session_attach
 pub use crate::ag_ui_events::frame_event;
 pub(crate) use crate::ag_ui_events::frame_terminal_after_lifecycle_closes;
 use crate::ag_ui_events::{
-    ag_ui_role_for_history, append_event_frames, build_live_event_body, frame_run_finished_event,
-    history_content_text, history_stable_base, history_tool_call_id, live_subscription_events,
+    append_event_frames, build_live_event_body, frame_run_finished_event, live_subscription_events,
     session_state_is_active, LiveEventContext,
 };
 #[cfg(test)]
@@ -42,18 +44,20 @@ use ag_ui_core::{
         context::Context,
         ids::{MessageId, RunId, ThreadId, ToolCallId},
         input::RunAgentInput,
-        message::{FunctionCall, Message as AgUiMessage, Role},
-        tool::{Tool, ToolCall},
+        message::{Message as AgUiMessage, Role},
+        tool::Tool,
     },
     JsonValue,
 };
 use bytes::Bytes;
+#[cfg(test)]
+use harnx_core::message::Message as HistoryMsg;
 use harnx_core::{
     event::{
         AgentEvent, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent,
         TurnOutcome,
     },
-    message::{Message as HistoryMsg, MessageContent, MessageContentPart, MessageRole},
+    message::{MessageContent, MessageContentPart, MessageRole},
 };
 use harnx_runtime::{
     config::{Config, GlobalConfig},
@@ -270,20 +274,42 @@ impl From<broadcast::Sender<Event>> for AgUiEventTx {
     }
 }
 
-#[derive(Debug, Clone)]
-struct TextSegmentState {
-    open_message_id: Option<MessageId>,
-    content_emitted: bool,
+#[derive(PartialEq, Eq, Hash)]
+enum ModelOutputSource {
+    Parent,
+    SubAgent {
+        agent: String,
+        session_id: Option<String>,
+    },
+}
+
+#[derive(Default)]
+struct ModelOutputState {
+    streamed_text: bool,
+    streamed_thought: bool,
+}
+
+impl ModelOutputState {
+    fn fallback_text<'a>(&self, output: &'a str) -> &'a str {
+        if self.streamed_text {
+            ""
+        } else {
+            output
+        }
+    }
 }
 
 pub struct AgUiSink {
     tx: AgUiEventTx,
     message_id: MessageId,
-    text_segment_state: Mutex<TextSegmentState>,
-    history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
+    open_text_message_id: Mutex<Option<MessageId>>,
+    // Fallback state is per model call and source, not per wire segment.
+    // Closing a thinking segment (e.g. on LogSeqAssigned) can precede Final.
+    model_output: parking_lot::Mutex<HashMap<ModelOutputSource, ModelOutputState>>,
+    history_snapshot: Option<Arc<dyn Fn() -> HistorySnapshot + Send + Sync>>,
     session_context: Option<Arc<dyn Fn() -> Option<UsageContextSnapshot> + Send + Sync>>,
     pending_run_error: Mutex<Option<String>>,
-    in_thinking_segment: std::sync::atomic::AtomicBool,
+    in_thinking_segment: AtomicBool,
     turn_counter: std::sync::atomic::AtomicUsize,
 }
 
@@ -298,18 +324,16 @@ impl AgUiSink {
         Self::with_snapshot_and_context(tx, message_id, true, None, None)
     }
 
-    pub fn new_broadcast_with_snapshot(
-        tx: broadcast::Sender<Event>,
-        message_id: MessageId,
-        history_snapshot: Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>,
-    ) -> Self {
-        Self::with_snapshot_and_context(tx, message_id, true, Some(history_snapshot), None)
+    /// Uses an unbounded internal channel; the bounded wire queue applies
+    /// backpressure without discarding lifecycle events.
+    pub(crate) fn new_for_remote_follow(tx: UnboundedSender<Event>, message_id: MessageId) -> Self {
+        Self::with_snapshot_and_context(tx, message_id, false, None, None)
     }
 
     pub(crate) fn new_broadcast_with_snapshot_and_context(
         tx: broadcast::Sender<Event>,
         message_id: MessageId,
-        history_snapshot: Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>,
+        history_snapshot: Arc<dyn Fn() -> HistorySnapshot + Send + Sync>,
         session_context: Arc<dyn Fn() -> Option<UsageContextSnapshot> + Send + Sync>,
     ) -> Self {
         Self::with_snapshot_and_context(
@@ -321,12 +345,15 @@ impl AgUiSink {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_snapshot(
         tx: impl Into<AgUiEventTx>,
         message_id: MessageId,
         text_message_started: bool,
         history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
     ) -> Self {
+        let history_snapshot = history_snapshot
+            .map(|provider| Arc::new(move || HistorySnapshot::from(provider())) as Arc<_>);
         Self::with_snapshot_and_context(
             tx,
             message_id,
@@ -340,21 +367,19 @@ impl AgUiSink {
         tx: impl Into<AgUiEventTx>,
         message_id: MessageId,
         text_message_started: bool,
-        history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
+        history_snapshot: Option<Arc<dyn Fn() -> HistorySnapshot + Send + Sync>>,
         session_context: Option<Arc<dyn Fn() -> Option<UsageContextSnapshot> + Send + Sync>>,
     ) -> Self {
         let open_message_id = text_message_started.then_some(message_id.clone());
         Self {
             tx: tx.into(),
             message_id,
-            text_segment_state: Mutex::new(TextSegmentState {
-                open_message_id,
-                content_emitted: false,
-            }),
+            open_text_message_id: Mutex::new(open_message_id),
+            model_output: parking_lot::Mutex::default(),
             history_snapshot,
             session_context,
             pending_run_error: Mutex::new(None),
-            in_thinking_segment: std::sync::atomic::AtomicBool::new(false),
+            in_thinking_segment: AtomicBool::new(false),
             turn_counter: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -376,8 +401,8 @@ impl AgUiSink {
     }
 
     fn ensure_text_message_started(&self) -> MessageId {
-        let mut state = self.text_segment_state.lock().expect("text segment state");
-        if let Some(message_id) = &state.open_message_id {
+        let mut open = self.open_text_message_id.lock().expect("open text message");
+        if let Some(message_id) = open.as_ref() {
             return message_id.clone();
         }
 
@@ -387,16 +412,16 @@ impl AgUiSink {
             message_id: message_id.clone(),
             role: Role::Assistant,
         }));
-        state.open_message_id = Some(message_id.clone());
+        *open = Some(message_id.clone());
         message_id
     }
 
     pub(crate) fn close_text_segment(&self) -> Option<MessageId> {
-        let message_id = {
-            let mut state = self.text_segment_state.lock().expect("text segment state");
-            state.content_emitted = false;
-            state.open_message_id.take()
-        }?;
+        let message_id = self
+            .open_text_message_id
+            .lock()
+            .expect("open text message")
+            .take()?;
 
         self.send(Event::TextMessageEnd(TextMessageEndEvent {
             base: Self::base_event(),
@@ -406,10 +431,9 @@ impl AgUiSink {
     }
 
     pub(crate) fn has_open_text_segment(&self) -> bool {
-        self.text_segment_state
+        self.open_text_message_id
             .lock()
-            .expect("text segment state")
-            .open_message_id
+            .expect("open text message")
             .is_some()
     }
 
@@ -433,10 +457,6 @@ impl AgUiSink {
         }
         self.close_thinking_segment();
         let message_id = self.ensure_text_message_started();
-        self.text_segment_state
-            .lock()
-            .expect("text segment state")
-            .content_emitted = true;
         self.send(Event::TextMessageContent(TextMessageContentEvent {
             base: Self::base_event(),
             message_id,
@@ -470,30 +490,19 @@ impl AgUiSink {
         ));
     }
 
-    fn finish_turn(&self) {
-        self.close_thinking_segment();
-    }
-
     /// Closes out the AG-UI step for a turn that just ended, however it
     /// ended. Shared by `Ended` and `Interrupted`: both stop the turn and,
     /// for a sub-agent, close the `StepStarted` they opened with a matching
     /// `StepFinished` — they differ only in what they emit afterward (a turn
     /// outcome vs. an interruption notice).
     fn finish_turn_step(&self, is_sub_agent: bool) {
-        self.finish_turn();
+        self.close_thinking_segment();
         if is_sub_agent {
             self.send(Event::StepFinished(StepFinishedEvent {
                 base: Self::base_event(),
                 step_name: self.step_name_for_turn(),
             }));
         }
-    }
-
-    fn text_content_emitted(&self) -> bool {
-        self.text_segment_state
-            .lock()
-            .expect("text segment state")
-            .content_emitted
     }
 
     fn record_run_error(&self, message: String) {
@@ -521,7 +530,7 @@ impl AgUiSink {
     }
 
     fn emit_history_snapshot(&self, snapshot: Option<HistorySnapshot>) {
-        for event in snapshot.into_iter().flat_map(HistorySnapshot::events) {
+        for event in snapshot.into_iter().flat_map(HistorySnapshot::live_events) {
             self.send(event);
         }
     }
@@ -668,7 +677,7 @@ impl AgUiSink {
         );
     }
 
-    fn emit_tool_event(&self, event: ToolEvent) {
+    fn emit_tool_event(&self, event: ToolEvent, source: &ModelOutputSource) {
         self.close_thinking_segment();
         match event {
             ToolEvent::Started {
@@ -678,21 +687,9 @@ impl AgUiSink {
                 input,
                 ..
             } => {
-                self.close_text_segment();
-                self.send(Event::ToolCallStart(ToolCallStartEvent {
-                    base: Self::base_event(),
-                    tool_call_id: Self::tool_call_id(id.clone()),
-                    tool_call_name: name,
-                    parent_message_id: Some(self.message_id.clone()),
-                }));
-                if let Some(markdown) = markdown {
-                    self.emit_tool_summary(id.clone(), markdown);
-                }
-                self.send(Event::ToolCallArgs(ToolCallArgsEvent {
-                    base: Self::base_event(),
-                    tool_call_id: Self::tool_call_id(id),
-                    delta: input.to_string(),
-                }));
+                // A tool round ends its model call without emitting Final.
+                self.take_model_output(source);
+                self.emit_tool_start(id, name, markdown, input);
             }
             ToolEvent::Completed {
                 id,
@@ -729,6 +726,34 @@ impl AgUiSink {
         }
     }
 
+    fn emit_tool_start(
+        &self,
+        id: String,
+        name: String,
+        markdown: Option<String>,
+        input: JsonValue,
+    ) {
+        self.close_text_segment();
+        self.send(Event::ToolCallStart(ToolCallStartEvent {
+            base: Self::base_event(),
+            tool_call_id: Self::tool_call_id(id.clone()),
+            tool_call_name: name,
+            parent_message_id: Some(self.message_id.clone()),
+        }));
+        self.emit_optional_tool_summary(&id, markdown);
+        self.send(Event::ToolCallArgs(ToolCallArgsEvent {
+            base: Self::base_event(),
+            tool_call_id: Self::tool_call_id(id),
+            delta: input.to_string(),
+        }));
+    }
+
+    fn emit_optional_tool_summary(&self, id: &str, markdown: Option<String>) {
+        if let Some(markdown) = markdown {
+            self.emit_tool_summary(id.to_owned(), markdown);
+        }
+    }
+
     fn content_text(blocks: &[ContentBlock]) -> String {
         blocks
             .iter()
@@ -739,20 +764,15 @@ impl AgUiSink {
             .collect()
     }
 
-    fn emit_model_event(&self, event: ModelEvent, is_sub_agent: bool) {
+    fn emit_model_event(&self, event: ModelEvent, source: ModelOutputSource) {
         match event {
             ModelEvent::MessageChunk { blocks } => {
-                self.emit_text_delta(Self::content_text(&blocks));
+                self.emit_model_chunk(Self::content_text(&blocks), source, false);
             }
             ModelEvent::ThoughtChunk { blocks } => {
-                self.emit_thinking_delta(Self::content_text(&blocks));
+                self.emit_model_chunk(Self::content_text(&blocks), source, true);
             }
-            ModelEvent::Final { output, .. } => {
-                if !self.text_content_emitted() {
-                    self.emit_text_delta(output);
-                }
-                self.finish_turn();
-            }
+            ModelEvent::Final { output, .. } => self.emit_model_final(output, &source),
             ModelEvent::Usage {
                 input,
                 output,
@@ -769,13 +789,58 @@ impl AgUiSink {
                     session_label,
                 }),
             ),
-            ModelEvent::Error(message) => self.record_model_error(message, is_sub_agent),
+            ModelEvent::Error(message) => self.record_model_error(message, &source),
         }
     }
 
-    fn record_model_error(&self, message: String, is_sub_agent: bool) {
-        self.finish_turn();
-        if !is_sub_agent {
+    fn emit_model_chunk(&self, delta: String, source: ModelOutputSource, thinking: bool) {
+        let emit = if thinking {
+            Self::emit_thinking_delta
+        } else {
+            Self::emit_text_delta
+        };
+        self.record_model_chunk(&delta, source, thinking);
+        emit(self, delta);
+    }
+
+    fn record_model_chunk(&self, delta: &str, source: ModelOutputSource, thinking: bool) {
+        if delta.is_empty() {
+            return;
+        }
+        let mut calls = self.model_output.lock();
+        let state = calls.entry(source).or_default();
+        state.streamed_thought |= thinking;
+        state.streamed_text |= !thinking;
+    }
+
+    fn take_model_output(&self, source: &ModelOutputSource) -> ModelOutputState {
+        self.model_output.lock().remove(source).unwrap_or_default()
+    }
+
+    fn emit_model_final(&self, output: String, source: &ModelOutputSource) {
+        let streamed = self.take_model_output(source);
+        // Thought chunks take precedence even if Final has more reasoning.
+        // Final has no offsets to reliably distinguish replay from a suffix.
+        self.emit_final_content(streamed.fallback_text(&output), !streamed.streamed_thought);
+        self.close_thinking_segment();
+    }
+
+    fn emit_final_content(&self, output: &str, include_thoughts: bool) {
+        let (answer, thoughts) = split_history_reasoning(output);
+        for thought in thoughts.into_iter().filter(|_| include_thoughts) {
+            self.emit_thinking_delta(thought.to_owned());
+        }
+        self.emit_text_delta(answer.to_owned());
+    }
+
+    fn record_model_error(&self, message: String, source: &ModelOutputSource) {
+        self.take_model_output(source);
+        self.close_thinking_segment();
+        self.record_parent_run_error(message, source);
+    }
+
+    fn record_parent_run_error(&self, message: String, source: &ModelOutputSource) {
+        if matches!(source, ModelOutputSource::Parent) {
             self.record_run_error(message);
         }
     }
@@ -789,7 +854,9 @@ impl AgUiSink {
         self.emit_custom("notice", json!({ "level": level, "message": message }));
     }
 
-    fn emit_turn_event(&self, event: TurnEvent, is_sub_agent: bool) {
+    fn emit_turn_event(&self, event: TurnEvent, source: &ModelOutputSource) {
+        self.reset_model_output_at_turn_boundary(&event, source);
+        let is_sub_agent = !matches!(source, ModelOutputSource::Parent);
         match event {
             TurnEvent::Started if is_sub_agent => {
                 let turn = self
@@ -838,6 +905,19 @@ impl AgUiSink {
         }
     }
 
+    fn reset_model_output_at_turn_boundary(&self, event: &TurnEvent, source: &ModelOutputSource) {
+        if matches!(
+            event,
+            TurnEvent::Started
+                | TurnEvent::Ended { .. }
+                | TurnEvent::Interrupted { .. }
+                | TurnEvent::RetryAttempt { .. }
+                | TurnEvent::ModelFallback { .. }
+        ) {
+            self.take_model_output(source);
+        }
+    }
+
     fn emit_turn_outcome(&self, outcome: TurnOutcome) {
         let outcome_is_empty = [
             outcome.output.is_empty(),
@@ -858,6 +938,7 @@ impl AgUiSink {
         );
     }
 
+    // qual:allow(iosp) — Keep session event routing and its wire mappings in one match.
     fn emit_session_event(&self, event: SessionEvent) {
         match event {
             SessionEvent::HandoffCommitted {
@@ -883,10 +964,7 @@ impl AgUiSink {
                 self.emit_custom("session_compacting_started", payload);
             }
             event @ SessionEvent::CompactingCompleted { .. } => {
-                let snapshot = self
-                    .history_snapshot
-                    .as_ref()
-                    .map(|provider| HistorySnapshot::from(provider()));
+                let snapshot = self.history_snapshot.as_ref().map(|provider| provider());
                 self.emit_compacting_completed(event, snapshot);
             }
             SessionEvent::CompactingFailed {
@@ -919,25 +997,32 @@ impl AgUiSink {
                 self.emit_custom("session_title_updated", json!({ "title": title }));
             }
             SessionEvent::Generic { text } => {
-                self.finish_turn();
+                self.close_thinking_segment();
                 self.emit_custom("session_generic", json!({ "text": text }));
             }
-            SessionEvent::LogSeqAssigned { .. } => self.finish_turn(),
+            SessionEvent::LogSeqAssigned { .. } => self.close_thinking_segment(),
         }
     }
 }
 
 impl harnx_core::event::AgentEventSink for AgUiSink {
     fn emit(&self, event: AgentEvent) {
-        let (event, is_sub_agent) = match event {
-            AgentEvent::SubAgent { event, .. } => (*event, true),
-            event => (event, false),
+        let (event, source) = match event {
+            AgentEvent::SubAgent { source, event } => (
+                *event,
+                ModelOutputSource::SubAgent {
+                    agent: source.agent,
+                    session_id: source.session_id,
+                },
+            ),
+            event => (event, ModelOutputSource::Parent),
         };
         match event {
-            AgentEvent::Model(event) => self.emit_model_event(event, is_sub_agent),
-            AgentEvent::Tool(tool_event) => self.emit_tool_event(tool_event),
-            AgentEvent::Turn(event) => self.emit_turn_event(event, is_sub_agent),
-            AgentEvent::Session(SessionEvent::HandoffCommitted { .. }) if is_sub_agent => {}
+            AgentEvent::Model(event) => self.emit_model_event(event, source),
+            AgentEvent::Tool(event) => self.emit_tool_event(event, &source),
+            AgentEvent::Turn(event) => self.emit_turn_event(event, &source),
+            AgentEvent::Session(SessionEvent::HandoffCommitted { .. })
+                if !matches!(source, ModelOutputSource::Parent) => {}
             AgentEvent::Session(event) => self.emit_session_event(event),
             AgentEvent::Notice(notice) => self.emit_notice(notice),
             AgentEvent::Plan { entries } => {
@@ -965,6 +1050,7 @@ fn initial_attach_frame_with_attachment_metadata(
     history_warnings: Vec<String>,
     log_entries: Option<&[(u64, harnx_core::session::SessionLogEntry)]>,
     hydrate_history: bool,
+    features: SnapshotFeatures,
 ) -> Option<Bytes> {
     let attachment_events = if hydrate_history {
         log_entries
@@ -974,7 +1060,7 @@ fn initial_attach_frame_with_attachment_metadata(
         Vec::new()
     };
     append_event_frames(
-        initial_attach_frame(snapshot, history_warnings, hydrate_history),
+        initial_attach_frame(snapshot, history_warnings, hydrate_history, features),
         attachment_events,
     )
 }
@@ -1224,18 +1310,18 @@ fn build_promptless_event_stream_with_guard(
     Box::pin(tokio_stream::StreamExt::chain(hydrated, body))
 }
 
-pub(crate) fn build_ag_ui_event_stream(
+fn build_ag_ui_event_stream(
     handle: &SessionHandle,
-    run_id: &str,
-    thread_id_text: &str,
+    context: LiveEventContext<'_>,
     subscription: SubscribeResult,
-    has_prompt: Option<&str>,
-    is_active: bool,
+    prompted: bool,
+    features: SnapshotFeatures,
 ) -> GuardedEventStream {
+    let LiveEventContext { run_id, thread_id } = context;
+    let is_active = session_state_is_active(&subscription.state);
     let guard = Arc::new(Mutex::new(LiveStreamGuard::default()));
     let SubscribeResult {
         snapshot,
-        compaction,
         history_warnings,
         state,
         events,
@@ -1259,16 +1345,14 @@ pub(crate) fn build_ag_ui_event_stream(
         | crate::session_actor::SessionState::Interrupted { .. } => None,
     };
     let initial_frame = initial_attach_frame_with_attachment_metadata(
-        HistorySnapshot {
-            messages: snapshot,
-            compaction,
-        },
+        snapshot,
         history_warnings,
         log_entries.as_deref(),
-        has_prompt.is_none(),
+        !prompted,
+        features,
     );
-    let live_stream = live_subscription_events(handle, events);
-    let stream = match has_prompt {
+    let live_stream = live_subscription_events(handle, events, features);
+    let stream = match prompted {
         // A prompted run is a pure delta stream (RUN_STARTED -> TEXT_MESSAGE_*/... ->
         // RUN_FINISHED). We deliberately do NOT emit MESSAGES_SNAPSHOT here: the
         // snapshot is captured before the new prompt is recorded, so it would not
@@ -1276,16 +1360,16 @@ pub(crate) fn build_ag_ui_event_stream(
         // (assistant-ui's applyExternalMessages is a full replace) would wipe the
         // optimistically-appended user message and the streaming reply. Clients
         // hydrate via their own promptless subscribe stream instead (multiplayer-safe).
-        Some(_) => build_prompted_event_stream(
+        true => build_prompted_event_stream(
             run_id,
-            thread_id_text,
+            thread_id,
             (initial_frame, attached_seq),
             live_stream,
             guard.clone(),
         ),
-        None => build_promptless_event_stream_with_guard(
+        false => build_promptless_event_stream_with_guard(
             run_id,
-            thread_id_text,
+            thread_id,
             initial_frame,
             live_stream,
             is_active,
@@ -1353,6 +1437,7 @@ pub async fn ag_ui_run_with_call_fn(
         web_base_url: None,
         user_id: None,
         user_principals: None,
+        snapshot_features: SnapshotFeatures::default(),
     };
     ag_ui_run_for_target(
         base_config,
@@ -1368,6 +1453,7 @@ pub(crate) struct AgUiRunRequest<'a> {
     pub(crate) target: &'a crate::session_actor::ResolvedAgentTarget,
     pub(crate) session: &'a str,
     pub(crate) body: &'a [u8],
+    pub(crate) snapshot_features: SnapshotFeatures,
     /// The Web UI base inferred from the request; see
     /// [`SessionPromptOptions::web_base_url`].
     pub(crate) web_base_url: Option<String>,
@@ -1398,6 +1484,7 @@ pub(crate) async fn ag_ui_run_for_target(
     let (target, session, req_body) = (request.target, request.session, request.body);
     let relaxed_run_input: RelaxedRunAgentInput<JsonValue> = serde_json::from_slice(req_body)
         .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI request body: {err}")))?;
+    let features = request.snapshot_features;
     let prompt_options = request.into_prompt_options(relaxed_run_input.timeout_secs);
     let run_id = relaxed_run_input
         .run_id
@@ -1415,21 +1502,12 @@ pub(crate) async fn ag_ui_run_for_target(
     let unsubscribe_guard = UnsubscribeOnDrop {
         handle: handle.clone(),
     };
-    let subscribed_state = subscription.state.clone();
-    let local_is_active = session_state_is_active(&subscribed_state);
+    let local_is_active = session_state_is_active(&subscription.state);
     let requested_prompt = (!is_resume)
-        .then(|| pending_user_prompt(&run_input, &subscription.snapshot))
+        .then(|| pending_user_prompt(&run_input, &subscription.snapshot.messages))
         .flatten();
     if let Some(text) = requested_prompt.as_deref() {
-        if let PromptResult::Rejected { reason } = prompt(&handle, text, prompt_options).await {
-            log::warn!(
-                "AG-UI prompt rejected for agent {} session {}: {}",
-                target.agent(),
-                session,
-                reason
-            );
-            return Err(AgUiError::Conflict(reason));
-        }
+        admit_run_prompt(&handle, text, prompt_options, target.agent(), session).await?;
     }
 
     let thread_id = derive_thread_id(session);
@@ -1442,6 +1520,7 @@ pub(crate) async fn ag_ui_run_for_target(
             run_id: &run_id,
             thread_id: &thread_id_text,
             subscription: &subscription,
+            features,
             eligible: requested_prompt.is_none() && !local_is_active,
         },
     )
@@ -1451,17 +1530,33 @@ pub(crate) async fn ag_ui_run_for_target(
     } else {
         build_ag_ui_event_stream(
             &handle,
-            &run_id,
-            &thread_id_text,
+            LiveEventContext {
+                run_id: &run_id,
+                thread_id: &thread_id_text,
+            },
             subscription,
-            requested_prompt.as_deref(),
-            local_is_active,
+            requested_prompt.is_some(),
+            features,
         )
     };
     let stream =
         crate::serve_shutdown::close_stream_on_shutdown(stream, shutdown, &thread_id_text, &run_id);
 
     ag_ui_event_response(stream, unsubscribe_guard, thread_id)
+}
+
+async fn admit_run_prompt(
+    handle: &SessionHandle,
+    text: &str,
+    options: SessionPromptOptions,
+    agent: &str,
+    session: &str,
+) -> Result<(), AgUiError> {
+    if let PromptResult::Rejected { reason } = prompt(handle, text, options).await {
+        log::warn!("AG-UI prompt rejected for agent {agent} session {session}: {reason}");
+        return Err(AgUiError::Conflict(reason));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1496,26 +1591,6 @@ pub fn build_local_input(
     let mut input = harnx_runtime::config::input::from_str(prompt_config, prompt_text, None);
     harnx_runtime::config::input::set_agent(&mut input, prompt_config, agent.into_config());
     Ok(input)
-}
-
-fn completed_history_tool_message(
-    result: &harnx_core::tool::ToolResult,
-    tool_call_id: ToolCallId,
-) -> Option<AgUiMessage> {
-    if harnx_runtime::config::session::is_pending_tool_result(result) {
-        return None;
-    }
-    let content = result
-        .markdown
-        .clone()
-        .or_else(|| result.output.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| result.output.to_string());
-    Some(AgUiMessage::Tool {
-        id: MessageId::random(),
-        content,
-        tool_call_id,
-        error: None,
-    })
 }
 
 fn image_attachment_values(content: &MessageContent) -> Vec<JsonValue> {
@@ -1568,75 +1643,6 @@ fn message_attachments_event_from_values(
             }),
         })
     })
-}
-
-pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiMessage> {
-    let mut messages = Vec::with_capacity(history.len());
-    for (ordinal, message) in history.iter().enumerate() {
-        let role = ag_ui_role_for_history(message.role);
-        let visible = history_content_text(&message.content);
-        let id = message
-            .id
-            .as_deref()
-            .map(wire_message_id)
-            .unwrap_or_else(MessageId::random);
-        // Stable base for synthesizing tool-call ids — never the random `id` above.
-        let stable_base = history_stable_base(message, ordinal);
-        match &message.content {
-            MessageContent::ToolCalls(tool_calls) => {
-                let assistant_tool_calls = tool_calls
-                    .tool_results
-                    .iter()
-                    .enumerate()
-                    .map(|(index, tool_result)| {
-                        let tool_call_id = history_tool_call_id(
-                            &stable_base,
-                            index,
-                            tool_result.call.id.as_deref(),
-                        );
-                        ToolCall {
-                            id: tool_call_id,
-                            call_type: "function".to_string(),
-                            function: FunctionCall {
-                                name: tool_result.call.name.clone(),
-                                arguments: serde_json::to_string(&tool_result.call.arguments)
-                                    .expect("tool call args should serialize"),
-                            },
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                messages.push(AgUiMessage::Assistant {
-                    id: id.clone(),
-                    content: Some(visible),
-                    name: None,
-                    tool_calls: Some(assistant_tool_calls.clone()),
-                });
-                // In-flight tools have assistant calls but no result messages.
-                messages.extend(
-                    tool_calls
-                        .tool_results
-                        .iter()
-                        .zip(&assistant_tool_calls)
-                        .filter_map(|(result, call)| {
-                            completed_history_tool_message(result, call.id.clone())
-                        }),
-                );
-            }
-            // ag-ui-core's generic constructor intentionally creates assistant
-            // messages with `content: None`; construct this variant explicitly
-            // so persisted assistant text survives snapshot hydration.
-            MessageContent::Text(_) if role == Role::Assistant => {
-                messages.push(AgUiMessage::Assistant {
-                    id,
-                    content: Some(visible),
-                    name: None,
-                    tool_calls: None,
-                });
-            }
-            _ => messages.push(AgUiMessage::new(role, id, visible)),
-        }
-    }
-    messages
 }
 
 fn history_role_for_client(role: &Role) -> MessageRole {
