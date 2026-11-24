@@ -14,21 +14,22 @@ import yaml
 
 from model_variants import (
     ADAPTIVE_EFFORT_VARIANTS,
-    BASE_EFFORT,
+    BEDROCK_ADAPTIVE_THINKING_PATCH,
     BEDROCK_THINKING_PATCH,
+    CLAUDE_THINKING_PATCH,
     OPENAI_NO_SAMPLING_PATCH,
     OPENAI_SUMMARY_PATCH,
+    THINKING_SUPPORT_FIELD,
+    ThinkingSupport,
     apply_base_model_rules,
     apply_base_thinking,
     apply_openai_base_patches,
     claude_adaptive_patch,
     claude_requires_max_tokens,
-    is_adaptive_only_opus,
     is_generated_variant_name,
     is_variant_name,
     model_variants,
     openai_effort_variants,
-    opus_minor_version,
     provider_sort_key,
     thinking_variants,
 )
@@ -84,13 +85,26 @@ CURATED_CAPABILITY_FLAGS = [
 # Modes harnx ingests. Everything else the registry offers — image
 # generation, audio, speech, realtime, moderation, … — is out of scope for
 # the chat/embedding catalog, so one membership test rejects it.
-INCLUDED_MODES = {"chat", "embedding", "reranker"}
+# LiteLLM modes, which `model_type_for_mode` turns into catalog types.
+INCLUDED_MODES = {"chat", "embedding", "rerank"}
+
+# Limits of harnx's clients, which `client_can_call` applies. Vertex dispatches
+# chat by model family and sends embeddings in the text-embedding schema: keep
+# these in step with `ModelCategory::from_str` and `prepare_embeddings` in
+# crates/harnx-client/src/vertexai.rs.
+VERTEX_CHAT_FAMILIES = ("gemini", "claude", "mistral", "codestral")
+VERTEX_TEXT_EMBEDDING_FAMILIES = (
+    "text-embedding",
+    "text-multilingual-embedding",
+    "gemini-embedding",
+)
+# Clients with no rerank operation.
+PROVIDERS_WITHOUT_RERANK = {"bedrock", "vertexai", "gemini", "claude", "openai"}
 
 CHAT_PROVIDER_DEFAULTS = {
     "openai",
     "anthropic",
     "gemini",
-    "google_ai",
     "vertex_ai",
     "bedrock",
     "mistral",
@@ -99,31 +113,29 @@ CHAT_PROVIDER_DEFAULTS = {
     "perplexity",
     "deepseek",
     "cloudflare",
-    "openrouter",
     "ai21",
-    "x_ai",
-    "zhipu",
-    "alibaba_cloud",
-    "baidu",
+    "xai",
+    "zai",
     "tencent",
     "minimax",
     "moonshot",
     "deepinfra",
-    "github",
 }
 
+# LiteLLM's provider names, each one the registry uses today: a stale name
+# leaves its provider frozen, which `collect_provider_models` warns about.
+# Some harnx providers are left out on purpose and stay hand-maintained:
+# qianwen (LiteLLM's `dashscope` list lacks most of the open-weight Qwen3
+# models DashScope serves, and prices few of the rest), zhipuai (calls
+# open.bigmodel.cn; the registry's `zai` is the international api.z.ai),
+# ernie, openrouter and github (GitHub Models, not `github_copilot`).
 LITELLM_TO_HARNX_PROVIDER = {
     "openai": "openai",
     "anthropic": "claude",
     # LiteLLM lists the Gemini catalog under the `gemini/` key prefix and
-    # `litellm_provider: "gemini"`; nothing upstream uses `google_ai` anymore.
-    # Without this entry every Gemini model is discarded before any other
-    # check runs, so a refresh silently keeps stale entries that lack
-    # `cache_read_price` and cached-token calls then record no cost (#2638).
+    # `litellm_provider: "gemini"`; it renamed `google_ai`, which left every
+    # Gemini entry stale until this changed (#2638).
     "gemini": "gemini",
-    # Legacy alias kept for older registry snapshots that still tag entries
-    # `google_ai`.
-    "google_ai": "gemini",
     "vertex_ai": "vertexai",
     "bedrock": "bedrock",
     # LiteLLM tags most of the current Bedrock catalog `bedrock_converse`
@@ -140,18 +152,20 @@ LITELLM_TO_HARNX_PROVIDER = {
     "deepseek": "deepseek",
     "voyage": "voyageai",
     "cloudflare": "cloudflare",
-    "openrouter": "openrouter",
     "ai21": "ai21",
-    "x_ai": "xai",
-    "zhipu": "zhipuai",
-    "alibaba_cloud": "qianwen",
-    "baidu": "ernie",
+    "xai": "xai",
+    "zai": "zai",
     "tencent": "hunyuan",
     "minimax": "minimax",
     "moonshot": "moonshot",
     "deepinfra": "deepinfra",
-    "github": "github",
     "jina_ai": "jina",
+    # Bare keys (no `provider/` prefix) carry a `litellm_provider` naming a
+    # model family rather than the API. A covered provider drops every model
+    # the registry stops listing, so an unmapped family deletes live models.
+    "cohere_chat": "cohere",
+    "vertex_ai-language-models": "vertexai",
+    "vertex_ai-embedding-models": "vertexai",
 }
 
 PROVIDER_ORDER = [
@@ -557,11 +571,8 @@ def chat_output_is_supported(payload: dict[str, Any]) -> bool:
 
 
 def model_type_for_mode(mode: str) -> str | None:
-    if mode == "chat":
-        return None
-    if mode in {"embedding", "reranker"}:
-        return mode
-    return None
+    """The catalog `type` for a LiteLLM mode; chat models have none."""
+    return {"embedding": "embedding", "rerank": "reranker"}.get(mode)
 
 
 def build_price_fields(payload: dict[str, Any], mode: str) -> dict[str, float | int]:
@@ -608,10 +619,17 @@ def build_model_from_litellm(name: str, payload: dict[str, Any], mode: str) -> d
 
 
 def should_skip_model(today: dt.date, payload: dict[str, Any]) -> bool:
+    return is_deprecated(today, payload) or lacks_useful_data(payload)
+
+
+def is_deprecated(today: dt.date, payload: dict[str, Any]) -> bool:
     deprecation_date = parse_date(payload.get("deprecation_date"))
-    if deprecation_date is not None and deprecation_date < today:
-        return True
-    # Skip models with no useful data (e.g. LiteLLM's "container" entry)
+    return deprecation_date is not None and deprecation_date < today
+
+
+def lacks_useful_data(payload: dict[str, Any]) -> bool:
+    """An entry with nothing to build a model from, such as LiteLLM's
+    "container" entry or an `alias_of` pointer."""
     cache_price_fields = {
         "cache_read_input_token_cost",
         "cache_creation_input_token_cost",
@@ -621,11 +639,9 @@ def should_skip_model(today: dt.date, payload: dict[str, Any]) -> bool:
         "input_cost_per_token", "output_cost_per_token",
         "supports_vision", "supports_function_calling",
     }
-    if not any(payload.get(field) for field in useful_fields) and not any(
+    return not any(payload.get(field) for field in useful_fields) and not any(
         payload.get(field) is not None for field in cache_price_fields
-    ):
-        return True
-    return False
+    )
 
 
 def load_existing_data() -> tuple[list[dict[str, Any]], dict[str, dict[str, dict[str, Any]]]]:
@@ -812,48 +828,50 @@ def regenerate_provider_models(
     provider: str,
     old_models: dict[str, dict[str, Any]],
     fetched_models: dict[str, dict[str, Any]] | None,
-    warnings: list[str],
+    listed_kinds: set[str | None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Merge one provider and regenerate only the variants owned by it."""
-    if not fetched_models:
+    """Rebuild one provider from the registry, or keep it as it is when the
+    registry lists nothing for it.
+
+    For each kind of model (chat, embedding, reranker) the registry lists for
+    a provider, the registry is the whole list: a model it stops listing is
+    dropped with its aliases, and the diff summary reports it as removed.
+    That holds when every entry of a kind is deprecated or uncallable, so
+    `fetched_models` can be empty while `listed_kinds` isn't. Hand-maintained
+    entries are for providers and kinds it doesn't list, such as Jina's
+    embedding models.
+    """
+    fetched_models = fetched_models or {}
+    if listed_kinds is None:
+        listed_kinds = {model.get("type") for model in fetched_models.values()}
+    if not listed_kinds:
         return [copy.deepcopy(old_models[name]) for name in sorted(old_models, key=provider_sort_key)]
+    models = _models_of_unlisted_kinds(old_models, listed_kinds)
+    models.update(_registry_base_models(provider, fetched_models))
+    return _regenerate_model_variants(provider, models)
 
-    merged, extra_names = _merge_provider_models(provider, old_models, fetched_models)
-    _warn_preserved_models(provider, extra_names, warnings)
-    return _regenerate_model_variants(provider, merged)
+
+def _models_of_unlisted_kinds(
+    old_models: dict[str, dict[str, Any]], listed_kinds: set[str | None]
+) -> dict[str, dict[str, Any]]:
+    """Hand-maintained models of a kind the registry lists none of here."""
+    return {
+        name: copy.deepcopy(model)
+        for name, model in old_models.items()
+        if model.get("type") not in listed_kinds
+    }
 
 
-def _merge_provider_models(
-    provider: str,
-    old_models: dict[str, dict[str, Any]],
-    fetched_models: dict[str, dict[str, Any]],
-) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    merged = {
+def _registry_base_models(
+    provider: str, fetched_models: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    # Generated variants are rebuilt from their refreshed base models, so a
+    # registry entry that collides with one never overrides it.
+    return {
         name: copy.deepcopy(model)
         for name, model in fetched_models.items()
         if not is_generated_variant_name(provider, name)
     }
-    # Generated variants are rebuilt from their refreshed base models. Other
-    # aliases are curated entries, even when they share a suffix such as
-    # `:thinking` or `:max`, and must remain in the catalog.
-    extra_names = sorted(
-        (
-            name
-            for name in set(old_models) - set(fetched_models)
-            if not is_generated_variant_name(provider, name)
-        ),
-        key=provider_sort_key,
-    )
-    for name in extra_names:
-        merged[name] = copy.deepcopy(old_models[name])
-    return merged, extra_names
-
-
-def _warn_preserved_models(provider: str, extra_names: list[str], warnings: list[str]) -> None:
-    if extra_names:
-        warnings.append(
-            f"provider {provider}: preserving models not present in LiteLLM: {', '.join(extra_names)}"
-        )
 
 
 def _regenerate_model_variants(
@@ -883,11 +901,11 @@ def _entry_provider_and_mode(
 
 
 def resolve_catalog_entry(
-    key: str, payload: dict[str, Any], today: dt.date
+    key: str, payload: dict[str, Any], today: dt.date, *, include_deprecated: bool = False
 ) -> tuple[str, str, str] | None:
     """Map one registry entry to `(provider, model_name, mode)`, or `None`
-    when gating drops it: unmapped provider, unusable payload, unhandled
-    mode, audio-only chat output, or an invalid Bedrock id.
+    when gating drops it: unmapped provider, unusable or deprecated payload,
+    unhandled mode, audio-only chat output, or an invalid Bedrock id.
     """
     parsed = provider_prefix_and_model_name(key, payload)
     if parsed is None:
@@ -895,7 +913,7 @@ def resolve_catalog_entry(
     prefix, model_name = parsed
     if prefix not in LITELLM_TO_HARNX_PROVIDER:
         return None
-    if should_skip_model(today, payload):
+    if not _payload_is_usable(payload, today, include_deprecated):
         return None
     provider_and_mode = _entry_provider_and_mode(prefix, payload)
     if provider_and_mode is None:
@@ -904,6 +922,59 @@ def resolve_catalog_entry(
     if provider == "bedrock" and not is_valid_bedrock_model_name(model_name):
         return None
     return provider, model_name, mode
+
+
+def _payload_is_usable(payload: dict[str, Any], today: dt.date, include_deprecated: bool) -> bool:
+    if lacks_useful_data(payload):
+        return False
+    return include_deprecated or not is_deprecated(today, payload)
+
+
+def client_can_call(provider: str, model_name: str, mode: str) -> bool:
+    """Whether harnx's client for `provider` can send this model a request.
+
+    A catalog entry outside these limits is selectable but fails every call.
+    """
+    if mode == "rerank":
+        return provider not in PROVIDERS_WITHOUT_RERANK
+    if provider != "vertexai":
+        return True
+    families = VERTEX_CHAT_FAMILIES if mode == "chat" else VERTEX_TEXT_EMBEDDING_FAMILIES
+    return model_name.startswith(families)
+
+
+def registry_kinds(litellm: dict[str, Any]) -> dict[str, set[str | None]]:
+    """The kinds of model (`type`, `None` for chat) the registry lists for each
+    provider, counting deprecated entries.
+
+    A kind listed only by expired entries, or only by models harnx's client
+    can't call, is still the registry's to decide, so its old models are
+    dropped rather than kept by hand.
+    """
+    today = dt.date.today()
+    kinds: dict[str, set[str | None]] = defaultdict(set)
+    for key, payload in litellm.items():
+        resolved = resolve_catalog_entry(key, payload, today, include_deprecated=True)
+        if resolved is not None:
+            provider, _, mode = resolved
+            kinds[provider].add(model_type_for_mode(mode))
+    return kinds
+
+
+def unmatched_provider_names(litellm: dict[str, Any]) -> list[str]:
+    """Names in `LITELLM_TO_HARNX_PROVIDER` that no registry entry uses.
+
+    Such a name is how a provider freezes without notice: LiteLLM renamed
+    `google_ai` to `gemini` and `x_ai` to `xai`, and the refresh kept the old
+    entries without a word.
+    """
+    used = {
+        parsed[0]
+        for key, payload in litellm.items()
+        if isinstance(payload, dict)
+        and (parsed := provider_prefix_and_model_name(key, payload)) is not None
+    }
+    return [name for name in LITELLM_TO_HARNX_PROVIDER if name not in used]
 
 
 def collect_provider_models(
@@ -918,16 +989,22 @@ def collect_provider_models(
     """
     today = dt.date.today()
     new_provider_models: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-    warnings: list[str] = []
+    unmatched = unmatched_provider_names(litellm)
+    warnings = (
+        [f"mapped LiteLLM providers with no registry entries: {', '.join(unmatched)}"]
+        if unmatched
+        else []
+    )
 
     for key, payload in litellm.items():
         resolved = resolve_catalog_entry(key, payload, today)
-        if resolved is None:
+        if resolved is None or not client_can_call(*resolved):
             continue
         provider, model_name, mode = resolved
         model = build_model_from_litellm(model_name, payload, mode)
         old_model = old_by_provider.get(provider, {}).get(model_name)
         model = merge_old_fields(model, old_model)
+        model[THINKING_SUPPORT_FIELD] = ThinkingSupport.from_registry(payload)
         apply_openai_endpoint_default(model, provider, payload)
         apply_openai_reasoning_summary(model, provider, payload)
         new_provider_models[provider][model_name] = model
@@ -940,6 +1017,7 @@ def main() -> int:
     litellm = fetch_litellm_data()
 
     new_provider_models, warnings = collect_provider_models(litellm, old_by_provider)
+    kinds = registry_kinds(litellm)
 
     drop_bedrock_in_region_duplicates(new_provider_models["bedrock"])
     apply_bedrock_card_corrections(new_provider_models["bedrock"], warnings)
@@ -951,7 +1029,7 @@ def main() -> int:
         old_models = old_by_provider.get(provider, {})
         fetched_models = new_provider_models.get(provider)
         final_provider_models[provider] = regenerate_provider_models(
-            provider, old_models, fetched_models, warnings
+            provider, old_models, fetched_models, kinds.get(provider)
         )
 
     MODELS_YAML_PATH.write_text(render_models_yaml(final_provider_models))

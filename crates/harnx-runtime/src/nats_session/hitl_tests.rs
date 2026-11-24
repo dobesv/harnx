@@ -41,6 +41,7 @@ fn decision(approved: bool) -> SessionLogEntry {
 
 fn results() -> SessionLogEntry {
     SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results: vec![],
         timestamp: None,
     }
@@ -196,5 +197,54 @@ fn nats_tool_confirmation_retry_does_not_adopt_replacement_round_after_rewind() 
     };
     assert_eq!(original.outcome(&entries, true)?, Some(false));
     assert!(already_decided(&entries, CALL, true)?);
+    Ok(())
+}
+
+#[test]
+fn interaction_aware_follow_waits_for_terminal_but_legacy_boundary_is_unchanged() -> Result<()> {
+    let mut entries = vec![
+        (1, calls(CALL)),
+        (
+            2,
+            serde_json::from_value(json!({
+                "type":"interaction_requested", "tool_round_seq":1, "tool_call_id":CALL,
+                "interaction_id":"confirm-1", "producer":"middleware:approval", "step_path":[],
+                "key":"gate", "kind":"confirm", "payload":{}, "summary":"Run?",
+                "chain_version":"v1", "checkpoint":"private", "fence_token":1
+            }))?,
+        ),
+    ];
+    // Unready requests are never legacy completion boundaries either.
+    assert!(!NatsSession::is_follow_completion_visible(
+        &entries, None, 0, true
+    ));
+    entries.push((
+        3,
+        SessionLogEntry::SuspensionReady {
+            tool_round_seq: 1,
+            pending: vec!["confirm-1".into()],
+            fence_token: 1,
+        },
+    ));
+    assert!(NatsSession::is_turn_completion_visible(&entries, None, 0));
+    assert!(!NatsSession::is_follow_completion_visible(
+        &entries, None, 0, true
+    ));
+    entries.push((
+        4,
+        SessionLogEntry::TurnEnd {
+            through_seq: 0,
+            fence_token: 1,
+            timestamp: None,
+            usage: None,
+        },
+    ));
+    assert!(NatsSession::is_follow_completion_visible(
+        &entries, None, 0, true
+    ));
+    let legacy = pending();
+    assert!(NatsSession::is_follow_completion_visible(
+        &legacy, None, 0, true
+    ));
     Ok(())
 }

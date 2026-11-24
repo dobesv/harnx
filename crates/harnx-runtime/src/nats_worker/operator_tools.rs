@@ -1,8 +1,7 @@
-//! Idle-session operator RPC. Reuses worker providers, server claims and hooks;
+//! Idle-session operator RPC. Reuses worker providers, server claims and middleware;
 //! does not acquire an inference turn or append a user prompt.
 
 use super::daemon_runtime::WorkerRuntime;
-use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use super::server_reconciler::ServerReconciler;
 use crate::operator_tools::{OperatorToolMessage, OperatorToolReply, OperatorToolRequest};
 use anyhow::{ensure, Context, Result};
@@ -39,6 +38,7 @@ pub(super) async fn subscribe(runtime: Arc<WorkerRuntime>) -> Result<AbortOnDrop
                     if tasks.len() >= MAX_PENDING {
                         send(&runtime.client, &reply, OperatorToolMessage::Finished(OperatorToolReply {
                             output: String::new(), error: Some("Worker is busy with operator tool commands".into()),
+                            error_kind: None,
                         })).await;
                         continue;
                     }
@@ -100,6 +100,7 @@ async fn handle(runtime: Arc<WorkerRuntime>, message: async_nats::Message) {
     let reply_value = result.unwrap_or_else(|error| OperatorToolReply {
         output: String::new(),
         error: Some(format!("{error:#}")),
+        error_kind: None,
     });
     send(
         &runtime.client,
@@ -149,29 +150,14 @@ async fn execute(
         runtime.config.read().clone(),
     ));
     super::daemon::install_session_metadata_agent(&config, &record.metadata)?;
-    {
-        let mut config = config.write();
-        let mut session = crate::config::session::new(&config, &record.metadata.session_id, None)?;
-        if let Some(selectors) = &request.use_tools {
-            session.set_use_tools(Some(selectors.clone()));
-        }
-        // The session metadata tools reach the session through its sink. A
-        // direct call holds no lease, so it writes unfenced, as a frontend's
-        // dot commands do; nothing on this path appends to the log.
-        let sink: Arc<dyn crate::config::session::SessionAppendSink> = Arc::new(
-            super::NatsSessionLogBackend::new(
-                runtime.jetstream.clone(),
-                request.session_key.clone(),
-                runtime.lease.replicas,
-            )
-            .with_metadata_store(Some(runtime.session_metadata.clone())),
-        );
-        session.runtime = Some(Arc::new(sink));
-        config.session = Some(session);
-        // Isolate declaration caches too; Config::clone shares its cache Arc.
-        config.nats_tool_declarations = Arc::new(parking_lot::RwLock::new(Vec::new()));
-        config.maintenance_abort = Some(abort.clone());
-    }
+    activate_operator_identity(&config, &request, &record.metadata.variables)?;
+    install_operator_session(
+        runtime,
+        &config,
+        &request,
+        &record.metadata.session_id,
+        abort,
+    )?;
     admit_operator_call(runtime, &config, &request).await?;
     let mut claim = Claim {
         reconciler: runtime.server_reconciler.clone(),
@@ -189,6 +175,75 @@ async fn execute(
     .await;
     claim.close().await;
     result
+}
+
+/// Decision 11: an operator request carries the operator's own identity
+/// (filled by the CLI/TUI from the cluster default), and every tool call
+/// it dispatches must act as the operator, not the active session's
+/// owner — including discovery, which filters user-scoped registrations
+/// by this identity. Legacy requests without the field keep the session
+/// owner. Re-stamping the principals over the just-installed session
+/// agent is the same activation path, just with the operator's snapshot.
+fn activate_operator_identity(
+    config: &crate::config::GlobalConfig,
+    request: &OperatorToolRequest,
+    variables: &harnx_core::agent_config::AgentVariables,
+) -> Result<()> {
+    if let Some(operator) = request.user_id.as_ref() {
+        apply_operator_principals(config, operator.as_deref(), variables)?;
+    }
+    Ok(())
+}
+
+/// Resolve the operator's principals and stamp them over the session agent.
+fn apply_operator_principals(
+    config: &crate::config::GlobalConfig,
+    operator: Option<&str>,
+    variables: &harnx_core::agent_config::AgentVariables,
+) -> Result<()> {
+    let principals = harnx_core::user_principals::from_resolved(operator, None, &[], &[]);
+    config
+        .write()
+        .apply_session_agent_patches(&principals, variables)
+        .context("activate operator identity")
+}
+
+/// Apply the request's tool selectors to the session, leaving the fresh
+/// session's config-derived selection alone when the request has none.
+fn apply_use_tools(session: &mut crate::config::session::Session, selectors: &Option<Vec<String>>) {
+    if let Some(selectors) = selectors {
+        session.set_use_tools(Some(selectors.clone()));
+    }
+}
+
+/// Give the operator call its own isolated session: declaration caches are
+/// not shared (`Config::clone` shares the Arc), and the session metadata
+/// tools reach the session through its sink — a direct call holds no
+/// lease, so it writes unfenced, as a frontend's dot commands do; nothing
+/// on this path appends to the log.
+fn install_operator_session(
+    runtime: &WorkerRuntime,
+    config: &crate::config::GlobalConfig,
+    request: &OperatorToolRequest,
+    session_id: &str,
+    abort: &crate::utils::AbortSignal,
+) -> Result<()> {
+    let mut config = config.write();
+    let mut session = crate::config::session::new(&config, session_id, None)?;
+    apply_use_tools(&mut session, &request.use_tools);
+    let sink: Arc<dyn crate::config::session::SessionAppendSink> = Arc::new(
+        super::NatsSessionLogBackend::new(
+            runtime.jetstream.clone(),
+            request.session_key.clone(),
+            runtime.lease.replicas,
+        )
+        .with_metadata_store(Some(runtime.session_metadata.clone())),
+    );
+    session.runtime = Some(Arc::new(sink));
+    config.session = Some(session);
+    config.nats_tool_declarations = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    config.maintenance_abort = Some(abort.clone());
+    Ok(())
 }
 
 async fn admit_operator_call(
@@ -291,28 +346,22 @@ async fn execute_claimed(
         let claimed = reconciler.claim_users(&claim.token, servers).await;
         WorkerRuntime::wait_for_tool_server_start(reconciler.clone(), claimed, &claim.token).await;
     }
-    // Invocation-owned agent hooks use a separate scope, so nested agents cannot
-    // discover their parent's policies. Stop them before releasing tool claims.
-    let mut hooks = if matches!(
-        request.command,
-        crate::operator_tools::OperatorToolCommand::Call { .. }
-            | crate::operator_tools::OperatorToolCommand::Bash { .. }
-    ) {
-        start_agent_hooks(runtime, config, &claim.token).await?
-    } else {
-        None
-    };
-    let result = execution
-        .execute_discovered(
-            &admission_selectors,
-            package,
-            hooks.as_ref().map(|(_, scope)| scope),
-        )
-        .await;
-    if let Some((hooks, _)) = &mut hooks {
-        hooks.shutdown().await;
-    }
-    result
+    execution
+        .execute_discovered(&admission_selectors, package)
+        .await
+}
+
+/// Record one discovered provider into the config caches: the declaration
+/// list and the route-name set the script-tool collision view treats as
+/// owned by the provider — the same captures
+/// `refresh_nats_tool_declarations` performs for agent rounds, so the
+/// collision view does not depend on which path discovered the tools.
+fn record_provider_inventory(
+    config: &crate::config::GlobalConfig,
+    provider: &crate::nats_tool_provider::NatsToolProvider,
+) {
+    *config.read().nats_tool_declarations.write() = provider.declarations().to_vec();
+    *config.read().nats_served_tool_names.write() = provider.route_names().collect();
 }
 
 impl OperatorExecution<'_> {
@@ -320,7 +369,6 @@ impl OperatorExecution<'_> {
         &self,
         selectors: &[String],
         package: Option<String>,
-        hook_scope: Option<&harnx_core::instance::ServerScope>,
     ) -> Result<OperatorToolReply> {
         let Self {
             runtime,
@@ -343,12 +391,7 @@ impl OperatorExecution<'_> {
         )
         .await
         .context("Operator tool discovery failed")?;
-        *config.read().nats_tool_declarations.write() = provider.declarations().to_vec();
-        let hook_provider = self.discover_hooks(hook_scope).await?;
-        let params = crate::tool_context::BuildToolEvalContextParams {
-            nats_hook_provider: Some(hook_provider),
-            ..params
-        };
+        record_provider_inventory(config, &provider);
         let provider = Arc::new(provider);
         // #2630: Bash evaluates on a command-scoped context whose catalog,
         // executor allowlist and allowed names all derive from one admitted
@@ -421,9 +464,6 @@ impl OperatorExecution<'_> {
             bash_context_slot: Some(slot.clone()),
             command_bash: Some(crate::bash_provider::CommandBashInputs {
                 inner_declarations: admitted,
-                // The operator already consented to this script's inner
-                // calls; ordinary agent and child policies stay normal.
-                operator_inner_consent: true,
             }),
             ..params
         };
@@ -432,7 +472,6 @@ impl OperatorExecution<'_> {
         ctx.allowed_tool_names
             .insert(crate::config::BASH_TOOL_NAME.to_string());
         let root_call_id = uuid::Uuid::new_v4().to_string();
-        crate::operator_tools::approve_root_bash_call(&mut ctx, &root_call_id);
         let owner = slot.install(ctx);
         let reply = crate::operator_tools::evaluate_bash(
             &owner,
@@ -447,28 +486,6 @@ impl OperatorExecution<'_> {
         .await;
         drop(owner);
         reply
-    }
-
-    async fn discover_hooks(
-        &self,
-        hook_scope: Option<&harnx_core::instance::ServerScope>,
-    ) -> Result<Arc<crate::nats_hook_provider::NatsHookProvider>> {
-        let runtime = self.runtime;
-        let mut hook_provider = crate::nats_hook_provider::NatsHookProvider::discover_with_client(
-            runtime.client.clone(),
-            runtime.instance_id.clone(),
-        )
-        .await
-        .context("Operator hook provider discovery failed")?;
-        if let Some(scope) = hook_scope {
-            let own_hooks = crate::nats_hook_provider::NatsHookProvider::discover_with_client(
-                runtime.client.clone(),
-                scope.clone(),
-            )
-            .await?;
-            hook_provider = hook_provider.with_scoped_hooks(own_hooks);
-        }
-        Ok(Arc::new(hook_provider))
     }
 
     fn filtered_command(
@@ -496,52 +513,48 @@ impl OperatorExecution<'_> {
     }
 }
 
-async fn start_agent_hooks(
-    runtime: &WorkerRuntime,
-    config: &crate::config::GlobalConfig,
-    label: &str,
-) -> Result<Option<(HookServerSupervisor, harnx_core::instance::ServerScope)>> {
-    let hooks = config
-        .read()
-        .agent
-        .as_ref()
-        .and_then(|agent| agent.hooks().cloned())
-        .unwrap_or_default();
-    if hooks.entries.is_empty() {
-        return Ok(None);
-    }
-    ensure!(
-        runtime.manage_servers,
-        "Worker cannot start the active agent's operator hooks"
-    );
-    let snapshot = config.read().clone();
-    let server = snapshot
-        .resolve_nats_server(snapshot.default_cluster_key())
-        .await?;
-    let token = server
-        .token
-        .clone()
-        .context("Operator agent hooks require a NATS token")?;
-    let scope = harnx_core::instance::ServerScope::new();
-    let start = HookServerStartConfig::new(
-        runtime.client.clone(),
-        scope.clone(),
-        server.url.clone(),
-        token,
-    )
-    .with_replicas(server.replicas)
-    .with_broker_settings(&harnx_nats_common::connect::NatsEndpoint::from(
-        server.as_ref(),
-    ));
-    Ok(Some((
-        HookServerSupervisor::start_local(start, &hooks, label).await?,
-        scope,
-    )))
-}
-
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 #[path = "operator_tools/admission_tests.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "operator_tools/reserved_identity_tests.rs"]
+mod reserved_identity_tests;
+#[cfg(test)]
+mod served_names_tests {
+    use super::*;
+
+    /// 4659980786 follow-up: the operator discovery path fills both config
+    /// caches — the declaration list and the served-name set, raw aliases
+    /// included — so the model-visible collision view matches the round's.
+    #[tokio::test]
+    async fn record_provider_inventory_populates_served_names_with_raw_aliases(
+    ) -> anyhow::Result<()> {
+        let server = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(server.url()).await?;
+        let provider = crate::nats_tool_provider::NatsToolProvider::snapshot_test_provider(
+            &client,
+            vec![("read", "fs", "read")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await?;
+
+        let config = crate::config::GlobalConfig::default();
+        record_provider_inventory(&config, &provider);
+        assert!(
+            config.read().nats_served_tool_names.read().contains("read"),
+            "the operator path must record the raw alias in the served-name cache"
+        );
+        assert!(
+            config.read().nats_tool_declarations.read().is_empty(),
+            "the test provider declares nothing; only the route name matters"
+        );
+        Ok(())
+    }
+}

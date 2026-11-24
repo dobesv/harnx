@@ -178,6 +178,7 @@ async fn handoff_session_row_in_history_matches_live() {
         },
         output,
         markdown: None,
+        user_surfaces: Vec::new(),
         content: vec![],
         switch_agent: None,
         execution_context: None,

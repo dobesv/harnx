@@ -94,7 +94,7 @@ impl Runner {
         ticket: &FixedAdmissionTicket,
     ) -> Result<RecoveryAction> {
         for _ in 0..3 {
-            let progress = session.fixed_prompt_progress(ticket).await?;
+            let progress = crate::hitl::interaction::fixed_progress(session, ticket).await?;
             if let Some(action) =
                 hitl_progress::classify_recovered_progress(self, session, authority, progress)
                     .await?

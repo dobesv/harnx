@@ -6,16 +6,11 @@ use crate::config::{
     macro_execute, remote_session_ops, AgentVariables, Config, ConfigLock, GlobalConfig, Input,
     LastMessage,
 };
-use crate::nats_hook_provider::{
-    discover_process_nats_hook_provider, dispatch_hook_event, HookDispatchMeta, HookEventDispatch,
-};
+
 use crate::utils::{dimmed_text, set_text, AbortSignal};
-use harnx_hooks::{HookEvent, HookResultControl};
-use harnx_render::render_error;
 
 use anyhow::{anyhow, bail, Context, Result};
 use fancy_regex::Regex;
-use std::env;
 use std::sync::{Arc, LazyLock};
 
 /// Outcome of running a dot-command.
@@ -246,19 +241,21 @@ pub fn run_command_with_output_and_local_worker<'a>(
         tokio::sync::Mutex<Option<crate::local_orchestrator::LocalWorkerSupervisor>>,
     >,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CommandOutcome>> + Send + 'a>> {
-    // Every command otherwise embeds the largest agent-execution branch in its
-    // callers' futures. Heap allocation keeps nested dispatch within worker stacks.
+    // The outer box keeps dispatch state out of callers' futures. Box the async
+    // branches below too: debug poll frames reserve temporaries for every branch,
+    // even a `.delete` that fails before doing I/O. Inlining these futures used
+    // over 800 KiB for this poll frame alone and overflowed Windows TUI tests.
     Box::pin(async move {
         let line = normalize_command_line(line);
         if crate::operator_tools::is_operator_tool_command(line) {
             let command = crate::operator_tools::parse_operator_line(line)?;
-            let reply = crate::operator_tools::run_session_tool_command(
+            let reply = Box::pin(crate::operator_tools::run_session_tool_command(
                 config,
                 &abort_signal,
                 command,
                 false,
                 local_worker,
-            )
+            ))
             .await?;
             writeln!(output, "{}", reply.output)?;
             if let Some(error) = reply.error {
@@ -314,10 +311,10 @@ pub fn run_command_with_output_and_local_worker<'a>(
                     // Generate synchronously so the user sees the outcome right
                     // here. Isolate the title-agent's own model/retry events
                     // from the transcript via NullSink.
-                    let result = harnx_core::sink::with_agent_event_sink(
+                    let result = Box::pin(harnx_core::sink::with_agent_event_sink(
                         Arc::new(harnx_core::event::NullSink),
                         Config::generate_title(config),
-                    )
+                    ))
                     .await;
                     // Report the outcome directly as command output. On success
                     // also emit `TitleUpdated` (updates the terminal title and
@@ -441,7 +438,7 @@ pub fn run_command_with_output_and_local_worker<'a>(
                 config.write().apply_prepared_agent_selection(candidate.read().clone());
             }
             ".rag" => {
-                Config::use_rag(config, args, abort_signal.clone()).await?;
+                Box::pin(Config::use_rag(config, args, abort_signal.clone())).await?;
             }
             ".agent" => match split_first_arg(args) {
                 Some((agent_name, args)) => {
@@ -462,9 +459,13 @@ pub fn run_command_with_output_and_local_worker<'a>(
                     if !variables.is_empty() {
                         config.write().agent_variables = Some(variables);
                     }
-                    let ret =
-                        Config::use_agent(config, agent_name, session_name, abort_signal.clone())
-                            .await;
+                    let ret = Box::pin(Config::use_agent(
+                        config,
+                        agent_name,
+                        session_name,
+                        abort_signal.clone(),
+                    ))
+                    .await;
                     config.write().agent_variables = None;
                     ret?;
                 }
@@ -484,13 +485,13 @@ pub fn run_command_with_output_and_local_worker<'a>(
                         Some(text) => {
                             writeln!(output, "{}", dimmed_text(&format!(">> {text}")))?;
                             let input = crate::config::input::from_str(config, &text, None);
-                            ask(
+                            Box::pin(ask(
                                 config,
                                 local_worker,
                                 abort_signal.clone(),
                                 input,
                                 true,
-                            )
+                            ))
                             .await?;
                         }
                         None => {
@@ -528,16 +529,16 @@ pub fn run_command_with_output_and_local_worker<'a>(
                         bail!("Raw session-file editing is unavailable for NATS sessions")
                     }
                     Some("rag-docs") => {
-                        Config::edit_rag_docs(config, abort_signal.clone()).await?;
+                        Box::pin(Config::edit_rag_docs(config, abort_signal.clone())).await?;
                     }
                     Some(args) if args.starts_with("message ") => {
                         let (from, to) = parse_message_range(&args[8..])?;
-                        remote_session_ops::edit_remote_message_range(
+                        Box::pin(remote_session_ops::edit_remote_message_range(
                             config,
                             from,
                             to,
                             &abort_signal,
-                        )
+                        ))
                         .await?;
                     }
                     _ => writeln!(output, r#"Usage: .edit <config|agent|session|rag-docs|message <n>|message <n>-<m>>"#)?,
@@ -545,25 +546,25 @@ pub fn run_command_with_output_and_local_worker<'a>(
             }
             ".compact" => match args {
                 Some("session") => {
-                    crate::config::session_ops_compaction::handle_compact_session_command(
+                    Box::pin(crate::config::session_ops_compaction::handle_compact_session_command(
                         config,
                         &abort_signal,
                         output,
-                    )
+                    ))
                     .await?;
                 }
                 _ => writeln!(output, r#"Usage: .compact session"#)?,
             },
             ".empty" => match args {
                 Some("session") => {
-                    remote_session_ops::clear_remote_session(config, &abort_signal).await?;
+                    Box::pin(remote_session_ops::clear_remote_session(config, &abort_signal)).await?;
                     config.write().empty_session_after_persisted_clear()?;
                 }
                 _ => writeln!(output, r#"Usage: .empty session"#)?,
             },
             ".reset" => match args {
                 Some("session") | Some("repl") => {
-                    remote_session_ops::clear_remote_session(config, &abort_signal).await?;
+                    Box::pin(remote_session_ops::clear_remote_session(config, &abort_signal)).await?;
                     config.write().reset_session_after_persisted_clear()?;
                 }
                 _ => {
@@ -572,7 +573,7 @@ pub fn run_command_with_output_and_local_worker<'a>(
             },
             ".rebuild" => match args {
                 Some("rag") => {
-                    Config::rebuild_rag(config, abort_signal.clone()).await?;
+                    Box::pin(Config::rebuild_rag(config, abort_signal.clone())).await?;
                 }
                 _ => writeln!(output, r#"Usage: .rebuild rag"#)?,
             },
@@ -596,13 +597,13 @@ pub fn run_command_with_output_and_local_worker<'a>(
             ".file" => match args {
                 Some(args) => {
                     let (files, text) = split_args_text(args, cfg!(windows));
-                    let input = crate::config::input::from_files_with_spinner(
+                    let input = Box::pin(crate::config::input::from_files_with_spinner(
                         config,
                         text,
                         files,
                         None,
                         abort_signal.clone(),
-                    )
+                    ))
                     .await?;
                     Box::pin(ask(
                         config,
@@ -640,13 +641,13 @@ pub fn run_command_with_output_and_local_worker<'a>(
                     None => bail!("Unable to continue the response"),
                 };
                 input.set_continue_output(&output);
-                ask(
+                Box::pin(ask(
                     config,
                     local_worker,
                     abort_signal.clone(),
                     input,
                     true,
-                )
+                ))
                 .await?;
             }
             ".regenerate" => {
@@ -661,13 +662,13 @@ pub fn run_command_with_output_and_local_worker<'a>(
                     None => bail!("Unable to regenerate the response"),
                 };
                 crate::config::input::set_regenerate(&mut input, config);
-                ask(
+                Box::pin(ask(
                     config,
                     local_worker,
                     abort_signal.clone(),
                     input,
                     true,
-                )
+                ))
                 .await?;
             }
             ".use" => match split_first_arg(args) {
@@ -727,12 +728,12 @@ pub fn run_command_with_output_and_local_worker<'a>(
             ".delete" => match args {
                 Some(args) if args.starts_with("message ") => {
                     let (from, to) = parse_message_range(&args[8..])?;
-                    remote_session_ops::delete_remote_message_range(
+                    Box::pin(remote_session_ops::delete_remote_message_range(
                         config,
                         from,
                         to,
                         &abort_signal,
-                    )
+                    ))
                     .await?;
                     writeln!(output, "Deleted entries {from}-{to}.")?;
                 }
@@ -750,7 +751,7 @@ pub fn run_command_with_output_and_local_worker<'a>(
                     .trim()
                     .parse::<usize>()
                     .context("Invalid sequence number")?;
-                remote_session_ops::rewind_remote_session(config, n, &abort_signal).await?;
+                Box::pin(remote_session_ops::rewind_remote_session(config, n, &abort_signal)).await?;
                 writeln!(output, "↩ Rewound session to entry {n}.")?;
             }
             ".copy" => {
@@ -784,62 +785,9 @@ pub fn run_command_with_output_and_local_worker<'a>(
             _ => unknown_command()?,
         },
         None => {
-            let (session_id, config_snapshot) = {
-                let config = config.read();
-                (
-                    config
-                        .session
-                        .as_ref()
-                        .map(|session| session.id().to_string())
-                        .unwrap_or_else(|| "default".to_string()),
-                    config.clone(),
-                )
-            };
-            let nats_hook_provider =
-                discover_process_nats_hook_provider(&config_snapshot).await;
-            let cwd = env::current_dir().unwrap_or_default();
-            let event = HookEvent::UserPromptSubmit {
-                prompt: line.to_string(),
-            };
-            let outcome = dispatch_hook_event(
-                HookEventDispatch {
-                    event,
-                    provider: nats_hook_provider.as_deref(),
-                    meta: HookDispatchMeta {
-            abort: None,
-                        session_id: session_id.clone(),
-                        cwd: cwd.clone(),
-                        resume_count: 0,
-                    },
-                    pending_async_context: None,
-                },
-            )
-            .await;
-            match outcome.control {
-                HookResultControl::Block { reason } => {
-                    render_error(anyhow!(reason));
-                }
-                HookResultControl::Ask { .. } => {
-                    // Ask is not applicable for UserPromptSubmit event, treat as Continue
-                }
-                HookResultControl::Continue => {
-                    let input_text = match outcome.result.additional_context {
-                        Some(additional_context) if !additional_context.is_empty() => {
-                            format!("{line}\n\n{additional_context}")
-                        }
-                        _ => line.to_string(),
-                    };
-                    let input = crate::config::input::from_str(config, &input_text, None);
-                    ask(
-                        config,
-                        local_worker,
-                        abort_signal.clone(),
-                        input,
-                        true,
-                    )
-                    .await?;
-                }
-            }
+            // Prompt hooks run in the worker's canonical loop, including remote turns.
+            let input = crate::config::input::from_str(config, line, None);
+            Box::pin(ask(config, local_worker, abort_signal.clone(), input, true)).await?;
         }
     }
 
@@ -1188,6 +1136,27 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    #[test]
+    fn command_dispatch_future_keeps_branch_state_boxed() {
+        let config = Arc::new(ConfigLock::new(Config::default()));
+        let local_worker = Arc::new(tokio::sync::Mutex::new(None));
+        let mut output = Vec::new();
+        let future = run_command_with_output_and_local_worker(
+            &config,
+            crate::utils::create_abort_signal(),
+            ".delete message 1-1",
+            &mut output,
+            &local_worker,
+        );
+        // Measure the dynamic future, not its Box/Pin wrapper. Don't poll it:
+        // the dispatcher has the same layout regardless of the selected command.
+        let bytes = std::mem::size_of_val(future.as_ref().get_ref());
+        assert!(
+            bytes <= 16 * 1024,
+            "command dispatch future is {bytes} bytes; keep async branches boxed"
+        );
     }
 
     #[test]

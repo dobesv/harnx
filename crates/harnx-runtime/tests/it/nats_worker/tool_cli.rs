@@ -3,7 +3,7 @@ use anyhow::{ensure, Context};
 use futures_util::StreamExt;
 use harnx_core::instance::ServerScope;
 use harnx_runtime::config::{ConfigLock, GlobalConfig, NatsRouting, ToolServerConfig};
-use harnx_toolset::{ToolInvocation, ToolInvokeError, ToolSpec, Toolset};
+use harnx_toolset::{ToolInvokeError, ToolSpec, Toolset};
 use serde_json::Value;
 use std::{path::PathBuf, process::Output};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
@@ -59,6 +59,7 @@ fn configure_managed_tools(
         description: None,
         package: package.then(|| "pkg".into()),
         hooks: None,
+        middleware: Default::default(),
     }];
     let path = if package {
         dir.join("packages/pkg/agents/limited.md")
@@ -96,10 +97,6 @@ fn nested_cli_inference(calls: &Arc<AtomicUsize>) -> harnx_runtime::agent_loop::
         })
     })
 }
-
-#[path = "tool_cli/hook_fixture.rs"]
-mod hook_fixture;
-use hook_fixture::CliHookFixture;
 
 struct Harness {
     dir: tempfile::TempDir,
@@ -429,8 +426,8 @@ impl Harness {
         Ok(())
     }
 
-    async fn assert_managed_hook_policy(&self, args: &str) -> Result<()> {
-        self.set_managed_agent_policy("ask")?;
+    async fn assert_managed_middleware_policy(&self) -> Result<()> {
+        self.set_managed_agent_middleware("allow")?;
         let transformed = self
             .json(
                 &[
@@ -447,8 +444,7 @@ impl Harness {
             .await?;
         assert!(transformed.to_string().contains("complete CLI file output"));
         self.empty_fs_registration().await?;
-        self.empty_hook_registrations().await?;
-        self.set_managed_agent_policy("deny")?;
+        self.set_managed_agent_middleware("deny")?;
         let denied = self
             .json(
                 &[
@@ -457,19 +453,14 @@ impl Harness {
                     "call",
                     "tool",
                     "fs_read",
-                    args,
+                    "{}",
                     "--json",
                 ],
                 false,
             )
             .await?;
-        assert_eq!(denied["blocked_by_hook"], true);
-        assert!(denied["error"]
-            .as_str()
-            .unwrap()
-            .contains("CLI managed policy"));
+        assert!(denied.to_string().contains("CLI managed policy"));
         self.empty_fs_registration().await?;
-        self.empty_hook_registrations().await?;
         Ok(())
     }
 }
@@ -482,31 +473,15 @@ async fn cli_managed_activation_package_allowlist_patterns_and_release_all_outco
     };
     h.assert_packaged_catalog().await?;
     h.assert_packaged_schema().await?;
-    let args = h.assert_packaged_calls().await?;
+    h.assert_packaged_calls().await?;
     h.assert_packaged_failures().await?;
-    h.assert_managed_hook_policy(&args).await?;
+    h.assert_managed_middleware_policy().await?;
     assert_eq!(
         h.calls.load(Ordering::SeqCst),
         0,
         "operator ran root inference"
     );
     assert!(!h.worker.is_finished());
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_real_hooks_results_validation_timeouts_nested_asks_and_identity() -> Result<()> {
-    let Some(h) = Harness::start(false, false).await? else {
-        return Ok(());
-    };
-    let fixture = CliHookFixture::start(&h).await?;
-    fixture.assert_inventory().await?;
-    fixture.assert_transformed_results().await?;
-    fixture.assert_deny_validation().await?;
-    fixture.assert_error_partial_transport().await?;
-    fixture.assert_timeout_cleanup().await?;
-    fixture.assert_nested_consent().await?;
-    fixture.stop();
     Ok(())
 }
 
@@ -607,21 +582,31 @@ async fn cli_ambiguous_names_fail_without_dispatch_and_closed_generation_is_reje
 }
 
 impl Harness {
-    fn set_managed_agent_policy(&self, decision: &str) -> Result<()> {
-        let expression = json!({
-            "hookSpecificOutput":{"permissionDecision":decision,"permissionDecisionReason":"CLI managed policy"},
-            "mutatedToolInput":{"path": self.dir.path().join("file with spaces.txt")}
-        }).to_string();
-        let hook = shell_words::join([
-            binary("harnx-claude-compatible-hook-server")?
-                .to_string_lossy()
-                .into_owned(),
-            "--event".into(),
-            "PreToolUse".into(),
-            "--jaq".into(),
-            expression,
-        ]);
-        let header = json!({"model":"/test:test-model","use_tools":["fs_read"],"hooks":{"entries":[{"command":hook}]}});
+    /// Agent tool policy now lives in middleware instead of legacy
+    /// PreToolUse hooks. "allow" rewrites the arguments to the fixture file
+    /// before dispatch; "deny" rejects before the tool runs.
+    fn set_managed_agent_middleware(&self, mode: &str) -> Result<()> {
+        let bash = match mode {
+            // The rewritten arguments ride stdin because the path contains
+            // spaces that would otherwise split the `next` JSON argument.
+            "allow" => {
+                let arguments = serde_json::to_string(&json!({
+                    "path": self.dir.path().join("file with spaces.txt"),
+                }))?;
+                format!("printf '%s' '{}' | next", arguments.replace('\'', "'\\''"))
+            }
+            _ => "deny \"CLI managed policy\"".to_string(),
+        };
+        let header = json!({
+            "model": "/test:test-model",
+            "use_tools": ["fs_read"],
+            "middleware": [{
+                "name": "policy",
+                "match": "^fs_read$",
+                "bash": bash,
+                "on_error": "deny",
+            }],
+        });
         std::fs::write(
             self.dir.path().join("packages/pkg/agents/limited.md"),
             format!(
@@ -630,21 +615,6 @@ impl Harness {
             ),
         )?;
         Ok(())
-    }
-    async fn empty_hook_registrations(&self) -> Result<()> {
-        let store = async_nats::jetstream::new(self.client.clone())
-            .get_key_value(harnx_hookset_server::HOOK_REGISTRY_BUCKET)
-            .await?;
-        poll_until(async || {
-            let mut keys = store.keys().await?;
-            while let Some(key) = keys.next().await {
-                if store.get(key?).await?.is_some() {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        })
-        .await
     }
 }
 

@@ -14,6 +14,8 @@ use harnx_runtime::{
     },
     tool_reservation_client::ToolReservationHandle,
 };
+mod bash_streams;
+
 use std::{future::Future, sync::Arc, time::Duration};
 
 fn validate(command: &OperatorToolCommand) -> Result<()> {
@@ -120,12 +122,17 @@ async fn bounded_operation(
         .unwrap_or(OperatorToolReply {
             output: String::new(),
             error: None,
+            error_kind: None,
         });
     reply.error = Some(reason.into());
     Ok(reply)
 }
 
-async fn execute(cli: &Cli, command: OperatorToolCommand, json: bool) -> Result<OperatorToolReply> {
+pub(crate) async fn execute(
+    cli: &Cli,
+    command: OperatorToolCommand,
+    json: bool,
+) -> Result<OperatorToolReply> {
     // Reject JSON before loading configuration or starting any worker/tool process.
     validate(&command)?;
     let abort = create_abort_signal();
@@ -195,13 +202,13 @@ async fn execute(cli: &Cli, command: OperatorToolCommand, json: bool) -> Result<
     result
 }
 
-struct CallerSelection {
-    config: harnx_runtime::config::Config,
-    named: Option<(String, String)>,
-    cluster: String,
+pub(crate) struct CallerSelection {
+    pub(crate) config: harnx_runtime::config::Config,
+    pub(crate) named: Option<(String, String)>,
+    pub(crate) cluster: String,
 }
 
-async fn resolve_caller(cli: &Cli) -> Result<CallerSelection> {
+pub(crate) async fn resolve_caller(cli: &Cli) -> Result<CallerSelection> {
     let mut config = tokio::time::timeout(
         Duration::from_secs(60),
         crate::init_frontend_config(WorkingMode::Cmd, true),
@@ -267,12 +274,19 @@ async fn execute_reserved(
 }
 
 pub(crate) async fn run(cli: &Cli, command: OperatorToolCommand, json: bool) -> Result<u8> {
+    let is_bash = matches!(command, OperatorToolCommand::Bash { .. });
     let reply = execute(cli, command, json)
         .await
         .unwrap_or_else(|error| OperatorToolReply {
             output: String::new(),
             error: Some(format!("{error:#}")),
+            error_kind: None,
         });
+    if is_bash && !json {
+        if let Some(code) = bash_streams::print(&reply) {
+            return Ok(code);
+        }
+    }
     let failed = reply.error.is_some();
     if !reply.output.is_empty() {
         println!("{}", reply.output);
@@ -294,6 +308,7 @@ pub(crate) async fn run(cli: &Cli, command: OperatorToolCommand, json: bool) -> 
 mod tests {
     use super::*;
     use clap::Parser;
+
     #[test]
     fn virtual_view_never_uses_a_default_agent() {
         assert_eq!(
@@ -344,13 +359,15 @@ mod tests {
         for args in ["null", "[]", "1", "true", "{bad"] {
             assert!(validate(&OperatorToolCommand::Call {
                 name: "fs_read".into(),
-                args_json: args.into()
+                args_json: args.into(),
+                tool_input: None,
             })
             .is_err());
         }
         validate(&OperatorToolCommand::Call {
             name: "fs_read".into(),
             args_json: r#"{"path":"a b", "quote":"\""}"#.into(),
+            tool_input: None,
         })
         .unwrap();
     }
@@ -362,6 +379,7 @@ mod tests {
             Ok(OperatorToolReply {
                 output: r#"{"partial":true,"data":[1]}"#.into(),
                 error: None,
+                error_kind: None,
             })
         };
         let reply = bounded_operation(operation, Duration::from_millis(1), &abort)

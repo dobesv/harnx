@@ -37,6 +37,10 @@ fn templates_path() -> PathBuf {
 }
 
 fn run_waiter(fixture: WaiterFixture<'_>) -> Output {
+    run_waiter_with_env(fixture, &[])
+}
+
+fn run_waiter_with_env(fixture: WaiterFixture<'_>, env: &[(&str, &str)]) -> Output {
     let WaiterFixture {
         fake_gh,
         direct_pr,
@@ -79,6 +83,7 @@ fn run_waiter(fixture: WaiterFixture<'_>) -> Output {
             .env("REPO", "example/project")
             .env("BRANCH", "feature");
     }
+    command.envs(env.iter().copied());
     let mut child = command.spawn().expect("run waiter");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -93,6 +98,130 @@ fn run_waiter(fixture: WaiterFixture<'_>) -> Output {
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Parses every stdout line as JSON; protocol mode must never emit anything else.
+fn progress_lines(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("stdout line is not JSON ({error}): {line}"))
+        })
+        .collect()
+}
+
+fn progress_field(lines: &[serde_json::Value], index: usize, field: &str) -> String {
+    lines[index]["progress"][field]
+        .as_str()
+        .unwrap_or_else(|| panic!("progress line {index} has no {field}: {}", lines[index]))
+        .to_owned()
+}
+
+const DISCOVERY_GH: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+case "$1 $2" in
+  "pr list")
+    count_file="$STATE_DIR/list-count"
+    count=0
+    [[ -f "$count_file" ]] && read -r count < "$count_file"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$count_file"
+    if ((count >= 2)); then
+      printf '%s\t%s\n' "${FAKE_OWNER:-example}" 'https://github.com/example/project/pull/42'
+    fi
+    ;;
+  "pr view") printf 'OPEN\t%s\tsha-1\tupdated-1\tcomments-1\treviews-1\n' 'https://github.com/example/project/pull/42' ;;
+  "pr checks") printf 'pass\tCI\tbuild\tSUCCESS\n' ;;
+  *) exit 91 ;;
+esac
+"#;
+
+fn run_jsonl_discovery(env: &[(&str, &str)]) -> (Vec<serde_json::Value>, String) {
+    let mut all_env = vec![(harnx_bash_tools::TOOL_PROTOCOL_ENV, "jsonl")];
+    all_env.extend_from_slice(env);
+    let output = run_waiter_with_env(
+        WaiterFixture {
+            fake_gh: DISCOVERY_GH,
+            direct_pr: false,
+            stall_seconds: 999,
+        },
+        &all_env,
+    );
+    let (stdout, stderr) = output_text(&output);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    (progress_lines(&stdout), stderr)
+}
+
+#[test]
+fn jsonl_waiter_links_to_compare_page_then_pr() {
+    let (lines, stderr) = run_jsonl_discovery(&[]);
+    let first = progress_field(&lines, 0, "markdown");
+    assert!(
+        first.contains(
+            "[Open pull request](https://github.com/example/project/compare/feature?expand=1)"
+        ),
+        "{first}"
+    );
+    let later: Vec<String> = (1..lines.len())
+        .map(|index| progress_field(&lines, index, "markdown"))
+        .collect();
+    assert!(
+        later.iter().any(|markdown| markdown
+            .contains("[PR #42](https://github.com/example/project/pull/42)")
+            && markdown.contains("1 passed")),
+        "{later:?}"
+    );
+    for fragment in [
+        "Waiting for an open pull request for example/project:feature",
+        "https://github.com/example/project/compare/feature?expand=1",
+        "Monitoring https://github.com/example/project/pull/42",
+        "reason=checks_terminal",
+        "checks_pass=1",
+    ] {
+        assert!(stderr.contains(fragment), "missing {fragment}: {stderr}");
+    }
+    let stdout_text = serde_json::to_string(&lines).expect("serialize");
+    assert!(!stdout_text.contains("PR_STABLE"), "{stdout_text}");
+    assert!(!stdout_text.contains("Monitoring"), "{stdout_text}");
+}
+
+#[test]
+fn jsonl_waiter_compare_link_uses_base_and_fork_owner() {
+    let (lines, _) = run_jsonl_discovery(&[
+        ("BASE", "stack/parent"),
+        ("HEAD_OWNER", "forker"),
+        ("FAKE_OWNER", "forker"),
+    ]);
+    let first = progress_field(&lines, 0, "markdown");
+    assert!(
+        first.contains(
+            "https://github.com/example/project/compare/stack/parent...forker:feature?expand=1"
+        ),
+        "{first}"
+    );
+}
+
+#[test]
+fn jsonl_waiter_compare_link_percent_encodes_branch_names() {
+    let (lines, _) = run_jsonl_discovery(&[("BRANCH", "fix/#12"), ("BASE", "stack/a&b")]);
+    let first = progress_field(&lines, 0, "markdown");
+    assert!(
+        first.contains(
+            "https://github.com/example/project/compare/stack/a%26b...fix/%2312?expand=1"
+        ),
+        "{first}"
+    );
+}
+
+#[test]
+fn jsonl_waiter_same_owner_compare_link_has_no_owner_prefix() {
+    let (lines, _) = run_jsonl_discovery(&[("HEAD_OWNER", "example")]);
+    let first = progress_field(&lines, 0, "markdown");
+    assert!(
+        first.contains("https://github.com/example/project/compare/feature?expand=1"),
+        "{first}"
+    );
 }
 
 fn output_text(output: &Output) -> (String, String) {
@@ -152,6 +281,19 @@ fn shipped_pantheon_templates_are_valid() {
 }
 
 #[test]
+fn shipped_waiter_template_declares_the_jsonl_protocol() {
+    let path = templates_path().join("wait_for_pr_stable.yaml");
+    let template: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(path).expect("read waiter template"))
+            .expect("parse waiter template");
+    assert_eq!(
+        template.get("protocol").and_then(serde_yaml::Value::as_str),
+        Some("jsonl"),
+        "the waiter template must opt in to the protocol or the link never shows"
+    );
+}
+
+#[test]
 fn shipped_waiter_uses_fifteen_minute_stall_threshold() {
     let script = fs::read_to_string(waiter_path()).expect("read shipped waiter");
     assert!(
@@ -184,7 +326,7 @@ esac
         direct_pr: false,
         stall_seconds: 999,
     });
-    assert_successful_waiter(ExpectedWaiter {
+    let (stdout, _) = assert_successful_waiter(ExpectedWaiter {
         output,
         stdout_fragments: &[
             "Waiting for an open pull request",
@@ -193,6 +335,7 @@ esac
             "checks_pass=1",
         ],
     });
+    assert!(!stdout.contains("{\"progress\""), "{stdout}");
 }
 
 #[test]
@@ -351,6 +494,64 @@ exit 1
     );
     assert!(stderr.contains("attempt 3/3"));
     assert!(stderr.contains("Stopping after 3 consecutive"));
+}
+
+#[test]
+fn jsonl_github_errors_keep_the_compare_link_on_screen() {
+    let output = run_waiter_with_env(
+        WaiterFixture {
+            fake_gh: r#"#!/usr/bin/env bash
+set -euo pipefail
+case "$1 $2" in
+  "pr list")
+    count_file="$STATE_DIR/list-count"
+    count=0
+    [[ -f "$count_file" ]] && read -r count < "$count_file"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$count_file"
+    if ((count <= 2)); then
+      printf 'bad "quote" back\\slash\ttab\001ctl [x](https://api.github.com/y)\n' >&2
+      exit 1
+    fi
+    printf '%s\t%s\n' example 'https://github.com/example/project/pull/42'
+    ;;
+  "pr view") printf 'OPEN\t%s\tsha-1\tupdated-1\tcomments-1\treviews-1\n' 'https://github.com/example/project/pull/42' ;;
+  "pr checks") printf 'pass\tCI\tbuild\tSUCCESS\n' ;;
+  *) exit 91 ;;
+esac
+"#,
+            direct_pr: false,
+            stall_seconds: 999,
+        },
+        &[(harnx_bash_tools::TOOL_PROTOCOL_ENV, "jsonl")],
+    );
+    let (stdout, stderr) = output_text(&output);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    let lines = progress_lines(&stdout);
+    let link = "[Open pull request](https://github.com/example/project/compare/feature?expand=1)";
+    assert!(progress_field(&lines, 0, "markdown").contains(link));
+    let last_markdown = lines
+        .iter()
+        .rev()
+        .find_map(|line| line["progress"]["markdown"].as_str())
+        .expect("a progress line with markdown");
+    assert!(
+        last_markdown.contains("[Open pull request](") || last_markdown.contains("[PR #42]"),
+        "{last_markdown}"
+    );
+    let retries: Vec<_> = lines
+        .iter()
+        .filter(|line| {
+            line["progress"]["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("retry"))
+        })
+        .collect();
+    assert!(!retries.is_empty());
+    for retry in retries {
+        assert!(retry["progress"].get("markdown").is_none(), "{retry}");
+    }
+    assert!(!stdout.contains("api.github.com"));
 }
 
 #[test]

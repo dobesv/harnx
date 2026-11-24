@@ -65,6 +65,11 @@ pub fn router_with_access_rules<H: a2a_server_lf::handler::RequestHandler>(
             ))
             .merge(cards)
         }
+        // Must stay outermost so rejection hooks receive the request-log metadata.
+        .layer(axum::middleware::from_fn_with_state(
+            export.public_name.clone(),
+            crate::request_log::http::start,
+        ))
     }))
 }
 
@@ -81,6 +86,9 @@ fn router_with(exports: &[Export], mut export_router: impl FnMut(&Export) -> Rou
         .route("/agents/{name}/", any(dispatch))
         .route("/agents/{name}/{*path}", any(dispatch))
         .with_state(Arc::new(routers))
+        .layer(axum::middleware::from_fn(
+            harnx_metrics::http_metrics_middleware,
+        ))
 }
 
 async fn dispatch(
@@ -239,16 +247,16 @@ mod tests {
             "http://public.example",
         )
         .await;
-        for value in ["", "  ", " , ignored", " user , ignored"] {
+        for (value, expected) in [
+            ("", StatusCode::UNAUTHORIZED),
+            ("  ", StatusCode::UNAUTHORIZED),
+            (" , opaque", StatusCode::OK),
+            (" user , opaque", StatusCode::OK),
+        ] {
             let mut req = request("/agents/tools");
             req.headers_mut()
                 .insert("x-user-id", value.parse().unwrap());
             let response = app.clone().oneshot(req).await.unwrap();
-            let expected = if value.starts_with(" user") {
-                StatusCode::OK
-            } else {
-                StatusCode::UNAUTHORIZED
-            };
             assert_eq!(response.status(), expected);
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -411,11 +419,15 @@ mod tests {
                     );
                     assert_eq!(
                         json["defaultInputModes"],
-                        serde_json::json!(["text/plain", "application/json"])
+                        serde_json::json!([
+                            "text/plain",
+                            "application/json",
+                            "application/a2ui+json"
+                        ])
                     );
                     assert_eq!(
                         json["defaultOutputModes"],
-                        serde_json::json!(["text/plain"])
+                        serde_json::json!(["text/plain", "application/a2ui+json"])
                     );
                     let decoded: a2a_lf::AgentCard =
                         a2a_pb::protojson_conv::from_value(json.clone()).unwrap();

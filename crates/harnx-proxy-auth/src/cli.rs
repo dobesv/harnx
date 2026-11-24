@@ -7,7 +7,25 @@ pub struct Args {
     pub metrics: MetricsFlags,
     #[command(flatten)]
     pub healthz: harnx_healthz::HealthzFlags,
-    /// Hook server name assigned by the supervisor.
+    /// Run the environment tool service (NATS by default).
+    #[arg(long)]
+    pub tool_server: bool,
+    /// Use MCP stdio transport for the tool service.
+    #[arg(long, conflicts_with = "mcp_http")]
+    pub mcp_stdio: bool,
+    /// Use MCP Streamable HTTP transport for the tool service.
+    #[arg(long)]
+    pub mcp_http: bool,
+    /// MCP HTTP bind host (default: 0.0.0.0).
+    #[arg(long, requires = "mcp_http")]
+    pub host: Option<String>,
+    /// MCP HTTP port (default: 3009).
+    #[arg(long, requires = "mcp_http")]
+    pub port: Option<u16>,
+    /// Enable only matching tools in tool-server mode (repeatable glob).
+    #[arg(long)]
+    pub enable_tool: Vec<String>,
+    /// Server name assigned by the supervisor.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 
@@ -74,4 +92,91 @@ pub struct Args {
     /// Format: name=command
     #[arg(long = "load-exec", value_name = "NAME=COMMAND")]
     pub load_exec: Vec<String>,
+}
+
+impl Args {
+    /// Tool-server argv isn't shell-expanded. Expand only this explicit package
+    /// prefix; never substitute variables inside jaq filters or inline scripts.
+    pub fn resolved_hooks(&self) -> anyhow::Result<Vec<String>> {
+        let package_dir = std::env::var_os("HARNX_PACKAGE_DIR");
+        self.hook
+            .iter()
+            .map(|hook| resolve_package_hook(hook, package_dir.as_deref()))
+            .collect()
+    }
+}
+
+fn resolve_package_hook(
+    hook: &str,
+    package_dir: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<String> {
+    let Some(relative) = hook.strip_prefix("$HARNX_PACKAGE_DIR/") else {
+        return Ok(hook.to_owned());
+    };
+    let dir =
+        package_dir.ok_or_else(|| anyhow::anyhow!("package --hook requires HARNX_PACKAGE_DIR"))?;
+    let dir = std::path::Path::new(dir);
+    anyhow::ensure!(dir.is_absolute(), "HARNX_PACKAGE_DIR must be absolute");
+    Ok(dir.join(relative).to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_hook_expansion_does_not_interpret_filters_or_shell_syntax() {
+        let dir = std::env::current_dir().unwrap().join("package with spaces");
+        let hook = "$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py";
+        assert_eq!(
+            resolve_package_hook(hook, Some(dir.as_os_str())).unwrap(),
+            dir.join("hooks/jira-auth-hook.py").to_string_lossy()
+        );
+        assert!(resolve_package_hook(hook, None).is_err());
+        assert!(resolve_package_hook(hook, Some(std::ffi::OsStr::new("relative"))).is_err());
+        for source in [
+            ".headers.auth = env.GITHUB_TOKEN",
+            "{path: $temp_file_root}",
+            "#!/bin/sh\necho $HARNX_PACKAGE_DIR",
+            "./script.py",
+        ] {
+            assert_eq!(resolve_package_hook(source, None).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn tool_transport_flags_are_strict_and_keep_assignment_forms() {
+        for args in [
+            vec![
+                "proxy",
+                "--tool-server",
+                "--mcp-stdio",
+                "--name=proxy_auth",
+                "--enable-tool=environment",
+            ],
+            vec![
+                "proxy",
+                "--mcp-stdio",
+                "--name=proxy_auth",
+                "--enable-tool=environment",
+            ],
+            vec![
+                "proxy",
+                "--tool-server",
+                "--mcp-http",
+                "--host=127.0.0.1",
+                "--port=3009",
+            ],
+            vec!["proxy", "--mcp-http", "--host=127.0.0.1", "--port=3009"],
+        ] {
+            assert!(Args::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["proxy", "--mcp-stdio", "--mcp-http"],
+            vec!["proxy", "--tool-server", "--mcp-stdio", "--mcp-http"],
+            vec!["proxy", "--tool-server", "--mcp-typo"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+    }
 }

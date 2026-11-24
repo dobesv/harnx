@@ -51,17 +51,7 @@ pub(super) async fn remove_owner_lease(t: &TwoBackends, storage: &str) -> Result
 async fn initialization_reservation_has_lease_before_metadata_and_sibling_does_not_orphan_it(
 ) -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut pause =
-        t.a.backend
-            .runner
-            .fault_hooks()
-            .pause(Boundary::FirstReservation, 1);
-    let send = tokio::spawn({
-        let app = t.a.app.clone();
-        async move { rpc(app, "alice", "SendMessage", first_message()).await }
-    });
-    pause.reached().await;
-    let saved = reservation(&t).await?;
+    let (pause, send, saved) = supervision::pause_first_reservation(&t).await?;
     assert_no_metadata(&t, &saved.allocation.storage_key).await?;
     assert!(t
         .b
@@ -107,7 +97,7 @@ async fn initialization_reservation_has_lease_before_metadata_and_sibling_does_n
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_dedupe_ignores_poisoned_lru_and_checks_identity_before_busy_and_terminal_target(
+async fn shared_dedupe_ignores_poisoned_lru_and_checks_identity_before_steering_and_terminal_target(
 ) -> Result<()> {
     let t = TwoBackends::start().await?;
     let response = t.a.rpc("alice", "SendMessage", first_message()).await?;
@@ -135,10 +125,17 @@ async fn shared_dedupe_ignores_poisoned_lru_and_checks_identity_before_busy_and_
     );
     let mut distinct = retry.clone();
     distinct["message"]["messageId"] = json!("distinct");
+    // Distinct work on the still-running context steers into the live turn
+    // and answers on the same task (issue #2774) instead of the old -32000.
     assert_eq!(
-        t.b.rpc("alice", "SendMessage", distinct).await?["error"]["code"],
-        -32000
+        result_task(&t.b.rpc("alice", "SendMessage", distinct).await?)?["id"],
+        task["id"]
     );
+    // Release the root round. Its answer closes the round, but the steered
+    // row is still unfed, so the same invocation opens a continuation round
+    // for it: a second held model request that must be released too.
+    t.h.llm.release.notify_one();
+    wait_for_requests(&t, 2).await?;
     t.h.llm.release.notify_one();
     let mut blocking = first_message();
     blocking["configuration"]["returnImmediately"] = json!(false);
@@ -152,21 +149,25 @@ async fn shared_dedupe_ignores_poisoned_lru_and_checks_identity_before_busy_and_
         result_task(&t.b.rpc("alice", "SendMessage", retry).await?)?["id"],
         task["id"]
     );
-    assert_eq!(t.h.llm.requests.lock().len(), 1);
+    assert_eq!(t.h.llm.requests.lock().len(), 2);
     t.a.backend.runner.shutdown().await;
     t.b.backend.runner.shutdown().await;
     Ok(())
 }
 
+async fn wait_for_requests(t: &TwoBackends, count: usize) -> Result<()> {
+    tokio::time::timeout(DEADLINE, async {
+        while t.h.llm.requests.lock().len() < count {
+            t.h.llm.requested.notified().await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
 async fn crashed_boundary(boundary: Boundary, prompt_count: usize) -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut pause = t.a.backend.runner.fault_hooks().pause(boundary, 1);
-    let send = tokio::spawn({
-        let app = t.a.app.clone();
-        async move { rpc(app, "alice", "SendMessage", first_message()).await }
-    });
-    pause.reached().await;
-    let saved = reservation(&t).await?;
+    let (pause, send, saved) = supervision::paused_first_message(&t, boundary, 1).await?;
     remove_owner_lease(&t, &saved.allocation.storage_key).await?;
     let response = t.b.rpc("alice", "SendMessage", first_message()).await?;
     assert_eq!(result_task(&response)?["id"], saved.allocation.task_id);
@@ -249,7 +250,7 @@ async fn crash_before_activation_never_replays_admitted_prompt() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn competing_followups_share_one_identity_or_preserve_busy_for_distinct_messages(
+async fn competing_followups_share_one_identity_or_steer_or_preserve_busy_for_distinct_messages(
 ) -> Result<()> {
     let t = TwoBackends::start().await?;
     let first = t.a.rpc("alice", "SendMessage", first_message()).await?;
@@ -261,9 +262,26 @@ async fn competing_followups_share_one_identity_or_preserve_busy_for_distinct_me
         result_task(&t.a.rpc("alice", "SendMessage", finish).await?)?["status"]["state"],
         "TASK_STATE_COMPLETED"
     );
+    // Schedule-aware counts: an identical pair lands one row (same id), a
+    // distinct pair lands one row unless both steered into the live turn,
+    // and every row is answered in its own continuation round.
+    let mut expected_rows = 2;
     for identical in [true, false] {
-        let mut winner = race_followup(&t, &context, identical).await?;
+        let before = t.h.llm.requests.lock().len();
+        let (mut winner, both_steered) = race_followup(&t, &context, identical).await?;
+        if both_steered {
+            expected_rows += 1;
+        }
         t.h.llm.release.notify_one();
+        if both_steered {
+            // Both rows steered into one live turn, so the loser's row is
+            // answered in a second, also-held continuation round that starts
+            // only after the first release; release it too before the
+            // blocking retry waits for terminal completion, or the task
+            // can never complete on this schedule.
+            llm_requested_count(&t.h, before + 2).await?;
+            t.h.llm.release.notify_one();
+        }
         winner["configuration"]["returnImmediately"] = json!(false);
         assert_eq!(
             result_task(&t.a.rpc("alice", "SendMessage", winner).await?)?["status"]["state"],
@@ -271,6 +289,7 @@ async fn competing_followups_share_one_identity_or_preserve_busy_for_distinct_me
         );
     }
     let session = t.resume(&t.a, context.as_str().context("context")?).await?;
+    let expected_prompts = 1 + expected_rows;
     assert_eq!(
         prompts(&NatsSessionLog::new(
             t.h.jetstream.clone(),
@@ -278,9 +297,13 @@ async fn competing_followups_share_one_identity_or_preserve_busy_for_distinct_me
         ))
         .await?
         .len(),
-        3
+        expected_prompts
     );
-    assert_eq!(t.h.llm.requests.lock().len(), 3);
+    assert_eq!(
+        t.h.llm.requests.lock().len(),
+        expected_prompts,
+        "each admitted row must reach its own model round"
+    );
     t.a.backend.runner.shutdown().await;
     t.b.backend.runner.shutdown().await;
     Ok(())
@@ -350,7 +373,7 @@ async fn assert_no_metadata(t: &TwoBackends, storage: &str) -> Result<()> {
     Ok(())
 }
 
-async fn race_followup(t: &TwoBackends, context: &Value, identical: bool) -> Result<Value> {
+async fn race_followup(t: &TwoBackends, context: &Value, identical: bool) -> Result<(Value, bool)> {
     let hooks_a = t.a.backend.runner.fault_hooks();
     let hooks_b = t.b.backend.runner.fault_hooks();
     let mut miss_a = hooks_a.pause(
@@ -382,6 +405,7 @@ async fn race_followup(t: &TwoBackends, context: &Value, identical: bool) -> Res
         let b = b.clone();
         async move { rpc(app, "alice", "SendMessage", b).await }
     });
+    let mut both_steered = false;
     tokio::join!(miss_a.reached(), miss_b.reached());
     drop((miss_a, miss_b));
     let (response_a, response_b) = (send_a.await??, send_b.await??);
@@ -395,12 +419,23 @@ async fn race_followup(t: &TwoBackends, context: &Value, identical: bool) -> Res
         assert_eq!(response_a["error"]["code"], -32000);
         result_task(&response_b)?;
         b
-    } else {
+    } else if response_b.get("error").is_some() {
         assert_eq!(response_b["error"]["code"], -32000);
         result_task(&response_a)?;
         a
+    } else {
+        // Both distinct follow-ups arrived after the winner's turn was
+        // already live at the runtime; the loser steered into it and both
+        // answered on the same task (issue #2774). Two rows land instead
+        // of one, which the schedule-aware counts below must reflect.
+        assert_eq!(
+            result_task(&response_a)?["id"],
+            result_task(&response_b)?["id"]
+        );
+        both_steered = true;
+        b
     };
-    Ok(winner)
+    Ok((winner, both_steered))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

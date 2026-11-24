@@ -1,10 +1,13 @@
 use super::*;
 
+mod long_lines;
 mod new_message;
 mod process_eviction;
 mod process_wait;
 #[cfg(unix)]
 mod template_new_message;
+#[cfg(unix)]
+mod template_protocol;
 use process_wait::{wait_params, wait_params_with};
 
 #[cfg(unix)]

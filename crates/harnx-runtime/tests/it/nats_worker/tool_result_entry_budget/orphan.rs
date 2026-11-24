@@ -21,6 +21,9 @@ async fn append_orphan_round(log: &NatsSessionLog) -> Result<u64> {
 
 fn orphan_request(key: &str, session_id: &str, round: u64) -> ToolRequest {
     ToolRequest {
+        user_id: None,
+        input_responses: None,
+        request_state: None,
         run_context: None,
         replay: None,
         call_id: "op-orphan".into(),
@@ -48,6 +51,7 @@ pub(super) async fn seed_journaled_reply(
     let round = append_orphan_round(log).await?;
     let request = orphan_request(key, session_id, round);
     let reply = ToolReply {
+        input_required: None,
         call_id: request.call_id.clone(),
         result: Ok(bloat_listing()),
         final_progress: None,
@@ -84,8 +88,8 @@ pub(super) async fn run_repair(
     tokio::time::timeout(
         CI_SAFE_TIMEOUT,
         run_agent_loop_with_nats(RunAgentLoopArgs {
+            surface_notes: None,
             cluster_key: "local",
-            manage_servers: false,
             session_id: key,
             config,
             instance_id: harnx_core::instance::ServerScope::new(),

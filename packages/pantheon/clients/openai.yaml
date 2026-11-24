@@ -2,10 +2,8 @@ type: openai
 # api_key: sk-...   # or set OPENAI_API_KEY env var
 # api_base: https://api.openai.com/v1   # optional override
 
-# Use patch to set per-model options like reasoning_effort.
-# Keys under chat_completions are regex patterns matched against the full model name.
-# patch:
-#   chat_completions:
-#     'o3':
-#       body:
-#         reasoning_effort: high
+# Use patches to set per-model options such as reasoning effort. Each entry is
+# a jaq filter that receives {url, headers, body} and returns it modified.
+# patches:
+#   responses:
+#     - 'if .body.model == "gpt-6.2-sol" then .body.reasoning = {"effort":"high","summary":"auto"} end'

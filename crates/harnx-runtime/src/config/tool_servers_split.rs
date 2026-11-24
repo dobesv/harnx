@@ -56,6 +56,13 @@ pub struct ToolServerConfig {
     /// Merged with global and agent hooks at runtime.
     #[serde(default)]
     pub hooks: Option<HooksConfig>,
+
+    /// Ordered middleware declarations, independent of tool-server process management.
+    #[serde(
+        default,
+        skip_serializing_if = "harnx_core::middleware::MiddlewareConfig::is_empty"
+    )]
+    pub middleware: harnx_core::middleware::MiddlewareConfig,
 }
 
 impl Config {
@@ -64,29 +71,48 @@ impl Config {
     /// Each `.yaml` file in `dir` defines one tool server. The file stem
     /// (basename without extension) becomes the server's `name`.
     pub fn load_tool_servers_from_dir(dir: &Path) -> Result<Vec<ToolServerConfig>> {
-        if !dir.exists() {
-            return Ok(vec![]);
+        Self::load_tool_servers_with_middleware_base(dir, None)
+    }
+
+    pub(super) fn load_tool_servers_with_middleware_base(
+        dir: &Path,
+        package_dir: Option<&Path>,
+    ) -> Result<Vec<ToolServerConfig>> {
+        let files = dir
+            .exists()
+            .then(|| Self::sorted_yaml_files(dir))
+            .transpose()?
+            .unwrap_or_default();
+        files
+            .iter()
+            .filter_map(|path| Self::load_tool_server_file(path, package_dir).transpose())
+            .collect()
+    }
+
+    fn load_tool_server_file(
+        path: &Path,
+        package_dir: Option<&Path>,
+    ) -> Result<Option<ToolServerConfig>> {
+        let Some(stem) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let content = read_to_string(path)
+            .with_context(|| format!("Failed to read tool server config '{}'", path.display()))?;
+        let mut server: ToolServerConfig = serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse tool server config '{}'", path.display()))?;
+        server.name = stem.to_owned();
+        middleware::bind_middleware(
+            &mut server.middleware,
+            middleware::file_origin(path, package_dir)?,
+        )?;
+        if let Some(hooks) = &mut server.hooks {
+            event_hooks::bind_event_hooks(hooks, middleware::file_origin(path, package_dir)?)?;
         }
-
-        let mut servers = Vec::new();
-        for path in Self::sorted_yaml_files(dir)? {
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(stem) if !stem.is_empty() => stem.to_string(),
-                _ => continue,
-            };
-
-            let content = read_to_string(&path).with_context(|| {
-                format!("Failed to read tool server config '{}'", path.display())
-            })?;
-            let mut server: ToolServerConfig =
-                serde_yaml::from_str(&content).with_context(|| {
-                    format!("Failed to parse tool server config '{}'", path.display())
-                })?;
-            server.name = stem;
-            servers.push(server);
-        }
-
-        Ok(servers)
+        Ok(Some(server))
     }
 }
 
@@ -118,39 +144,35 @@ command: harnx-time-tools
 command: harnx-time-tools
 hooks:
   max_resume: 3
-  entries:
-    - command: "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 -- /path/to/hook.sh"
-      status_message: "Checking time tool"
+  Stop:
+    - name: audit
+      bash: 'event_input | add_context "stopped"'
 "#;
         let config: ToolServerConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.command, "harnx-time-tools");
         let hooks = config.hooks.as_ref().expect("hooks should be parsed");
         assert_eq!(hooks.max_resume, Some(3));
-        assert_eq!(hooks.entries.len(), 1);
-        let entry = &hooks.entries[0];
-        assert_eq!(
-            entry.command,
-            "harnx-claude-compatible-hook-server --event PreToolUse --matcher time --timeout 30 -- /path/to/hook.sh"
-        );
-        assert_eq!(entry.status_message.as_deref(), Some("Checking time tool"));
-        assert!(entry.async_hook.is_none());
+        let chain = hooks.list(harnx_core::hooks::HookEventKind::Stop);
+        assert_eq!(chain.entries.len(), 1);
+        assert_eq!(chain.entries[0].name(), "audit");
     }
 
     #[test]
-    fn shipped_bash_config_launches_proxy_auth_as_tool_hook() {
+    fn shipped_bash_config_uses_proxy_auth_middleware() {
         let coding = include_str!("../../../../packages/coding/tool_servers/bash.yaml");
         let pantheon = include_str!("../../../../packages/pantheon/tool_servers/bash.yaml");
         assert_eq!(coding, pantheon);
 
         let config: ToolServerConfig = serde_yaml::from_str(coding).expect("parse bash config");
-        let hooks = config.hooks.expect("bash hooks");
-        assert_eq!(hooks.entries.len(), 1);
-        let hook = &hooks.entries[0];
-        assert!(hook.command.starts_with("harnx-proxy-auth --hook "));
-        assert!(hook
-            .command
-            .contains("$HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py"));
-        assert!(hook.command.contains("$temp_file_root"));
+        assert!(config.hooks.is_none());
+        assert_eq!(config.middleware.entries.len(), 1);
+        let middleware = serde_json::to_value(&config.middleware).unwrap();
+        assert_eq!(middleware[0]["match"], "^bash_(exec|spawn)$");
+        assert_eq!(
+            middleware[0]["tools"],
+            serde_json::json!(["proxy_auth_environment"])
+        );
+        assert_eq!(middleware[0]["script"], "middleware/proxy-auth.py");
     }
 
     #[test]

@@ -11,13 +11,17 @@ mod support;
 mod access_agents;
 mod access_cid;
 mod access_memberships;
+mod access_prompt_attachments;
 mod access_sessions;
 mod access_user_aliases;
 mod ag_ui_control_plane;
 mod ag_ui_remote_follow;
+mod handoff_identity;
 mod nats_attention_repair;
 mod nats_mark_read_unread;
 mod nats_sigterm_drain_e2e;
 mod nats_sse_read_gate;
+mod upload_cross_replica;
+mod user_principals;
 
 mod session_history;

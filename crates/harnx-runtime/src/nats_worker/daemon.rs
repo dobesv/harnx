@@ -105,7 +105,7 @@ fn validate_worker_daemon(daemon: &WorkerDaemonConfig) -> Result<()> {
         );
         anyhow::ensure!(
             daemon.manage_servers,
-            "targeted local workers require managed tool and hook servers"
+            "targeted local workers require managed tool servers"
         );
     }
     Ok(())
@@ -147,14 +147,8 @@ fn load_session_agent(
                 .read()
                 .retrieve_agent(name)
                 .with_context(|| format!("load named session agent '{name}'"))?;
-            crate::config::agent::resolve_file_defaults(&mut agent)
-                .with_context(|| format!("resolve file-backed variables for agent '{name}'"))?;
-            let variables = crate::config::agent::require_agent_variables(
-                agent.defined_variables(),
-                &metadata.variables,
-            )
-            .with_context(|| format!("initialize variables for agent '{name}'"))?;
-            agent.set_shared_variables(variables);
+            crate::config::agent::resolve_session_variables(&mut agent, &metadata.variables)
+                .with_context(|| format!("initialize variables for agent '{name}'"))?;
             agent
         }
         SessionAgentSource::Inline { instructions } => crate::config::Agent::new(
@@ -232,6 +226,15 @@ fn apply_limit_overrides(
 /// an agent like `pantheon/sisyphus` fails with an undefined value on its
 /// first render.
 ///
+/// This is the one shared effective-agent builder: baseline agent load →
+/// session overrides → the agent's own `patches` (with the session's
+/// caller-principals snapshot bound as `$user`) → runtime resolution (a
+/// patched `model` id re-resolves here). It runs before anything reads
+/// `Config.agent`, so server selection, hooks, middleware, run limits, prompt
+/// rendering and Input rebuilds all see the effective agent. A `patches`
+/// failure is fatal for the activation (G6): workers never run the unpatched
+/// config.
+///
 /// A missing or invalid named agent is fatal; workers never substitute their
 /// own active configuration for the session's immutable identity.
 ///
@@ -245,7 +248,11 @@ pub(super) fn install_session_metadata_agent(
     let agent = load_session_agent(per_session, metadata)?;
     let mut cfg = per_session.write();
     cfg.use_agent_obj(agent).context("activate session agent")?;
-    apply_session_overrides(&mut cfg, &metadata.overrides)
+    apply_session_overrides(&mut cfg, &metadata.overrides)?;
+    cfg.apply_session_agent_patches(
+        &crate::nats_session_metadata::user_principals(metadata),
+        &metadata.variables,
+    )
 }
 
 /// Optional execution and lifecycle controls for a worker daemon.
@@ -494,7 +501,6 @@ fn build_worker_runtime(build: WorkerRuntimeBuild) -> Arc<WorkerRuntime> {
         activation_route: setup.daemon.activation_route(),
         activation_mode: setup.daemon.activation_mode,
         activation_heartbeat_interval: setup.daemon.activation_ack_wait() / 3,
-        manage_servers: setup.daemon.manage_servers,
         worker_id: setup.daemon.worker_id.clone(),
         identity: startup.identity,
         lease: setup.daemon.lease,

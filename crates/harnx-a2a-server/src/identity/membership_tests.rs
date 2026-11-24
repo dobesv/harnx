@@ -9,8 +9,11 @@ fn policy() -> Identity {
     harnx_core::require_nextest();
     Identity::with_memberships(
         &["X-User".into()],
-        &["X-Groups".into(), "X-Other-Groups".into()],
-        &["X-Roles".into()],
+        &[
+            "header-csv:X-Groups".into(),
+            "header-csv:X-Other-Groups".into(),
+        ],
+        &["header-csv:X-Roles".into()],
     )
     .unwrap()
 }
@@ -21,7 +24,7 @@ fn memberships_header_and_service_params_agree_without_flattening_users() {
     let params = ServiceParams::from([
         (
             "x-user".into(),
-            vec!["alice, ignored-user".into(), "ignored-too".into()],
+            vec!["CN=alice,OU=eng,O=Acme Corp".into(), "ignored-too".into()],
         ),
         (
             "x-groups".into(),
@@ -41,16 +44,121 @@ fn memberships_header_and_service_params_agree_without_flattening_users() {
         policy.resolve_request(&headers).unwrap(),
         policy.resolve_request_params(&params).unwrap(),
     ] {
-        assert_eq!(request.principal, Principal::User("alice".into()));
+        assert_eq!(
+            request.principal,
+            Principal::User("CN=alice,OU=eng,O=Acme Corp".into())
+        );
         assert_eq!(
             request.groups,
             ["engineering", "ops", "support", "engineering", "extra"]
         );
         assert_eq!(request.roles, ["reviewer", "admin"]);
         let caller = request.caller();
-        assert_eq!(caller.view().users, ["alice"]);
+        assert_eq!(caller.view().users, ["CN=alice,OU=eng,O=Acme Corp"]);
         assert_eq!(caller.view().groups.len(), 5);
         assert_eq!(caller.view().roles.len(), 2);
+    }
+}
+
+#[test]
+fn header_specs_apply_to_users_and_memberships_in_both_request_paths() {
+    harnx_core::require_nextest();
+    let user = "CN=alice,OU=eng,O=Acme";
+    let group = "CN=admins,OU=eng,O=Acme";
+    let list = r#""CN=admins,OU=eng,O=Acme", "CN=ops,O=Acme""#;
+    for prefix in ["", "HeAdEr:", "HeAdEr-CsV:"] {
+        let csv = prefix.eq_ignore_ascii_case("header-csv:");
+        let policy = Identity::with_memberships(
+            &[format!("{prefix}X-User")],
+            &[format!("{prefix}X-Groups")],
+            &[format!("{prefix}X-Roles")],
+        )
+        .unwrap();
+        let groups = if csv { list } else { group };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user", user.parse().unwrap());
+        headers.insert("x-groups", groups.parse().unwrap());
+        headers.insert("x-roles", groups.parse().unwrap());
+        let params = ServiceParams::from([
+            ("x-user".into(), vec![user.into()]),
+            ("x-groups".into(), vec![groups.into()]),
+            ("x-roles".into(), vec![groups.into()]),
+        ]);
+        for request in [
+            policy.resolve_request(&headers).unwrap(),
+            policy.resolve_request_params(&params).unwrap(),
+        ] {
+            assert_eq!(
+                request.principal.user_id(),
+                Some(if csv { "CN=alice" } else { user })
+            );
+            let expected = if csv {
+                vec![group, "CN=ops,O=Acme"]
+            } else {
+                vec![group]
+            };
+            assert_eq!(request.groups, expected);
+            assert_eq!(request.roles, expected);
+        }
+    }
+}
+
+#[test]
+fn memberships_quoted_dns_match_group_globs_in_both_request_paths() {
+    let policy = policy();
+    let params = ServiceParams::from([
+        ("x-user".into(), vec!["alice".into()]),
+        (
+            "x-groups".into(),
+            vec![
+                r#""CN=admins,OU=eng"#.into(),
+                r#"O=Acme", "CN=ops,O=Acme", plain-group"#.into(),
+            ],
+        ),
+    ]);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-user", "alice".parse().unwrap());
+    for value in &params["x-groups"] {
+        headers.append("x-groups", value.parse().unwrap());
+    }
+    let rules = harnx_core::access_rules::AccessRules::from_yaml(
+        "rules:\n  - agents: [admins]\n    groups: ['CN=admins,OU=*,O=Acme']\n  - agents: [ops]\n    groups: ['CN=ops,O=*']\n",
+    ).unwrap();
+    for request in [
+        policy.resolve_request(&headers).unwrap(),
+        policy.resolve_request_params(&params).unwrap(),
+    ] {
+        assert_eq!(
+            request.groups,
+            ["CN=admins,OU=eng,O=Acme", "CN=ops,O=Acme", "plain-group"]
+        );
+        assert_eq!(request.principal.user_id(), Some("alice"));
+        let caller = request.caller();
+        assert!(rules.can_create_session("admins", caller.view()));
+        assert!(rules.can_create_session("ops", caller.view()));
+    }
+}
+
+#[test]
+fn memberships_invalid_quoting_fails_closed_in_both_request_paths() {
+    let policy = policy();
+    for name in ["x-groups", "x-other-groups", "x-roles"] {
+        for raw in [r#""secret"#, r#""secret"junk, admin"#] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-user", "alice".parse().unwrap());
+            headers.insert(name, raw.parse().unwrap());
+            let params = ServiceParams::from([
+                ("x-user".into(), vec!["alice".into()]),
+                (name.into(), vec![raw.into()]),
+            ]);
+            for error in [
+                policy.resolve_request(&headers).unwrap_err(),
+                policy.resolve_request_params(&params).unwrap_err(),
+            ] {
+                assert_eq!(error.code, MISSING_IDENTITY_CODE);
+                assert!(!error.message.contains("secret"));
+            }
+        }
     }
 }
 
@@ -80,8 +188,12 @@ fn memberships_never_replace_user_or_authentication() {
             policy.resolve_request(&headers).unwrap_err().code,
             MISSING_IDENTITY_CODE
         );
-        let anonymous =
-            Identity::with_memberships(&[], &["x-groups".into()], &["x-roles".into()]).unwrap();
+        let anonymous = Identity::with_memberships(
+            &[],
+            &["header-csv:x-groups".into()],
+            &["header-csv:x-roles".into()],
+        )
+        .unwrap();
         assert!(anonymous.validate_access_rules(true).is_err());
         let request = anonymous.resolve_request(&headers).unwrap();
         assert_eq!(request.principal, Principal::Anonymous);
@@ -115,8 +227,8 @@ fn memberships_merge_through_service_params() {
     // Test that merge happens correctly through resolve_request_params
     let policy = Identity::with_memberships(
         &["x-user".into()],
-        &["x-groups".into()],
-        &["x-roles".into()],
+        &["header-csv:x-groups".into()],
+        &["header-csv:x-roles".into()],
     )
     .unwrap()
     .with_user_aliases(Some(Arc::new(
@@ -149,7 +261,8 @@ async fn memberships_invalid_config_fails_before_exports_with_or_without_rules()
         for flag in ["--group-header", "--role-header"] {
             for name in [
                 "invalid name",
-                "header:x-members",
+                "header-csv:",
+                "bearer-claim:groups",
                 "cookie:members",
                 "x-good,x-other",
             ] {

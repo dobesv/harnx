@@ -31,6 +31,7 @@ fn server_config(name: &str, bin: &str) -> Result<ToolServerConfig> {
         binary.display()
     );
     Ok(ToolServerConfig {
+        middleware: Default::default(),
         name: name.to_owned(),
         command: binary.to_string_lossy().into_owned(),
         args: vec!["--name".to_owned(), name.to_owned()],

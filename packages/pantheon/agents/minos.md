@@ -1,9 +1,9 @@
 ---
 role: subagent
-model: gemini:gemini-4-argon
+model: gemini:gemini-4-neon
 model_fallbacks:
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
 - bedrock:us.zai.glm-5.3
 compaction_agent: compact-reviewer
@@ -29,7 +29,7 @@ use_tools:
 description: "Methodical auditor \u2014 systematically verifies code review findings\
   \ by tracing evidence chains, checking cited code, and rendering verdicts. Named\
   \ after Minos (MY-nos), judge of the Underworld who weighed the deeds of the deceased.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

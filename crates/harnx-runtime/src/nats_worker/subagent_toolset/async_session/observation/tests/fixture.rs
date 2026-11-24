@@ -91,6 +91,9 @@ impl Fixture {
             None => toolset,
         };
         let request = ToolRequest {
+            user_id: None,
+            input_responses: None,
+            request_state: None,
             operation_id: "operation".into(),
             call_id: "original-prompt".into(),
             tool: "session_send".into(),
@@ -261,6 +264,7 @@ pub(super) async fn block(f: &Fixture) -> Result<()> {
 pub(super) async fn settled_round(f: &Fixture, call_id: &str) -> Result<()> {
     f.append(tool_calls(call_id, "ping")).await?;
     f.append(SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results: vec![],
         timestamp: None,
     })
@@ -293,10 +297,7 @@ pub(super) fn assert_pending(value: &Value, wait_expired: bool) {
 pub(super) fn assert_unprovable(value: &Value, wait_expired: bool) {
     assert_eq!(value["status"], "unknown");
     assert_eq!(value["wait_expired"], wait_expired);
-    assert_eq!(
-        value["output"]["observation"]["error"],
-        "live_state_unprovable"
-    );
+    assert_eq!(value["observation"]["error"], "live_state_unprovable");
 }
 
 pub(super) async fn assert_initial_dispatch_unchanged(f: &Fixture) -> Result<()> {

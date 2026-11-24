@@ -21,7 +21,7 @@ fn test_hook_passthrough_to_clap() {
     // Hook group is removed; remaining args have normal flags
     let raw = vec![
         "--hook".to_string(),
-        "claude-command".to_string(),
+        "environment".to_string(),
         "echo".to_string(),
         ";".to_string(),
         "--no-network".to_string(),
@@ -31,6 +31,26 @@ fn test_hook_passthrough_to_clap() {
     let (hooks, remaining) = pre_parse_hooks(raw).expect("parse");
     assert_eq!(hooks.len(), 1);
     assert_eq!(remaining, vec!["--no-network", "--", "ls"]);
+}
+
+#[test]
+fn test_parse_environment_hook_syntax() {
+    let raw = vec![
+        "--hook".to_string(),
+        "environment".to_string(),
+        "harnx-proxy-auth".to_string(),
+        "--mcp-stdio".to_string(),
+        ";".to_string(),
+        "--".to_string(),
+        "curl".to_string(),
+        "https://example.com".to_string(),
+    ];
+    let (hooks, remaining) = pre_parse_hooks(raw).expect("parse");
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks[0].hook_type, "environment");
+    assert_eq!(hooks[0].command, "harnx-proxy-auth");
+    assert_eq!(hooks[0].args, vec!["--mcp-stdio"]);
+    assert_eq!(remaining, vec!["--", "curl", "https://example.com"]);
 }
 
 #[test]

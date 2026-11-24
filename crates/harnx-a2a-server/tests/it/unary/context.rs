@@ -148,17 +148,25 @@ async fn setup_busy_and_complete(http: &Http) -> Result<Value> {
     let first = http.working(message("dedupe", None)).await?;
     let retry = http.working(message("dedupe", None)).await?;
     assert_eq!(first["id"], retry["id"]);
-    let busy = http
-        .rpc(
-            "SendMessage",
-            json!({"message": message("busy", Some(&first["contextId"]))}),
-        )
+    // A second message to the running context steers into the live turn and
+    // answers on the same task instead of the old -32000 busy rejection
+    // (issue #2774). Steer only once the running turn's model request is in
+    // flight; the steering join targets a live turn. The Text script has no
+    // tool round, so a continuation round answers the steered row after the
+    // main round ends.
+    // Bounded: a wedged model round must fail the test, not hang it.
+    tokio::time::timeout(DEADLINE, http.h.llm.requested.notified())
+        .await
+        .context("model round never started")?;
+    let steered = http
+        .working(message("busy", Some(&first["contextId"])))
         .await?;
-    code(&busy, -32000);
-    assert!(busy["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("retry later"));
+    assert_eq!(steered["id"], first["id"]);
+    // Release the running round, prove the continuation round that answers
+    // the steered row registered its own waiter, then release it; the task
+    // settles with that row covered.
+    http.h.llm.release.notify_one();
+    crate::support::llm_requested_count(&http.h, 2).await?;
     http.h.llm.release.notify_one();
     http.completed(&first["id"]).await?;
     Ok(first)
@@ -202,12 +210,14 @@ async fn assert_terminal_cancel_fails(http: &Http, first: &Value) -> Result<()> 
         cancel["error"]["message"],
         a2a_lf::A2AError::task_not_cancelable(first["id"].as_str().unwrap()).message
     );
-    assert_eq!(http.h.llm.requests.lock().len(), 1);
+    // Round 1 answers the root prompt; round 2 is the continuation that
+    // answered the steered row (issue #2774).
+    assert_eq!(http.h.llm.requests.lock().len(), 2);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unary_dedupe_busy_terminal_and_fingerprint_mismatch() -> Result<()> {
+async fn unary_dedupe_steering_terminal_and_fingerprint_mismatch() -> Result<()> {
     let http = Http::start().await?;
     let first = setup_busy_and_complete(&http).await?;
     assert_terminal_dedupe_and_mismatch(&http, &first).await?;

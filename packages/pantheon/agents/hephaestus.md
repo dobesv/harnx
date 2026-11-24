@@ -1,10 +1,10 @@
 ---
 role: subagent
-model: codex:gpt-6.1-sol:high
+model: codex:gpt-6.2-sol:high
 model_fallbacks:
-- openai:gpt-6.1-sol:high
+- openai:gpt-6.2-sol:high
 - claude:claude-opus-5-5
-- gemini:gemini-4-argon
+- gemini:gemini-4-neon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-dev
 use_tools:
@@ -44,7 +44,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Deep work and complex refactoring specialist — grinds through autonomous, heavy-duty problem-solving at the forge. Named after Hephaestus (heh-FES-tus), the Divine Blacksmith.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

@@ -11,6 +11,10 @@ import {
   listSessions,
   sendPrompt,
   uploadAttachment,
+  submitInteractionResponse,
+  InteractionResponseError,
+  submitSurfaceAction,
+  SurfaceActionError,
 } from '../api';
 
 const fetchMock = vi.fn();
@@ -500,6 +504,344 @@ describe('api.ts', () => {
       await expect(
         getSessionHistory('agent1', 'session1', { before_compaction: 999 }),
       ).rejects.toThrow('RPC Error: invalid sequence');
+    });
+  });
+  describe('submitInteractionResponse', () => {
+    it('sends exact JSON-RPC params for approve without note', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { applied: true, outcome: 'applied' },
+        }),
+      });
+
+      const res = await submitInteractionResponse('test-agent', 'test-session', {
+        interactionId: 'int-123',
+        requestSeq: 7,
+        response: {
+          action: 'approve',
+          data: {},
+        },
+      });
+
+      expect(res).toEqual({ applied: true, outcome: 'applied' });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe('/v1/agents/test-agent/sessions/test-session');
+      expect(init.method).toBe('POST');
+      expect(init.headers).toEqual({ 'Content-Type': 'application/json' });
+      expect(JSON.parse(init.body)).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/interaction_response',
+        params: {
+          interaction_id: 'int-123',
+          request_seq: 7,
+          response: {
+            action: 'approve',
+            data: {},
+          },
+        },
+      });
+    });
+
+    it('sends exact JSON-RPC params for deny with trimmed note', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { applied: true, outcome: 'applied' },
+        }),
+      });
+
+      const res = await submitInteractionResponse('test-agent', 'test-session', {
+        interactionId: 'int-456',
+        requestSeq: 12,
+        response: {
+          action: 'deny',
+          data: { reason_code: 'user_cancelled' },
+          note: '  not safe to run  ',
+        },
+      });
+
+      expect(res).toEqual({ applied: true, outcome: 'applied' });
+      const [, init] = fetchMock.mock.calls[0];
+      expect(JSON.parse(init.body)).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/interaction_response',
+        params: {
+          interaction_id: 'int-456',
+          request_seq: 12,
+          response: {
+            action: 'deny',
+            data: { reason_code: 'user_cancelled' },
+            note: 'not safe to run',
+          },
+        },
+      });
+    });
+
+    it('handles already_applied success outcome', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { applied: true, outcome: 'already_applied' },
+        }),
+      });
+
+      const res = await submitInteractionResponse('test-agent', 'test-session', {
+        interactionId: 'int-123',
+        requestSeq: 7,
+        response: { action: 'approve' },
+      });
+
+      expect(res).toEqual({ applied: true, outcome: 'already_applied' });
+    });
+
+    it.each([
+      'stale',
+      'conflicting',
+      'wrong_sequence',
+      'after_complete',
+      'lease_lost',
+    ] as const)('handles rejected JSON-RPC error -32004 with outcome %s', async (outcome) => {
+      fetchMock.mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          error: {
+            code: -32004,
+            message: 'interaction response rejected',
+            data: { outcome },
+          },
+        }),
+      });
+
+      await expect(
+        submitInteractionResponse('test-agent', 'test-session', {
+          interactionId: 'int-stale',
+          requestSeq: 3,
+          response: { action: 'approve' },
+        }),
+      ).rejects.toSatisfy((err: unknown) => {
+        expect(err).toBeInstanceOf(InteractionResponseError);
+        const interErr = err as InteractionResponseError;
+        expect(interErr.code).toBe(-32004);
+        expect(interErr.message).toBe('interaction response rejected');
+        expect(interErr.outcome).toBe(outcome);
+        expect(interErr.data).toEqual({ outcome });
+        return true;
+      });
+    });
+
+    it.each([
+      ['applied: false', { applied: false, outcome: 'applied' }],
+      ['missing outcome', { applied: true }],
+      ['invalid outcome', { applied: true, outcome: 'invalid_outcome' }],
+      ['missing result', null],
+      ['non-object result', 'success'],
+    ])('throws when result is malformed (%s)', async (_, malformedResult) => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: malformedResult,
+        }),
+      });
+
+      await expect(
+        submitInteractionResponse('test-agent', 'test-session', {
+          interactionId: 'int-123',
+          requestSeq: 1,
+          response: { action: 'approve' },
+        }),
+      ).rejects.toThrow('RPC call returned malformed interaction response result');
+    });
+
+    it('throws on HTTP network/transport failure', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: false,
+        status: 502,
+        statusText: 'Bad Gateway',
+        json: async () => {
+          throw new Error('Not JSON');
+        },
+      });
+
+      await expect(
+        submitInteractionResponse('test-agent', 'test-session', {
+          interactionId: 'int-err',
+          requestSeq: 1,
+          response: { action: 'approve' },
+        }),
+      ).rejects.toThrow('RPC call failed with HTTP 502');
+    });
+  });
+
+  describe('submitSurfaceAction', () => {
+    it('sends exact JSON-RPC params for declared button action without note or user_message', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { applied: true, outcome: 'applied' },
+        }),
+      });
+
+      const res = await submitSurfaceAction('test-agent', 'test-session', {
+        surfaceId: 'surf-1',
+        publishSeq: 5,
+        response: {
+          action: 'deploy',
+          data: { env: 'prod' },
+        },
+      });
+
+      expect(res).toEqual({ applied: true, outcome: 'applied' });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe('/v1/agents/test-agent/sessions/test-session');
+      expect(init.method).toBe('POST');
+      expect(init.headers).toEqual({ 'Content-Type': 'application/json' });
+      expect(JSON.parse(init.body)).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/surface_action',
+        params: {
+          surface_id: 'surf-1',
+          publish_seq: 5,
+          response: {
+            action: 'deploy',
+            data: { env: 'prod' },
+          },
+        },
+      });
+    });
+
+    it('sends optional note and user_message when present', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { applied: true, outcome: 'already_applied' },
+        }),
+      });
+
+      const res = await submitSurfaceAction('test-agent', 'test-session', {
+        surfaceId: 'surf-2',
+        publishSeq: 12,
+        response: {
+          action: 'confirm',
+          data: {},
+          note: '  operator note  ',
+        },
+        userMessage: '  please proceed  ',
+      });
+
+      expect(res).toEqual({ applied: true, outcome: 'already_applied' });
+      const [, init] = fetchMock.mock.calls[0];
+      expect(JSON.parse(init.body)).toEqual({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/surface_action',
+        params: {
+          surface_id: 'surf-2',
+          publish_seq: 12,
+          response: {
+            action: 'confirm',
+            data: {},
+            note: 'operator note',
+          },
+          user_message: 'please proceed',
+        },
+      });
+    });
+
+    it.each([
+      'conflicting',
+      'unknown_surface',
+      'undeclared_action',
+      'invalid_visibility',
+      'invalid_data',
+      'unauthorized_tool',
+    ])('throws SurfaceActionError on rejection outcome (%s)', async (outcome) => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          error: {
+            code: -32004,
+            message: 'surface action rejected',
+            data: { outcome },
+          },
+        }),
+      });
+
+      await expect(
+        submitSurfaceAction('test-agent', 'test-session', {
+          surfaceId: 'surf-1',
+          publishSeq: 1,
+          response: { action: 'test' },
+        }),
+      ).rejects.toSatisfy((err: unknown) => {
+        expect(err).toBeInstanceOf(SurfaceActionError);
+        const surfErr = err as SurfaceActionError;
+        expect(surfErr.code).toBe(-32004);
+        expect(surfErr.message).toBe('surface action rejected');
+        expect(surfErr.outcome).toBe(outcome);
+        expect(surfErr.data).toEqual({ outcome });
+        return true;
+      });
+    });
+
+    it('throws when result is malformed', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { applied: false, outcome: 'applied' },
+        }),
+      });
+
+      await expect(
+        submitSurfaceAction('test-agent', 'test-session', {
+          surfaceId: 'surf-1',
+          publishSeq: 1,
+          response: { action: 'test' },
+        }),
+      ).rejects.toThrow('RPC call returned malformed surface action result');
+    });
+
+    it('throws on HTTP network/transport failure', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        statusText: 'Service Unavailable',
+        json: async () => {
+          throw new Error('Not JSON');
+        },
+      });
+
+      await expect(
+        submitSurfaceAction('test-agent', 'test-session', {
+          surfaceId: 'surf-1',
+          publishSeq: 1,
+          response: { action: 'test' },
+        }),
+      ).rejects.toThrow('RPC call failed with HTTP 503');
     });
   });
 });

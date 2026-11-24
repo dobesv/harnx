@@ -8,14 +8,21 @@ use http::StatusCode;
 use multer::Multipart;
 use serde_json::json;
 
+mod upload_store;
+
+pub(super) use upload_store::{attachment_store_error, AttachmentObjectStore, UploadPutError};
+
 use crate::{is_safe_agent_path, is_safe_path_segment, percent_decode, MAX_UPLOAD_BYTES};
 
-pub(super) async fn save_attachment_file(
+/// Store the blob locally and return its identity: the same `CidUrl` the
+/// response ref is built from, whose `kv_key()` is also the object-store key
+/// the blob is published under.
+async fn save_attachment_file(
     attachments_dir: &Path,
     attachment_session: &SessionRef,
     data: &[u8],
     mime: &str,
-) -> Result<String> {
+) -> Result<CidUrl> {
     let stored_cid = store_attachment_bytes_async(attachments_dir, data, mime).await?;
     let hash = stored_cid
         .strip_prefix(CID_PREFIX)
@@ -23,8 +30,7 @@ pub(super) async fn save_attachment_file(
     Ok(CidUrl::Media {
         session: attachment_session.clone(),
         hash: hash.to_string(),
-    }
-    .to_string())
+    })
 }
 
 pub(super) async fn read_cached_or_nats_attachment(
@@ -41,12 +47,13 @@ pub(super) async fn read_cached_or_nats_attachment(
     }
 }
 
-type AttachmentUploadError = (StatusCode, serde_json::Value);
+pub(super) type AttachmentUploadError = (StatusCode, serde_json::Value);
 
 async fn process_field(
     field: multer::Field<'_>,
     attachments_dir: &Path,
     attachment_session: &SessionRef,
+    object_store: &mut AttachmentObjectStore<'_>,
     refs: &mut Vec<String>,
 ) -> Result<Option<AttachmentUploadError>> {
     let name = field.name().unwrap_or_default().to_string();
@@ -83,7 +90,29 @@ async fn process_field(
         )));
     }
 
-    refs.push(save_attachment_file(attachments_dir, attachment_session, &data, &mime).await?);
+    // Local write first: it is the content-addressed warm cache, and the hash
+    // the returned ref is built from comes from this store. A NATS failure may
+    // leave this file behind; that is a stale cache entry, not a correctness
+    // problem.
+    let url = save_attachment_file(attachments_dir, attachment_session, &data, &mime).await?;
+    match object_store.put(&url, &data, &mime).await {
+        Ok(()) => {}
+        Err(UploadPutError::Store(error)) => {
+            return Ok(Some(attachment_store_error(error)));
+        }
+        Err(UploadPutError::SessionGone) => {
+            // The session this upload addresses was deleted (or recreated
+            // with a new incarnation) while this part was being stored. 404
+            // matches how the rest of the API answers a missing session: the
+            // client is addressing a session identity that no longer exists,
+            // whether it was deleted or replaced under the same id.
+            return Ok(Some((
+                StatusCode::NOT_FOUND,
+                json!({"error": "session no longer exists"}),
+            )));
+        }
+    }
+    refs.push(url.to_string());
     Ok(None)
 }
 
@@ -92,6 +121,7 @@ pub(super) async fn process_multipart_upload(
     boundary: String,
     attachments_dir: &Path,
     attachment_session: &SessionRef,
+    object_store: &mut AttachmentObjectStore<'_>,
 ) -> Result<Result<Vec<String>, AttachmentUploadError>> {
     let stream =
         futures_util::stream::once(
@@ -105,8 +135,14 @@ pub(super) async fn process_multipart_upload(
         .await
         .map_err(|err| anyhow!("Bad Request: {err}"))?
     {
-        if let Some(error) =
-            process_field(field, attachments_dir, attachment_session, &mut refs).await?
+        if let Some(error) = process_field(
+            field,
+            attachments_dir,
+            attachment_session,
+            object_store,
+            &mut refs,
+        )
+        .await?
         {
             return Ok(Err(error));
         }

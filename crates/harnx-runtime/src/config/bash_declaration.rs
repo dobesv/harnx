@@ -35,7 +35,7 @@ pub(crate) fn synthesize_bash_declaration(inner_tools: &[ToolDeclaration]) -> To
             },
             "max_output_bytes": {
                 "type": "integer",
-                "description": "Truncate the script output to this many bytes."
+                "description": "Truncate the script output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window."
             }
         },
         "required": ["script"]
@@ -68,6 +68,7 @@ fn bash_tool_description(inner_tools: &[ToolDeclaration]) -> String {
             name: tool.name.clone(),
             description: tool.description.clone(),
             schema: tool.parameters.as_value().clone(),
+            output: None,
         })
         .collect();
     harnx_script::description::bash_tool_description(

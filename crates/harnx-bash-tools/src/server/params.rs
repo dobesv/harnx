@@ -1,5 +1,8 @@
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;
+use crate::tool_template::output::{
+    HEAD_LINES_DESCRIPTION, MAX_OUTPUT_BYTES_DESCRIPTION, TAIL_LINES_DESCRIPTION,
+};
 
 #[cfg(test)]
 mod tests;
@@ -40,9 +43,9 @@ impl JsonSchema for ExecCommandParams {
                 ("command", "Bash command to execute. Avoid shell pipes like | head, | tail, | grep — use head_lines, tail_lines, max_output_bytes instead. For multi-line Python/Node/Ruby/etc. scripts, start the command with a shebang line (e.g. #!/usr/bin/env python3) and write the script body on subsequent lines — the correct interpreter will be used automatically.", command),
                 ("working_dir", "Working directory for the command. Defaults to the project root.", working_dir),
                 ("timeout_secs", "Kill the command after this many seconds, 1 to 86400. Defaults to 86400 (24 hours).", timeout_secs),
-                ("head_lines", "Return only the first N lines of combined output. Prefer this over `| head -N` in the command.", head_lines),
-                ("tail_lines", "Return only the last N lines of combined output. Prefer this over `| tail -N` in the command.", tail_lines),
-                ("max_output_bytes", "Truncate output to this many bytes. Prefer this over `| head -c N` in the command.", max_output_bytes),
+                ("head_lines", HEAD_LINES_DESCRIPTION, head_lines),
+                ("tail_lines", TAIL_LINES_DESCRIPTION, tail_lines),
+                ("max_output_bytes", MAX_OUTPUT_BYTES_DESCRIPTION, max_output_bytes),
                 ("env", "Additional environment variables for the command. Merged on top of the server's environment; per-call overrides only.", env),
             ],
             &["command"],
@@ -105,7 +108,7 @@ impl JsonSchema for ReadExecLogParams {
                 ("tail_lines", "Return only the last N lines.", tail_lines),
                 (
                     "max_output_bytes",
-                    "Truncate output to this many bytes.",
+                    "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window.",
                     max_output_bytes,
                 ),
             ],
@@ -242,7 +245,7 @@ impl WaitOptions {
         vec![
             ("head_lines", "Return only the first N lines of output. Prefer this over post-processing with head.", head_lines),
             ("tail_lines", "Return only the last N lines of output. Prefer this over post-processing with tail.", tail_lines),
-            ("max_output_bytes", "Truncate output to this many bytes.", max_output_bytes),
+            ("max_output_bytes", "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window.", max_output_bytes),
             ("grep", "Filter output lines by regex.", grep),
         ]
     }

@@ -404,7 +404,7 @@ pub(super) fn spawn_metis_worker_with_hooks(
     let worker_config = Config {
         data: harnx_core::config_data::ConfigData {
             model_id: "test:test-model".to_string(),
-            hooks,
+            hooks: hooks.map(Box::new),
             ..Default::default()
         },
         agent: Some(crate::config::Agent::new(worker_agent)),
@@ -618,6 +618,7 @@ fn test_orphan_partition_logic() {
 #[test]
 fn test_non_idempotent_output_is_synthesized() {
     let lost = ToolOutput {
+        user_surfaces: Vec::new(),
         id: Some("call_1".to_string()),
         name: "write_file".to_string(),
         output: json!({
@@ -1348,11 +1349,21 @@ async fn subagent_silent_turn_waits_for_lease_backed_completion() {
 // Nested delegation exercises the production worker activation path. A fixed
 // budget below Tokio's default catches oversized async frames on Linux too,
 // rather than relying on platform-specific code generation to expose them.
+// The nested path uses roughly 1.5 MB of worker stack: measured by bounding
+// the stack from an env override (Linux, dev profile), main at 7261cb51e
+// passes a 1,528,000-byte stack and aborts at 1,520,000, and steering
+// (issue #2774) passes 1,536,000 and aborts at 1,528,000 — steering adds
+// ~8 KB to an already tight budget, and MSVC's larger frames overflowed
+// the original 1536 KiB limit on Windows. Keep 256 KiB of headroom below
+// Tokio's 2 MiB default for ordinary growth in the shared turn path; a
+// genuinely oversized frame still trips this well before the default does.
+const BOUNDED_WORKER_STACK: usize = 1792 * 1024;
+
 fn run_with_bounded_worker_stack(future: impl std::future::Future<Output = ()>) {
     harnx_core::require_nextest();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
-        .thread_stack_size(1536 * 1024)
+        .thread_stack_size(BOUNDED_WORKER_STACK)
         .enable_all()
         .build()
         .expect("build bounded-stack runtime")

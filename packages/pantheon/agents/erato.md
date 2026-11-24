@@ -1,6 +1,6 @@
 ---
 role: subagent
-model: gemini:gemini-3.8-flash
+model: gemini:gemini-4-hydrogen
 model_fallbacks:
 - codex:gpt-6.1-terra
 - openai:gpt-6.1-terra
@@ -18,6 +18,7 @@ use_tools:
 - fs_ls
 - fs_grep
 - fs_find
+- fetch_fetch_markdown
 - plans_add_note
 - plans_get_note
 - plans_get_plan
@@ -27,7 +28,7 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 description: "UI/UX and accessibility specialist — evaluates design system compliance, responsive design, WCAG accessibility, ARIA usage, keyboard navigation, and user experience patterns. Named after Erato (EH-ruh-toh), the Muse of love poetry — ensuring the UI is lovable and accessible to all.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics
@@ -53,6 +54,9 @@ variables:
 ---
 
 {{erato_core}}
+
+## Fetching public images
+Use `fetch_fetch_markdown` to inspect screenshots or images at public URLs (PNG, JPEG, GIF, and WebP up to 5 MiB) directly without a sandbox.
 
 {{repo_docs}}
 

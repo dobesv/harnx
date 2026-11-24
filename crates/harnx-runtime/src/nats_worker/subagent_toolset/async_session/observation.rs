@@ -3,6 +3,10 @@
 mod budget;
 mod load;
 mod output;
+mod pending;
+#[cfg(test)]
+mod pending_tests;
+pub(in crate::nats_worker::subagent_toolset) use pending::attach_pending_progress;
 mod repair;
 mod scope;
 mod snapshot;
@@ -23,8 +27,9 @@ pub(in crate::nats_worker::subagent_toolset) use load::{
 
 use super::super::{normalize_session_id, SubagentToolset};
 use super::{
-    dispatch, parse_send_args, parse_wait_args, progress, DispatchConfirmation, PromptHandle,
-    ResolvedWait, SessionPromptResult, SessionPromptStatus, WaitStop,
+    dispatch, parse_send_args, parse_wait_args, progress, serialized_len, Activity,
+    DispatchConfirmation, LatestStep, Observation, PromptHandle, ResolvedWait, SessionPromptResult,
+    SessionPromptStatus, WaitStop, RESULT_MAX_BYTES,
 };
 use crate::nats_worker::subagent_progress::SharedSnapshots;
 use budget::{Budget, BudgetStops};
@@ -38,6 +43,12 @@ use serde_json::Value;
 use snapshot::Snapshot;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+tokio::task_local! {
+    // Lets cancellation tests stop the caller after dispatch, inside observation.
+    pub(in crate::nats_worker::subagent_toolset) static OBSERVATION_ENTERED: std::sync::Arc<tokio::sync::Notify>;
+}
+
 /// Dispatch remains synchronous through durable acceptance; only observation
 /// has a soft budget. No future is spawned or left running when this returns.
 pub(in crate::nats_worker::subagent_toolset) async fn send(
@@ -46,7 +57,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn send(
     cancel: CancellationToken,
     context: ToolInvocationContext,
 ) -> Result<Value, ToolInvokeError> {
-    let (args, wait) = parse_send_args(arguments.clone()).map_err(ToolInvokeError::Recoverable)?;
+    let (args, _) = parse_send_args(arguments.clone()).map_err(ToolInvokeError::Recoverable)?;
     let prospective = PromptHandle {
         session_id: context
             .checkpoint
@@ -57,11 +68,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn send(
             .unwrap_or_else(|| "000000".into()),
         prompt_id: context.call_id.clone(),
     };
-    let max_bytes = wait.as_ref().map_or(
-        super::super::session_read::DEFAULT_MAX_OUTPUT_BYTES as usize,
-        |w| w.read.max_output_bytes,
-    );
-    Frame::new(&prospective, max_bytes).preflight(Some(&context.call_id))?;
+    Frame::new(&prospective, RESULT_MAX_BYTES).preflight(Some(&context.call_id))?;
     let (dispatched, wait) =
         dispatch::dispatch_send(toolset, arguments, cancel.clone(), context.clone()).await?;
     // The prompt is durably admitted and activated: announce it as Running
@@ -94,7 +101,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn send(
         )
         .await
     } else {
-        let mut frame = Frame::new(&dispatched.handle, max_bytes);
+        let mut frame = Frame::new(&dispatched.handle, RESULT_MAX_BYTES);
         frame.set_invocation(dispatched.prompt.execution_id());
         frame.result.dispatch = dispatched.dispatch;
         frame.result.status = if dispatched.dispatch.is_some() {
@@ -207,7 +214,7 @@ fn wait_watcher(
 }
 
 /// The wait's observation budget: single-pass when the caller's deadline is
-/// already reached (the caller still deserves one bounded page, as
+/// already reached (the caller still deserves one observation, as
 /// `session_load` takes), otherwise the full soft budget for the wait.
 fn observation_budget(
     wait: &ResolvedWait,
@@ -224,23 +231,29 @@ fn observation_budget(
     (budget, single_pass)
 }
 
-/// Close out a settled observation: the frame's result value plus the durable
-/// terminal summary attached to it, merged with the live watcher's last
-/// published snapshot. Everything the summary needs except the watcher share
-/// lives on the observer (toolset, wait budget ceiling); synchronous —
-/// publishing here is the caller's job.
+fn live_snapshot(
+    watcher_share: Option<&SharedSnapshots>,
+) -> Option<harnx_core::event::SubAgentProgress> {
+    watcher_share.and_then(|shared| shared.lock().expect("watcher share").clone())
+}
+
+/// Merge durable observation results with the watcher's last published snapshot.
+/// Publishing remains the caller's job.
 fn finish_with_terminal_progress(
     observer: &Observer<'_>,
-    frame: Frame,
+    mut frame: Frame,
     watcher_share: Option<&SharedSnapshots>,
 ) -> Value {
     let toolset = observer.toolset;
-    let max_bytes = observer.wait.read.max_output_bytes;
+    let max_bytes = RESULT_MAX_BYTES;
     let terminal = observer.snapshot.terminal_evidence();
     let observed = (
         frame.result.session_id.clone(),
         frame.result.prompt_id.clone(),
     );
+    if observer.wait.include_partial {
+        frame.set_live(live_snapshot(watcher_share));
+    }
     let mut value = frame.finish(&observer.budget);
     if let Some((status, usage)) = terminal {
         // Merge the live watcher's last published snapshot: title, tool count
@@ -250,15 +263,15 @@ fn finish_with_terminal_progress(
         // duration (F11). Read the cell held since `ensure_watcher`, not the
         // registry: the watcher may have exited and unregistered itself
         // before this summary is built.
-        let live = watcher_share.and_then(|shared| shared.lock().expect("watcher share").clone());
+        let live = live_snapshot(watcher_share);
         attach_terminal_progress(
             &mut value,
             toolset,
             TerminalSummary {
                 child: progress::ChildIdentity {
                     agent: toolset.agent.clone(),
-                    session_id: observed.0,
-                    prompt_id: observed.1,
+                    session_id: observed.0.clone(),
+                    prompt_id: observed.1.clone(),
                 },
                 status,
                 usage,
@@ -266,6 +279,15 @@ fn finish_with_terminal_progress(
                 max_bytes,
             },
         );
+    }
+    if let Some(pending) = observer.snapshot.pending_interaction(
+        &toolset.agent,
+        toolset.route.cluster(),
+        &observed.0,
+        observer.scope.admission.invocation_id.as_str(),
+    ) {
+        let live = live_snapshot(watcher_share);
+        attach_pending_progress(&mut value, pending, live, max_bytes);
     }
     value
 }
@@ -282,8 +304,10 @@ async fn observe(
         dispatch,
         tool_call_id,
     } = request;
+    #[cfg(test)]
+    let _ = OBSERVATION_ENTERED.try_with(|entered| entered.notify_one());
     let (budget, single_pass) = observation_budget(&wait, cancel, context);
-    let mut frame = Frame::new(&handle, wait.read.max_output_bytes);
+    let mut frame = Frame::new(&handle, RESULT_MAX_BYTES);
     frame.preflight(None)?;
     frame.result.dispatch = dispatch;
     let scope = match Scope::resolve(toolset, &handle, context, &budget).await {
@@ -396,8 +420,9 @@ impl Observer<'_> {
             let refresh = self.snapshot.refresh(&log, &self.scope, &self.budget).await;
             frame.update(&self.snapshot);
             refresh?;
-            // Cache a bounded partial page before sleeping. On expiry/cancellation
-            // there is no extra I/O allowance outside the absolute soft deadline.
+            // Record the latest step (or the settled reply) before sleeping. On
+            // expiry/cancellation there is no extra I/O allowance outside the
+            // absolute soft deadline.
             frame.render(self).await?;
             if self.single_pass {
                 return Err(Stop::CallerDeadline);

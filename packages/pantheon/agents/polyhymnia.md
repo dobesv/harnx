@@ -1,10 +1,10 @@
 ---
 role: subagent
-model: codex:gpt-6.1-sol
+model: codex:gpt-6.2-sol
 model_fallbacks:
-- openai:gpt-6.1-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
-- gemini:gemini-4-argon
+- gemini:gemini-4-neon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-reviewer
 use_tools:
@@ -35,7 +35,7 @@ description: "Privacy and compliance specialist \u2014 evaluates PII handling, d
   \ protection patterns, consent flows, data retention, logging practices, and regulatory\
   \ compliance. Named after Polyhymnia (pol-ee-HIM-nee-uh), the Muse of sacred poetry\
   \ \u2014 guardian of sacred personal data.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

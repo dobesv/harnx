@@ -1,12 +1,15 @@
 //! Media object store operations on the `harnx_attachments` bucket.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future, ops::Deref, time::Duration};
 
-use anyhow::{Context, Result};
-use async_nats::jetstream::{self, object_store, stream};
-use tokio::io::AsyncReadExt;
+use anyhow::{ensure, Context, Result};
+use async_nats::jetstream::{self, message::StreamMessage, object_store, stream};
+use base64::Engine as _;
+use futures_util::TryFutureExt;
+use tokio::{io::AsyncReadExt, time::Instant};
 
 use harnx_core::cid_url::CidUrl;
+use harnx_nats_common::leader_reads::{retry_transient, retry_transient_until};
 
 /// JetStream object-store bucket containing durable session attachment blobs.
 pub const ATTACHMENTS_BUCKET: &str = "harnx_attachments";
@@ -14,25 +17,79 @@ pub const ATTACHMENTS_BUCKET: &str = "harnx_attachments";
 /// Content type metadata key for the object store.
 const CONTENT_TYPE_METADATA_KEY: &str = "content_type";
 
+// Leave room beyond the 15 s recovery budget for sequential reads of large blobs.
+const LEADER_MEDIA_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The attachment object store and a handle for reading its stream leader.
+///
+/// `ObjectStore` doesn't expose its stream or context. Keep both handles so
+/// writes and leader reads always use the same JetStream account and domain.
+#[derive(Clone)]
+pub struct AttachmentsBucket {
+    store: object_store::ObjectStore,
+    stream: stream::Stream<()>,
+}
+
+impl AttachmentsBucket {
+    async fn new(jetstream: &jetstream::Context, store: object_store::ObjectStore) -> Result<Self> {
+        // This constructs a handle without a STREAM.INFO request.
+        let stream = jetstream
+            .get_stream_no_info(object_store_stream_name())
+            .await
+            .context("build the attachment object-store stream handle")?;
+        Ok(Self { store, stream })
+    }
+}
+
+impl Deref for AttachmentsBucket {
+    type Target = object_store::ObjectStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+/// The outcome of one media put: a dedup hit on an existing object, or a
+/// new committed version with the NUID that identifies exactly this
+/// attempt's chunks and metadata version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaPut {
+    /// An object with this key already existed and was left untouched; the
+    /// caller owns nothing and must not clean anything up.
+    DedupHit,
+    /// A new object version was committed under this NUID.
+    Written { nuid: String },
+}
+
 /// Put a media blob into the object store.
 ///
 /// The blob is stored at the key specified by `CidUrl::kv_key()`.
 pub async fn put_media(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     url: &CidUrl,
     bytes: &[u8],
     mime_type: &str,
 ) -> Result<()> {
-    put_media_chunked(
+    put_media_versioned(
         store,
         MediaBlob {
             url,
             bytes,
             mime_type,
         },
-        None,
     )
     .await
+    .map(|_| ())
+}
+
+/// [`put_media`] with the write outcome: a dedup hit or the NUID of the new
+/// version. The NUID scopes a later cleanup to exactly what this put
+/// committed (see [`purge_media_version`]).
+pub async fn put_media_versioned(
+    store: &AttachmentsBucket,
+    blob: MediaBlob<'_>,
+) -> Result<MediaPut> {
+    put_media_chunked(store, blob, None).await
 }
 
 /// A media object's identity, exact bytes and stored content type.
@@ -47,7 +104,7 @@ pub struct MediaBlob<'a> {
 /// broker's payload ceiling when it is smaller than the client's 128 KiB default.
 /// Object metadata still has to fit in a single message; failures propagate.
 pub async fn put_media_with_chunk_limit(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     blob: MediaBlob<'_>,
     max_chunk_bytes: usize,
 ) -> Result<()> {
@@ -55,25 +112,57 @@ pub async fn put_media_with_chunk_limit(
         max_chunk_bytes > 0,
         "attachment chunk limit must be positive"
     );
-    put_media_chunked(store, blob, Some(max_chunk_bytes.min(128 * 1024))).await
+    put_media_chunked(store, blob, Some(max_chunk_bytes.min(128 * 1024)))
+        .await
+        .map(|_| ())
+}
+
+/// Identifies the metadata message one put wrote. `ObjectStore::put` does
+/// not return the NUID it generated when the put fails, so the
+/// `PurgeOldChunks` recovery (which fires after the new metadata is
+/// acknowledged) can only prove the version it reads back is this put's own
+/// by a marker stored in the metadata itself. Readers that only want the
+/// content type ignore it.
+const PUT_ID_METADATA_KEY: &str = "harnx_put_id";
+
+/// A fresh put identifier: content-addressed keys can be written
+/// concurrently by this process or another replica, so a random UUID (not a
+/// per-process counter or the wall clock) keeps the recovery's version
+/// proof unique across replicas.
+fn fresh_put_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 async fn put_media_chunked(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     blob: MediaBlob<'_>,
     chunk_size: Option<usize>,
-) -> Result<()> {
+) -> Result<MediaPut> {
     let MediaBlob {
         url,
         bytes,
         mime_type,
     } = blob;
     let key = url.kv_key();
-    if store.info(&key).await.is_ok() {
-        return Ok(()); // Already exists, skip duplicate put
+    // The dedup probe is optional, but its failure is the typed evidence a
+    // later put failure has none of: `ObjectStore::put` stringifies its
+    // chunk and metadata publish errors, so a hung JetStream behind a live
+    // TCP connection looks like a store failure, not unavailability. Keep
+    // the probe's error so the put's failure can chain it.
+    let mut probe_error = None;
+    match leader_media_info(store, &key).await {
+        Ok(Some(info)) if !info.deleted => return Ok(MediaPut::DedupHit),
+        Ok(_) => {}
+        Err(error) => {
+            // Dedup is optional: a content-addressed put can be repeated.
+            log::debug!("media dedup probe failed; attempting put: {error:#}");
+            probe_error = Some(error);
+        }
     }
     let mut metadata = HashMap::new();
     metadata.insert(CONTENT_TYPE_METADATA_KEY.to_string(), mime_type.to_string());
+    let put_id = fresh_put_id();
+    metadata.insert(PUT_ID_METADATA_KEY.to_string(), put_id.clone());
     let object = object_store::ObjectMetadata {
         name: key.clone(),
         description: Some(format!("Attachment {}", url)),
@@ -82,12 +171,80 @@ async fn put_media_chunked(
         ..Default::default()
     };
     let mut cursor = std::io::Cursor::new(bytes);
-    store
-        .put(object, &mut cursor)
-        .await
-        .with_context(|| format!("failed to put media blob '{}'", key))?;
+    match store.put(object, &mut cursor).await {
+        Ok(written) => Ok(MediaPut::Written { nuid: written.nuid }),
+        Err(error) if error.kind() == object_store::PutErrorKind::PurgeOldChunks => {
+            committed_after_failed_cleanup(store, &key, &put_id, error).await
+        }
+        Err(error) => Err(put_failure(probe_error, error, &key)),
+    }
+}
 
-    Ok(())
+/// The put's failure, with the dedup probe's typed evidence chained when the
+/// probe also failed. `ObjectStore::put` publishes chunks and metadata with
+/// stringified causes, so the probe's typed chain — which names the same
+/// JetStream the put then failed against — is the availability evidence a
+/// caller's classification needs. The put's own failure stays visible as
+/// the context message.
+fn put_failure(
+    probe_error: Option<anyhow::Error>,
+    put_error: object_store::PutError,
+    key: &str,
+) -> anyhow::Error {
+    let put_error =
+        anyhow::Error::new(put_error).context(format!("failed to put media blob '{key}'"));
+    match probe_error {
+        Some(probe) => probe.context(format!(
+            "failed to put media blob '{key}' after a failed dedup probe: {put_error:#}"
+        )),
+        None => put_error,
+    }
+}
+
+/// `ObjectStore::put` acknowledges the new metadata before purging the
+/// previous version's chunks, so a `PurgeOldChunks` failure means this put's
+/// version is committed. Report the commit, not the cleanup: the caller's
+/// recheck and its own version-scoped cleanup still apply to the committed
+/// NUID, and the orphaned old chunks are the known invisible-orphan class.
+///
+/// The NUID is read back from the leader because the failed put does not
+/// return it — and only reported when that version is provably this put's
+/// own, by the `PUT_ID_METADATA_KEY` marker the put stored in its metadata.
+/// The leader's current version may instead be a concurrent same-key put's
+/// (it superseded this one between the commit and the re-read); reporting
+/// its NUID would hand the caller's version-scoped cleanup someone else's
+/// object, so anything unproven — a foreign or deleted version, no record,
+/// or a failed re-read — surfaces as an error and purges nothing. Both
+/// failures stay visible when the confirmation read fails too.
+async fn committed_after_failed_cleanup(
+    store: &AttachmentsBucket,
+    key: &str,
+    put_id: &str,
+    cleanup_error: object_store::PutError,
+) -> Result<MediaPut> {
+    log::warn!(
+        "committed media blob '{key}' but failed to purge the previous version's chunks: {cleanup_error}"
+    );
+    match leader_media_version(store, key).await {
+        Ok(Some((_, info))) => {
+            if !info.deleted && info.metadata.get(PUT_ID_METADATA_KEY).is_some_and(|id| id == put_id) {
+                return Ok(MediaPut::Written {
+                    nuid: info.nuid.clone(),
+                });
+            }
+            Err(anyhow::Error::msg(format!(
+                "committed media blob '{key}' but cannot confirm its version: the leader's current metadata is not this put's own (deleted: {}, this put's id present: {}): {cleanup_error}",
+                info.deleted,
+                info.metadata.contains_key(PUT_ID_METADATA_KEY)
+            )))
+        }
+        Ok(None) => Err(anyhow::Error::msg(format!(
+            "committed media blob '{key}' but cannot confirm its version: no leader metadata after a failed chunk cleanup: {cleanup_error}"
+        ))),
+        Err(read_error) => Err(read_error.context(format!(
+            "committed media blob '{key}' but cannot confirm its version after a failed chunk cleanup: {cleanup_error}"
+        ))),
+    }
 }
 
 /// Object size without downloading its body. Returns `None` when the object is
@@ -145,12 +302,7 @@ pub(crate) async fn get_media_with_limit(
 
     // ObjectStore::get only fetches metadata; chunk download starts on the first read.
     crate::limits::check_size(object.info().size, max_bytes)?;
-    let mime_type = object
-        .info()
-        .metadata
-        .get(CONTENT_TYPE_METADATA_KEY)
-        .cloned()
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let mime_type = media_content_type(object.info()).to_owned();
     let bytes = read_media_bytes(object, &key, max_bytes).await?;
     Ok(Some((bytes, mime_type)))
 }
@@ -178,12 +330,25 @@ fn object_store_stream_name() -> String {
     format!("OBJ_{}", ATTACHMENTS_BUCKET)
 }
 
+/// The JetStream stream that backs the attachments bucket, for callers that
+/// probe its existence directly.
+pub fn attachments_stream_name() -> String {
+    object_store_stream_name()
+}
+
 fn stream_missing(kind: &jetstream::context::GetStreamErrorKind) -> bool {
     matches!(
         kind,
         jetstream::context::GetStreamErrorKind::JetStream(error)
             if error.kind() == jetstream::ErrorCode::STREAM_NOT_FOUND
     )
+}
+
+/// Whether a failed stream lookup definitively means the attachment
+/// object-store stream is gone, as opposed to the lookup request itself
+/// failing (a timeout is not an absence).
+pub fn attachments_stream_missing(kind: &jetstream::context::GetStreamErrorKind) -> bool {
+    stream_missing(kind)
 }
 
 async fn raise_object_store_replicas(
@@ -216,7 +381,7 @@ async fn raise_object_store_replicas(
 pub async fn ensure_attachments_bucket(
     jetstream: &jetstream::Context,
     replicas: usize,
-) -> Result<object_store::ObjectStore> {
+) -> Result<AttachmentsBucket> {
     let create = jetstream
         .create_object_store(object_store::Config {
             bucket: ATTACHMENTS_BUCKET.to_string(),
@@ -227,31 +392,30 @@ pub async fn ensure_attachments_bucket(
         })
         .await;
     if let Ok(store) = create {
-        return Ok(store);
+        return AttachmentsBucket::new(jetstream, store).await;
     }
     if let Err(error) = raise_object_store_replicas(jetstream, replicas).await {
         log::warn!(
             "could not reconcile replicas for attachment object store '{ATTACHMENTS_BUCKET}': {error:#}"
         );
     }
-    jetstream
+    open_attachments_bucket(jetstream).await
+}
+
+async fn open_attachments_bucket(jetstream: &jetstream::Context) -> Result<AttachmentsBucket> {
+    let store = jetstream
         .get_object_store(ATTACHMENTS_BUCKET)
         .await
-        .map_err(anyhow::Error::from)
-        .context("open NATS session attachment object store")
+        .context("open NATS session attachment object store")?;
+    AttachmentsBucket::new(jetstream, store).await
 }
 
 /// Get an existing attachments bucket, or None if it doesn't exist.
 pub async fn optional_attachments_bucket(
     jetstream: &jetstream::Context,
-) -> Result<Option<object_store::ObjectStore>> {
+) -> Result<Option<AttachmentsBucket>> {
     match jetstream.get_stream(object_store_stream_name()).await {
-        Ok(_) => jetstream
-            .get_object_store(ATTACHMENTS_BUCKET)
-            .await
-            .map(Some)
-            .map_err(anyhow::Error::from)
-            .context("open NATS session attachment object store"),
+        Ok(_) => open_attachments_bucket(jetstream).await.map(Some),
         Err(error) if stream_missing(&error.kind()) => Ok(None),
         Err(error) => {
             Err(anyhow::Error::from(error)).context("inspect NATS session attachment object store")
@@ -277,12 +441,8 @@ pub async fn delete_media_prefix(jetstream: &jetstream::Context, owner: &str) ->
         }
     }
 
-    let stream = jetstream
-        .get_stream(object_store_stream_name())
-        .await
-        .context("open the attachment object-store stream")?;
     for name in &names {
-        delete_media_object(&stream, name)
+        delete_media_object(&store, name)
             .await
             .with_context(|| format!("delete media object '{}'", name))?;
     }
@@ -290,41 +450,203 @@ pub async fn delete_media_prefix(jetstream: &jetstream::Context, owner: &str) ->
     Ok(names.len())
 }
 
+fn media_metadata_subject(key: &str) -> String {
+    format!(
+        "$O.{ATTACHMENTS_BUCKET}.M.{}",
+        base64::engine::general_purpose::URL_SAFE.encode(key)
+    )
+}
+
+fn media_chunk_subject(nuid: &str) -> String {
+    format!("$O.{ATTACHMENTS_BUCKET}.C.{nuid}")
+}
+
+/// Read metadata for an object key (`CidUrl::kv_key()`) from the stream leader.
+/// Returns `None` only if the key is absent. Tombstones are returned with
+/// `deleted` set so callers can distinguish them from live objects.
+pub async fn leader_media_info(
+    store: &AttachmentsBucket,
+    key: &str,
+) -> Result<Option<object_store::ObjectInfo>> {
+    Ok(leader_media_version(store, key)
+        .await?
+        .map(|(_, info)| info))
+}
+
+/// The current metadata version of one media object as the stream leader
+/// has it: the stream sequence of its metadata message plus the decoded
+/// version. `None` when the object has no metadata message.
+pub(crate) async fn leader_media_version(
+    store: &AttachmentsBucket,
+    key: &str,
+) -> Result<Option<(u64, object_store::ObjectInfo)>> {
+    let subject = media_metadata_subject(key);
+    let message = retry_transient(|| async {
+        match store.stream.get_last_raw_message_by_subject(&subject).await {
+            Ok(message) => Ok(Some(message)),
+            Err(error) if error.kind() == stream::LastRawMessageErrorKind::NoMessageFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    })
+    .await
+    .with_context(|| format!("read media metadata for '{key}'"))?;
+    message
+        .map(|message| {
+            let info: object_store::ObjectInfo = serde_json::from_slice(&message.payload)
+                .with_context(|| format!("decode media metadata for '{key}'"))?;
+            Ok((message.sequence, info))
+        })
+        .transpose()
+}
+
+/// Best-effort removal of exactly one committed object version: the
+/// object's metadata message, but only while it still names the same NUID
+/// — a concurrent put under the same content-addressed key owns any newer
+/// version and must not be removed — then the chunks of that one put
+/// attempt (identified by the NUID [`put_media_versioned`] returned).
+/// Never call this for a dedup hit: the caller does not own the object.
+///
+/// The metadata message is deleted first, on purpose: if the deletion
+/// fails transiently, a partial cleanup leaves at most orphan chunks
+/// (invisible; sweeping them is P2), never live metadata pointing at
+/// purged chunks — a later same-CID put would dedup-hit that chunkless
+/// object and hand out refs that cannot be read.
+///
+/// A missing metadata message still purges this NUID's chunks: no version
+/// of ours is left named by the object.
+pub async fn purge_media_version(
+    store: &AttachmentsBucket,
+    url: &CidUrl,
+    nuid: &str,
+) -> Result<()> {
+    let key = url.kv_key();
+    if let Some((sequence, info)) = leader_media_version(store, &key).await? {
+        if info.nuid == nuid {
+            store
+                .stream
+                .delete_message(sequence)
+                .await
+                .with_context(|| format!("delete metadata of media blob '{key}' (nuid {nuid})"))?;
+        }
+    }
+    let chunk_subject = format!("$O.{}.C.{}", ATTACHMENTS_BUCKET, nuid);
+    store
+        .stream
+        .purge()
+        .filter(&chunk_subject)
+        .await
+        .with_context(|| format!("purge chunks of media blob '{key}' (nuid {nuid})"))?;
+    Ok(())
+}
+
+/// Content type reported by `get_media` for this object's metadata.
+pub fn media_content_type(info: &object_store::ObjectInfo) -> &str {
+    info.metadata
+        .get(CONTENT_TYPE_METADATA_KEY)
+        .map(String::as_str)
+        .unwrap_or("application/octet-stream")
+}
+
+/// Read the chunks for live metadata from [`leader_media_info`]. Uses the
+/// stream leader for every chunk, without re-reading metadata or opening a
+/// consumer. All chunks and their retries share one 30-second deadline.
+/// Returns an error on timeout, missing chunks, or a size mismatch. The caller
+/// must verify the content digest if needed.
+pub async fn read_media_from_leader(
+    store: &AttachmentsBucket,
+    info: &object_store::ObjectInfo,
+) -> Result<Vec<u8>> {
+    ensure!(!info.deleted, "media object '{}' is deleted", info.name);
+    // next_by_subj is a filter, so don't use metadata that could match other objects.
+    ensure!(
+        !info.nuid.is_empty()
+            && info
+                .nuid
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+        "invalid chunk ID for media object '{}'",
+        info.name
+    );
+    let subject = media_chunk_subject(&info.nuid);
+    read_media_chunks(info, |sequence| {
+        store
+            .stream
+            .get_first_raw_message_by_subject(&subject, sequence)
+            .err_into()
+    })
+    .await
+}
+
+async fn read_media_chunks<Fut>(
+    info: &object_store::ObjectInfo,
+    mut get_chunk: impl FnMut(u64) -> Fut,
+) -> Result<Vec<u8>>
+where
+    Fut: Future<Output = Result<StreamMessage>>,
+{
+    let deadline = Instant::now() + LEADER_MEDIA_READ_TIMEOUT;
+    let mut sequence = 0;
+    let mut bytes = Vec::new();
+    for index in 0..info.chunks {
+        let chunk = retry_transient_until(deadline, || get_chunk(sequence))
+            .await
+            .with_context(|| {
+                format!(
+                    "read chunk {} of {} for '{}'",
+                    index + 1,
+                    info.chunks,
+                    info.name
+                )
+            })?;
+        ensure!(
+            chunk.payload.len() <= info.size - bytes.len(),
+            "media object '{}' exceeds declared size of {} bytes",
+            info.name,
+            info.size
+        );
+        bytes.extend_from_slice(&chunk.payload);
+        sequence = chunk.sequence + 1;
+    }
+    ensure!(
+        bytes.len() == info.size,
+        "media object '{}' has {} bytes, expected {}",
+        info.name,
+        bytes.len(),
+        info.size
+    );
+    // A ready response can win the race with the timeout in the final poll.
+    // Return the same typed marker `retry_until` returns when the deadline
+    // expires with the last chunk still pending, so a caller matching the
+    // marker sees one failure shape for one expiry.
+    if Instant::now() >= deadline {
+        return Err(anyhow::Error::new(
+            harnx_nats_common::recovery::RecoveryDeadlineExceeded,
+        ))
+        .with_context(|| format!("read media chunks of '{}'", info.name));
+    }
+    Ok(bytes)
+}
+
 /// Remove one object, leaving nothing behind. The object store's own `delete`
 /// writes a metadata entry marked deleted, which then stays forever. The
 /// chunks go first, so a failure between the two purges leaves an entry the
 /// next deletion still finds, rather than chunks nothing points at.
-async fn delete_media_object(stream: &stream::Stream, name: &str) -> Result<()> {
-    use base64::Engine as _;
-    // The object store names an object's metadata subject by the URL-safe
-    // base64 of its name.
-    let metadata_subject = format!(
-        "$O.{ATTACHMENTS_BUCKET}.M.{}",
-        base64::engine::general_purpose::URL_SAFE.encode(name)
-    );
-    // Read the metadata from the stream leader. `ObjectStore::info` is a direct
-    // read that a replica behind the object's latest write can answer with
-    // "not found", which would leave the object behind.
-    let message = match stream
-        .get_last_raw_message_by_subject(&metadata_subject)
-        .await
-    {
-        Ok(message) => message,
-        Err(error) if error.kind() == stream::LastRawMessageErrorKind::NoMessageFound => {
-            return Ok(());
-        }
-        Err(error) => return Err(error).context("read media object metadata"),
+async fn delete_media_object(store: &AttachmentsBucket, name: &str) -> Result<()> {
+    let Some(info) = leader_media_info(store, name).await? else {
+        return Ok(());
     };
-    let info: object_store::ObjectInfo =
-        serde_json::from_slice(&message.payload).context("decode media object metadata")?;
-    stream
+    store
+        .stream
         .purge()
-        .filter(format!("$O.{ATTACHMENTS_BUCKET}.C.{}", info.nuid))
+        .filter(media_chunk_subject(&info.nuid))
         .await
         .context("purge media object chunks")?;
-    stream
+    store
+        .stream
         .purge()
-        .filter(metadata_subject)
+        .filter(media_metadata_subject(name))
         .await
         .context("purge media object metadata")?;
     Ok(())
@@ -332,6 +654,373 @@ async fn delete_media_object(stream: &stream::Stream, name: &str) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use async_nats::jetstream::{message::StreamMessage, stream};
+    use tokio::time::{sleep, Instant};
+
+    use super::{read_media_chunks, ATTACHMENTS_BUCKET};
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_chunk_reads_share_one_deadline() {
+        let info = serde_json::from_value(serde_json::json!({
+            "name": "attachment", "bucket": ATTACHMENTS_BUCKET, "nuid": "chunks",
+            "chunks": 3, "size": 3,
+        }))
+        .unwrap();
+        let start = Instant::now();
+        let mut requests = Vec::new();
+        let result = read_media_chunks(&info, |sequence| {
+            let first_attempt = requests.is_empty();
+            requests.push(sequence);
+            async move {
+                if first_attempt {
+                    return Err(
+                        stream::RawMessageError::new(stream::RawMessageErrorKind::Other).into(),
+                    );
+                }
+                // Each chunk would finish within its own 15 s budget, but the
+                // third cannot finish before 30 s from the start of the read.
+                sleep(Duration::from_secs(12)).await;
+                Ok(StreamMessage {
+                    subject: "attachment-chunks".into(),
+                    sequence,
+                    headers: Default::default(),
+                    payload: "x".into(),
+                    time: async_nats::datetime::now(),
+                })
+            }
+        })
+        .await;
+
+        let error = result.expect_err("the aggregate deadline must discard partial bytes");
+        // The retry window's expiry surfaces as the typed recovery marker
+        // (`RecoveryDeadlineExceeded`), so availability classification can
+        // match it without error text.
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<harnx_nats_common::recovery::RecoveryDeadlineExceeded>()),
+            "the deadline must surface as the typed recovery marker: {error:#}"
+        );
+        assert!(error.to_string().contains("read chunk 3 of 3"), "{error:#}");
+        assert_eq!(
+            requests,
+            [0, 0, 1, 2],
+            "retry the first chunk at the same sequence"
+        );
+        assert!(start.elapsed() < Duration::from_secs(31));
+    }
+
+    #[test]
+    fn put_failure_chains_the_dedup_probe_evidence() {
+        use async_nats::jetstream::object_store::{PutError, PutErrorKind};
+        use harnx_nats_common::recovery::RecoveryDeadlineExceeded;
+
+        // The probe failed with the typed recovery marker; the put then
+        // failed with a stringified publish error. The chain must keep the
+        // probe's typed evidence for availability classification, and the
+        // put's own failure must stay visible.
+        let probe = anyhow::Error::new(RecoveryDeadlineExceeded)
+            .context("read media metadata for 'media/o/k'");
+        let error = super::put_failure(
+            Some(probe),
+            PutError::new(PutErrorKind::PublishChunks),
+            "media/o/k",
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<RecoveryDeadlineExceeded>()),
+            "the probe's typed marker must survive: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("failed dedup probe"),
+            "the put failure stays visible: {error:#}"
+        );
+
+        // Without a failed probe the put failure stands on its own: no
+        // fabricated availability evidence.
+        let error = super::put_failure(None, PutError::new(PutErrorKind::PublishMetadata), "k");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<RecoveryDeadlineExceeded>()),
+            "a put failure alone must not claim the recovery marker: {error:#}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_chunk_read_past_deadline_surfaces_the_typed_marker() {
+        let info = serde_json::from_value(serde_json::json!({
+            "name": "attachment", "bucket": ATTACHMENTS_BUCKET, "nuid": "chunks",
+            "chunks": 3, "size": 3,
+        }))
+        .unwrap();
+        // Every chunk answers, but the aggregate finishes at the deadline:
+        // the expiry must surface as the typed recovery marker either way —
+        // from `retry_until` if the last chunk is still pending, or from
+        // the final clock check if it just made it.
+        let result = read_media_chunks(&info, |sequence| async move {
+            sleep(Duration::from_secs(10)).await;
+            Ok(StreamMessage {
+                subject: "attachment-chunks".into(),
+                sequence,
+                headers: Default::default(),
+                payload: "x".into(),
+                time: async_nats::datetime::now(),
+            })
+        })
+        .await;
+
+        let error = result.expect_err("the aggregate deadline must reject the read");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<harnx_nats_common::recovery::RecoveryDeadlineExceeded>()),
+            "the expiry must surface as the typed recovery marker: {error:#}"
+        );
+    }
+
+    /// The synthesized `PurgeOldChunks` failure the recovery tests pass to
+    /// `committed_after_failed_cleanup`: the state it implies was built by
+    /// [`committed_cleanup_state`].
+    fn failed_chunk_cleanup() -> async_nats::jetstream::object_store::PutError {
+        async_nats::jetstream::object_store::PutError::new(
+            async_nats::jetstream::object_store::PutErrorKind::PurgeOldChunks,
+        )
+    }
+
+    /// The committed state `ObjectStore::put` leaves behind when the new
+    /// metadata is acknowledged but the old-chunk purge fails: a first
+    /// version, then a raw second put on the same key carrying the
+    /// `harnx_put_id` marker ("committed-put-id") a real put's own version
+    /// would have. A purge-denying stream cannot build this end to end
+    /// (rollup publishes need the same permission), so the second put is
+    /// raw and the cleanup failure is synthesized by the callers. Returns
+    /// `None` the same way `spawn_nats_server` does when the broker binary
+    /// is unavailable.
+    async fn committed_cleanup_state(
+        label: &str,
+    ) -> anyhow::Result<
+        Option<(
+            harnx_test_bins::NatsServerHandle,
+            super::AttachmentsBucket,
+            String,
+        )>,
+    > {
+        harnx_core::require_nextest();
+        let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(None);
+        };
+        let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+        let store = super::ensure_attachments_bucket(&jetstream, 1).await?;
+        let session = harnx_core::cid_url::SessionRef::new(None, "cleanup".into())?;
+        let url = crate::media_cid_url(&session, label);
+        let key = url.kv_key();
+        super::put_media(&store, &url, b"first", "text/plain").await?;
+        let object = async_nats::jetstream::object_store::ObjectMetadata {
+            name: key.clone(),
+            description: Some("Attachment".into()),
+            metadata: [
+                (
+                    super::CONTENT_TYPE_METADATA_KEY.to_string(),
+                    "text/plain".to_string(),
+                ),
+                (
+                    super::PUT_ID_METADATA_KEY.to_string(),
+                    "committed-put-id".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let mut cursor = std::io::Cursor::new(b"second");
+        store.put(object, &mut cursor).await?;
+        Ok(Some((server, store, key)))
+    }
+
+    /// The `PurgeOldChunks` recovery reports the committed version, and only
+    /// when the re-read metadata is provably this put's own by its
+    /// `harnx_put_id` marker: the reported NUID names the committed version
+    /// and it reads back whole.
+    #[tokio::test]
+    async fn purge_failure_after_commit_reports_the_committed_version() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let Some((_server, store, key)) = committed_cleanup_state("purgefail").await? else {
+            return Ok(());
+        };
+
+        let outcome = super::committed_after_failed_cleanup(
+            &store,
+            &key,
+            "committed-put-id",
+            failed_chunk_cleanup(),
+        )
+        .await?;
+        let super::MediaPut::Written { nuid } = &outcome else {
+            panic!("the recovery reports the committed version, not the stale one: {outcome:?}");
+        };
+        let info = super::leader_media_info(&store, &key)
+            .await?
+            .context("committed version")?;
+        assert_eq!(
+            &info.nuid, nuid,
+            "the reported NUID names the committed version"
+        );
+        assert_eq!(
+            super::read_media_from_leader(&store, &info).await?,
+            b"second",
+            "the committed version reads back whole"
+        );
+        Ok(())
+    }
+
+    /// The `PurgeOldChunks` recovery reports nothing it cannot prove is this
+    /// put's own version: another put's marker, a tombstone, and an absent
+    /// record all error — with the cleanup failure visible — and the foreign
+    /// version is left in place.
+    #[tokio::test]
+    async fn purge_failure_unproven_version_errors_and_purges_nothing() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let Some((_server, store, key)) = committed_cleanup_state("purgefail-unproven").await?
+        else {
+            return Ok(());
+        };
+
+        // Another put's marker: not a commit of this put's own.
+        let error = super::committed_after_failed_cleanup(
+            &store,
+            &key,
+            "another-put-id",
+            failed_chunk_cleanup(),
+        )
+        .await
+        .expect_err("a foreign version must not be reported as committed");
+        assert!(
+            error.to_string().contains("not this put's own"),
+            "the confirmation failure surfaces: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("failed purging old chunks"),
+            "the cleanup failure stays visible: {error:#}"
+        );
+        let info = super::leader_media_info(&store, &key)
+            .await?
+            .context("foreign version stays")?;
+        assert_eq!(
+            super::read_media_from_leader(&store, &info).await?,
+            b"second",
+            "the foreign version still reads back whole: nothing was purged"
+        );
+
+        // A tombstone is not a commit either: the same put id on a deleted
+        // version errors instead of reporting it.
+        store.delete(&key).await?;
+        let error = super::committed_after_failed_cleanup(
+            &store,
+            &key,
+            "committed-put-id",
+            failed_chunk_cleanup(),
+        )
+        .await
+        .expect_err("a deleted version must not be reported as committed");
+        assert!(
+            error.to_string().contains("not this put's own"),
+            "the deleted version is rejected the same way: {error:#}"
+        );
+
+        // Nothing committed under a fresh key surfaces too, not a phantom
+        // commit.
+        let fresh = crate::media_cid_url(
+            &harnx_core::cid_url::SessionRef::new(None, "cleanup".into())?,
+            "purgefail-absent",
+        )
+        .kv_key();
+        let error = super::committed_after_failed_cleanup(
+            &store,
+            &fresh,
+            "committed-put-id",
+            failed_chunk_cleanup(),
+        )
+        .await
+        .expect_err("nothing was committed");
+        assert!(
+            error.to_string().contains("no leader metadata"),
+            "the absent-record case surfaces: {error:#}"
+        );
+        Ok(())
+    }
+
+    /// The recovery's confirmation read can fail on its own; both failures
+    /// must surface, and nothing is reported as committed.
+    #[tokio::test]
+    async fn purge_failure_confirmation_read_failure_surfaces_both_failures() -> anyhow::Result<()>
+    {
+        let Some((mut server, store, key)) = committed_cleanup_state("purgefail-read").await?
+        else {
+            return Ok(());
+        };
+
+        // The confirmation read cannot reach the broker: both failures
+        // must surface, and the recovery must not report a commit.
+        server.kill()?;
+        server.wait()?;
+        let error = super::committed_after_failed_cleanup(
+            &store,
+            &key,
+            "committed-put-id",
+            failed_chunk_cleanup(),
+        )
+        .await
+        .expect_err("an unconfirmable recovery must not report a commit");
+        assert!(
+            error.to_string().contains("cannot confirm its version"),
+            "the confirmation failure surfaces: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("failed purging old chunks"),
+            "the cleanup failure stays visible: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("read media metadata"),
+            "the read failure keeps its own context: {error:#}"
+        );
+        Ok(())
+    }
+
+    /// The production put path really stamps the put-id marker the
+    /// recovery's version proof reads: `put_media` (through
+    /// `put_media_chunked`, the only production metadata writer) leaves
+    /// `PUT_ID_METADATA_KEY` on the stored metadata, as a fresh UUID.
+    #[tokio::test]
+    async fn put_media_stamps_put_id_marker_on_stored_metadata() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        harnx_core::require_nextest();
+        let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+        let store = super::ensure_attachments_bucket(&jetstream, 1).await?;
+        let session = harnx_core::cid_url::SessionRef::new(None, "putidmark".into())?;
+        let url = crate::media_cid_url(&session, "stamp-put-id");
+        let key = url.kv_key();
+        super::put_media(&store, &url, b"some attachment bytes", "text/plain").await?;
+        let info = super::leader_media_info(&store, &key)
+            .await?
+            .context("stored metadata")?;
+        let marker = info
+            .metadata
+            .get(super::PUT_ID_METADATA_KEY)
+            .context("the put stamps its put-id marker on the stored metadata")?;
+        assert!(
+            uuid::Uuid::parse_str(marker).is_ok(),
+            "the marker is a fresh UUID, not a derived or shared value: {marker}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn kv_key_format() {
         use harnx_core::cid_url::SessionRef;

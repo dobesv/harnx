@@ -96,10 +96,23 @@ async fn record_outcome(
     outcome: Result<Value, ToolInvokeError>,
     final_progress: Option<harnx_toolset::ToolProgressPatch>,
 ) -> Result<ToolReply, ToolInvokeError> {
+    let (result, input_required) = match outcome {
+        // A challenge is an outcome, not a failure: deliver it beside the
+        // compatibility error so older callers fail visibly instead of
+        // treating a suspended call as complete.
+        Err(ToolInvokeError::InputRequired(input)) => (
+            Err(ToolErrorPayload::Recoverable(
+                harnx_toolset::INPUT_REQUIRED_COMPAT_ERROR.to_string(),
+            )),
+            Some(*input),
+        ),
+        outcome => (outcome.map_err(map_invoke_error), None),
+    };
     let reply = ToolReply {
         call_id: request.call_id.clone(),
-        result: outcome.map_err(map_invoke_error),
+        result,
         final_progress,
+        input_required,
     };
     context
         .journal
@@ -141,6 +154,13 @@ fn invocation_context(
         // Only a live invocation can be signalled; `invocation` wires its
         // call's token in.
         new_message: Default::default(),
+        // Runtime-owned challenge answers (MRTR inputResponses) and the
+        // tool's requestState, delivered beside the arguments, never in them.
+        input_responses: request.input_responses.clone().unwrap_or_default(),
+        request_state: request.request_state.clone().unwrap_or(Value::Null),
+        // The caller's harnx user identity, stamped by the worker from the
+        // trusted session owner (or operator identity); never from args.
+        user_id: request.user_id.clone(),
     }
 }
 

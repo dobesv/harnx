@@ -104,6 +104,7 @@ enum ProgressCommand {
     /// right before `Finish`; the synchronous path never needs it, because its
     /// events already carry every request's usage.
     SetUsage(CompletionTokenUsage),
+    PendingInteraction(Option<harnx_core::pending_interaction::PendingInteractionSummary>),
     Finish {
         status: SubAgentProgressStatus,
         reply: oneshot::Sender<(SubAgentProgress, anyhow::Result<()>)>,
@@ -146,6 +147,7 @@ impl ProgressTracker {
         } = invocation;
         Self {
             snapshot: SubAgentProgress {
+                pending_interaction: None,
                 invocation_id,
                 agent,
                 session_id,
@@ -332,6 +334,14 @@ impl ReporterTask {
                 self.tracker.set_usage(usage);
                 true
             }
+            ProgressCommand::PendingInteraction(pending) => {
+                if self.tracker.snapshot.pending_interaction != pending {
+                    self.tracker.snapshot.pending_interaction = pending;
+                    let snapshot = self.tracker.heartbeat(elapsed_ms(self.started));
+                    self.share_and_publish(snapshot);
+                }
+                true
+            }
             ProgressCommand::Finish { status, reply } => {
                 self.handle_finish(status, reply).await;
                 false
@@ -465,6 +475,14 @@ impl SubagentProgressReporter {
 
     pub(super) fn sink(&self) -> Arc<dyn AgentEventSink> {
         Arc::clone(&self.sink)
+    }
+
+    /// Publish changed pending identity immediately, without waiting for heartbeat.
+    pub(super) fn set_pending_interaction(
+        &self,
+        pending: Option<harnx_core::pending_interaction::PendingInteractionSummary>,
+    ) {
+        let _ = self.tx.send(ProgressCommand::PendingInteraction(pending));
     }
 
     /// Replace the accumulated usage estimate with an authoritative durable

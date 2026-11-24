@@ -184,6 +184,9 @@ async fn same_session_handoff_queues_without_self_await() {
         "model: openai:gpt-4o\nuse_tools: loop-agent_session_handoff",
         "You are the loop agent.",
     );
+    if !crate::test_support::ensure_test_nats().await {
+        return;
+    }
 
     let calls = Arc::new(AtomicUsize::new(0));
     let registry = registry_with_call_fn(self_handoff_call_fn(Arc::clone(&calls)));

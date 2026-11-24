@@ -74,7 +74,13 @@ impl InvocationJournal {
                 pending = Some(prepare_pending_reply(reply, &record, for_delivery)?);
             }
             if limits.is_none() {
-                limits = Some(self.0.status().await?.info.config);
+                // `kv::Store::status()` clones cached stream info, so a limit
+                // changed after this handle was opened would stay invisible
+                // forever. The typed-size retry must plan against the row
+                // ceiling that actually rejected the preflight, so fetch the
+                // stream's config fresh from the broker.
+                let mut stream = self.1.get_stream(self.0.stream_name.clone()).await?;
+                limits = Some(stream.info().await?.config.clone());
             }
             let config = limits.as_ref().expect("limits loaded");
             let budget = CompletionBudget::for_record(
@@ -87,7 +93,7 @@ impl InvocationJournal {
             let reply = pending
                 .as_mut()
                 .expect("pending reply initialized")
-                .bounded(&attachments, budget.reply_bytes, size_retry)
+                .bounded(&attachments, budget.reply_bytes, size_retry, for_delivery)
                 .await?;
             record.reply = Some(reply.clone());
             let payload = budget.encode(&record)?;

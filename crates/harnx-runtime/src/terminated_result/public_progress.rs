@@ -209,7 +209,9 @@ mod durable_tests {
     fn nonstreaming_timeout_keeps_durable_artifact_references_but_not_later_turn_or_thinking() {
         let reference = format!("cid:media:test/session/{}", "a".repeat(64));
         let results = |text: String| SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![harnx_core::session::ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some("call".into()),
                 name: "artifact".into(),
                 output: serde_json::json!({"uri": text}),

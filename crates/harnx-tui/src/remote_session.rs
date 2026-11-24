@@ -6,6 +6,8 @@ use futures_util::FutureExt;
 use harnx_runtime::config::{GlobalConfig, LOCAL_CLUSTER_KEY};
 use harnx_runtime::nats_lease::{lease_holder_in, NatsLeaseConfig};
 use harnx_runtime::{NatsSession, NatsSessionConfig};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -176,6 +178,16 @@ impl Tui {
         self.exit_after_cancel = true;
         self.start_cancellation(session_id, cluster);
         true
+    }
+
+    /// Type-erased seam for the run loop (PR #2835 Windows CI query-depth
+    /// overflow): `Pin<Box<dyn Future>>` stops rustc's cumulative layout
+    /// walk of the loop's future at this await; see AGENTS.md "Future size
+    /// and type erasure in harnx-runtime".
+    pub(crate) fn poll_pending_exit_cancel_erased(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+        Box::pin(self.poll_pending_exit_cancel())
     }
 
     pub(crate) async fn poll_pending_exit_cancel(&mut self) {

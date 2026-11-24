@@ -92,11 +92,15 @@ Harnx automatically manages the following JetStream resources:
   - Workers bump `last_attention_seq` on `TurnEnd` (final message) and `HitlApprovalRequested`.
   - Invalidation subject: `harnx.session.{storage_key}.read.invalidated` (separate from metadata invalidation).
 - **KV Bucket**: `harnx_tool_registry` — tool server discovery, with a
-  per-registration TTL.
-- **KV Buckets**: `harnx_hook_registry` and `harnx_hook_expectations` — hook
-  server discovery and its fail-closed fallback routes. The registration TTL
-  is set on the bucket and applies to all registrations, including those
-  opened by the worker daemon.
+  per-registration TTL. One server identity can hold several registrations:
+  global (bare `{scope}.{identity}`), user-scoped (`{scope}.{identity}.u.{user}`)
+  and ownerless-only (`{scope}.{identity}.anon`); a session sees the global ones
+  plus the one registration in its audience. Workers re-read the bucket's
+  stream sequence before every completion, so a registration published before
+  `<server>_connect` returns is visible on the very next completion without
+  waiting out the 30 s discovery cache; the async KV watch is only best-effort
+  early invalidation, never the guarantee (`crates/harnx-runtime/src/tool_registry_watch.rs`).
+  See [Tool Server Credentials](tool-credentials.md).
 - **Streams**: `SESSION_<sha256(id)>` (Subject: `sessions.{id}.log`) stores only the
   durable append-only conversation history. Agent identity, settings, rendered
   prompts, and titles do not belong in this stream. Hash the exact, case-sensitive
@@ -115,7 +119,11 @@ Harnx automatically manages the following JetStream resources:
   `media/<owner>/<hash>` where `owner` is `session_key(agent, sid)` (see
   `harnx_core::cid_url::CidUrl::kv_key`). Session deletion purges each object's
   chunk and metadata subjects, leaving nothing; the object store's own `delete`
-  would leave a metadata entry marked deleted that stays forever.
+  would leave a metadata entry marked deleted that stays forever. Object-store
+  reads (`get_media`) are direct gets that a lagging follower can answer with
+  "not found" for an already-acknowledged write; read-after-write checks confirm
+  misses with stream-leader reads (see "Read a record that was just written"
+  under [Recovery contract](#recovery-contract-and-shared-implementation)).
 - **KV Bucket**: `harnx_plans` — stores plan index, task, and note documents
   under `plan/<owner>/<slug>/...` keys. The bucket honours the cluster's configured
   `replicas` count (`ensure_plans_bucket`). Documents are retained indefinitely
@@ -144,8 +152,7 @@ count (`None` means 1, no HA):
 
 - **Honour `replicas`**:
   - All KV buckets (`harnx_leases`, `harnx_sessions`, `harnx_tool_registry`,
-    `harnx_hook_registry`, `harnx_hook_expectations`, and
-    `harnx_tool_invocations`)
+    and `harnx_tool_invocations`)
   - Attachment object store (`harnx_attachments`)
   - Plans KV bucket (`harnx_plans`)
   - Session transcript streams (`SESSION_<sha256(id)>`)
@@ -160,12 +167,16 @@ resources unable to tolerate a node loss.
 
 For NATS sessions, a local `cid:` file is only a cache entry. Inline user
 payloads are uploaded before their `cid:` is appended to the transcript. Locally
-created tool images are uploaded before the durable turn boundary. A worker can
+created tool images are uploaded before the durable turn boundary. Web UI
+multipart uploads (`POST /v1/agents/<agent>/sessions/<sid>/attachments`) are
+published to `harnx_attachments` by the upload handler itself, so the returned
+ref is readable by any replica even before the prompt is sent. A worker can
 backfill a legacy local-only blob, but fails the turn if the blob exists in
 neither place. HTTP(S) attachment URLs remain external references and are
 intentionally not copied into the object store.
 
-Bridge-offloaded image `resource_link` parts use canonical `cid:media:` URLs.
+Offloaded image `resource_link` parts (from native NATS tool replies or
+`harnx-mcp-bridge`) use canonical `cid:media:` URLs.
 Workers hydrate missing image blobs before each agent model call, including the next
 call in the same turn, and when replaying a session on another worker. Cached
 and downloaded blobs are checked against the SHA-256 of the full data URI,
@@ -393,11 +404,14 @@ extension but do not copy it into new sub-agent sessions.
 ### Session properties
 
 The reserved `dev.harnx.session_properties` extension records what a session
-is working on: the user it acts for, the GitHub repository, branch, issue and
-pull request, an external task URL, a working directory, the Web UI address,
+is working on: the user it acts for (`user_id`), the caller principals
+snapshot (`user_principals`), the GitHub repository, branch, issue and pull
+request, an external task URL, a working directory, the Web UI address,
 labels, and custom properties agents define. Agents read and change it with
 the `harnx_read_session_meta` and `harnx_write_session_meta` built-in tools
-(see the [Agent Guide](agent-guide.md#session-metadata-tools)).
+(see the [Agent Guide](agent-guide.md#session-metadata-tools)). Read-only
+properties like `user_id` and `user_principals` are stamped by Harnx at
+session creation and cannot be changed by agents.
 
 The extension is one object keyed by property name. Each entry holds the
 value, an `inherit` flag, and a `source` when Harnx recorded the value itself
@@ -432,6 +446,15 @@ says which properties are copied by default, which only on request, and which
 never: `web_session_url` names one session's page, so it is never copied,
 even from a record that says otherwise. A parent whose properties can't be
 decoded still delegates; the child starts without them.
+
+During a rolling upgrade, update workers before upgrading frontends
+(`harnx-serve`, `harnx-a2a-server`) or deploying agent `patches`. Older
+workers treat `user_principals` as an unknown custom property rather than a
+read-only property, and they ignore `patches` in agent front-matter (running
+the unpatched configuration). Once all workers are upgraded, update frontends
+to capture caller principals at session creation, and enable agent `patches`
+last. When rolling back, remove `patches` from agent definitions before
+rolling back workers.
 
 harnx-serve records `web_session_url` when it sends a session a prompt. It
 builds the address from `serve_public_url` (`HARNX_SERVE_PUBLIC_URL`, or
@@ -514,10 +537,10 @@ harnx-worker --cluster local --worker-id worker-1
 
 - `--cluster`: The key from `nats_servers/`.
 - `--worker-id`: (Optional but recommended) A stable identity for the worker.
-- `--manage-servers`: Launch this worker's own tool and hook servers as child
+- `--manage-servers`: Launch this worker's own tool servers as child
   processes. Without it, the worker discovers independently deployed servers
   under `HARNX_SERVER_SCOPE` instead — see
-  [Independently Deployed Tool and Hook Servers](#independently-deployed-tool-and-hook-servers)
+  [Independently Deployed Tool Servers](#independently-deployed-tool-servers)
   below.
 
 For the default local cluster you don't run this yourself: `harnx` and
@@ -576,9 +599,9 @@ active worker for a session dies, another persistent worker will acquire the
 lease and resume execution. Local redundancy instead comes from the owning
 frontend respawning its worker on the same targeted route.
 
-### Independently Deployed Tool and Hook Servers
+### Independently Deployed Tool Servers
 
-By default a worker launches its own tool and hook servers as child processes
+By default a worker launches its own tool servers as child processes
 and assigns them a scope. To run them as their own containers instead, give
 every process the same `HARNX_SERVER_SCOPE` and leave `--manage-servers` off:
 
@@ -595,14 +618,14 @@ HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
 **`--cluster prod` alone is not enough for the worker container.** `--cluster`
 only tells the worker which `nats_servers/<cluster>.yaml` to use for the
 *session* connection (leases, session log, control plane). Discovering tool
-and hook servers is a separate connection that never reads that file — it
+servers is a separate connection that never reads that file — it
 always resolves from `HARNX_NATS_URL`/`HARNX_NATS_TOKEN` (and, on a TLS or
 mTLS cluster, `HARNX_NATS_TLS`, `HARNX_NATS_TLS_CERT`, `HARNX_NATS_TLS_KEY`,
 `HARNX_NATS_TLS_CA`, plus `HARNX_NATS_IGNORE_DISCOVERED_SERVERS` when that is
 set explicitly) in the worker's own environment. A worker pod must carry
 these env vars *in addition to* `--cluster`, even when `prod.yaml` already
 has the same URL and TLS settings — otherwise the worker connects fine for
-sessions but can't discover any tool or hook server, or (on a TLS cluster)
+sessions but can't discover any tool server, or (on a TLS cluster)
 can't discover them at all because that connection falls back to plaintext.
 
 Both sides must carry the same scope value. A mismatch is not an error — the
@@ -620,6 +643,32 @@ boundary.
 Each worker also serves its own sub-agent toolset in-process. When several
 workers share a scope they all register that toolset under the same key and
 join one queue group, so any worker may serve any sub-agent request.
+
+### Per-User Credentials for Remote Tool Servers
+
+A remote MCP server can run in native mode so every user connects their own
+account (OAuth or a token) instead of sharing one upstream credential. The
+server needs the cluster connection env vars and `HARNX_SERVER_SCOPE` like any
+independently deployed tool server, plus its key file:
+
+```bash
+# Tool server container (native per-user credential mode)
+HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
+  HARNX_SERVER_SCOPE=shared harnx-mcp-remote \
+  --url https://atlassian.com/…/mcp --name jira \
+  --credentials-key-file /etc/harnx/jira-credentials-key.json \
+  --auth-methods oauth --oauth-scope offline_access \
+  --public-base-url https://harnx.example.com/mcp-remote/ \
+  --http-bind 0.0.0.0:8080
+```
+
+The public base URL must be routed to the server's HTTP port (an ingress
+subpath or a dedicated host), and a hosted deployment must also set
+`--trusted-user-header` so the request's user identity is authenticated. The
+credential itself never passes through NATS or tool arguments; users enter it
+on the connect page. Connection management from any front-end:
+`harnx credentials list|connect|disconnect` or the TUI `.credentials`
+command. See [Tool Server Credentials](tool-credentials.md) for details.
 
 ## Using Remote Agents
 
@@ -648,7 +697,7 @@ export HARNX_NATS_SERVER=remote
 The front-end reads connection settings from `nats_servers/<name>.yaml` (in this
 example, `nats_servers/remote.yaml`) and runs as a pure client:
 
-- It does not start a local `nats-server`, worker, or tool/hook servers.
+- It does not start a local `nats-server`, worker, or tool servers.
 - No local chat model or `clients/` directory is required. The model requirement
   belongs to the worker that runs the agent loop, not to the front-end. When the
   local catalog is empty, `setup_model` logs an informational message and
@@ -675,7 +724,7 @@ token: "${HARNX_NATS_TOKEN}"
 ```
 
 Note that `HARNX_NATS_URL` and `HARNX_NATS_TOKEN` configure transport credentials
-for workers, standalone tool/hook servers, or `${VAR}` expansion in cluster configs.
+for workers, standalone tool servers, or `${VAR}` expansion in cluster configs.
 Setting them on a front-end does not join an external cluster on its own; use
 `HARNX_NATS_SERVER` with a corresponding `nats_servers/<name>.yaml` file.
 
@@ -1080,16 +1129,22 @@ wind-up has cancelled them. Two guards make the order irrelevant.
 
 **Ancestor check.** A sub-agent session records `parent: { session_id,
 tool_call_id }` in its metadata at creation. Before rolling an
-`InFlightResumable` turn forward, the worker reads the parent's log
-(`nats_worker/ancestor_check.rs`): if the parent's `ToolCalls` for that call id
-is followed by a `Cancel`, or the call already has a result, nothing is waiting
-for the child's answer, so it does not resume — it interrupts itself with the
-parent's cancellation id and winds up instead. The walk follows parent links
-upward, at most 32 levels, and fails closed: a parent log it cannot read is
-never taken for "the parent is still waiting". As implemented, that failure
-ends the child's turn with an `Error` entry rather than being retried — the
-activation is Term'd, not retried, so a transient read failure costs the child
-its turn.
+`InFlightResumable` turn forward — and before each later turn of the same
+session — the worker runs `refuse_resume_under_interrupted_parent`
+(`nats_worker/daemon_turn_input.rs`): if a parent delegation
+invocation ended in `Cancel` or `Error`, nothing is waiting for the child's
+answer, so it does not resume — it interrupts itself with a `parent-stop:`
+cancellation and winds up instead. The walk follows admission links upward,
+at most 32 levels, and stops at a detached admission (issue #2779):
+`session_send` work keeps running after its parent stops, while the
+synchronous children of a detached parent still stop when that parent itself
+is cancelled. The guarantee needs every worker on the new version; an older
+worker resuming such a child still cancels it. A parent whose admission
+metadata lives at another broker is skipped — the snapshot copied at dispatch
+still bounds the child, and the original RPC cancellation crosses brokers. A
+parent log that fails to load ends the child's turn with an `Error` entry
+rather than being retried — the activation is Term'd, not retried, so a
+transient read failure costs the child its turn.
 
 **Idempotent wind-up cancels.** When the root is activated, its wind-up resends
 a cancel for every call with no journal reply, catching any child that slipped
@@ -1159,13 +1214,12 @@ activation and stops there; a wind-up with a steering message queued behind the
 pending input. An activation whose `requested_seq` names a `Cancel` already
 wound up is acknowledged as covered.
 
-### Cancelling tools, hooks and sub-agents
+### Cancelling tools and sub-agents
 
 Cancellation travels one level at a time through the tool protocol, never by
 inspecting a tree. `ControlMessage::cancel(server, session_id, call_id,
 cancellation_id)` goes to the server's control subject
-(`harnx.v1.{instance}.tools.control`, or
-`harnx.v1.{instance}.hook.{server}.control` for hooks) and is answered with a
+(`harnx.v1.{instance}.tools.control`) and is answered with a
 `CancelAcceptance`: `Accepted`, `AlreadyFinished`, `Rejected { reason }`, or
 `Unknown { reason }` meaning the cancel may have committed and should be retried
 with the same id. Acknowledgements are for logging; no caller blocks on one.
@@ -1221,12 +1275,6 @@ waits and replaced reservations do not schedule another cancel batch. Failover
 also suppresses cancellation so a replacement worker can resume the remote
 invocation.
 
-Hooks use the same mechanism. The hook server keeps no journal, so a call id it
-is not currently running is simply `AlreadyFinished` — nothing durable is left to
-consult once the future is gone. The worker-side hook provider registers
-controlled hook calls in the same in-flight registry as tools, so one interrupt
-path reaches both.
-
 Sub-agents are an ordinary tool whose checkpoint holds the child session id.
 Both the live cancel and the orphan `cancel` read that checkpoint and call
 `interrupt_session` on the child with `requested_by = "parent:<session_id>"`.
@@ -1264,14 +1312,10 @@ transcript that stops mid-turn while finished sub-agent rows keep appearing.
 
 ### Upgrading from the execution-control gate
 
-The internal tool protocol is **v5**, and the two server kinds fail differently
-on a mismatch. A tool server that registers under another version fails
-discovery loudly with "incompatible tool protocol … upgrade workers and tool
-servers together", so none of its tools load at all. A hook server still
-registers under its own unchanged protocol version and keeps working, but the
-cancel control messages are v5, so a mismatched one answers `Rejected` and
-quietly becomes uninterruptible. Deploy workers, tool servers, hook servers and
-frontends together.
+The internal tool protocol is **v5**. A tool server that registers under
+another version fails discovery loudly with "incompatible tool protocol … upgrade
+workers and tool servers together", so none of its tools load at all. Deploy
+workers, tool servers and frontends together.
 
 The `harnx_execution_control` KV bucket is never created or read again.
 Operators delete it once:
@@ -1501,7 +1545,7 @@ survivors elect one replacement. Existing workers keep their PIDs, environments,
 tool servers, and activation routes. Exiting a frontend still shuts down that
 frontend's own worker tree; this recovery contract covers surviving frontends.
 
-All production runtime, tool-server, and hook-server connections use
+All production runtime and tool-server connections use
 `harnx_nats_common::connect::NatsEndpoint`. It keeps reconnecting to the stable
 endpoint with bounded reconnect delay. Reusing the same `async_nats::Client`
 preserves Core subscription identity. Socket reconnection alone cannot recover
@@ -1514,11 +1558,11 @@ Use these operation-specific patterns when adding a NATS caller:
 | Operation | Recovery rule and implementation |
 | --- | --- |
 | Read durable state | `recovery::read` retries transport reads within a fixed deadline. Decode/validate outside the retry. Never translate an unreadable record into absence. |
-| Read a record that was just written | A follower answers KV `get` and `entry` from whatever it has applied: async-nats sends them as direct gets whenever the bucket allows it, and it creates every KV bucket that way. `keys` lists from a consumer, which NATS can place on any replica. Read such records from the stream leader, whether this process wrote them a moment ago or another one did before handing over the work. For a key, use `harnx_nats_common::leader_reads::{entry, get}`, which send `STREAM.MSG.GET` and refuse a key with a wildcard, because the leader treats that subject as a filter. `leader_reads::entry_matching` takes `*` tokens on purpose and answers with the newest key they match, so it suits only a pattern that one key can match, such as the invocation journal's lookup of a call by session and wire call id. The session metadata store reads every key that way (`SessionMetadataStore::leader_entry`), so a frontend sees the admission it just wrote and a worker sees what its frontend wrote before activating it. Nothing answers such a read while the stream elects a leader, where a follower used to, so the store retries it with `leader_reads::retry_transient` for up to `RECOVERY_TIMEOUT`; a stream that doesn't exist fails at once. For a listing, page `STREAM.INFO` with a subjects filter and refuse a page whose `cluster` names no leader: while the stream has no leader, every replica answers that request from its own store. `invocation_journal/leader_reads.rs` does that for the tool invocation journal. |
+| Read a record that was just written | A follower answers KV `get` and `entry` from whatever it has applied: async-nats sends them as direct gets whenever the bucket allows it, and it creates every KV bucket that way. `keys` lists from a consumer, which NATS can place on any replica. Read such records from the stream leader, whether this process wrote them a moment ago or another one did before handing over the work. For a key, use `harnx_nats_common::leader_reads::{entry, get}`, which send `STREAM.MSG.GET` and refuse a key with a wildcard, because the leader treats that subject as a filter. `leader_reads::entry_matching` takes `*` tokens on purpose and answers with the newest key they match, so it suits only a pattern that one key can match, such as the invocation journal's lookup of a call by session and wire call id. The session metadata store reads every key that way (`SessionMetadataStore::leader_entry`), so a frontend sees the admission it just wrote and a worker sees what its frontend wrote before activating it. Nothing answers such a read while the stream elects a leader, where a follower used to, so the store retries it with `leader_reads::retry_transient` for up to `RECOVERY_TIMEOUT`; a stream that doesn't exist fails at once. For a listing, page `STREAM.INFO` with a subjects filter and refuse a page whose `cluster` names no leader: while the stream has no leader, every replica answers that request from its own store. `invocation_journal/leader_reads.rs` does that for the tool invocation journal. The object store has the same issue: async-nats creates `OBJ_harnx_attachments` with `allow_direct`, so the metadata reads behind `get_media` are direct gets a lagging follower can answer with "not found" for a write that was already acknowledged. Prompt admission and cold worker hydration (`harnx-runtime/src/nats_attachments.rs`) confirm a `get_media` miss with `harnx_blob_store::media::leader_media_info`, a raw `STREAM.MSG.GET` on the metadata subject that returns tombstones visibly; a live entry is enough for admission (size and MIME come from the metadata), while hydration fetches the bytes with `read_media_from_leader` (next-by-subject raw gets on the chunk subject, no consumers, which a lagging replica could host) and still validates the digest. `put_media`'s dedup uses the same leader lookup and skips only live objects, so a tombstone or a stale follower entry never suppresses a write. A deployment that restricts JetStream subjects must allow `$JS.API.STREAM.MSG.GET.OBJ_harnx_attachments` for attachment writes and these fallback reads. The upload handler captures the session record at the first accepted part and re-reads it after each stored part whenever the session has a metadata record — a never-created owner (an upload that bypassed session creation) has no record to protect it and stores unrechecked — and when the session was deleted or replaced it purges the just-written object version (`harnx_blob_store::media::purge_media_version`), which deletes the object's metadata message with `STREAM.MSG.DELETE` and purges that version's chunks with `STREAM.PURGE`; credentials that upload attachments need those two subjects on the same stream as well. |
 | Append a transcript entry | Retain the same message ID, payload, and CAS expectation through `recovery::retry_until`. Retry timeout/broken-pipe errors; a CAS conflict is authoritative. |
 | Mutate session metadata | `cas::update` reads back an ambiguous acknowledgement from the stream leader. Matching persisted bytes confirm the write; an unchanged revision permits retrying the exact CAS. A different value or revision leaves the outcome unknown. |
 | Renew a session lease | Retry the same deduplicated CAS only until the previously confirmed lease deadline. A conflict or expired deadline fences the worker; reconnect never restores lost ownership. |
-| Invoke a tool or hook | `rpc::request`, `RequestActivity`, and `ReplyTarget` confirm activity and acknowledge replies. Resend a completed result until receipt, never rerun the handler. A NATS 503 is not a reply receipt. |
+| Invoke a tool | `rpc::request`, `RequestActivity`, and `ReplyTarget` confirm activity and acknowledge replies. Resend a completed result until receipt, never rerun the handler. A NATS 503 is not a reply receipt. |
 | Renew discovery registration | `registry::refreshes` retains a separate pending renewal future so broker latency cannot block serving requests, controls, or shutdown. |
 | Observe turn completion | Incremental transcript polling operates independently of live advisories. Durable coverage determines which prompt completed; a prior turn's advisory cannot complete an injected prompt. |
 | Consume worker activations | Reopen the durable pull stream after errors/closure; acknowledge according to the activation's durable admission and lease state. |
@@ -1531,7 +1575,7 @@ Loss of activity or exhausted recovery reports that the call's outcome is
 descendant stopped. Interruption never depends on that answer: the session log
 alone decides whether a turn ended.
 
-Deploy the frontend, worker, and tool/hook binaries together for this contract.
+Deploy the frontend, worker, and tool binaries together for this contract.
 Older clients still receive ordinary replies, but an older server cannot provide
 the activity receipts expected by a new long-running RPC caller. Restart all
 local frontends for the persistent endpoint policy: an old broker owner still
@@ -1662,14 +1706,28 @@ The shared NATS tool server checks native and bridged terminal replies against
 both the connected broker's `max_payload` and the journal stream's independent
 message-size limit. The budget includes the complete invocation row, CAS headers,
 and final reply metadata. This is a per-record/message limit, not a whole-session
-limit. Native results that fit aren't subject to the MCP bridge's 32 KiB
+limit. Native results that fit aren't subject to the MCP bridge's 128 KiB
 presentation cap.
 
-An oversized terminal reply is stored as an `application/json` attachment under
-the trusted invoking session, then replaced by an explicit recoverable size error
-with its `cid:media:` reference. Without trusted ownership, the error says the
-original wasn't retained. Read retained output with `attachment_read` byte paging;
-don't blindly retry side-effecting tools. The first bounded completion committed
+When a successful reply exceeds that budget because of inline `image/*` blocks
+and has a trusted invoking session owner, the server stores those decoded
+images in `harnx_attachments` and replaces them in place with `resource_link`
+blocks (`cid:media:...`, `mimeType`, byte `size`, and original `annotations` and
+`_meta`) if the projected reply fits the budget. This lets `fs_read`, `fetch_*`,
+`attachment_read`, and the Kubernetes sandbox gateway deliver large images
+without hitting the 1 MiB default `max_payload` ceiling. Image uploads are
+checked against the budget before writing and must succeed before the link is
+committed; a failed upload stays fatal rather than falling back to an oversized
+reply or a dangling link.
+
+Replies that fit stay inline with no bucket access. Otherwise (when there is no
+trusted owner, the reply is an error, no eligible image blocks are present, or
+the projected reply still exceeds the budget), an oversized terminal reply is
+stored as an `application/json` attachment under the trusted invoking session,
+then replaced by an explicit recoverable size error with its `cid:media:`
+reference. Without trusted ownership, the error says the original wasn't retained.
+Read retained output with `attachment_read` byte paging; don't blindly retry
+side-effecting tools. The first bounded completion committed
 by journal CAS is delivered unchanged and reused on replay, without rerunning the
 tool or hydrating the large original into the reply. Fatal and interrupted
 outcomes keep their categories. Attachment outages and other non-size storage or
@@ -1696,6 +1754,14 @@ re-wedge the session exactly as before the fix. A round of many small results th
 overflows only by count keeps its outputs: a size error is bigger than the result it
 replaces, so nothing is degraded and the typed rejection terminates the activation
 instead.
+
+The 128 KiB agent-facing default (`harnx-core` `DEFAULT_MAX_BYTES`) applies per
+truncation application, not per tool result: bash tools truncate stdout and
+stderr independently (`harnx-bash-tools/src/server/render.rs`), so one result
+can carry about 256 KiB, and with the default 1 MiB broker payload ceiling a
+round of roughly seven parallel full-size results reaches the budget. Hitting
+that budget degrades results through the path above — it is the designed
+backstop for aggressive parallel fan-out, not a bug.
 
 ## Manual Compaction
 
@@ -1873,7 +1939,7 @@ no TLS settings, pointed at a server that demands TLS in its INFO. Say
 `tls: true` (or use `tls://`) for such a cluster.
 
 Config-based TLS (`tls`/`tls_cert`/`tls_key`/`tls_ca` in `nats_servers/<cluster>.yaml`)
-covers the client and worker session connection. It does **not** cover tool/hook
+covers the client and worker session connection. It does **not** cover tool
 discovery — see
-[Independently Deployed Tool and Hook Servers](#independently-deployed-tool-and-hook-servers)
+[Independently Deployed Tool Servers](#independently-deployed-tool-servers)
 for the separate `HARNX_NATS_TLS*` env vars that connection needs.

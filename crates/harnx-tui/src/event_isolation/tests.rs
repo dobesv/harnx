@@ -20,6 +20,7 @@ pub(crate) fn old_events() -> Vec<AgentEvent> {
         }),
         AgentEvent::Turn(TurnEvent::SubAgentProgress(
             harnx_core::event::SubAgentProgress {
+                pending_interaction: None,
                 invocation_id: "old-child-invocation".into(),
                 agent: "child".into(),
                 session_id: "child-session".into(),

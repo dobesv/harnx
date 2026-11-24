@@ -1,13 +1,10 @@
-mod cli;
-mod client_handler;
-mod server;
-mod transport;
-
 use std::time::Duration;
 
 use clap::Parser;
+use harnx_mcp_remote::cli;
+use harnx_mcp_remote::native;
+use harnx_mcp_remote::server::RemoteProxyServer;
 use rmcp::ServiceExt;
-use server::RemoteProxyServer;
 use tokio_util::sync::CancellationToken;
 
 fn main() -> anyhow::Result<()> {
@@ -22,16 +19,31 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     let _ = harnx_core::logging::init(harnx_core::logging::LogSink::Stderr);
+    let cli = cli::Cli::parse();
+
+    // Native NATS mode: per-user credentials, connect pages and per-user
+    // registrations. Selected only by --credentials-key-file; without it the
+    // stdio proxy path below runs unchanged (R10). The shared runner owns
+    // metrics, healthz, telemetry and SIGTERM handling in this mode, so this
+    // branch must not initialize any of them first.
+    if cli.credentials_key_file.is_some() {
+        log::info!(
+            "harnx-mcp-remote v{}: starting native mode for {}",
+            env!("CARGO_PKG_VERSION"),
+            cli.url
+        );
+        let config = native::NativeConfig::from_cli(&cli)?;
+        return native::run_native(config).await;
+    }
+
     let telemetry = harnx_telemetry::init_telemetry("harnx-mcp-remote")?;
 
-    let result = run().await;
+    let result = run(&cli).await;
     telemetry.shutdown().await;
     result
 }
 
-async fn run() -> anyhow::Result<()> {
-    let cli = cli::Cli::parse();
-
+async fn run(cli: &cli::Cli) -> anyhow::Result<()> {
     // Initialize metrics if configured via --metrics-addr or HARNX_METRICS_ADDR env.
     let flags = harnx_metrics::MetricsFlags {
         metrics_addr: cli.metrics_addr.clone(),
@@ -50,7 +62,7 @@ async fn run() -> anyhow::Result<()> {
         cli.url
     );
 
-    let server = RemoteProxyServer::new(cli);
+    let server = RemoteProxyServer::new(cli.clone());
     let transport = rmcp::transport::stdio();
     let serve_ct = CancellationToken::new();
     let shutdown = harnx_nats_common::shutdown::cancel_token_on_shutdown_signal();

@@ -19,14 +19,18 @@ Usage: harnx-a2a-server [OPTIONS] --agent <SPEC>
 | `--host <HOST>` | `127.0.0.1` | HTTP bind host. Set explicitly (for example, `0.0.0.0`) when listening behind a reverse proxy or container gateway. |
 | `--port <PORT>` | `3020` | HTTP bind port. Distinct from toolset ports (3000–3007) and MCP HTTP (3010). |
 | `--agent <SPEC>` | *(required)* | Agent export specification: bare `name` or `alias=name`. Repeatable, comma-separated. Environment variable `HARNX_A2A_AGENTS`. Specifying CLI flags replaces `HARNX_A2A_AGENTS`. There is no default "expose all" mode; at least one agent is required. |
-| `--metrics-addr <ADDR>` | disabled | Optional Prometheus listener (`IP:PORT` or `:PORT`); exports recovery, pending-age and sweep diagnostics. |
+| `--healthz-addr <ADDR>` | disabled | Optional readiness listener at `/healthz` (`IP:PORT` or `:PORT`); environment variable `HARNX_HEALTHZ_ADDR`. CLI takes precedence. |
+| `--metrics-addr <ADDR>` | disabled | Optional Prometheus listener at `/metrics` (`IP:PORT` or `:PORT`); exports HTTP request metrics and recovery, pending-age and sweep diagnostics. CLI only, no environment variable fallback. |
 | `--cluster <CLUSTER>` | none | Target NATS cluster name for shared workers. |
 | `--config-dir <PATH>` | `HARNX_CONFIG_DIR` | Path to the harnx configuration directory containing `config.yaml`. |
 | `--access-rules <PATH>` | `<config dir>/access.yaml` if present | Access rules file, also set by `HARNX_ACCESS_RULES`. Requires `--user-id-header` when rules are enabled. |
 | `--public-base-url <URL>` | none | Base URL used in Agent Card interface URLs (for example, `https://agents.example.com`). If omitted, inferred from `X-Forwarded-*` or `Host` headers. |
-| `--user-id-header <NAME>` | none | Trusted identity source: bare header name, `header:NAME`, or `cookie:NAME` (repeatable, first present source wins). Empty or invalid values fail closed. Enables user isolation mode. |
-| `--group-header <NAME>` | none | Trusted group membership header name (repeatable, all values contribute). |
-| `--role-header <NAME>` | none | Trusted role membership header name (repeatable, all values contribute). |
+| `--user-id-header <NAME>` | none | Trusted identity source: bare header name, `header:NAME` (opaque), `header-csv:NAME` (first list item), `cookie:NAME`, `forge-fit`, or `bearer-claim:CLAIM` (repeatable, first present source wins). Bare `forge-fit` is the Forge token source, not a header name. Without verification flags, bearer sources operate in decode-only mode. Empty or invalid values fail closed. Enables user isolation mode. |
+| `--group-header <NAME>` | none | Trusted group header spec: `header:NAME`/bare `NAME` for an opaque item per field, `header-csv:NAME` for quoted comma lists (repeatable, all items contribute). |
+| `--role-header <NAME>` | none | Trusted role header spec (same syntax as `--group-header`; repeatable, all items contribute). |
+| `--bearer-jwks-url <URL>` | none | Verify bearer identity sources against this JWKS URL. Requires `--bearer-issuer` and `--bearer-audience`; off by default. |
+| `--bearer-issuer <ISSUER>` | none | Expected bearer token issuer (requires `--bearer-jwks-url` and `--bearer-audience`). |
+| `--bearer-audience <AUDIENCE>` | none | Expected bearer token audience (requires `--bearer-jwks-url` and `--bearer-issuer`). Pinning audience is essential because all Forge apps share signing keys. |
 | `--max-data-part-bytes <BYTES>` | `65536` | Maximum combined byte budget for rendered data and inline text/JSON file parts per message. Over-limit requests return an invalid params error. |
 
 ### Export Specifications and Startup Validation
@@ -43,6 +47,101 @@ harnx-a2a-server \
 - **Explicit exports only**: Wildcards (`*`, `?`, glob characters) are rejected.
 - **Agent validation**: Every exported agent must exist in local agent markdown or builtin configuration at startup. Unknown agents cause startup failure.
 - **Lookup key uniqueness**: Any collision across export lookup keys fails startup immediately.
+
+## Readiness and metrics ports
+
+```sh
+harnx-a2a-server --agent reviewer --host 0.0.0.0 --port 3020 \
+  --healthz-addr :8081 --metrics-addr :8456
+curl -i http://127.0.0.1:8081/healthz
+curl http://127.0.0.1:8456/metrics
+```
+
+A2A traffic uses port `3020` by default. Readiness and metrics are opt-in,
+independent listeners; `8081` and `8456` are example ports, not defaults. Don't
+reuse the application port or put both optional listeners on the same port.
+Blank hosts bind `0.0.0.0`. Restrict readiness and metrics to your probe/scraper
+network; they don't use A2A authentication or access rules.
+
+`GET /healthz` returns an empty `503 Service Unavailable` until agent validation,
+NATS/JetStream connection, coordination provisioning, backend initialization and
+the A2A listener bind succeed, then an empty `200 OK`. SIGTERM or Ctrl-C flips it
+back to `503` before runners are aborted/drained and HTTP shutdown finishes. This
+is startup/shutdown readiness, not a continuous check of broker or worker health.
+Use it for a Kubernetes readiness probe, not a liveness probe.
+
+`GET /metrics` serves Prometheus text, including HTTP request counts and durations
+with bounded route-template labels, plus A2A recovery diagnostics. Metrics use
+`--metrics-addr` only, matching `harnx-serve` and `harnx-worker`; they don't read
+`HARNX_METRICS_ADDR`. See [operations](../../docs/a2a-operations.md#listeners-and-readiness)
+and [Kubernetes deployment](../../docs/kubernetes-deployment.md#a2a-backends-behind-ingress).
+
+## Request logging
+
+Each handled A2A request emits one `info` event on the tracing target
+`harnx_a2a_server::requests` when it finishes. Streaming requests log at stream
+EOF or drop, not when the handler returns the SSE response. Agent Card fetches
+(including the legacy alias), identity rejections, hidden exports and compatibility
+rejections are included.
+
+To see only request records, in JSON with separate structured fields:
+
+```sh
+HARNX_LOG_LEVEL=info \
+HARNX_LOG_FILTER=harnx_a2a_server::requests \
+HARNX_LOG_FORMAT=json \
+harnx-a2a-server --agent jira=team/triage
+```
+
+The server uses the shared `HARNX_LOG_LEVEL`, `HARNX_LOG_FILTER` (target prefix)
+and `HARNX_LOG_FORMAT` settings. `RUST_LOG` is a fallback for a **bare level** only,
+not per-target directives. When no `HARNX_LOG_*` setting is present, an ignored
+non-bare `RUST_LOG` value produces one startup warning without echoing its value.
+`HARNX_LOG_FILTER` matches one target prefix, so you can isolate request records
+but not exclude them while keeping other logs — there's no negation or
+per-target directive syntax. Logs go to stderr. A2A tracing JSON events store
+structured values under `fields` rather than embedding them in `message`.
+
+| Field | Meaning |
+| --- | --- |
+| `export` | Public export name, even when addressed through another lookup key |
+| `method` | Canonical `SendMessage`, `SendStreamingMessage`, `GetTask`, `SubscribeToTask`, `CancelTask`, `ListTasks`, `AgentCard`, or an optional protocol method |
+| `task_id`, `context_id` | IDs from the request or returned task/events, when available |
+| `message_id` | Incoming message ID for sends |
+| `state` | Returned/latest delivered task state, for example `Working`, `Completed`, `InputRequired` |
+| `error_code`, `error_message` | A2A error, including mapped task-not-found (`-32001`), busy (`-32000`) and invalid-params errors |
+| `duration_ms` | Elapsed milliseconds through unary completion or stream end/drop |
+| `events_sent` | Stream events yielded to the SSE codec, including snapshots and error envelopes; excludes keepalive comments |
+| `end_reason` | Stream end classification (below) |
+| `tasks_returned` | Number of tasks in a successful `ListTasks` page (no single task state applies) |
+| `http_status` | HTTP status for discovery and pre-dispatch rejections |
+
+Clients should use opaque, non-sensitive IDs: IDs are logged as sent (up to
+256 characters plus `…`), so treat info correlation logs as operational data.
+Error messages for unsupported media types, unsupported
+A2A versions and non-cancelable tasks omit echoed client values. Wire responses
+are unchanged.
+
+Stream end reasons are `terminal` (completed, canceled, failed or rejected),
+`interrupted` (input/auth required), `client_disconnect` (dropped before a response
+boundary), and `server_shutdown` (backend abort). `error` records a setup,
+rejection or delivery error; pre-stream rejections have `events_sent=0`.
+`stream_closed` means the source ended without a response boundary.
+`events_sent` counts events handed to the transport, not client acknowledgements.
+Disconnecting doesn't cancel the underlying task. Shutdown abort closes open
+streams so they don't hold graceful shutdown indefinitely.
+
+Request records never contain message parts, prompt/response text or bearer
+tokens. Resolved `user_id` is emitted only by a separate `debug` event on the same
+target (`A2A caller resolved`). It can contain a Forge account DN; enable
+`HARNX_LOG_LEVEL=debug` only when needed and protect those logs as personal data.
+
+**Coverage gap:** JSON-RPC parse, invalid-envelope, parameter-decoding and
+method-not-found errors generated inside the external `a2a_server_lf` router
+don't reach our handler and aren't recorded here. Requests to unknown export
+names or paths aren't request records either. HTTP metrics still count these
+responses. Our identity/access and compatibility rejections log only protocol
+metadata; unrecognized methods in those rejections are labeled `Unknown`.
 
 ## Endpoints and Name Resolution
 
@@ -70,7 +169,7 @@ Agent Cards are public when access rules are disabled. With access rules enabled
 
 - **Server-allocated contexts**: `contextId` is identical to the durable harnx session ID. Contexts are strictly allocated by the server. Incoming requests containing an unknown or unauthorized `contextId` are rejected with `TaskNotFoundError` (`-32001`). Clients cannot invent context IDs. With access rules enabled, `admin` can operate another user's context on the same export; creating a context still requires `prompt`.
 - **Task ID format**: Task IDs are opaque strings formatted as `{contextId}.{uuid}`. Because harnx session IDs are base64url strings without dots, the dot cleanly delimits the context ID from the task UUID.
-- **One active task per context**: A context can execute only one task at a time. If a client sends a new prompt to a context while a task is still running, the server rejects the request with code `-32000` ("context has an active task; retry later").
+- **One active task per context**: A context can execute only one task at a time. A new prompt for a context whose task is still running is steered into that task's turn and answered on the same task (issue #2774). Only a context whose steered work has not settled yet — including a parked `INPUT_REQUIRED` reply wait or a legacy context without a steerable invocation — rejects a fresh prompt with the retryable busy code `-32000` ("context already has an active task; retry later").
 - **Message deduplication**: Requests are deduped by `messageId`.
   - Retrying an identical `messageId` and content returns the existing task record—even if the task has already reached a terminal state.
   - Sending an existing `messageId` with different content returns `InvalidParams` (`-32602`).
@@ -156,7 +255,7 @@ The server emits JSON-RPC 2.0 error responses with structured `google.rpc.ErrorI
 
 | Code | Reason | Description |
 |---|---|---|
-| `-32000` | Server-specific | Missing or empty user identity header (HTTP 401), or busy context (active task in progress). |
+| `-32000` | Server-specific | Missing or empty user identity header (HTTP 401), or busy context (parked `INPUT_REQUIRED` task or legacy context; a running task steers new input into its turn instead, issue #2774). |
 | `-32001` | `TASK_NOT_FOUND` | Task or server-allocated context does not exist, or the caller can't access its agent, owner or export. |
 | `-32002` | `TASK_NOT_CANCELABLE` | Task is already in a terminal state (`COMPLETED`, `FAILED`, `CANCELED`). |
 | `-32003` | `PUSH_NOT_SUPPORTED` | Push notification configuration requested (push notifications unsupported). |
@@ -180,6 +279,100 @@ The server emits JSON-RPC 2.0 error responses with structured `google.rpc.ErrorI
 - When access rules are enabled, `--user-id-header` is **required**. Startup fails closed if rules are active without configured identity headers.
 - When no rules file or flag is present, access control is disabled and standard A2A behavior applies.
 
+### Caller Identity Sources
+
+Configure caller identity sources with `--user-id-header <SPEC>`. The flag is repeatable; sources are evaluated in order and the first present source wins.
+
+| Source Syntax | Wire Location | Resolved Identity | Description |
+|---|---|---|---|
+| `NAME` or `header:NAME` | Header `NAME` | Header value | Reads the whole trimmed value of the first header field, preserving commas and backslashes without unquoting. Fails closed on empty or invalid values. |
+| `header-csv:NAME` | Header `NAME` | First list item | Explicit legacy first-item user-id behavior. Parses the first field with the shared quoted-list parser; an empty first item or malformed list fails closed. |
+| `cookie:NAME` | Cookie `NAME` | Cookie value | Cookie names are case-sensitive. Must carry a proxy-verified user ID, not a token. |
+| `forge-fit` | `Authorization: Bearer <FIT>` | X.500 DN | Base64url-decodes Atlassian Forge Invocation Token payload and formats a DN. Bare `forge-fit` is the source name, not a header name. |
+| `bearer-claim:CLAIM` | `Authorization: Bearer <JWT>` | Claim value | Reads named top-level string claim from the decoded token payload. |
+
+For AWS ALB mTLS verify mode, configure `--user-id-header header:X-Amzn-Mtls-Clientcert-Subject`. A subject value of `CN=alice,OU=eng,O=Acme Corp` becomes the full user ID; RFC 2253 escaped commas such as `CN=Smith\, Alice,OU=eng` are preserved without DN parsing or unescaping. Repeated identity header fields still use only the first field. Use `header-csv:NAME` only to select the first comma-list item instead. Header prefixes are case-insensitive. Both user-id and group/role options use these same header specs; membership lists require `header-csv:`. The proxy must replace client-supplied identity headers, not append fields or comma-join values.
+
+#### Forge DN Format
+
+The `forge-fit` source formats caller identity into an X.500 Distinguished Name (DN) ordered CN-first:
+
+- **User invocations** (`principal` claim present and not `"unidentified"`):
+  `CN=<principal>,OU=<context.cloudId>,O=atlassian.com`
+  Example: `CN=655362:312d3308-8954-42b0-aa38-771a10c88656,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com`
+- **Automation and anonymous invocations** (`principal` claim absent or `"unidentified"`):
+  `OU=<context.cloudId>,O=atlassian.com`
+  Example: `OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com`
+
+Component values are validated against control characters, leading/trailing whitespace, and DN delimiter characters (`,`, `=`, `+`, `<`, `>`, `#`, `;`, `"`, `\`). Any invalid character fails closed (HTTP 401 / JSON-RPC `-32000`).
+
+#### Shared-Owner Caveat for Org-Only Identities
+
+All calls lacking a user principal from the same Atlassian site/cloudId (system automations, scheduled triggers, lifecycle events, anonymous callers) resolve to the same org-only identity `OU=<cloudId>,O=atlassian.com`. Because A2A session ownership is keyed to the exact resolved identity string, these automated tasks share a single owner: any task or trigger from that site can view, prompt, or manage other sessions owned by that org-only identity under `prompt` scope.
+
+#### Fallthrough and Fail-Closed Precedence
+
+- Sources are evaluated in `--user-id-header` order. The first source present in the request wins.
+- If `Authorization` is absent or uses a scheme other than `Bearer`, the bearer source is skipped and resolution falls through to the next configured source.
+- If a bearer source is selected and an `Authorization: Bearer` token is present, resolution never falls through. If the token is malformed, missing required claims, expired, or fails verification, the request fails closed immediately with HTTP 401 / JSON-RPC `-32000`. Later sources are never tried.
+- Earlier sources take precedence. For example, with `--user-id-header header:X-User-Id --user-id-header forge-fit`, a valid `X-User-Id` header takes precedence even if an invalid bearer token is also sent.
+- If no configured source matches (the end of the source list is reached), the request is rejected with HTTP 401 / JSON-RPC `-32000`. When identity sources are configured, this rejection protects all endpoints under `/agents/{name}`, including Agent Cards when access rules are enabled (when access rules are disabled, Agent Cards remain public).
+- With zero sources configured (no `--user-id-header` flags), the server runs in shared anonymous mode and accepts requests without identity checks.
+- There is no separate "require a token" flag. The verification flags do not make a token mandatory by themselves; they ensure any present token is verified. A token becomes mandatory when the bearer source is the only configured `--user-id-header` source, because a request omitting the token reaches the end of the source list and is rejected with HTTP 401 (see [Built-in Bearer Token Verification](#built-in-bearer-token-verification)).
+
+#### Access Control and Alias Examples for Forge DNs
+
+In `access.yaml`:
+
+```yaml
+rules:
+  # Allow all authenticated Jira users from a specific site
+  - agents:
+      - triage-agent
+    scopes:
+      - prompt
+    users:
+      - "CN=*,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+
+  # Match both user calls and automated/no-user calls from the same site
+  # (*OU matches CN=...,OU=... and OU=... because * spans commas)
+  - agents:
+      - triage-agent
+    scopes:
+      - prompt
+    users:
+      - "*OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+```
+
+In `users.yaml`, map a specific Forge DN to display metadata, alias groups, and roles:
+
+```yaml
+- name: Forge Jira Lead
+  identities:
+    - "CN=655362:312d3308-8954-42b0-aa38-771a10c88656,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+  groups:
+    - engineering
+  roles:
+    - admin
+```
+
+#### Finding Cloud ID and Account ID
+
+To configure allow lists in `access.yaml` or user mappings in `users.yaml`, operators need the site's Cloud ID (`OU`) and the user's Account ID (`CN`):
+
+- **Cloud ID (`OU`)**: Identifies the Atlassian site (UUID format).
+  - Query `https://<site>.atlassian.net/_edge/tenant_info` (an unauthenticated endpoint returning JSON with `cloudId`).
+  - Read `context.cloudId` from a Forge invocation payload or app logs.
+  - Check the site's settings in Atlassian Administration (`admin.atlassian.com`).
+- **Account ID (`CN`)**: Identifies the user within Atlassian (e.g. `655362:312d3308-...`).
+  - Open the user's profile in Jira; the URL is `https://<site>.atlassian.net/jira/people/<accountId>`.
+  - Call the Jira REST API `GET /rest/api/3/myself`, which returns the caller's `accountId`.
+  - Look up the user in Atlassian Administration (`admin.atlassian.com`) under Directory > Users.
+
+Atlassian account IDs are global across sites, while `OU` pins the specific site. Combining them as `CN=<id>,OU=<cloudId>,O=atlassian.com` restricts the user's access to that single site.
+
+For security and privacy, `harnx-a2a-server` logs resolved caller identities only at `debug`, in the separate request-target caller event described under [request logging](#request-logging). Tokens and other token claims aren't logged. Without enabling debug logs, operators can inspect the resolved identity in session metadata after a test call: `harnx info session <agent> <session-id> --format json` records the identity under `extensions["dev.harnx.session_properties"].user_id.value`.
+
 ### Behavior Under Rules
 - **Authentication**: All endpoints under `/agents/{name}`, including Agent Cards and discovery GET requests, require trusted caller identity and return HTTP `401 Unauthorized` (JSON-RPC error code `-32000`) if missing. (When access rules are disabled, Agent Cards remain public).
 - **Agent Reference Matching**: Rules are evaluated against the internal agent reference (`Export::agent_ref()`, such as `coder` or `coder@cluster`), **never** against public export aliases (such as `alias=coder`).
@@ -190,11 +383,25 @@ The server emits JSON-RPC 2.0 error responses with structured `google.rpc.ErrorI
   - Context creation without `prompt` scope returns JSON-RPC permission error code `-32010` (`session creation requires prompt scope`).
   - Accessing another user's context without `admin` scope returns JSON-RPC `-32001` (`task not found`).
 - **ListTasks Scoping**: `ListTasks` requires `contextId`. Callers with `prompt` scope can list tasks in their own contexts; callers with `admin` scope can list tasks in any authorized context.
-- **Group and Role Memberships**: Callers can supply group and role memberships via `--group-header <NAME>` and `--role-header <NAME>` flags. All configured headers contribute values; repeated headers and comma-separated tokens are split and trimmed. Any invalid header bytes fail closed with JSON-RPC error code `-32000` (HTTP 401). Memberships are evaluated per request and never persisted in session metadata or NATS task storage. Memberships never satisfy context ownership (which remains tied solely to caller `user_id`), but rules granting `admin` scope allow full task management across all contexts.
+- **Group and Role Memberships**: Configure repeatable `--group-header <SPEC>` and `--role-header <SPEC>` flags. `header:NAME` or bare `NAME` keeps each whole trimmed field as one opaque membership, with no comma splitting or unquoting. `header-csv:NAME` enables the same quoted-list parser as user-id sources, but contributes every item rather than only the first. Prefixes are case-insensitive; non-header kinds (`cookie:`, `forge-fit`, `bearer-claim:`) fail startup.
+  - **Migration:** Change `--group-header X-Groups` to `--group-header header-csv:X-Groups` when a proxy sends a comma-separated list (similarly for roles). Bare names no longer split lists.
+  - With `header-csv:`, repeated fields of each name are comma-joined before parsing. Commas outside double quotes separate items, except escaped commas (`\,`), which stay literal. Unquoted items are trimmed; empty items (including `""`) are dropped. Order and duplicates are retained.
+  - Double-quote an entire item to include DN commas. Inside quotes, `\"` becomes `"`, `\\` becomes `\`, and other escapes stay literal, preserving RFC 4514 `\,`. Whitespace inside quotes stays part of the value. After a closing quote, only whitespace and a comma or the end of the list are allowed.
+  - Invalid bytes or malformed `header-csv:` quoting fail closed with JSON-RPC `-32000` (HTTP 401), without echoing header contents.
+  - Memberships are evaluated per request for access control and are not used for authorization persistence. For agent prompt and tool customization, a snapshot of resolved caller principals (`user_id`, expanded `users`, `groups`, `roles`) is captured at session creation (and with first-message reservations) into the read-only `user_principals` session property (`__user__` in templates, `$user` in agent `patches`); access rules never consult that snapshot. See [Customizing Agents by Caller](../../docs/configuration-guide.md#customizing-agents-by-caller-patches-and-__user__) and the [Agent Guide](../../docs/agent-guide.md#agent-patches-patches).
+  - Memberships never satisfy context ownership (tied solely to caller `user_id`), but rules granting `admin` allow task management across contexts.
+
+  For example, `--group-header header-csv:X-Groups` accepts two DN groups and a plain group:
+
+  ```http
+  X-Groups: "CN=admins,OU=eng,O=Acme", "CN=ops,O=Acme", plain-group
+  ```
+
+  Access-rule `groups:` globs match each full DN. For a single unquoted DN group, use `--group-header header:X-Groups` instead.
 - **User Aliases (`users.yaml`)**: Optional user alias configuration loaded once at startup from `<config-dir>/users.yaml`. See the [User Aliases section in the Configuration Guide](../../docs/configuration-guide.md#user-aliases-usersyaml) for schema, semantics, and examples.
   - An authenticated caller's identity expands into the first matching entry's `identities` list for agent export visibility and context access.
   - Optional `groups` and `roles` declared on the matched entry are merged into caller memberships (appended after header values and deduped) and matched against `access.yaml` rules, even without membership headers configured.
-  - Stored owner identities in A2A bindings are never expanded. New contexts record the caller's raw incoming identity in the binding. Configured groups and roles never grant context ownership and are not stored in task bindings or session metadata.
+  - Stored owner identities in A2A bindings are never expanded. New contexts record the caller's raw incoming identity in the binding. Configured groups and roles never grant context ownership and are not stored in task bindings. For prompt and tool customization, resolved caller principals are snapshotted into the session's read-only `user_principals` property, but that snapshot is never consulted for context or session authorization.
   - When access rules are disabled, owner isolation still applies: callers can access bindings where the stored owner is in their expanded identities. Anonymous access (`None` stored owner and `None` caller) succeeds; mixed anonymous/authenticated access fails.
   - Missing `users.yaml` preserves singleton identity behavior. An invalid present file fails startup immediately with path context. Modifying the file requires a server restart; there is no live reload.
   - Because alias mappings grant authorization, `users.yaml` should be edited only by trusted operators.
@@ -205,11 +412,23 @@ In production, run `harnx-a2a-server` behind a reverse proxy (such as Nginx, Env
 
 ### Reverse Proxy Responsibilities
 
-1. **Authentication and JWT verification**: The server does not validate tokens or authentication signatures. For Atlassian Forge apps, the reverse proxy must verify the Forge Invocation Token (FIT JWT) signed by Atlassian's JWKS.
+1. **Authentication and token verification**: For bearer tokens, built-in verification (`--bearer-jwks-url`, `--bearer-issuer`, `--bearer-audience`) is recommended. If you verify tokens at the reverse proxy instead, configure bearer sources (`forge-fit`, `bearer-claim:CLAIM`) without verification flags; the server will operate in decode-only mode and trust the upstream proxy's validation.
 2. **Strip or overwrite identity sources**: When `--user-id-header`, `--group-header`, or `--role-header` are configured, the proxy **must strip or overwrite** the selected headers or cookies on incoming requests from clients. Cookies must contain a proxy-verified user ID, not a token or client-supplied identity. The server doesn't verify cookie signatures.
 3. **Disable SSE response buffering**: Streaming responses use Server-Sent Events (`text/event-stream`). The proxy must disable buffer accumulation (e.g. `proxy_buffering off` in Nginx; `X-Accel-Buffering: no` is emitted by the server).
 4. **Long route timeouts**: Remote agent turns can run for several minutes. Set proxy read and send timeouts to at least **900 seconds** (15 minutes), matching Forge's SSE stream allowance.
 5. **Base URL configuration**: Set `--public-base-url https://agents.example.com` or pass standard forwarding headers (`Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`) so Agent Cards generate reachable public URLs. Set `--public-base-url` in production so the card origin does not depend on request headers.
+
+### Trust Model
+
+Bearer token configuration has two distinct parts:
+1. **Identity extraction**: Bearer identity sources (`forge-fit` and `bearer-claim:CLAIM`, configured via `--user-id-header`) read caller identity from the `Authorization: Bearer` token.
+2. **Token verification**: Cryptographic verification flags (`--bearer-jwks-url`, `--bearer-issuer`, `--bearer-audience`) validate token signatures and claims against the issuer's JWKS.
+
+**Recommended approach: built-in verification.** The server verifies RS256 signatures against the JWKS endpoint, validates `iss`, `aud`, and `exp`, and checks `nbf`/`iat`. When verifying Forge tokens (whether built-in or at an upstream proxy), **pinning the audience (`aud`) is critical for security**. All Atlassian Forge apps share the same signing keys and JWKS endpoint (`https://forge.cdn.prod.atlassian-dev.net/.well-known/jwks.json`). A token signed by Atlassian is cryptographically valid for any Forge app; only matching `aud` against your app's specific ARI (`ari:cloud:ecosystem::app/<app id>`) prevents tokens from other Forge apps from authenticating against your server.
+
+**AWS ALB cannot verify Forge Invocation Tokens.** ALB rejects a `jwt-validation` listener configuration whose `Issuer` isn't a URL, so it can't be configured for the FIT issuer `forge/invocation-token`. For Forge deployments, use the server's built-in verification.
+
+**Alternative: reverse proxy verification (decode-only mode).** When verification flags are omitted, bearer sources operate in decode-only mode, parsing token payloads without verifying cryptographic signatures or expiration. This is safe only when `harnx-a2a-server` runs in a private network behind a reverse proxy that verifies every incoming token before forwarding requests, with nothing else able to reach the server. If unauthenticated traffic reaches the server directly in decode-only mode, callers can forge identities by sending arbitrary JWT payloads.
 
 ### Nginx Configuration Example
 
@@ -254,6 +473,60 @@ server {
 }
 ```
 
+## Built-in Bearer Token Verification
+
+`harnx-a2a-server` can verify bearer tokens directly against a remote JWKS without requiring a verifying proxy upstream.
+
+### Verification CLI Flags
+
+All three flags are required together to enable verification:
+
+| Flag | Value | Description |
+|---|---|---|
+| `--bearer-jwks-url <URL>` | JWKS URL | Remote JWKS endpoint URL to fetch RS256 public keys. Must use `https`; `http` is only accepted for loopback hosts (testing). Redirects are never followed. |
+| `--bearer-issuer <ISSUER>` | Issuer string | Expected `iss` claim in the bearer token (for Forge: `forge/invocation-token`). Must be non-empty. |
+| `--bearer-audience <AUDIENCE>` | Audience string | Expected `aud` claim in the bearer token (for Forge: `ari:cloud:ecosystem::app/<app id>`). Must be non-empty. Pinning audience is essential because all Forge apps share signing keys. |
+
+### Verification Example
+
+```sh
+harnx-a2a-server \
+  --agent jira=team/triage \
+  --user-id-header forge-fit \
+  --bearer-jwks-url https://forge.cdn.prod.atlassian-dev.net/.well-known/jwks.json \
+  --bearer-issuer forge/invocation-token \
+  --bearer-audience ari:cloud:ecosystem::app/d0d52620-3203-4cfa-8db5-f2587155f0dd
+```
+
+To require a valid token, configure `forge-fit` (or `bearer-claim:CLAIM`) as the only `--user-id-header` source alongside the verification flags:
+- When an `Authorization: Bearer` token is present, the verification flags ensure it is verified. An invalid, expired, or unverified token fails closed immediately (HTTP 401 / JSON-RPC `-32000`) with no fallthrough to later sources.
+- If a request lacks an `Authorization` header, resolution falls through to subsequent configured sources. Any additional `header:` or `cookie:` source would admit requests lacking a bearer token. With no other sources configured, requests without an `Authorization` header fail resolution and are rejected with HTTP 401.
+- Omitting `--user-id-header` entirely runs the server in shared anonymous mode without identity checks.
+
+### Verification Behavior and Parameters
+
+- **Algorithm**: Pinned to `RS256`. Tokens specifying any other algorithm (such as `none` or symmetric `HS256`) are rejected immediately before key lookup.
+- **JWKS Transport**: The JWKS URL must use `https`; an `http` URL fails startup unless the host is loopback (`127.0.0.1`, `::1`, `localhost`), which exists for tests. Redirects are never followed, so an endpoint can't be re-pointed or downgraded to a plaintext hop.
+- **JWKS Cache and Key Rotation**: Keys are fetched lazily on the first bearer request and cached by key ID (`kid`) for at most 10 minutes after a successful fetch. An unknown `kid` or an expired cache triggers a refresh, even when the `kid` matches a cached key. Refetches are single-flight (concurrent requests share one fetch) and throttled to at most one attempt per 30 seconds, including failed or cancelled attempts, to prevent fetch storms. A refresh replaces the entire cached key set, rejecting rotated-out keys. Expired keys are never served if refresh fails: requests fail closed with no stale-key grace period, so a JWKS outage can't extend trust in a removed or compromised key. Verification resumes after a successful refresh, subject to the same throttle. JWKS requests time out after 5 seconds and response bodies are capped at 1 MiB.
+- **JWKS Key Encoding**: RSA `n` and `e` values may carry trailing `=` padding. RFC 7518 says they're unpadded base64url, but Forge's JWKS pads them, so the padding is stripped before the key is built.
+- **Claims Validation**:
+  - `iss` must match `--bearer-issuer`.
+  - `aud` must match `--bearer-audience`. Pinning `aud` is essential because all Forge apps share Atlassian signing keys.
+  - `exp` is required; expired tokens are rejected.
+  - `nbf` and `iat` are validated when present. Tokens issued in the future are rejected. A present `iat` that isn't a JSON number fails closed.
+  - Clock-skew leeway for time claims is 10 seconds (tuned for FIT tokens with ~25-second lifespans).
+- **Failure Behavior**:
+  - Verification failures fail closed: HTTP 401 Unauthorized with JSON-RPC error code `-32000` and a static reason category (e.g. `bad bearer token signature`, `bearer token is expired`, `jwks fetch failed`).
+  - No fallthrough: if a bearer source is selected and an `Authorization: Bearer` token is present, any verification or decoding failure rejects the request immediately. Subsequent identity sources are never tried.
+  - Missing `Authorization` header or non-`Bearer` scheme falls through to the next configured identity source.
+- **Logging**: JWKS fetch failures and invalid responses are logged at `warn` with a reason category, bounded by the 30-second refetch throttle. Rejection diagnostics, including invalid keys and `jwks unavailable (expired set, refresh throttled)`, are logged at `debug`. Request completion records still report the generic unauthorized error at `info` on `harnx_a2a_server::requests`.
+- **Redaction**: Raw tokens, other claim values, and JWKS response payloads are never logged or echoed in error responses. The resolved identity (DN or claim string) is stored as the session or task owner and appears only at `debug` in caller-resolution logs.
+- **Startup Validation**:
+  - Setting any of `--bearer-jwks-url`, `--bearer-issuer`, or `--bearer-audience` without the others fails startup: `"--bearer-jwks-url, --bearer-issuer and --bearer-audience are all required to enable bearer token verification"`.
+  - A non-https `--bearer-jwks-url` on a non-loopback host fails startup: `"--bearer-jwks-url must use https; http is only allowed on loopback hosts"`.
+  - An empty or whitespace-only `--bearer-issuer` or `--bearer-audience` fails startup: `"--bearer-issuer must not be empty"` / `"--bearer-audience must not be empty"`.
+  - Setting verification flags without a bearer source (`forge-fit` or `bearer-claim:CLAIM`) fails startup: `"bearer verification flags require a bearer identity source; configure --user-id-header forge-fit or bearer-claim:CLAIM"`.
+
 ## Atlassian Forge Manifest Example
 
 To connect Jira Remote Agents via Forge, define a `rovo:agentConnector` module in your Forge `manifest.yml`. References:
@@ -289,12 +562,21 @@ remotes:
 
 ## Interactive tool approval
 
-When a tool requires confirmation (for example, a `PreToolUse` hook returns
-`permissionDecision: ask`), the task pauses at `TASK_STATE_INPUT_REQUIRED`.
+When a tool requires confirmation (for example, middleware calls `confirm`),
+the task pauses at `TASK_STATE_INPUT_REQUIRED`.
 Its agent status message contains a plain-text Markdown challenge with the tool
 name, persisted JSON arguments (truncated above 8 KiB), and approval reason.
 Blocking `SendMessage` returns at this boundary. `SendStreamingMessage` and
 `SubscribeToTask` close after the interrupted status; the task is **not terminal**.
+
+Middleware `confirm` interactions use the same boundary and yes/no reply grammar.
+Their challenge shows the middleware's message, without legacy tool arguments.
+A request becomes visible only after its durable `SuspensionReady` manifest.
+Only the first pending interaction is shown; the others follow in manifest order,
+even when concurrent calls persisted their requests in a different order.
+Unknown interaction kinds show "not supported by this client" and accept only a
+rejection. An approval or unrecognized reply repeats the challenge without saving
+an intent or answering anything.
 
 Send another `SendMessage` or `SendStreamingMessage` to answer. Preserve the
 returned `contextId`. Include the same `taskId`, or send only `contextId` to answer
@@ -313,10 +595,10 @@ The first whitespace-delimited word selects the decision, case-insensitively:
 Trailing `.`, `!`, and `,` on the first word are accepted (`Y!`, `no.`).
 The rest is an optional note. Approval notes are **audit-only**, not new messages
 to the model. Rejection notes are **model-visible** in the blocked-tool result.
-Only text parts are accepted as decisions. Data parts, mixed text/data messages,
-and unrecognized words such as `yesterday` return the challenge and reply
-instructions without adding agent context, calling the model, or deciding anything.
-There is no A2UI or structured JSON approval format.
+For confirmations, only text parts are accepted as decisions. Data parts, mixed
+text/data messages, and unrecognized words such as `yesterday` return the challenge
+and reply instructions without adding agent context, calling the model, or deciding
+anything. Forms requested by `interact` use the [A2UI answer format](#a2ui-form-interactions) below.
 
 For example, reply using values returned by the challenge:
 
@@ -367,8 +649,89 @@ remains of the original invocation budget. See
 [publisher segments and frozen deadlines](src/runner/README.md#hitl-publisher-segments)
 and the [tool confirmation guide](../../docs/tool-confirmation-guide.md).
 
+## A2UI form interactions
+
+Middleware `interact` forms use the same `TASK_STATE_INPUT_REQUIRED` boundary,
+original invocation, and exact-request receipt binding as confirmations. Only the
+pending head is shown, after `SuspensionReady`. Agent Cards advertise
+`application/a2ui+json` in input and output modes. The status message has two parts:
+
+- A TextPart from `harnx_core::interaction::text::render`, with form text, options,
+  inputs, and available actions.
+- A DataPart with `mediaType: "application/a2ui+json"` and `data` equal to the
+  pending A2UI v1.0 `createSurface` envelope, including its runtime-stamped
+  `surfaceId`. **A2A 1.0 uses `mediaType`, not MCP's `mimeType`.**
+
+Reply with one DataPart or text only, not mixed parts. A structured reply follows
+[A2UI v1.0's action envelope](https://github.com/a2ui-project/a2ui/blob/07735d6a654ae3ba25951a8753ddd57b344b1169/specification/v1_0/json/renderer_to_agent.json):
+exactly `version` and `action` at the root; all five required action fields
+(`name`, `surfaceId`, `sourceComponentId`, RFC3339 `timestamp`, `context`). Use
+`action.metadata.extensions.harnx_response` for input `data` and optional `note`.
+The underscore is deliberate: extension keys must be Unicode identifiers.
+
+For the deployment form in the [middleware guide](../../docs/middleware-guide.md#interact-a2ui-surfaces),
+a `SendMessage` or `SendStreamingMessage` parameter object looks like:
+
+```json
+{
+  "message": {
+    "messageId": "form-answer-1",
+    "role": "ROLE_USER",
+    "contextId": "<returned contextId>",
+    "taskId": "<returned taskId>",
+    "parts": [{
+      "mediaType": "application/a2ui+json",
+      "data": {
+        "version": "1.0",
+        "action": {
+          "name": "deploy",
+          "surfaceId": "<surfaceId from the challenge>",
+          "sourceComponentId": "submit",
+          "timestamp": "2026-06-30T12:00:00Z",
+          "context": {"choice": ["prod"], "name": "rel-1"},
+          "metadata": {
+            "extensions": {
+              "harnx_response": {
+                "data": {"choice": ["prod"], "name": "rel-1"},
+                "note": "Release approved"
+              }
+            }
+          }
+        }
+      }
+    }]
+  }
+}
+```
+
+`name` must match a Button event declared by `sourceComponentId`, and `surfaceId`
+must match the pending surface. Extension `data` contains **input values**, not
+pre-resolved action context. Keys are binding pointers without the leading `/`
+(`/a/b` becomes `a/b`). ChoicePicker values are arrays of option **values**;
+TextField values are strings, including spaces. Missing inputs use the surface's
+`dataModel`, then empty defaults. The server rebuilds canonical response data
+with shared `build_data`, resolving declared context itself rather than trusting
+client `action.context`. Extension `data` and `note` are optional.
+
+For text fallback, send `parts: [{"text": "deploy choice=prod name=rel-1"}]`.
+The shared parser accepts `<action> [key=value ...]`; actions may also use an
+unambiguous button label. Picker options accept values or labels, comma-separated
+for multi-select. TextField values cannot contain whitespace in text replies;
+use a DataPart when needed. Text replies have no note field. Both forms produce
+identical canonical `InteractionResponse.data` for identical input values.
+
+`deny` dismisses the form with empty data. Send text `deny`, or a structured
+action named `deny` with the required envelope fields (no declared button is
+needed for dismissal). Malformed replies, undeclared actions, wrong input types,
+and bad picker options return `INPUT_REQUIRED` with a visible `Reply rejected:`
+correction and the same surface. Nothing is journaled or applied. Correct and
+resubmit with a new `messageId`. Retry an accepted answer with its original ID;
+that receipt can never answer a later form. Structured replies aren't prompts
+and aren't forwarded to the model. Confirmation yes/no behavior is unchanged.
+
 ## Limitations
 
+- **Non-modal surfaces not rendered**: A2A supports modal A2UI forms that suspend execution via `TASK_STATE_INPUT_REQUIRED`. It does not render or accept actions for non-modal user-audience surfaces (`ToolResult.user_surfaces`). A2A has no out-of-band user channel: task messages are model-facing turn inputs (which would leak user surfaces to model text), and `TASK_STATE_INPUT_REQUIRED` is turn-suspending by design. Non-modal surfaces are excluded from the A2A stream, allowing the task to run uninterrupted. Users can inspect and act on published surfaces using the Web UI, TUI, or CLI (`harnx surface list|act`) for the same session.
 - **Multi-replica routing**: Shared admission, ownership, cancellation and streaming work through any backend without sticky sessions. Drain old turns and exclude mixed writers when upgrading; deploy runtime readers before `admission_closed` writers. See [operations](../../docs/a2a-operations.md). Recovery is eventual and TTL-based, not a fixed failover SLO. Interrupted work is never replayed and tool side effects aren't rolled back.
 - **No push notifications**: Push notification methods (`CreateTaskPushNotificationConfig`, etc.) return `PushNotificationNotSupportedError` (`-32003`). `capabilities.pushNotifications` is set to `false`.
 - **Anonymous mode lacks isolation**: When `--user-id-header` is not configured, all requests operate as a single anonymous principal. Any client reaching the endpoint can access or resume sessions.

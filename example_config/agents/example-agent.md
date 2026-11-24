@@ -2,7 +2,7 @@
 # Agent-specific configuration
 # Location: `<harnx-config-dir>/agents/<agent-name>.md`
 
-model: openai:gpt-4o             # Specify the LLM to use
+model: openai:gpt-6.2-sol        # Specify the LLM to use
 temperature: null                # Set default temperature parameter, range (0, 1)
 top_p: null                      # Set default top-p parameter
 use_tools:                       # Which MCP tools to allow
@@ -14,6 +14,8 @@ use_tools:                       # Which MCP tools to allow
   - fs_grep
   - fs_find
   - harnx_agent_session_history_read
+# patches:                       # jaq filters applied at session activation with $user bound
+#   - 'if ($user.groups | index("developers")) then . else .use_tools |= map(select(. != "fs_write" and . != "fs_edit")) end'
 description: ""                  # Short description of the agent
 version: ""                      # Agent version string
 compaction_agent: example-compaction-agent  # Agent to use for context compression (uses its model/system prompt)
@@ -34,10 +36,16 @@ conversation_starters:           # Suggested starting prompts
 documents:                       # RAG document paths (relative to config dir)
   - docs/guide.md
 
-# hooks:                         # Per-agent hooks (merged with global)
+# hooks:                         # Per-agent lifecycle event hooks (merged with global)
 #   max_resume: 3
-#   entries:
-#   - command: harnx-claude-compatible-hook-server --event Stop -- /path/to/agent-hook.sh
+#   Stop:
+#     - name: keep-going
+#       tools: [plans_list_notes]  # Allowlisted tools available to the script.
+#       bash: resume "finish the checklist first"
+#   SessionStart:
+#     - name: session-context
+#       enabled: false          # disable the global entry for this agent
 ---
 
 You are a helpful AI assistant. Your task is to help the user with their questions and tasks.
+{% if "developers" in __user__.groups %}You may use filesystem write and edit tools to modify files.{% endif %}

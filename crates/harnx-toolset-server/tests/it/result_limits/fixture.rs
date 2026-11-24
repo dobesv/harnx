@@ -2,6 +2,7 @@ use crate::common;
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, kv};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use harnx_core::instance::ServerScope;
 use harnx_nats_common::connect::NatsConnection;
 use harnx_toolset::{
@@ -337,6 +338,43 @@ pub(super) fn request(call_id: &str, count: usize, owned: bool) -> ToolRequest {
         request.parent_local_session_id = Some("out123".into());
     }
     request
+}
+
+/// Send `request` while subscribed to its journal row's KV subject and collect
+/// the payload sizes of every terminal reply the broker routed, until the
+/// committed `message` payload shows up. The subscribe/round-trip ordering is
+/// what makes the first observation reliable.
+pub(super) async fn call_observing_terminal_writes(
+    fixture: &Fixture,
+    request: &ToolRequest,
+) -> Result<(async_nats::Message, Vec<usize>)> {
+    let mut writes = fixture
+        .client
+        .subscribe(format!(
+            "$KV.{}.{}",
+            harnx_toolset_server::invocation_journal::BUCKET,
+            key(request)
+        ))
+        .await?;
+    common::round_trip(&fixture.client).await?;
+    let message = fixture.call(request).await?;
+    let mut terminal_sizes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let write = writes.next().await.context("journal writes closed")?;
+            let row: RecordedInvocation = serde_json::from_slice(&write.payload)?;
+            if let Some(reply) = row.reply {
+                terminal_sizes.push(write.payload.len());
+                if serde_json::to_vec(&reply)? == message.payload {
+                    break;
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("observe terminal journal writes")??;
+    Ok((message, terminal_sizes))
 }
 
 pub(super) fn key(request: &ToolRequest) -> String {

@@ -4,7 +4,7 @@ model: codex:gpt-6-luna
 model_fallbacks:
 - openai:gpt-6-luna
 - minimax:MiniMax-M3.1-Flash
-- gemini:gemini-3.8-flash
+- gemini:gemini-4-hydrogen
 - claude:claude-haiku-5-5
 - bedrock:minimax.minimax-m2.5
 compaction_agent: compact-dev
@@ -45,7 +45,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Maintenance, stability, and routine tasks specialist — keeps the codebase warm, clean, and stable for day-to-day operations. Named after Hestia (HES-tee-uh), Guardian of the Hearth.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

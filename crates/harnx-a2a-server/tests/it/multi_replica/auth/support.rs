@@ -29,8 +29,8 @@ pub(super) fn revoked(user: &str) -> RequestIdentity {
 fn policy() -> Result<Identity> {
     Identity::with_memberships(
         &["X-User-ID".into()],
-        &["X-Groups".into()],
-        &["X-Roles".into()],
+        &["header-csv:X-Groups".into()],
+        &["header-csv:X-Roles".into()],
     )
 }
 pub(super) async fn start() -> Result<TwoBackends> {
@@ -169,6 +169,19 @@ pub(super) async fn assert_stored_owner(t: &TwoBackends, context: &str, owner: &
     }
     let registration = registration.context("recovery registration")?;
     assert_eq!(registration.owner.as_deref(), Some(owner));
+    // The caller-principals snapshot is the one place request memberships
+    // persist: customization data for prompts and tools, never authorization
+    // state. Strip it from the metadata record and the recovery registration
+    // before the containment check; everything else must stay membership-free.
+    let mut metadata = serde_json::to_value(&metadata)?;
+    if let Some(properties) = metadata["extensions"]["dev.harnx.session_properties"].as_object_mut()
+    {
+        properties.remove("user_principals");
+    }
+    let mut registration = serde_json::to_value(&registration)?;
+    if let Some(first) = registration["first"].as_object_mut() {
+        first.remove("principals");
+    }
     let bytes = serde_json::to_string(&(
         metadata,
         registration,

@@ -19,6 +19,7 @@ fancy-regex = { workspace = true }
 globset.workspace = true
 harnx-toolset = { workspace = true }
 hmac = { workspace = true }
+humantime = { workspace = true }
 indexmap = { workspace = true }
 os_info = { workspace = true }
 path-absolutize = { workspace = true }
@@ -34,6 +35,7 @@ unicode-width = { workspace = true }
 uuid = { workspace = true }
 
 urlencoding = { workspace = true }
+url = "2"
 minijinja = { workspace = true }
 log = { workspace = true }
 jaq-core = { workspace = true }

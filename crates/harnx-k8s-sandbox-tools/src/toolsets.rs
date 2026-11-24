@@ -11,17 +11,20 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 mod attachment_write;
+mod binding;
+mod connection;
 mod lifecycle_toolset;
 mod proxy;
 mod repo_clone;
+mod specs;
 
 use lifecycle_toolset::LifecycleToolset;
 use proxy::ProxyToolset;
 
 #[cfg(test)]
-use lifecycle_toolset::lifecycle_specs;
-#[cfg(test)]
 use proxy::proxy_spec;
+#[cfg(test)]
+use specs::lifecycle_specs;
 
 /// MCP ports for bash and fs services in a sandbox.
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +132,24 @@ pub fn sandbox_toolsets_with_names(
     ]
 }
 
+/// Decode a stored raw binding value into its usable sandbox ID.
+///
+/// Well-formed but unusable bindings (unknown version or blank ID) yield
+/// `None`; a malformed value errors. Shared by every ambient-binding read
+/// so the validity rules live in one place.
+fn usable_binding_id(value: Option<&Value>) -> Result<Option<String>, ToolInvokeError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let binding: SandboxBinding = serde_json::from_value(value.clone()).map_err(|error| {
+        ToolInvokeError::Recoverable(format!("invalid ambient sandbox binding: {error}"))
+    })?;
+    Ok(
+        (binding.version == 1 && !binding.sandbox_id.trim().is_empty())
+            .then_some(binding.sandbox_id),
+    )
+}
+
 impl Gateway {
     async fn sandbox_id(
         &self,
@@ -183,16 +204,51 @@ impl Gateway {
         Ok(())
     }
 
-    /// The session's usable ambient binding, if any.
+    /// Bind `sandbox_id` to the session only while the session's stored
+    /// binding still matches `observed`, the raw binding value the caller
+    /// read when it started, returning whether the binding was applied.
     ///
-    /// Unlike [`Gateway::sandbox_id`], well-formed but unusable bindings
-    /// (unknown version or blank ID) yield `None` instead of an error, so
-    /// callers like `sandbox_connect` can fall back to creating a fresh
-    /// sandbox and replacing the binding. Malformed metadata still errors.
-    async fn ambient_binding(
+    /// A connect that resolves or activates its sandbox slowly must not
+    /// overwrite a binding written by a concurrent or later connect, so the
+    /// delayed unready bind goes through here. The precondition and the
+    /// write are one compare-and-set on the metadata revision; `Ok(false)`
+    /// means the precondition no longer held and the bind was skipped —
+    /// whether the claim is then destroyed depends on the binding re-read
+    /// in the destroy path, not on this result alone.
+    async fn bind_if_unchanged(
+        &self,
+        session_id: &str,
+        sandbox_id: &str,
+        observed: Option<&Value>,
+    ) -> Result<bool, ToolInvokeError> {
+        let value = serde_json::to_value(SandboxBinding {
+            version: 1,
+            sandbox_id: sandbox_id.to_string(),
+        })
+        .map_err(fatal)?;
+        self.metadata
+            .replace_tool_context_value_if(
+                ToolContextEntry {
+                    session_id,
+                    key: SANDBOX_CONTEXT_KEY,
+                },
+                observed,
+                value,
+            )
+            .await
+            .map_err(recoverable)
+    }
+
+    /// The session's raw stored binding value, present-but-unusable values
+    /// included.
+    ///
+    /// Callers that will conditionally overwrite the binding compare
+    /// against this raw value, so a stored binding that is present but
+    /// unusable is treated as present, not as absent.
+    async fn raw_binding(
         &self,
         session_id: Option<&str>,
-    ) -> Result<Option<String>, ToolInvokeError> {
+    ) -> Result<Option<Value>, ToolInvokeError> {
         let Some(session_id) = session_id else {
             return Ok(None);
         };
@@ -204,20 +260,20 @@ impl Gateway {
         else {
             return Ok(None);
         };
-        context
-            .values
-            .get(SANDBOX_CONTEXT_KEY)
-            .cloned()
-            .map(serde_json::from_value::<SandboxBinding>)
-            .transpose()
-            .map(|binding| {
-                binding
-                    .filter(|binding| binding.version == 1 && !binding.sandbox_id.trim().is_empty())
-                    .map(|binding| binding.sandbox_id)
-            })
-            .map_err(|error| {
-                ToolInvokeError::Recoverable(format!("invalid ambient sandbox binding: {error}"))
-            })
+        Ok(context.values.get(SANDBOX_CONTEXT_KEY).cloned())
+    }
+
+    /// The session's usable ambient binding, if any.
+    ///
+    /// Unlike [`Gateway::sandbox_id`], well-formed but unusable bindings
+    /// (unknown version or blank ID) yield `None` instead of an error, so
+    /// callers like `sandbox_connect` can fall back to creating a fresh
+    /// sandbox and replacing the binding. Malformed metadata still errors.
+    async fn ambient_binding(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<String>, ToolInvokeError> {
+        usable_binding_id(self.raw_binding(session_id).await?.as_ref())
     }
 
     async fn call_remote(

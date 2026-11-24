@@ -385,7 +385,7 @@ fn interrupt_tui_during_hook() -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !sentinel.exists() {
         if std::time::Instant::now() >= deadline {
-            panic!("PreToolUse hook never fired (sentinel missing after 10s)");
+            panic!("Blocking hook never fired (sentinel missing after 10s)");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -459,7 +459,7 @@ fn interrupt_oneshot_during_hook() -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !sentinel.exists() {
         if std::time::Instant::now() >= deadline {
-            panic!("PreToolUse hook never fired (sentinel missing after 10s)");
+            panic!("Blocking hook never fired (sentinel missing after 10s)");
         }
         std::thread::sleep(Duration::from_millis(50));
     }

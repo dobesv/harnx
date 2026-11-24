@@ -27,7 +27,10 @@ use harnx_runtime::{
     AgentLoopContext,
 };
 use serde_json::json;
-use std::sync::{atomic::AtomicU64, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use tokio::sync::Barrier;
 
 struct Harness {
@@ -150,6 +153,7 @@ async fn cancel_vs_transcript_same_lease_new_generation_succeeds() -> Result<()>
             [
                 assistant("stale assistant"),
                 SessionLogEntry::ToolResults {
+                    handoff_selection: None,
                     results: vec![],
                     timestamp: None,
                 },
@@ -347,22 +351,19 @@ async fn cancel_tool_output(failure: bool) -> Result<()> {
         failure,
     })];
     eval.allowed_tool_names.insert("paused".into());
-    let post_hooks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let post_middleware = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let results = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    eval.dispatch_hook_fn = {
-        let count = post_hooks.clone();
-        Arc::new(move |event| {
-            if !matches!(event, harnx_core::hooks::HookEvent::PreToolUse { .. }) {
+    eval.middleware_fn = Some({
+        let count = post_middleware.clone();
+        Arc::new(move |prepared, _origin, next| {
+            let count = count.clone();
+            Box::pin(async move {
+                let result = next(prepared.arguments).await?;
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            Box::pin(async {
-                harnx_core::hooks::HookOutcome {
-                    control: harnx_core::hooks::HookResultControl::Continue,
-                    result: Default::default(),
-                }
+                Ok(result)
             })
         })
-    };
+    });
     eval.emit_tool_call_fn = Arc::new(|_, _| {});
     eval.emit_tool_result_fn = {
         let count = results.clone();
@@ -392,7 +393,7 @@ async fn cancel_tool_output(failure: bool) -> Result<()> {
         format!("{error:#}").contains("interrupted"),
         "expected an interruption, got {error:#}"
     );
-    assert_eq!(post_hooks.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(post_middleware.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(results.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(
         matches!(h.entries().await?.last(), Some((seq, SessionLogEntry::Cancel { .. })) if *seq == cancel_seq)
@@ -411,7 +412,7 @@ async fn cancel_after_handler_suppresses_recoverable_failure() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancel_during_pre_hook_prevents_queued_dispatch() -> Result<()> {
+async fn cancel_during_middleware_prevents_queued_dispatch() -> Result<()> {
     let h = Harness::new().await?;
     let config = Arc::new(harnx_runtime::config::ConfigLock::new(Config::default()));
     let scope = harnx_core::instance::ServerScope::new();
@@ -421,21 +422,24 @@ async fn cancel_during_pre_hook_prevents_queued_dispatch() -> Result<()> {
     .await;
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
-    eval.dispatch_hook_fn = {
+    eval.middleware_fn = Some({
         let (entered, release) = (entered.clone(), release.clone());
-        Arc::new(move |_| {
+        Arc::new(move |prepared, _origin, next| {
             let (entered, release) = (entered.clone(), release.clone());
             Box::pin(async move {
                 entered.wait().await;
                 release.wait().await;
-                harnx_core::hooks::HookOutcome {
-                    control: harnx_core::hooks::HookResultControl::Continue,
-                    result: Default::default(),
-                }
+                next(prepared.arguments).await
             })
         })
+    });
+    let starts = Arc::new(AtomicUsize::new(0));
+    eval.emit_tool_call_fn = {
+        let starts = starts.clone();
+        Arc::new(move |_, _| {
+            starts.fetch_add(1, Ordering::SeqCst);
+        })
     };
-    eval.emit_tool_call_fn = Arc::new(|_, _| panic!("stopped dispatch emitted start"));
     eval.emit_tool_result_fn = Arc::new(|_, _| panic!("stopped dispatch emitted result"));
     let abort = h.abort.clone();
     let worker = tokio::spawn(async move {
@@ -451,7 +455,10 @@ async fn cancel_during_pre_hook_prevents_queued_dispatch() -> Result<()> {
         )
         .await
     });
-    entered.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.wait())
+        .await
+        .context("middleware must start before cancellation")?;
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
     h.interrupt().await?;
     release.wait().await;
     let error = worker
@@ -504,14 +511,14 @@ fn model_context(
         usage_at_start: Default::default(),
         call_fn: Some(call),
         on_tool_round: None,
-        on_hitl_approval_required: None,
         on_text_response: None,
         initial_with_embeddings: false,
         initial_resume_count: 0,
         max_resume: Some(0),
         prepare_handoff_fn: None,
-        nats_hook_provider: None,
+
         pending_async_context: None,
+        surface_notes: None,
         working_dir: None,
         tool_loop_guard: Default::default(),
     }

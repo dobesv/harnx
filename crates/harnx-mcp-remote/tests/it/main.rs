@@ -7,4 +7,9 @@ mod common;
 
 mod auth;
 mod headers;
+mod lazy_connect;
+mod native;
+mod native_common;
 mod streamable_http;
+
+mod native_oauth;

@@ -150,7 +150,35 @@ pub struct NatsSessionSeed<'a> {
     pub messages: &'a [harnx_core::message::Message],
 }
 
+/// Read the identity the serve handoff path would pass to its target prompt.
+/// Integration tests use this with an isolated broker to verify stored identity
+/// propagation without starting a worker or external model provider.
+// qual:test_helper
+pub async fn handoff_identity_for_test(
+    config: &Config,
+    cluster: &str,
+    agent: &str,
+    session_id: &str,
+) -> anyhow::Result<(
+    Option<String>,
+    Option<harnx_core::user_principals::UserPrincipals>,
+)> {
+    let key = crate::session_actor::SessionKey::new(
+        crate::session_actor::ResolvedAgentTarget::new(agent, cluster),
+        session_id,
+    );
+    crate::session_actor::lookup_identity_for_tests(config, &key).await
+}
+
 /// Return whether the optional NATS test dependency is available.
+///
+/// Create the `TestConfigSandbox` before calling this, not after: the shared
+/// local broker is located and registered through
+/// `config_paths::nats_runtime_ports_file()`, which resolves under the state
+/// dir the sandbox installs. A sandbox created after this call redirects the
+/// config to a different state dir than the one the broker was registered
+/// under, so the test either spawns a second broker or connects to the wrong
+/// one.
 pub async fn ensure_test_nats() -> bool {
     if let Err(error) =
         crate::ensure_frontend_nats_owner(harnx_runtime::config::LOCAL_CLUSTER_KEY).await

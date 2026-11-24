@@ -76,7 +76,12 @@ impl<'a> ToolResultsBudget<'a> {
     /// entry, and any entry that is not a `ToolResults` round, is returned
     /// unchanged; a non-`ToolResults` rejection keeps its typed broker error.
     pub(crate) async fn bound(&self, entry: &SessionLogEntry) -> Result<SessionLogEntry> {
-        let SessionLogEntry::ToolResults { results, timestamp } = entry else {
+        let SessionLogEntry::ToolResults {
+            results,
+            timestamp,
+            handoff_selection,
+        } = entry
+        else {
             return Ok(entry.clone());
         };
         let total = serialized_len(entry)?;
@@ -93,7 +98,7 @@ impl<'a> ToolResultsBudget<'a> {
         passes.apply_fallback(self.budget, |url| {
             Some(minimal_size_error_message(url.is_some()))
         })?;
-        passes.finish(*timestamp)
+        passes.finish(*timestamp, handoff_selection.clone())
     }
 
     /// Replace one output with its recoverable size error, retaining the
@@ -133,6 +138,7 @@ fn size_error_output(original: &ToolOutput, message: String) -> ToolOutput {
         output: serde_json::json!({"is_error": true, "error": message}),
         markdown: None,
         content: Vec::new(),
+        user_surfaces: original.user_surfaces.clone(),
         switch_agent: original.switch_agent.clone(),
     }
 }
@@ -183,6 +189,7 @@ mod tests {
 
     fn output(id: &str, value: serde_json::Value) -> ToolOutput {
         ToolOutput {
+            user_surfaces: Vec::new(),
             id: Some(id.to_string()),
             name: "echo".to_string(),
             output: value,
@@ -194,6 +201,7 @@ mod tests {
 
     fn tool_results(results: Vec<ToolOutput>) -> SessionLogEntry {
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results,
             timestamp: None,
         }

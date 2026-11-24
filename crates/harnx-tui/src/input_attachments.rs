@@ -1,7 +1,9 @@
 //! Manage input attachments, paste-to-file conversion and submitted previews.
 
 use crate::types::{TranscriptItem, Tui};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 /// Byte budget for an attachment preview. Applied via `truncate_output`'s
 /// `max_output_bytes` (and split across per-line head/tail byte limits), so it
@@ -206,8 +208,25 @@ impl Tui {
         }
     }
 
+    /// Type-erased seam for the run loop (PR #2835 Windows CI query-depth
+    /// overflow): `Pin<Box<dyn Future>>` stops rustc's cumulative layout
+    /// walk of the loop's future at this await; see AGENTS.md "Future size
+    /// and type erasure in harnx-runtime".
+    pub(super) fn handle_paste_erased(
+        &mut self,
+        text: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+        Box::pin(self.handle_paste(text))
+    }
+
     pub(super) async fn handle_paste(&mut self, text: String) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.paste_interaction_note(&text) {
+            return;
+        }
+        if self.paste_surface_note(&text) {
+            return;
+        }
         if let Some(crate::types::ModalState::ConfirmToolUse(state)) = self.app.modal.as_mut() {
             state.last_key_at = std::time::Instant::now();
             state.message.insert_str(text);

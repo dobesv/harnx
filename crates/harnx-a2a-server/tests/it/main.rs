@@ -1,4 +1,5 @@
 mod access;
+mod bearer;
 mod compat;
 mod context_authority;
 mod e2e;
@@ -8,6 +9,7 @@ mod memberships;
 mod multi_replica;
 #[cfg(feature = "fault-injection")]
 mod multi_replica_inventory;
+mod request_log;
 mod runner;
 mod store_nats;
 mod store_nats_access;
@@ -16,6 +18,7 @@ mod streaming;
 mod support;
 mod unary;
 mod unary_listing;
+mod user_principals;
 mod wait_costs;
 
 mod operations;

@@ -152,6 +152,7 @@ impl Tui {
         entry
     }
 
+    // qual:allow(complexity, max_function_lines=294) reason: "one arm per transcript item kind; the surface arm delegates to render_surface_row"
     pub(super) fn render_entry(
         entry: &mut TranscriptItem,
         show_seq: bool,
@@ -451,6 +452,7 @@ impl Tui {
             TranscriptItem::MarkdownLink { text, url } => {
                 Self::render_markdown_link(text, url, width)
             }
+            item @ TranscriptItem::UserSurface { .. } => Self::render_surface_row(item, width),
         }
     }
 
@@ -595,6 +597,17 @@ impl Tui {
     }
 
     fn bottom_region_height(&self, input_width: u16, screen_height: u16) -> u16 {
+        if let Some(ModalState::ConfirmInteraction(state)) = &self.app.modal {
+            return self
+                .interaction_modal_height(input_width, state)
+                .max(crate::interaction_confirmation::MIN_MODAL_HEIGHT)
+                .min(screen_height);
+        }
+        if let Some(ModalState::SurfaceAction(state)) = &self.app.modal {
+            return crate::surfaces::render::surface_modal_height(input_width, state)
+                .max(crate::interaction_confirmation::MIN_MODAL_HEIGHT)
+                .min(screen_height);
+        }
         if let Some(modal @ ModalState::ConfirmToolUse(_)) = &self.app.modal {
             return self
                 .confirm_tool_modal_height(input_width, modal)
@@ -621,15 +634,42 @@ impl Tui {
         input_height + attachment_height + status_height
     }
 
-    fn render_bottom_region(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    fn render_confirmation_tray(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+    ) -> bool {
+        if matches!(self.app.modal, Some(ModalState::ConfirmInteraction(_))) {
+            if let Some(ModalState::ConfirmInteraction(mut state)) = self.app.modal.take() {
+                self.render_interaction_modal(frame, area, &mut state);
+                self.app.modal = Some(ModalState::ConfirmInteraction(state));
+            }
+            return true;
+        }
+        if matches!(self.app.modal, Some(ModalState::SurfaceAction(_))) {
+            if let Some(ModalState::SurfaceAction(mut state)) = self.app.modal.take() {
+                crate::surfaces::render::render_surface_modal(frame, area, &mut state);
+                self.app.modal = Some(ModalState::SurfaceAction(state));
+            }
+            return true;
+        }
         if matches!(self.app.modal, Some(ModalState::ConfirmToolUse(_))) {
-            let mut modal = self.app.modal.take().expect("modal checked above");
-            self.render_tool_confirm_overlay(frame, area, &mut modal);
-            self.app.modal = Some(modal);
-            return;
+            if let Some(mut modal) = self.app.modal.take() {
+                self.render_tool_confirm_overlay(frame, area, &mut modal);
+                self.app.modal = Some(modal);
+            }
+            return true;
         }
         if let Some(modal @ ModalState::ConfirmExit { .. }) = self.app.modal.clone() {
             self.render_exit_confirm_modal(frame, area, &modal);
+            return true;
+        }
+
+        false
+    }
+
+    fn render_bottom_region(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        if self.render_confirmation_tray(frame, area) {
             return;
         }
 
@@ -694,7 +734,9 @@ impl Tui {
         if let Some(modal) = &self.app.modal {
             if !matches!(
                 modal,
-                ModalState::ConfirmToolUse(_) | ModalState::ConfirmExit { .. }
+                ModalState::ConfirmToolUse(_)
+                    | ModalState::ConfirmInteraction(_)
+                    | ModalState::ConfirmExit { .. }
             ) {
                 self.render_modal(frame, area, modal);
             }
@@ -1025,6 +1067,7 @@ impl Tui {
     }
 
     /// Render a centered confirmation modal overlay.
+    // qual:allow(complexity, max_function_lines=62) reason: "one arm per modal variant; the surface arm delegates to render_surface_modal"
     fn render_modal(
         &self,
         frame: &mut Frame<'_>,
@@ -1036,6 +1079,16 @@ impl Tui {
             return;
         }
         match modal {
+            ModalState::ConfirmInteraction(state) => {
+                self.render_interaction_modal(frame, screen_size, &mut state.clone());
+            }
+            ModalState::SurfaceAction(state) => {
+                crate::surfaces::render::render_surface_modal(
+                    frame,
+                    screen_size,
+                    &mut state.clone(),
+                );
+            }
             ModalState::ConfirmToolUse(_) => {
                 let mut modal = modal.clone();
                 self.render_tool_confirm_overlay(frame, screen_size, &mut modal);
@@ -1048,20 +1101,7 @@ impl Tui {
                 selected,
                 query,
             } => {
-                let title = "Select Agent";
-                let footer = "type to filter  ↑↓ navigate  Enter select  Esc cancel";
-                let items = ModalState::filtered_agents(agents, query);
-                self.render_list_modal(
-                    frame,
-                    screen_size,
-                    &items,
-                    *selected,
-                    ListModalOpts {
-                        title,
-                        footer,
-                        query: Some(query),
-                    },
-                );
+                self.render_agent_picker(frame, screen_size, agents, *selected, query);
             }
             ModalState::SessionPicker {
                 sessions,
@@ -1095,6 +1135,30 @@ impl Tui {
             }
         }
     }
+    fn render_agent_picker(
+        &self,
+        frame: &mut Frame<'_>,
+        screen_size: ratatui::layout::Rect,
+        agents: &[String],
+        selected: usize,
+        query: &str,
+    ) {
+        let title = "Select Agent";
+        let footer = "type to filter  ↑↓ navigate  Enter select  Esc cancel";
+        let items = ModalState::filtered_agents(agents, query);
+        self.render_list_modal(
+            frame,
+            screen_size,
+            &items,
+            selected,
+            ListModalOpts {
+                title,
+                footer,
+                query: Some(query),
+            },
+        );
+    }
+
     fn render_simple_modal(
         &self,
         frame: &mut Frame<'_>,
@@ -1210,6 +1274,7 @@ impl Tui {
 
     /// Render the detail view overlay for the selected transcript range.
     /// Called from draw() when self.app.detail_view_open is true.
+    // qual:allow(complexity, max_function_lines=196) reason: "one detail arm per transcript item kind; the surface arm delegates to push_surface_detail_lines"
     pub(super) fn render_entry_detail(entry: &TranscriptItem) -> Vec<Line<'static>> {
         let label_style = Style::default().fg(Color::DarkGray);
         let mut lines = Vec::new();
@@ -1392,6 +1457,17 @@ impl Tui {
                 push_field!("agent", agent);
                 push_field!("session_id", session_id);
             }
+            TranscriptItem::UserSurface {
+                surface_id,
+                payload,
+                resolved,
+            } => push_surface_detail_lines(
+                &mut lines,
+                label_style,
+                surface_id,
+                payload,
+                resolved.as_deref(),
+            ),
         }
         lines
     }
@@ -1691,6 +1767,27 @@ impl Tui {
         };
         let shortcuts_para = Paragraph::new(shortcuts_text).style(Style::default().fg(color));
         frame.render_widget(shortcuts_para, footer_chunks[1]);
+    }
+}
+
+/// Detail-view lines for one surface row (render_entry_detail's surface arm).
+fn push_surface_detail_lines(
+    lines: &mut Vec<Line<'static>>,
+    label_style: Style,
+    surface_id: &str,
+    payload: &serde_json::Value,
+    resolved: Option<&str>,
+) {
+    lines.push(Line::from(Span::styled("── surface ──", label_style)));
+    runtime_note::push_detail_field(
+        lines,
+        label_style,
+        "headline",
+        &crate::surfaces::surface_headline(payload),
+    );
+    runtime_note::push_detail_field(lines, label_style, "surface_id", surface_id);
+    if let Some(resolved) = resolved {
+        runtime_note::push_detail_field(lines, label_style, "answered", resolved);
     }
 }
 

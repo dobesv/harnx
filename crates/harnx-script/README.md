@@ -12,6 +12,7 @@ async fn example() {
             script: "echo '{\"value\":42}' | jq '.value'",
             limits: ScriptLimits::default(),
             commands: vec![], // Arc<dyn ScriptCommand>
+            python_functions: None, // Explicit Python host capabilities
             fs_mounts: vec![], // FsMount
             cancel: CancellationToken::new(),
         })
@@ -40,7 +41,7 @@ async fn example() {
   syntax errors as ordinary stderr with exit 2; if its own stderr cap has
   discarded that diagnostic, the backend can't recover it.
 - BashKit is pinned to `=0.20.2`, with `jq` and `python` enabled. HTTP, SSH,
-  git and host filesystems aren't enabled. Curl/wget are also filtered out at
+  git and host filesystems aren't enabled. `http`/`curl`/`wget` are also filtered out at
   construction. Builtins operate on virtual files, including BashKit's synthetic
   `/etc` and `/proc`, not host files.
 
@@ -66,9 +67,10 @@ stdlib is a subset; network, subprocesses and `re` aren't available. Monty 0.0.1
 supports simple classes, but not inheritance or metaclasses. BashKit's older
 "no classes" hint doesn't describe this version.
 
-**Python cannot call tools.** No external-function handler is installed. Call
-tool commands in Bash, save their output in `/tmp`, then process those files in
-Python. Tool names, `tools` and `call_tool` aren't Python globals.
+**Python has no host functions by default.** With `python_functions: None`, the
+backend keeps `python_with_limits` behavior: Bash command registrations don't
+become Python globals. Call tool commands in Bash and process their VFS output in
+Python, or explicitly register Python host functions as described below.
 
 The backend enables in-process Python with
 `.env("BASHKIT_ALLOW_INPROCESS_PYTHON", "1")` on each Bash builder. It never sets
@@ -95,6 +97,71 @@ BashKit charges each Python invocation against a shared per-script work budget
 95 Python invocations; invoking Python a 96th time aborts the script with a work units
 resource limit. Rather than invoking `python` or `python3` repeatedly inside shell loops,
 batch per-item processing into a single Python invocation.
+
+### Python host functions
+
+Set `ScriptRequest.python_functions` to `Some(ScriptPythonFunctions { names,
+handler })`. Both `python` and `python3` then use BashKit 0.20.2's
+`python_with_external_handler` with the same Python resource limits. Names are an
+allowlist; an unregistered name raises `NameError` without calling the handler.
+The adapter also checks dispatch names so returned callable values can't bypass
+that allowlist.
+
+Implement `ScriptPythonHandler` using `async_trait`. Its async `call` receives the
+function name, positional arguments (`Vec<MontyObject>`), keyword arguments
+(`Vec<(MontyObject, MontyObject)>`) and `ScriptHostContext`. It returns
+`ExtFunctionResult::Return(value)` or `ExtFunctionResult::Error(exception)`.
+`MontyObject`, `ExtFunctionResult`, `MontyException` and `ExcType` are re-exported
+by this crate, so callers need no direct Monty dependency. Values aren't coerced
+through strings or JSON. The host must validate each operation's arguments.
+
+```rust
+use std::sync::Arc;
+use async_trait::async_trait;
+use harnx_script::{
+    BashKitBackend, CancellationToken, ExtFunctionResult, MontyObject, ScriptBackend,
+    ScriptHostContext, ScriptLimits, ScriptPythonFunctions, ScriptPythonHandler,
+    ScriptRequest, ScriptStatus,
+};
+
+struct Answer;
+
+#[async_trait]
+impl ScriptPythonHandler for Answer {
+    async fn call(
+        &self,
+        _name: String,
+        _args: Vec<MontyObject>,
+        _kwargs: Vec<(MontyObject, MontyObject)>,
+        _ctx: ScriptHostContext,
+    ) -> ExtFunctionResult {
+        ExtFunctionResult::Return(MontyObject::Int(42))
+    }
+}
+
+async fn example() {
+    let result = BashKitBackend.run(ScriptRequest {
+        script: "python3 -c 'print(answer())'",
+        limits: ScriptLimits::default(),
+        commands: vec![],
+        python_functions: Some(ScriptPythonFunctions {
+            names: vec!["answer".into()],
+            handler: Arc::new(Answer),
+        }),
+        fs_mounts: vec![],
+        cancel: CancellationToken::new(),
+    }).await;
+    assert_eq!(result.status, ScriptStatus::Ok);
+    assert_eq!(result.stdout, "42\n");
+}
+```
+
+A `ScriptCommand` and `ScriptPythonHandler` can share an `Arc` holding the same
+async host operations and run state. `ScriptHostContext` supplies the same child
+cancellation token and `ScriptControl` as Bash's command context. External calls
+are awaited inline, not detached. Their time counts against both the run deadline
+and Python's remaining duration; a slow downstream tool needs a larger run timeout.
+Host handlers should still enforce their own I/O limits.
 
 ### Known crash risks and isolation limits
 
@@ -155,7 +222,12 @@ implementation.
 
 The interpreter runs on a Tokio blocking worker so synchronous Monty execution
 can't prevent the caller from polling cancellation or its wall-clock deadline.
-A process-wide cap admits at most eight running or queued interpreter closures.
+Process-wide admission pools allow eight running or queued interpreter closures
+at each nesting depth. Depth 0 is the root and `MAX_SCRIPT_NESTING` is 16 (depths
+0–15), so at most 128 closures hold permits. Each pool is fair. A parent awaiting
+a host operation never competes with its descendants for the same permits.
+Depth 16 fails immediately with `ScriptStatus::Error` and
+`script nesting depth limit exceeded (maximum 16 runs)`, rather than waiting.
 Waiting for admission counts against the run deadline and observes cancellation;
 queued closures retain their permits until Tokio drops them.
 Cancellation sets BashKit's atomic flag (checked inside the VM) and cancels a
@@ -170,6 +242,45 @@ cannot undo remote side effects. Completing a run never cancels its caller's
 token. Joining a running worker has no hard grace-period bound: a native Monty
 operation that misses VM checkpoints can delay cancellation indefinitely.
 Returning after a grace period would detach interpreter-owned work, not stop it.
+
+### Host stops
+
+Bash commands and Python handlers can call `ctx.control.stop()`. It marks a
+host-only stop and cancels interpreter-owned work. The run returns
+`ScriptStatus::Stopped` (serialized `stopped`) and exit code 130, distinct from
+`Error`, `Cancelled` and `TimedOut`. Never infer a host stop from stdout or exit
+130: a script can produce either without stopping host-side control flow. Python
+`try`/`except`, Bash `set +e` and background jobs can't catch a host stop.
+
+For suspension or fatal/cancel propagation, store the original typed outcome in
+caller-owned state **before** calling `stop()`, then inspect that state after the
+backend returns `Stopped`. This crate doesn't serialize that payload or depend
+on runtime-specific outcome types. The host-stop marker takes precedence over a
+simultaneous interpreter error or deadline. Stop cancels the run's child token,
+not the caller's token, and uses the same worker/job cleanup as cancellation.
+
+Ordinary Python host errors remain catchable `ExtFunctionResult::Error` values.
+Bash `ScriptCommand::run` returning `Err(message)` still reports `Error`, not
+`Stopped`; use the control handle when the caller must propagate a typed outcome.
+
+### Nesting across host awaits
+
+A task-local depth is restored inside each blocking interpreter worker and
+propagates through Bash command and Python handler awaits, including BashKit's
+inline-polled pipelines and jobs. Prefer inline host futures. Tokio doesn't
+inherit task locals when spawning a new task. If host dispatch must spawn, clone
+its `ScriptControl` and call `control.scope(future).await` **inside** that task,
+then join it before the host operation returns. This also applies when passing
+work through a host queue to another task. Without that explicit scope, a
+separately spawned task looks like a new root and loses nesting protection.
+
+The pools bound interpreter closures, not arbitrary host tasks or remote effects.
+The Tokio blocking pool must have room for nested workers (Tokio's default 512
+threads exceeds the 128-closure admission bound). Embedders that lower its limit
+or occupy it with unrelated blocking work must leave capacity for descendants.
+Timeout and cancellation still observe queued-worker waits.
+
+### Mounts
 
 `FsMount` accepts a trusted virtual `FileSystem` mounted at an absolute path.
 Mounted filesystem paths start at `/`. For read-only mounts, wrap the filesystem
@@ -263,7 +374,8 @@ kebab-case; returned JSON keeps the schema's original property names. For exampl
 | string, number, integer | `--key value` or `--key=value` |
 | boolean | `--key` / `--no-key` (no value) |
 | array of scalars | repeat `--key value`; boolean items use `true` / `false` |
-| object, complex array, reference, union, nullable, untyped | `--key '<json>'` |
+| nullable scalar or scalar array (`type: [T, "null"]`, `nullable: true`, `anyOf` of one type and null) | same as the non-null type; `null` only through `--json` |
+| object, complex array, reference, union of two or more non-null types, untyped | `--key '<json>'` |
 
 `--json '<object>'` supplies a base object using original property names.
 `--json -` (also `--json=-`) reads that object from stdin. Stdin is otherwise
@@ -299,13 +411,50 @@ doesn't handle help requests.
 first and the description's first sentence. `help::help(name, schema, description)`
 returns NAME, SYNOPSIS, DESCRIPTION and OPTIONS sections with type, default and
 enum metadata. Both use the parser's flag/type classification, including JSON
-fallbacks for real MCP schemas with `$ref`, `anyOf` or nullable types.
+fallbacks for real MCP schemas with `$ref`, `anyOf` or unions of several types.
+
+## Shell-style tool output
+
+A tool can declare how its structured result reads as a command. It sets
+`harnx_toolset::ToolSpec::with_script_output(ScriptOutput { .. })`, which stores the
+mapping in the tool's `_meta` under `harnx:script_output`. The mapping has these keys:
+
+| Key | Meaning |
+| --- | --- |
+| `stdout` | `structuredContent` field printed on stdout. A string is printed as is, an array of strings one item per line, an array of objects through `row`. |
+| `row` | Format for an object item of `stdout`, such as `{path}:{line}:{text}`. |
+| `stderr` | Field holding notes (string or array of strings). Each note is printed as `<tool>: <note>`. |
+| `exit_code` | Integer field used as the exit status. |
+| `error_exit_code` | Exit status when the tool returns an error. Default 1. |
+| `summary` | One line shown in the OUTPUT section of `help <tool>`. |
+
+The `bash` tool's inner calls send the request capability
+`harnx:structured_result` (`harnx_toolset::CAPABILITY_STRUCTURED_RESULT`), so
+the tool returns script-style fields. Direct model calls don't send it and keep
+their results. A [script tool](../../docs/script-tools.md)'s Bash body sends it
+too, but its Python body doesn't, and neither does a middleware or hook on its
+own `call_tool`. A middleware or hook that
+wraps a `bash` script's inner call does see the script-shaped result, so one
+that scans `content` text for the data won't find it. The mapping applies only
+when the result has an object `structuredContent` and is not an error;
+otherwise the command renders as described above.
+
+```bash
+fs_grep --pattern TODO --path src | head -3   # src/lib.rs:12:// TODO tidy
+fs_grep --pattern no-such-text --path src || true   # prints nothing, exits 1; set -e would end the script without `|| true`
+fs_find --pattern '*.rs' --path src | head -1       # src/lib.rs, usable as fs_read --path
+fs_grep --pattern TODO --path src -o json | jq -r '.matches[0].path'
+```
+
+`-o json` prints the whole `structuredContent` on one line. Stderr and the exit
+status are the same in both formats. A mapped tool exits with its `exit_code` field
+on success. `help <tool>` shows an OUTPUT section built from the mapping.
 
 ## Generated `bash` description
 
 `description::bash_tool_description(tools, concurrent_cap, call_cap)` builds the
 model-facing guide from the resolved `ToolSpec` catalog. Builtins come from
-`BashKitBackend::builtin_names` (already filtered to exclude `curl`/`wget`);
+`BashKitBackend::builtin_names` (already filtered to exclude `http`/`curl`/`wget`);
 sorted tool synopses use the same generator as `tools` and `--help`. Runtime
 supplies admission caps; execution and filesystem defaults come from their limit
 types. The guide includes quoting patterns, Monty restrictions and one pipeline
@@ -340,12 +489,18 @@ can still be set with `--help=VALUE` or `--json`. Unknown commands use BashKit's
 last-chance `CommandResolver` to return exit 127 with nearby-name suggestions.
 This resolver only reports errors; it never dispatches an unknown tool.
 
-Output defaults to JSON from MCP `structuredContent` when present, otherwise
+Without a declared mapping, output defaults to JSON from MCP `structuredContent` when present, otherwise
 concatenated MCP text blocks. Plain non-MCP strings are text; other raw values
 are JSON. Nonempty output ends with a newline. `-o text` selects content text
 instead of structured content, falling back to structured JSON if there's no
 content text. `-o json` selects structured content or, without it, the provider
 payload as a JSON document. It doesn't try to parse arbitrary text blocks as JSON.
+
+Text output leaves out content blocks whose `annotations.audience` is an array
+that doesn't include `assistant`, such as one-line summaries meant only for the
+person watching. An error message applies the same filter but falls back to all
+the text when nothing else is left. `-o json` on a result without
+`structuredContent` still prints every block.
 
 MCP image, audio, resource-link and embedded-resource blocks become
 `[attachment: <uri> <mime>]` markers instead of inline data. Without a URI the
@@ -357,12 +512,12 @@ the transport succeeded; raw business JSON `is_error` keys aren't status flags.
 
 | Outcome | Exit | Streams |
 | --- | --- | --- |
-| success | 0 | rendered stdout |
-| tool error | 1 | error on stderr; available partial output on stdout |
+| success | 0, or the mapping's `exit_code` field (`fs_grep` exits 1 when nothing matched) | rendered stdout |
+| tool error | 1, or the mapping's `error_exit_code` | error on stderr; available partial output on stdout |
 | usage error | 2 | diagnostic on stderr, no dispatch |
-| approval required | 3 | `needs approval: <tool>; call it directly instead of from bash` |
-| blocked | 4 | reason on stderr |
-| rejected | 5 | reason on stderr |
+| approval required | 126 | `needs approval: <tool>; call it directly instead of from bash` |
+| blocked | 126 | `blocked: <reason>` on stderr |
+| rejected | 126 | `rejected: <reason>` on stderr |
 | unknown command | 127 | reason and suggestion on stderr |
 | fatal | abort run | error on stderr, even under `set +e` or in a background job |
 

@@ -4,6 +4,71 @@ A2A backends share context authority, message identities and task events in NATS
 Any replica can admit, read, cancel or stream a task without sticky routing.
 The worker execution lease remains separate from the A2A context lease.
 
+## Listeners and readiness
+
+Enable readiness and Prometheus metrics on separate ports from the A2A listener:
+
+```sh
+harnx-a2a-server --agent reviewer --cluster production \
+  --host 0.0.0.0 --port 3020 \
+  --healthz-addr :8081 --metrics-addr :8456
+```
+
+`GET :8081/healthz` returns an empty `503 Service Unavailable` during startup.
+It changes to `200 OK` only after agent validation, NATS/JetStream connection,
+coordination provisioning, backend setup and binding the A2A listener succeed.
+SIGTERM or Ctrl-C changes readiness back to `503` before aborting/draining runners
+and finishing HTTP shutdown. Backend abort closes open SSE streams. In-flight
+unary requests can still hold process exit until they finish or the termination
+grace period triggers SIGKILL. Readiness tracks startup and shutdown, not
+continuous broker health or worker capacity. It isn't a liveness probe or proof
+that all admitted tasks have settled.
+
+Both optional listeners are disabled unless configured. `HARNX_HEALTHZ_ADDR` is
+an alternative to `--healthz-addr` (CLI wins). Metrics require `--metrics-addr`;
+there's no environment variable fallback. `/healthz` and `/metrics` aren't served
+on the A2A application port. Blank hosts bind `0.0.0.0`; restrict these unauthenticated
+operational listeners to the probe/scraper network rather than public ingress.
+See [Kubernetes deployment](kubernetes-deployment.md#a2a-backends-behind-ingress)
+for named ports and a readiness probe.
+
+## Request logs
+
+Use the `harnx_a2a_server::requests` tracing target to see completed calls without
+logging message content. Each handled unary call records its export, canonical
+method, available task/context/message IDs, resulting task state or A2A error,
+and `duration_ms`. A streaming call emits its record at EOF/drop with
+`events_sent` and `end_reason`, so a long-lived subscription has no completion
+record while it's still open. Agent Card fetches and the server's own
+identity/access/compatibility rejections are included.
+
+```sh
+HARNX_LOG_LEVEL=info \
+HARNX_LOG_FILTER=harnx_a2a_server::requests \
+HARNX_LOG_FORMAT=json \
+harnx-a2a-server --agent jira=team/triage
+```
+
+Read JSON fields under `fields`. For example, `method=SubscribeToTask` followed by
+`end_reason=client_disconnect` shows a dropped subscription; a later `GetTask`
+or `SubscribeToTask` record shows how the client recovers. `terminal` and
+`interrupted` mean a task reached an expected response boundary.
+`server_shutdown` means the backend abort ended the stream. Setup, rejection and
+delivery errors use `error`; pre-stream rejections have `events_sent=0`.
+EOF without a boundary uses `stream_closed`. Counts measure events yielded to
+the SSE codec, not confirmed client receipt. Keepalive comments aren't counted.
+
+Caller `user_id` is absent at `info`; a separate `debug` event contains the
+resolved identity, which can be a Forge DN. Treat debug logs as personal data.
+Tokens and message parts aren't logged. The shared `HARNX_LOG_*` settings apply;
+`RUST_LOG` is only a bare-level fallback.
+
+External JSON-RPC router parse/envelope/parameter-decoding and method-not-found
+errors aren't hooked by these records. Unknown export paths aren't recorded
+either. Use HTTP metrics for those responses. See the
+[A2A server README](../crates/harnx-a2a-server/README.md#request-logging) for the
+field list and coverage details.
+
 ## Provisioning and limits
 
 Verified dependency pair: **NATS Server 2.11.6 / async-nats 0.50.0**. The lease
@@ -191,6 +256,12 @@ them with "interrupted by server restart" on startup or foreground access.
 
 Before rolling back to a version without interactive tool approval:
 - Drain parked approvals: answer or cancel tasks in `TASK_STATE_INPUT_REQUIRED`.
+- Drain steered continuations before rollback. Follow-ups to a running task are
+  steered into its turn (issue #2774) and are answered in continuation rounds that
+  can still run after the task's root answer already streamed. A follow-up sent to
+  a task whose steered work has not settled blocks new work on that context, so
+  let running tasks settle first instead of assuming `CancelTask` alone is enough
+  while the drain is still in flight.
 - Query active sessions via `ListTasks` with `status="TASK_STATE_INPUT_REQUIRED"`
   (or `"input-required"`) per context. ListTasks is paginated: check `nextPageToken`
   on each response and pass it as `pageToken` (with optional `pageSize`) until

@@ -7,10 +7,18 @@ use crate::config::session_externalize::{externalize_content, record_externalize
 /// this round, but cannot undo its input. NATS inputs retain their admission's
 /// `skip_user_log_append`; they are already generation-owned durable history.
 pub(crate) fn prepare_input(session: &mut Session, input: &mut Input) -> Result<()> {
-    if input.session_input_start.is_some() {
+    if input.continue_output().is_some() || input.regenerate() {
         return Ok(());
     }
-    if input.continue_output().is_some() || input.regenerate() {
+    if input.session_input_start.is_some() {
+        // Mid-round continuation: the turn's own rows are already durable and
+        // re-appending them would duplicate them. Hook-added context is the
+        // one exception — it has no other durable copy, so it still gets its
+        // row even on tool continuations and worker turns (issue #2198).
+        let all_appended = append_hook_context(session, input);
+        session.dirty |= !all_appended.is_complete();
+        require_authoritative_appends(session, all_appended, "hook context")?;
+        session.update_tokens();
         return Ok(());
     }
     let history_len = session.messages.len();
@@ -47,6 +55,7 @@ pub(super) fn begin_turn(
 
     all_appended &= append_input_data_urls(session, input);
     all_appended &= append_injected_user_text(session, input);
+    all_appended &= append_hook_context(session, input);
     Ok(all_appended)
 }
 
@@ -173,6 +182,33 @@ fn restore_injected_user_messages(session: &mut Session, input: &Input, injected
             .messages
             .extend(input.injected_user_messages.iter().cloned());
     }
+}
+
+/// Append hook-added context durably, including on tool continuations and
+/// worker turns (`skip_user_log_append`). Unlike the folded user rows, this
+/// text has no other durable copy — without this row it would never reach the
+/// transcript (issue #2198).
+///
+/// The row carries a reserved hook-context id rather than an ordinary
+/// message id: it is runtime-authored context, not a prompt, and must be
+/// excluded from prompt selection, admission checks and recovery the same
+/// way runtime notes are. Without the reserved id the NATS worker's mid-turn
+/// fold selected it as a fresh user message, and the turn failed with
+/// "injected user row has no durable admission" on the first tool round.
+fn append_hook_context(session: &mut Session, input: &Input) -> AppendStatus {
+    let Some(context) = input.hook_context() else {
+        return AppendStatus::complete();
+    };
+    let seq = session.next_seq();
+    let id = harnx_core::runtime_note::new_hook_context_message_id();
+    let message = Message::new(MessageRole::User, MessageContent::Text(context.to_string()))
+        .with_id(id.clone())
+        .with_log_seq(seq);
+    let all_appended =
+        append_session_message_with_id(session, id, message.role, message.content.clone());
+    session.messages.push(message);
+    emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
+    all_appended
 }
 
 pub(super) fn append_session_message(

@@ -13,6 +13,7 @@ const BUDGET: usize = 64 * 1024 - 1024;
 
 fn output(id: &str, bytes: usize) -> ToolOutput {
     ToolOutput {
+        user_surfaces: Vec::new(),
         id: Some(id.into()),
         name: "fallback_tool".into(),
         output: json!({"out": "x".repeat(bytes)}),
@@ -24,6 +25,7 @@ fn output(id: &str, bytes: usize) -> ToolOutput {
 
 fn entry(results: Vec<ToolOutput>) -> SessionLogEntry {
     SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results,
         timestamp: None,
     }

@@ -1,10 +1,9 @@
 use super::repo_clone::{clone_repo, CloneRequest, RepoSpec};
-use super::{fatal, lifecycle_error, mcp_endpoint, recoverable, Gateway, SANDBOX_CONTEXT_KEY};
+use super::specs::lifecycle_specs;
+use super::specs::parse_args;
+use super::{fatal, lifecycle_error, mcp_endpoint, Gateway};
 use async_trait::async_trait;
-use harnx_runtime::nats_session_metadata::ToolContextEntry;
-use harnx_toolset::{
-    ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolProgressKind, ToolSpec, Toolset,
-};
+use harnx_toolset::{ToolInvocation, ToolInvocationContext, ToolInvokeError, ToolSpec, Toolset};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -16,11 +15,11 @@ pub(super) struct LifecycleToolset {
 }
 
 #[derive(Deserialize)]
-struct ConnectArgs {
+pub(super) struct ConnectArgs {
     #[serde(default)]
-    sandbox_id: Option<String>,
+    pub(super) sandbox_id: Option<String>,
     #[serde(default)]
-    description: Option<String>,
+    pub(super) description: Option<String>,
     #[serde(default)]
     repos: Vec<RepoSpec>,
 }
@@ -54,13 +53,10 @@ impl LifecycleToolset {
                 "sandbox_connect requires an invoking Harnx session".to_string(),
             )
         })?;
-        let sandbox_id = self.resolve_connection(&args, context, &cancel).await?;
-        let pod_ip = self
-            .gateway
-            .manager
-            .ensure_active(&sandbox_id, &cancel)
-            .await
-            .map_err(lifecycle_error)?;
+        let connection = self.resolve_connection(&args, context, &cancel).await?;
+        let (sandbox_id, pod_ip) = self
+            .activate_sandbox(session_id, &connection, &cancel)
+            .await?;
         let endpoint = mcp_endpoint(&pod_ip, self.gateway.bash_mcp_port);
         self.bind_ready_sandbox(session_id, &sandbox_id).await?;
 
@@ -80,47 +76,6 @@ impl LifecycleToolset {
             );
         }
         Ok(json!({"sandbox_id": sandbox_id, "repos": repos}))
-    }
-
-    async fn resolve_connection(
-        &self,
-        args: &ConnectArgs,
-        context: &ToolInvocationContext,
-        cancel: &CancellationToken,
-    ) -> Result<String, ToolInvokeError> {
-        if let Some(id) = args.sandbox_id.as_ref().filter(|id| !id.trim().is_empty()) {
-            return Ok(id.clone());
-        }
-        // Omitted or blank ID: reuse the sandbox already bound to the invoking
-        // session so repeated connects converge on one sandbox (#2633), and
-        // only claim a new one when no usable binding exists.
-        if let Some(id) = self
-            .gateway
-            .ambient_binding(context.invoking_session_id.as_deref())
-            .await?
-        {
-            return Ok(id);
-        }
-        self.gateway
-            .manager
-            .create(&context.call_id, args.description.as_deref(), cancel)
-            .await
-            .map_err(lifecycle_error)
-    }
-
-    async fn bind_ready_sandbox(
-        &self,
-        session_id: &str,
-        sandbox_id: &str,
-    ) -> Result<(), ToolInvokeError> {
-        self.gateway
-            .bind(session_id, sandbox_id)
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Recoverable(format!(
-                    "sandbox '{sandbox_id}' is ready but its session binding failed: {error}"
-                ))
-            })
     }
 
     async fn status(
@@ -163,26 +118,6 @@ impl LifecycleToolset {
             self.clear_binding(context, &id).await?;
         }
         Ok(release_result(status, args.destroy))
-    }
-
-    async fn clear_binding(
-        &self,
-        context: &ToolInvocationContext,
-        sandbox_id: &str,
-    ) -> Result<(), ToolInvokeError> {
-        let Some(session_id) = context.invoking_session_id.as_deref() else {
-            return Ok(());
-        };
-        self.gateway
-            .metadata
-            .remove_tool_context_value(ToolContextEntry {
-                session_id,
-                key: SANDBOX_CONTEXT_KEY,
-            })
-            .await
-            .map_err(recoverable)?;
-        log::debug!("cleared sandbox '{sandbox_id}' binding from session '{session_id}'");
-        Ok(())
     }
 
     async fn invoke_inner(&self, invocation: ToolInvocation) -> Result<Value, ToolInvokeError> {
@@ -250,62 +185,4 @@ fn release_result(status: &str, destroy: bool) -> Value {
             "Sandbox suspended. Storage preserved. It will wake on the next tool call."
         }
     })
-}
-
-fn parse_args<T: for<'de> Deserialize<'de>>(tool: &str, args: Value) -> Result<T, ToolInvokeError> {
-    serde_json::from_value(args)
-        .map_err(|error| ToolInvokeError::Recoverable(format!("invalid {tool} arguments: {error}")))
-}
-
-pub(super) fn lifecycle_specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            cancellation_guarantee: Default::default(),
-            name: "connect".to_string(),
-            description: "Connect this Harnx session to an existing Kubernetes sandbox, the session's bound sandbox, or a newly created one.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "sandbox_id": {"type": "string", "description": "Existing sandbox ID; omit to reuse the session's bound sandbox, creating one if none is bound."},
-                    "description": {"type": "string"},
-                    "repos": {"type": "array", "items": {"type": "object", "properties": {
-                        "repo_url": {"type": "string"}, "branch": {"type": "string"}, "path": {"type": "string"}
-                    }, "required": ["repo_url"]}}
-                }
-            }),
-            idempotent_hint: false,
-            read_only_hint: false,
-            timeout_secs: Some(0),
-            meta: None,
-        }
-        .with_kind(ToolProgressKind::Execute),
-        ToolSpec {
-            cancellation_guarantee: Default::default(),
-            name: "status".to_string(),
-            description: "Observe sandbox status without waking it or extending its activity.".to_string(),
-            input_schema: json!({"type": "object", "properties": {
-                "sandbox_id": {"type": "string"},
-                "timeout_secs": {"type": "integer", "minimum": 0}
-            }}),
-            idempotent_hint: true,
-            read_only_hint: true,
-            timeout_secs: Some(0),
-            meta: None,
-        }
-        .with_kind(ToolProgressKind::Read),
-        ToolSpec {
-            cancellation_guarantee: Default::default(),
-            name: "release".to_string(),
-            description: "Hibernate the current sandbox while preserving storage, or permanently destroy it.".to_string(),
-            input_schema: json!({"type": "object", "properties": {
-                "sandbox_id": {"type": "string"},
-                "destroy": {"type": "boolean", "default": false}
-            }}),
-            idempotent_hint: false,
-            read_only_hint: false,
-            timeout_secs: Some(0),
-            meta: None,
-        }
-        .with_kind(ToolProgressKind::Delete),
-    ]
 }

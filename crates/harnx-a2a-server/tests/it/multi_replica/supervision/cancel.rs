@@ -140,17 +140,7 @@ async fn lost_cancel_ack_superseded_by_completion_resolves_identity_without_repl
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_cancel_of_unadmitted_ticket_closes_without_worker_execution() -> Result<()> {
     let t = TwoBackends::start().await?;
-    let mut admission =
-        t.a.backend
-            .runner
-            .fault_hooks()
-            .pause(Boundary::BeforeAdmission, 1);
-    let send = tokio::spawn({
-        let app = t.a.app.clone();
-        async move { rpc(app, "alice", "SendMessage", first_message()).await }
-    });
-    admission.reached().await;
-    let saved = reservation(&t).await?;
+    let (admission, send, saved) = paused_first_message(&t, Boundary::BeforeAdmission, 1).await?;
     t.b.backend
         .store
         .request_task_cancel(&saved.allocation.storage_key, &saved.allocation.task_id)
@@ -190,12 +180,7 @@ async fn accepted_cancel_of_unadmitted_ticket_closes_without_worker_execution() 
     ))
     .await?
     .is_empty());
-    let context =
-        t.b.backend
-            .store
-            .read_context(&saved.allocation.storage_key)
-            .await?
-            .context("closed authority")?;
+    let context = replica_b_context(&t, &saved.allocation.storage_key, "closed authority").await?;
     let active = context
         .document
         .state

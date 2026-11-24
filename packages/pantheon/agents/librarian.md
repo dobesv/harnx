@@ -1,6 +1,6 @@
 ---
 role: subagent
-model: gemini:gemini-3.8-flash
+model: gemini:gemini-4-hydrogen
 model_fallbacks:
 - codex:gpt-6.1-terra
 - openai:gpt-6.1-terra
@@ -18,7 +18,7 @@ use_tools:
 description: "External knowledge researcher \u2014 searches the web, library documentation,\
   \ and public GitHub repositories to find best practices, patterns, API references,\
   \ and solutions to technical questions.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: librarian_core
   description: Core identity and instructions for Librarian

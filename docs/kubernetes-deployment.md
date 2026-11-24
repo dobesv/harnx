@@ -274,7 +274,7 @@ spec:
 A Kubernetes worker pod requires three distinct configuration settings:
 
 1. **`--cluster prod`**: Specifies the session connection cluster profile (`nats_servers/prod.yaml`) used for leases, session logs, and worker coordination.
-2. **`HARNX_NATS_URL` and `HARNX_NATS_TOKEN`**: **Mandatory in the pod environment.** Tool and hook discovery is a separate connection that does not read `nats_servers/<cluster>.yaml`. It resolves connection settings strictly from the worker's own process environment. If these variables are omitted, session execution connects, but tool and hook discovery fails.
+2. **`HARNX_NATS_URL` and `HARNX_NATS_TOKEN`**: **Mandatory in the pod environment.** Tool discovery is a separate connection that does not read `nats_servers/<cluster>.yaml`. It resolves connection settings strictly from the worker's own process environment. If these variables are omitted, session execution connects, but tool discovery fails.
 3. **`HARNX_SERVER_SCOPE=shared`**: Workers and independently deployed tool servers must share the same scope identifier to discover one another.
 
 In Kubernetes, leave `--manage-servers` off (the default). Workers do not spawn local subprocesses for tools; tool servers run in their own containers.
@@ -647,13 +647,13 @@ For filesystem and shell execution in Kubernetes, deploy `harnx-k8s-sandbox-tool
 To use external Model Context Protocol (MCP) servers that communicate over stdio, run `harnx-mcp-bridge` in a container that installs the external MCP tool. `harnx-mcp-bridge` wraps the stdio process and exposes it as a native tool server on NATS within `HARNX_SERVER_SCOPE`.
 
 Set the bridge container's `HARNX_MCP_MAX_RESULT_BYTES` to change the default
-32,768-byte compact JSON cap per tool result. A `--max-result-bytes` argument
+131,072-byte (128 KiB) compact JSON cap per tool result. A `--max-result-bytes` argument
 before `--` overrides that environment variable; the minimum is 1,024 bytes:
 
 ```yaml
 env:
   - name: HARNX_MCP_MAX_RESULT_BYTES
-    value: "32768"
+    value: "262144"
 ```
 
 Oversized originals use the existing session-owned `harnx_attachments` object
@@ -709,3 +709,53 @@ Interrupted work isn't replayed and completed tool side effects aren't rolled ba
 Ingress disconnect is not task cancellation. Preserve the existing trusted-user
 header handling and disable SSE buffering. R3/deployment fanout capacity must be
 measured separately from the R1 regression probes documented in the operations guide.
+
+Configure each A2A container with separate application, healthz and metrics ports.
+This container-spec fragment assumes the `reviewer` export and `production` NATS
+cluster are present in its mounted harnx configuration:
+
+```yaml
+containers:
+  - name: harnx-a2a-server
+    image: ghcr.io/dobesv/harnx:<version>
+    command: [harnx-a2a-server]
+    args:
+      - --agent
+      - reviewer
+      - --cluster
+      - production
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3020"
+      - --healthz-addr
+      - :8081
+      - --metrics-addr
+      - :8456
+    ports:
+      - name: a2a
+        containerPort: 3020
+      - name: healthz
+        containerPort: 8081
+      - name: metrics
+        containerPort: 8456
+    readinessProbe:
+      httpGet:
+        path: /healthz
+        port: healthz
+      periodSeconds: 5
+      timeoutSeconds: 2
+```
+
+Route the ingress/Service to `a2a` (`3020`), not `healthz` or `metrics`. Allow the
+kubelet to reach `8081` and Prometheus to scrape `8456/metrics`, but don't expose
+these unauthenticated operational listeners through public ingress.
+
+Readiness returns `503` until bootstrap and the A2A bind succeed, then `200`.
+SIGTERM/Ctrl-C switches it back to `503` before runner shutdown and HTTP drain.
+It doesn't continuously check NATS or worker capacity. Don't use this readiness
+endpoint as a liveness probe, or Kubernetes could restart a healthy process during
+startup or shutdown. Choose `terminationGracePeriodSeconds` for your workload's
+drain needs; A2A doesn't inherit `harnx-serve`'s 25-second drain ceiling. Readiness
+isn't proof that admitted tasks have settled; follow the upgrade/drain procedure
+above before replacing old writers.

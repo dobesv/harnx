@@ -135,6 +135,7 @@ async fn replay_returns_the_journaled_reply_while_replicas_lag() -> Result<()> {
     let mut request = common::request("lagging-parent", "answered-call");
     journal_call(&journal, &request).await?;
     let saved = ToolReply {
+        input_required: None,
         call_id: request.call_id.clone(),
         result: Ok(json!({"saved": true})),
         final_progress: None,

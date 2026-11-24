@@ -444,16 +444,20 @@ impl SubagentToolset {
         // bounds the page to that prompt's turn. Load never resumes,
         // activates, repairs or waits on the session.
         let mut status = None;
+        let mut pending = None;
         if let Some(prompt_id) = args.prompt_id.as_deref() {
             if prompt_id.trim().is_empty() {
                 return Err(ToolInvokeError::Recoverable(
                     "prompt_id must not be empty".into(),
                 ));
             }
-            let scope = self.prompt_load_scope(&storage, prompt_id).await?;
+            let scope = self
+                .prompt_load_scope(&storage, &session_id, prompt_id)
+                .await?;
             session_read::scope_read_to_prompt(&mut read, scope.start, scope.end)
                 .map_err(ToolInvokeError::Recoverable)?;
             status = Some(scope.status);
+            pending = scope.pending_interaction;
         }
         let log = crate::nats_session_log::NatsSessionLog::new(self.jetstream.clone(), &storage);
         // The page is merged into the wrapper below, so the wrapper's own
@@ -475,16 +479,25 @@ impl SubagentToolset {
         let page = session_read::read_session_log_window(&log, &read, reserve)
             .await
             .map_err(ToolInvokeError::Recoverable)?;
-        let result = merge_page_into_wrapper(wrapper, page)?;
+        let mut result = merge_page_into_wrapper(wrapper, page)?;
+        if let Some(pending) = pending {
+            async_session::observation::attach_pending_progress(
+                &mut result,
+                pending,
+                None,
+                read.max_output_bytes,
+            );
+        }
         Ok(result)
     }
 
     async fn prompt_load_scope(
         &self,
         storage: &str,
+        session_id: &str,
         prompt_id: &str,
     ) -> Result<async_session::observation::PromptScope, ToolInvokeError> {
-        async_session::observation::resolve_prompt_scope(self, storage, prompt_id)
+        async_session::observation::resolve_prompt_scope(self, storage, session_id, prompt_id)
             .await
             .map_err(|error| {
                 ToolInvokeError::Recoverable(match error {
@@ -896,6 +909,14 @@ impl Toolset for SubagentToolset {
     /// call was running, by appending a `Cancel` to the CHILD's own log. Never
     /// created (no checkpoint recorded yet): nothing to interrupt.
     async fn cancel(&self, invocation: ToolInvocation) -> Result<(), ToolInvokeError> {
+        // Async dispatch and observation own no child cancellation authority,
+        // even when a cancelled inline wait has a dispatch checkpoint.
+        if !matches!(
+            invocation.tool.as_str(),
+            SUBAGENT_SESSION_PROMPT_TOOL | SUBAGENT_SESSION_NEW_TOOL
+        ) {
+            return Ok(());
+        }
         let Some(child) = invocation
             .context
             .checkpoint
@@ -1125,6 +1146,31 @@ impl SessionIdTool {
     }
 }
 
+/// One-line `session_load` summary: prompt status when a `prompt_id` scoped the
+/// page, the event count, and a continuation hint when more pages exist. The
+/// full page stays in the result for the model and the detail view.
+const LOAD_SUMMARY_ARM: &str = concat!(
+    "{% if result.prompt_id %}{{ result.status | default('unknown', true) }}",
+    "{% if result.terminal %} (terminal){% endif %} — {% endif %}",
+    "{% if result.entry_index is defined %}",
+    "entry {{ result.entry_index }}",
+    "{% if result.continuation is defined and result.continuation is not none %}",
+    " — more from byte {{ result.continuation.byte_offset }}{% endif %}",
+    "{% else %}",
+    "{% set count = result.events | default([]) | length %}",
+    "{{ count }} event{{ 's' if count != 1 }}",
+    "{% if result.next_index is defined and result.next_index is not none %}",
+    " — more from index {{ result.next_index }}",
+    "{% elif result.truncated %} — truncated{% endif %}",
+    "{% endif %}",
+);
+
+/// One-line `session_cancel` summary naming the outcome.
+const CANCEL_SUMMARY_ARM: &str = concat!(
+    "{% if result.outcome == 'accepted' %}cancelled",
+    "{% else %}{{ result.outcome | default('unknown', true) }}{% endif %}",
+);
+
 fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
     if matches!(tool, SessionIdTool::Load) {
         return session_load_spec(agent);
@@ -1152,12 +1198,13 @@ fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
         meta: None,
     }
     .with_call_template(&format!("@ {agent} {verb} {SHORT_SESSION_ID}"))
+    .with_result_template(&async_session::session_result_template(CANCEL_SUMMARY_ARM))
     .with_kind(kind)
 }
 
-/// Task 4b: session_load is a bounded, read-only inspection page. The shared
-/// `read` object matches session_wait/send waits; `prompt_id` restricts the
-/// page to one dispatched prompt's durable turn.
+/// Task 4b: session_load is a bounded, read-only inspection page, and the one
+/// tool that reads a child's transcript (waits return only the final reply);
+/// `prompt_id` restricts the page to one dispatched prompt's durable turn.
 fn session_load_spec(agent: &str) -> ToolSpec {
     ToolSpec {
         cancellation_guarantee: Default::default(),
@@ -1196,6 +1243,7 @@ fn session_load_spec(agent: &str) -> ToolSpec {
         meta: None,
     }
     .with_call_template(&format!("@ {agent} load {SHORT_SESSION_ID}"))
+    .with_result_template(&async_session::session_result_template(LOAD_SUMMARY_ARM))
     .with_kind(ToolProgressKind::Read)
 }
 
@@ -1423,6 +1471,116 @@ mod tests {
             config.activation_route,
             SessionActivationRoute::ClusterShared
         );
+    }
+
+    fn result_template_of(spec: &ToolSpec) -> String {
+        spec.meta
+            .as_ref()
+            .and_then(|meta| meta.get("result_template"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("tool '{}' has no result_template", spec.name))
+            .to_string()
+    }
+
+    fn render_result_template(template: &str, result: &Value) -> String {
+        let rendered =
+            harnx_core::tool::render_tool_result_template(template, result, "raw fallback")
+                .unwrap();
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+        rendered
+    }
+
+    #[test]
+    fn load_result_template_summarizes_the_page() {
+        let template = result_template_of(&session_load_spec("pkg/helper"));
+        for (result, expected) in [
+            (
+                json!({
+                    "session_id": "ab12cd", "events": [{}, {}, {}],
+                    "truncated": false, "next_index": 42
+                }),
+                "3 events — more from index 42",
+            ),
+            (
+                json!({
+                    "session_id": "ab12cd", "events": [],
+                    "truncated": false, "next_index": 0
+                }),
+                "0 events — more from index 0",
+            ),
+            (
+                json!({
+                    "entry_index": 7, "type": "message", "text": "part of event",
+                    "total_bytes": 1024, "truncated": true,
+                    "continuation": {"entry_index": 7, "byte_offset": 512},
+                    "omitted_ranges": []
+                }),
+                "entry 7 — more from byte 512",
+            ),
+            (
+                json!({
+                    "session_id": "ab12cd", "events": [{}],
+                    "truncated": false, "next_index": null
+                }),
+                "1 event",
+            ),
+            (
+                json!({"session_id": "ab12cd", "events": [], "truncated": true}),
+                "0 events — truncated",
+            ),
+            (
+                json!({
+                    "session_id": "ab12cd", "prompt_id": "long-prompt-id",
+                    "status": "pending", "terminal": false,
+                    "events": [{}, {}], "truncated": false, "next_index": null
+                }),
+                "pending — 2 events",
+            ),
+            (
+                json!({
+                    "session_id": "ab12cd", "prompt_id": "long-prompt-id",
+                    "status": "completed", "terminal": true,
+                    "events": [], "truncated": false, "next_index": null
+                }),
+                "completed (terminal) — 0 events",
+            ),
+            (
+                json!({"is_error": true, "error": "log unavailable\r\nretry"}),
+                "log unavailable  retry",
+            ),
+            (
+                json!({"error": "tool execution failed: worker unavailable"}),
+                "tool execution failed: worker unavailable",
+            ),
+            (json!({"is_error": true}), "raw fallback"),
+        ] {
+            assert_eq!(render_result_template(&template, &result), expected);
+        }
+    }
+
+    #[test]
+    fn cancel_result_template_names_the_outcome() {
+        let template =
+            result_template_of(&session_id_tool_spec("pkg/helper", SessionIdTool::Cancel));
+        for (result, expected) in [
+            (
+                json!({"outcome": "accepted", "cancel_seq": 3, "session_id": "ab12cd"}),
+                "cancelled",
+            ),
+            (
+                json!({"outcome": "already_interrupted", "cancel_seq": 7, "session_id": "ab12cd"}),
+                "already_interrupted",
+            ),
+            (json!({"outcome": "idle", "session_id": "ab12cd"}), "idle"),
+            (json!({}), "unknown"),
+            (json!({"is_error": true, "error": "no log"}), "no log"),
+            (
+                json!({"error": "tool execution failed: worker unavailable"}),
+                "tool execution failed: worker unavailable",
+            ),
+        ] {
+            assert_eq!(render_result_template(&template, &result), expected);
+        }
     }
 
     #[test]

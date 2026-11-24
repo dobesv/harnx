@@ -21,10 +21,6 @@ class TestGeminiProviderMapping(unittest.TestCase):
         self.assertEqual(um.LITELLM_TO_HARNX_PROVIDER["gemini"], "gemini")
         self.assertIn("gemini", um.CHAT_PROVIDER_DEFAULTS)
 
-    def test_google_ai_maps_to_gemini(self) -> None:
-        # Legacy alias from older registry snapshots; harmless to keep.
-        self.assertEqual(um.LITELLM_TO_HARNX_PROVIDER["google_ai"], "gemini")
-
 
 class TestGeminiRefreshPersistence(unittest.TestCase):
     """Regression coverage for #2638: a refresh must keep Gemini pricing
@@ -61,8 +57,7 @@ class TestGeminiRefreshPersistence(unittest.TestCase):
         model = um.merge_old_fields(model, old_models.get(model_name))
         fetched = {model_name: model}
 
-        warnings: list[str] = []
-        refreshed = um.regenerate_provider_models("gemini", old_models, fetched, warnings)
+        refreshed = um.regenerate_provider_models("gemini", old_models, fetched)
         return provider, refreshed
 
     def test_refresh_picks_up_current_gemini_provider_key(self) -> None:

@@ -24,6 +24,7 @@ COPY linux-${TARGETARCH}/harnx-fetch-tools /usr/local/bin/harnx-fetch-tools
 COPY linux-${TARGETARCH}/harnx-grep-tools /usr/local/bin/harnx-grep-tools
 COPY linux-${TARGETARCH}/harnx-plans-tools /usr/local/bin/harnx-plans-tools
 COPY linux-${TARGETARCH}/harnx-time-tools /usr/local/bin/harnx-time-tools
+COPY linux-${TARGETARCH}/harnx-claude-hook-tools /usr/local/bin/harnx-claude-hook-tools
 COPY linux-${TARGETARCH}/harnx-mcp-bridge /usr/local/bin/harnx-mcp-bridge
 COPY linux-${TARGETARCH}/harnx-mcp-remote /usr/local/bin/harnx-mcp-remote
 COPY linux-${TARGETARCH}/harnx-a2a-server /usr/local/bin/harnx-a2a-server
@@ -34,5 +35,6 @@ COPY linux-${TARGETARCH}/harnx-pkg /usr/local/bin/harnx-pkg
 COPY linux-${TARGETARCH}/harnx-proxy-auth /usr/local/bin/harnx-proxy-auth
 COPY linux-${TARGETARCH}/harnx-sandbox-run /usr/local/bin/harnx-sandbox-run
 COPY linux-${TARGETARCH}/harnx-sandbox-exec /usr/local/bin/harnx-sandbox-exec
+COPY linux-${TARGETARCH}/harnx-credentials-keygen /usr/local/bin/harnx-credentials-keygen
 COPY web-assets/ /usr/local/share/harnx/web-assets/
 ENV HARNX_WEB_ASSETS=/usr/local/share/harnx/web-assets

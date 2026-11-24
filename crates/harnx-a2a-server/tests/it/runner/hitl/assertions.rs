@@ -58,8 +58,11 @@ pub(super) async fn assert_suspended(
         .as_ref()
         .unwrap();
     let ticket = ticket(context, session.storage_key())?;
+    let progress = session.fixed_prompt_progress(&ticket).await?;
     assert!(
-        matches!(session.fixed_prompt_progress(&ticket).await?, PromptProgress::InputRequired(p) if p.request_seq == checkpoint.request.request_seq)
+        matches!(progress, PromptProgress::Parked)
+            || matches!(progress, PromptProgress::InputRequired(ref p) if p.request_seq == checkpoint.request.request_seq),
+        "unexpected fixed prompt progress: {progress:?}"
     );
     assert!(session.fixed_prompt_completion(&ticket).await?.is_none());
     let entries = NatsSessionLog::new_with_replicas(h.jetstream.clone(), session.storage_key(), 1)
@@ -72,6 +75,7 @@ pub(super) async fn assert_suspended(
             | SessionLogEntry::Error { .. }
             | SessionLogEntry::HandoffCommitted { .. }
             | SessionLogEntry::HitlApprovalDecision { .. }
+            | SessionLogEntry::InteractionResponse { .. }
     )));
     assert_suspended_admission_busy(h, session, &ticket, &entries).await?;
     Ok(())
@@ -163,7 +167,11 @@ pub(super) async fn assert_single_decision_and_task_history(
     assert_eq!(
         entries
             .iter()
-            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .filter(|(_, e)| matches!(
+                e,
+                SessionLogEntry::HitlApprovalDecision { .. }
+                    | SessionLogEntry::InteractionResponse { .. }
+            ))
             .count(),
         1
     );
@@ -203,7 +211,11 @@ pub(super) async fn assert_saved_intent_history_and_events(
     assert_eq!(
         entries
             .iter()
-            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .filter(|(_, e)| matches!(
+                e,
+                SessionLogEntry::HitlApprovalDecision { .. }
+                    | SessionLogEntry::InteractionResponse { .. }
+            ))
             .count(),
         1
     );
@@ -234,7 +246,11 @@ pub(super) async fn assert_inflight_duplicate_records(
     assert_eq!(
         entries
             .iter()
-            .filter(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. }))
+            .filter(|(_, e)| matches!(
+                e,
+                SessionLogEntry::HitlApprovalDecision { .. }
+                    | SessionLogEntry::InteractionResponse { .. }
+            ))
             .count(),
         1
     );

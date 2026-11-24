@@ -207,6 +207,9 @@ impl Peer {
     ) -> Result<String> {
         let server = "probe";
         let registration = Registration {
+            user_id: None,
+            ownerless_only: false,
+            connection_id: None,
             package: package.map(str::to_owned),
             config: "probe".to_owned(),
             server: server.to_owned(),
@@ -279,6 +282,7 @@ impl Peer {
         marker: &str,
     ) -> Result<()> {
         let reply = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(json!({"content":[{"type":"text", "text":marker}], "isError":false})),
             final_progress: None,

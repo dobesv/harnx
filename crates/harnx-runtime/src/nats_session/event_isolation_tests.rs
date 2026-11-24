@@ -105,7 +105,12 @@ fn partial_assistant_does_not_complete_before_durable_error() {
     ));
     assert!(NatsSession::is_turn_completion_visible(&entries, None, 1));
     assert_eq!(
-        NatsSession::extract_turn_error(&entries, 1).as_deref(),
+        NatsSession::extract_turn_error(
+            &entries,
+            1,
+            invocation_terminal_seq(&entries, 1).unwrap_or(u64::MAX)
+        )
+        .as_deref(),
         Some("terminal model failure")
     );
 }

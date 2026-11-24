@@ -45,7 +45,8 @@ impl NatsSession {
                 crate::nats_session::completion::bounded_refresh(self.load_durable_entries())
                     .await?;
             if let Some(terminal) = self
-                .observe_follow_boundary(&entries, cx.target, boundary_opts)?
+                .observe_follow_boundary(&entries, cx.target, boundary_opts)
+                .await?
                 .filter(|boundary| boundary.pending.is_none())
             {
                 return Ok(Some(terminal));
@@ -77,8 +78,9 @@ impl NatsSession {
             {
                 Ok(entries) => {
                     if let Some(boundary_opts) = cx.boundary_options {
-                        outcome.observed_boundary =
-                            self.observe_follow_boundary(&entries, cx.target, boundary_opts)?;
+                        outcome.observed_boundary = self
+                            .observe_follow_boundary(&entries, cx.target, boundary_opts)
+                            .await?;
                     }
                     let (resp, err) = Self::extract_turn_outcome(&entries, cx.target.prompt_seq);
                     outcome.final_response = resp;

@@ -9,11 +9,16 @@ mod cancellation;
 mod compaction;
 mod handoff;
 mod history;
+mod hitl_exact;
+mod hitl_legacy;
+mod interaction;
 mod registry;
 mod snapshot;
+mod surface_action;
 mod web_address;
 
 pub use crate::session_actor_types::*;
+pub(crate) use handoff::lookup_identity_for_tests;
 pub use registry::SessionRegistry;
 pub use test_log::load_test_session_messages;
 
@@ -189,7 +194,9 @@ fn derive_state_from_prompt(
             cancel_seq: harnx_core::session_reconstruct::last_terminator_seq(entries),
         };
     }
-    if let Some(metadata) = crate::ag_ui::derive_hitl_interrupt_outcome(entries) {
+    if let Some(metadata) = crate::ag_ui::derive_hitl_interrupt_outcome(entries)
+        .or_else(|| crate::ag_ui_interactions::pending_outcome(entries))
+    {
         return SessionState::AwaitingApproval {
             pending: Box::new(PendingInterrupt { metadata }),
         };
@@ -394,7 +401,8 @@ async fn run_actor_turn_supervised(
     } else {
         None
     };
-    let body = std::panic::AssertUnwindSafe(run_actor_turn(params)).catch_unwind();
+    // This future includes the injected executor path; keep its large state off the supervisor stack.
+    let body = std::panic::AssertUnwindSafe(Box::pin(run_actor_turn(params))).catch_unwind();
     let result = match deadline {
         Some(deadline) => tokio::time::timeout(
             deadline
@@ -556,19 +564,25 @@ impl SessionActor {
         }
     }
 
+    async fn answer_subscribe(
+        &mut self,
+        reply: tokio::sync::oneshot::Sender<SubscribeResult>,
+        reap_sleep: &mut std::pin::Pin<&mut Sleep>,
+    ) {
+        self.subscribers += 1;
+        self.cancel_reap(reap_sleep);
+        self.refresh_history_snapshot().await;
+        self.republish_pending_activation().await;
+        let _ = reply.send(self.subscription());
+    }
+
     async fn handle_command(
         &mut self,
         cmd: SessionCommand,
         reap_sleep: &mut std::pin::Pin<&mut Sleep>,
     ) {
         match cmd {
-            SessionCommand::Subscribe { reply } => {
-                self.subscribers += 1;
-                self.cancel_reap(reap_sleep);
-                self.refresh_history_snapshot().await;
-                self.republish_pending_activation().await;
-                let _ = reply.send(self.subscription());
-            }
+            SessionCommand::Subscribe { reply } => self.answer_subscribe(reply, reap_sleep).await,
             SessionCommand::Prompt {
                 text,
                 options,
@@ -584,22 +598,21 @@ impl SessionActor {
                 approved,
                 note,
                 reply,
-            } => {
-                let actor_config = self.actor_config.clone();
-                let key = self.key.clone();
-                let done_tx = self.hitl_approval_done_tx.clone();
-                tokio::spawn(async move {
-                    let result = Self::route_hitl_approval_decision(
-                        actor_config,
-                        key,
-                        tool_call_id,
-                        approved,
-                        note,
-                    )
-                    .await
-                    .map_err(|error| format!("{error:#}"));
-                    let _ = done_tx.send(HitlApprovalFinished { result, reply }).await;
-                });
+            } => self.answer_hitl_legacy(tool_call_id, approved, note, reply),
+            SessionCommand::HitlApprovalDecisionExact {
+                request,
+                approved,
+                note,
+                reply,
+            } => self.answer_hitl_exact(request, approved, note, reply),
+            SessionCommand::InteractionResponse {
+                interaction_id,
+                request_seq,
+                response,
+                reply,
+            } => self.answer_interaction(interaction_id, request_seq, response, reply),
+            SessionCommand::SurfaceAction { submission, reply } => {
+                self.answer_surface_action(submission, reply)
             }
             SessionCommand::Get { reply } => {
                 self.refresh_history_snapshot().await;
@@ -686,6 +699,7 @@ impl SessionActor {
         self.run_done_task = None;
         self.active_run = None;
         self.refresh_history_snapshot().await;
+        self.broadcast_pending_interaction();
         match &done.result {
             Ok(harnx_runtime::LoopResult::Completed)
             | Ok(harnx_runtime::LoopResult::AwaitingHitlApproval { .. }) => {
@@ -702,14 +716,15 @@ impl SessionActor {
                 .await
             {
                 Ok(prepared) => {
-                    self.dispatch_handoff_to_target(
+                    // Identity lookup makes this dispatch future stack-heavy on Windows' 1 MiB default stack.
+                    Box::pin(self.dispatch_handoff_to_target(
                         &done,
                         handoff::HandoffRequest {
                             prepared,
                             prompt: prompt.clone(),
                             handoff_tool_call_id: tool_call_id.clone(),
                         },
-                    )
+                    ))
                     .await;
                 }
                 Err(error) => self.fail_handoff(&done, error),

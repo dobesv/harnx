@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -17,9 +16,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 
@@ -73,7 +71,7 @@ async fn test_header_injection_through_proxy() {
         }
         .await;
 
-        shutdown_proxy(&mut proxy).await;
+        shutdown_proxy(proxy).await;
         test_result.expect("integration flow")
     })
     .await
@@ -108,55 +106,8 @@ async fn ca_cert_file_persists_while_proxy_runs() {
         }
         .await;
 
-        shutdown_proxy(&mut proxy).await;
+        shutdown_proxy(proxy).await;
         test_result.expect("CA certificate should persist for proxy lifetime");
-    })
-    .await
-    .expect("test timed out");
-}
-
-#[tokio::test]
-async fn persistent_jsonl_mode_has_no_readiness_preamble() {
-    timeout(Duration::from_secs(15), async {
-        let mut proxy = Command::new(proxy_binary_path())
-            .env(
-                harnx_core::hooks::HARNX_HOOK_PROTOCOL_ENV,
-                harnx_core::hooks::HARNX_HOOK_PROTOCOL_JSONL,
-            )
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn proxy");
-
-        let request = br#"{"id":"probe","tool_input":{"env":{}}}
-"#;
-        proxy
-            .stdin
-            .as_mut()
-            .expect("proxy stdin")
-            .write_all(request)
-            .await
-            .expect("write hook request");
-
-        let stdout = proxy.stdout.take().expect("proxy stdout");
-        let line = BufReader::new(stdout)
-            .lines()
-            .next_line()
-            .await
-            .expect("read first stdout line")
-            .expect("proxy response line");
-        let response: Value = serde_json::from_str(&line)
-            .unwrap_or_else(|error| panic!("first stdout line was not JSON: {line:?}: {error}"));
-
-        assert_eq!(response["id"], "probe");
-        assert!(
-            response["hookSpecificOutput"]["toolInput"]["env"]["HTTP_PROXY"]
-                .as_str()
-                .is_some()
-        );
-
-        shutdown_proxy(&mut proxy).await;
     })
     .await
     .expect("test timed out");
@@ -165,8 +116,6 @@ async fn persistent_jsonl_mode_has_no_readiness_preamble() {
 struct ProxyReadiness {
     proxy_port: u16,
     ca_cert_path: PathBuf,
-    // CA cert PEM (decoded from CA_CERT_PEM_B64 readiness line).
-    // Available for HTTPS tests; unused in the plain-HTTP test.
     #[allow(dead_code)]
     ca_cert_pem: Vec<u8>,
 }
@@ -184,94 +133,36 @@ impl Drop for TestServer {
     }
 }
 
-async fn spawn_proxy(host_matcher: &str) -> Result<Child> {
+async fn spawn_proxy(host_matcher: &str) -> Result<super::mcp_stdio::Session> {
     let proxy_bin = proxy_binary_path();
-    // jaq filter: if the host matches, inject the test header with a hardcoded value
     let hook = format!(
         r#"if .host == "{host_matcher}" then .headers["x-test-header"] = "hello-world" else . end"#
     );
-    let child = Command::new(&proxy_bin)
+    let mut command = Command::new(&proxy_bin);
+    command
+        .arg("--mcp-stdio")
+        .arg("--name=proxy_fixture")
         .arg("--hook")
-        .arg(&hook)
-        .stdin(Stdio::piped()) // Keep stdin open so the JSONL loop doesn't exit on EOF
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to spawn proxy binary at {}", proxy_bin.display()))?;
-    Ok(child)
+        .arg(&hook);
+    super::mcp_stdio::Session::start(&mut command, "proxy_fixture", false).await
 }
 
-/// Read lines from the proxy stdout until all readiness values are found.
-/// Separated from `read_proxy_readiness` to keep cyclomatic complexity below threshold.
-async fn collect_readiness_lines(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-) -> Result<(u16, PathBuf, String)> {
-    let mut proxy_port = None;
-    let mut ca_cert_path = None;
-    let mut ca_cert_pem_b64 = None;
-
-    for _ in 0..10 {
-        let line = timeout(Duration::from_secs(5), lines.next_line())
-            .await
-            .context("timed out waiting for proxy readiness output")??
-            .ok_or_else(|| anyhow!("proxy exited before readiness output"))?;
-
-        parse_readiness_line(&line, &mut proxy_port, &mut ca_cert_pem_b64)?;
-        parse_ca_cert_path(&line, &mut ca_cert_path);
-
-        if readiness_is_complete(&proxy_port, &ca_cert_path, &ca_cert_pem_b64) {
-            break;
-        }
-    }
-
-    Ok((
-        proxy_port.ok_or_else(|| anyhow!("missing PROXY_PORT output"))?,
-        ca_cert_path.ok_or_else(|| anyhow!("missing CA_CERT_PATH output"))?,
-        ca_cert_pem_b64.ok_or_else(|| anyhow!("missing CA_CERT_PEM_B64 output"))?,
-    ))
-}
-
-fn parse_readiness_line(
-    line: &str,
-    proxy_port: &mut Option<u16>,
-    ca_cert_pem_b64: &mut Option<String>,
-) -> Result<()> {
-    if let Some(port) = line.strip_prefix("PROXY_PORT=") {
-        *proxy_port = Some(port.parse::<u16>().context("invalid proxy port")?);
-    } else if let Some(b64) = line.strip_prefix("CA_CERT_PEM_B64=") {
-        *ca_cert_pem_b64 = Some(b64.to_string());
-    }
-    Ok(())
-}
-
-fn parse_ca_cert_path(line: &str, ca_cert_path: &mut Option<PathBuf>) {
-    if let Some(path) = line.strip_prefix("CA_CERT_PATH=") {
-        *ca_cert_path = Some(PathBuf::from(path));
-    }
-}
-
-fn readiness_is_complete(
-    proxy_port: &Option<u16>,
-    ca_cert_path: &Option<PathBuf>,
-    ca_cert_pem_b64: &Option<String>,
-) -> bool {
-    matches!(
-        (proxy_port, ca_cert_path, ca_cert_pem_b64),
-        (Some(_), Some(_), Some(_))
-    )
-}
-
-async fn read_proxy_readiness(proxy: &mut Child) -> Result<ProxyReadiness> {
-    let stdout = proxy
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("proxy stdout not captured"))?;
-    let mut lines = BufReader::new(stdout).lines();
-
-    let (proxy_port, ca_cert_path, ca_cert_b64) = collect_readiness_lines(&mut lines).await?;
-    let ca_cert_pem = harnx_proxy_auth::base64_decode(&ca_cert_b64)
-        .context("decode CA_CERT_PEM_B64 readiness line")?;
-
+async fn read_proxy_readiness(session: &mut super::mcp_stdio::Session) -> Result<ProxyReadiness> {
+    let env_output = session.environment().await?;
+    let http_proxy = env_output["env"]["HTTP_PROXY"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing HTTP_PROXY"))?;
+    let proxy_port = http_proxy
+        .rsplit(':')
+        .next()
+        .ok_or_else(|| anyhow!("invalid HTTP_PROXY port"))?
+        .parse::<u16>()?;
+    let ca_cert_path = PathBuf::from(
+        env_output["filesystem"]["ca_cert_path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing ca_cert_path"))?,
+    );
+    let ca_cert_pem = std::fs::read(&ca_cert_path).unwrap_or_default();
     Ok(ProxyReadiness {
         proxy_port,
         ca_cert_path,
@@ -401,7 +292,7 @@ async fn test_header_injection_through_https_connect_tunnel() {
         }
         .await;
 
-        shutdown_proxy(&mut proxy).await;
+        shutdown_proxy(proxy).await;
         test_result.expect("HTTPS CONNECT tunnel integration flow")
     })
     .await
@@ -490,13 +381,8 @@ fn proxy_binary_path() -> PathBuf {
     path
 }
 
-async fn shutdown_proxy(proxy: &mut Child) {
-    if proxy.id().is_none() {
-        return;
-    }
-
-    let _ = proxy.start_kill();
-    let _ = timeout(Duration::from_secs(3), proxy.wait()).await;
+async fn shutdown_proxy(proxy: super::mcp_stdio::Session) {
+    let _ = proxy.shutdown().await;
 }
 
 #[test]

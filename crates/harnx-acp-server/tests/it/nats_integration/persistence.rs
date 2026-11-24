@@ -487,12 +487,14 @@ fn load_fixture_entries() -> Vec<SessionLogEntry> {
             fence_token: None,
         },
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![ToolOutput {
                 id: Some("load-call".to_string()),
                 name: "fs_read".to_string(),
                 output: serde_json::json!("file contents"),
                 markdown: Some("read result".to_string()),
                 content: vec![],
+                user_surfaces: vec![],
                 switch_agent: None,
             }],
             timestamp: None,

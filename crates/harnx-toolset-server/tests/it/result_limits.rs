@@ -1,12 +1,11 @@
 //! Real broker coverage for output-only bounds and identical stored/live replies.
 mod failures;
 mod fixture;
+mod images;
 
 use anyhow::{Context, Result};
 use fixture::*;
-use futures_util::StreamExt;
 use harnx_toolset::{ReplayAttempt, ToolErrorPayload, ToolReply};
-use harnx_toolset_server::invocation_journal::RecordedInvocation;
 use serde_json::json;
 use std::{sync::atomic::Ordering, time::Duration};
 
@@ -16,7 +15,9 @@ async fn native_above_default_payload_preserves_original_and_sibling_across_rest
     let mut fixture = Fixture::start(None, None).await?;
     assert_eq!(fixture.client.server_info().max_payload, 1_048_576);
     let big = request("large-native", 2 * 1024 * 1024, true);
-    let small = request("small-sibling", 64 * 1024, false);
+    // The bridge derives its presentation cap from this shared default.
+    let bridge_cap = harnx_core::safety::DEFAULT_MAX_BYTES;
+    let small = request("small-sibling", bridge_cap + 4096, false);
     let (large, sibling) = tokio::try_join!(fixture.call(&big), fixture.call(&small))?;
     assert!(matches!(
         reply(&large).result,
@@ -28,7 +29,7 @@ async fn native_above_default_payload_preserves_original_and_sibling_across_rest
     );
     assert_eq!(reply(&sibling).result, Ok(output(&small.args)));
     assert!(
-        sibling.payload.len() > 32_768,
+        sibling.payload.len() > bridge_cap,
         "native replies have no bridge presentation cap"
     );
     fixture.check_stored(&big, &large, 1_048_576).await?;
@@ -120,6 +121,7 @@ async fn exact_row_boundary_counts_cas_headers() -> Result<()> {
         let revision = fixture.store.entry(key(&request)).await?.unwrap().revision;
         let header_bytes = 51 + revision.to_string().len();
         let mut original = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(json!("")),
             final_progress: None,
@@ -159,32 +161,7 @@ async fn changed_kv_limit_recovers_real_10054_by_committing_terminal_without_ree
     // Server journal handle predates the changed limit. Observe the actual
     // rejected terminal publish and the bounded CAS retry, not helper estimates.
     let request = request("changed-limit", 32 * 1024, true);
-    let mut writes = fixture
-        .client
-        .subscribe(format!(
-            "$KV.{}.{}",
-            harnx_toolset_server::invocation_journal::BUCKET,
-            key(&request)
-        ))
-        .await?;
-    crate::common::round_trip(&fixture.client).await?;
-    let message = fixture.call(&request).await?;
-    let mut terminal_sizes = Vec::new();
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let write = writes.next().await.context("journal writes closed")?;
-            let row: RecordedInvocation = serde_json::from_slice(&write.payload)?;
-            if let Some(reply) = row.reply {
-                terminal_sizes.push(write.payload.len());
-                if serde_json::to_vec(&reply)? == message.payload {
-                    break;
-                }
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("observe terminal journal writes")??;
+    let (message, terminal_sizes) = call_observing_terminal_writes(&fixture, &request).await?;
     assert_eq!(
         terminal_sizes.len(),
         2,
@@ -211,11 +188,13 @@ async fn competing_completions_return_the_same_authoritative_bounded_winner() ->
         .record(&request, ("echo", fixture.scope.as_str(), "____test"))
         .await?;
     let first = ToolReply {
+        input_required: None,
         call_id: request.call_id.clone(),
         result: Ok(json!("a".repeat(32 * 1024))),
         final_progress: None,
     };
     let second = ToolReply {
+        input_required: None,
         result: Ok(json!("b".repeat(48 * 1024))),
         ..first.clone()
     };
@@ -273,6 +252,7 @@ async fn stale_losing_candidate_never_replaces_or_rebounds_a_stored_winner() -> 
             _ = tokio::time::sleep(Duration::from_secs(60)) => anyhow::bail!("tool did not enter"),
         }
         let winner = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(json!({"winning": true})),
             final_progress: None,
@@ -355,6 +335,7 @@ async fn execution_metadata_overhead_is_bounded_and_raw_original_is_retained() -
         .await?;
     let row = fixture.journal.get(&request).await?.unwrap();
     let mut original = ToolReply {
+        input_required: None,
         call_id: request.call_id.clone(),
         result: Ok(json!({"output": "", "_meta": {EXECUTION_CONTEXT_NAMESPACE: observation}})),
         final_progress: None,
@@ -434,6 +415,7 @@ async fn raw_journal_metadata_contract_survives_while_legacy_wire_reply_is_sanit
             .record(&request, ("echo", fixture.scope.as_str(), "____test"))
             .await?;
         let original = ToolReply {
+            input_required: None,
             call_id: request.call_id.clone(),
             result: Ok(
                 json!({"answer": "legacy", "_meta": {EXECUTION_CONTEXT_NAMESPACE: observation}}),

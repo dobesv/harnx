@@ -74,6 +74,16 @@ impl ServerHandler for McpHandler {
 pub(crate) fn tool_result(result: Result<ToolProviderOutput, ToolError>) -> CallToolResult {
     match result {
         Ok(output) => {
+            // A tool challenge has no driver here: this server fronts a
+            // synchronous MCP session, not a durable runtime round, so nobody
+            // can show the interaction or replay the call with answers.
+            // Fail closed with the documented compatibility error instead of
+            // turning the challenge into a silent success.
+            if output.input_required.is_some() {
+                return CallToolResult::error(vec![ContentBlock::text(
+                    harnx_toolset::INPUT_REQUIRED_COMPAT_ERROR,
+                )]);
+            }
             // NATS tools can return the complete MCP result envelope, including
             // media, structuredContent, annotations, and isError. Preserve it.
             if let Ok(result) = serde_json::from_value::<CallToolResult>(output.value.clone()) {

@@ -13,6 +13,8 @@ use harnx_toolset_server::invocation_journal::InvocationJournal;
 
 #[path = "tool_round/compaction.rs"]
 mod compaction;
+#[path = "tool_round/no_middleware.rs"]
+mod no_middleware;
 
 /// A session whose log lives on the broker, and a time tool server registered
 /// under the scope its tool rounds discover.
@@ -80,6 +82,33 @@ impl RoundHarness {
         }))
     }
 
+    async fn seed_saved_round(
+        &self,
+        input: &harnx_runtime::config::input::Input,
+        output: &str,
+        calls: &[ToolCall],
+        approval_requests: &[(&str, &str)],
+    ) -> Result<u64> {
+        let lookup_id = approval_requests
+            .first()
+            .map(|(id, _)| *id)
+            .unwrap_or_default();
+        self.config
+            .write()
+            .append_session_tool_calls(input, output, None, calls)?;
+        let seq = self.tool_calls_seq(lookup_id).await?;
+        for &(id, summary) in approval_requests {
+            self.log()
+                .append_event_async(&SessionLogEntry::HitlApprovalRequested {
+                    tool_call_id: id.to_string(),
+                    summary: summary.to_string(),
+                    fence_token: 0,
+                })
+                .await?;
+        }
+        Ok(seq)
+    }
+
     /// A prompt in this session: with no agent named, it saves to the session.
     fn input(&self) -> harnx_runtime::config::input::Input {
         harnx_runtime::config::input::from_str(&self.config, "what time is it", None)
@@ -105,7 +134,7 @@ impl RoundHarness {
                 abort_signal: &abort,
                 working_dir: None,
                 prepare_handoff_fn: None,
-                nats_hook_provider: None,
+
                 pending_async_context: None,
                 tool_loop_guard: None,
             },
@@ -135,14 +164,14 @@ impl RoundHarness {
                 })
             })),
             on_tool_round: None,
-            on_hitl_approval_required: None,
             on_text_response: None,
             initial_with_embeddings: false,
             initial_resume_count: 0,
             max_resume: Some(0),
             prepare_handoff_fn: None,
-            nats_hook_provider: None,
+
             pending_async_context: None,
+            surface_notes: None,
             working_dir: None,
             tool_loop_guard: Default::default(),
         }
@@ -262,6 +291,7 @@ async fn dispatch_journals_the_round_it_is_handed() -> Result<()> {
                 "time_get_current_time",
                 json!({"timezone": "UTC"}),
                 ToolCallOrigin {
+                    structured_result: false,
                     tool_call_id: Some(call_id),
                     tool_round,
                 },
@@ -307,6 +337,7 @@ async fn a_provider_opens_the_journal_once_for_all_its_calls() -> Result<()> {
                 "time_get_current_time",
                 json!({"timezone": timezone}),
                 ToolCallOrigin {
+                    structured_result: false,
                     tool_call_id: Some(call_id),
                     tool_round: Some(3),
                 },
@@ -379,18 +410,13 @@ async fn an_approved_round_journals_its_calls_under_the_entry_that_made_them() -
     };
     let calls = vec![time_call("approved")];
     let input = harness.input();
-    harness
-        .config
-        .write()
-        .append_session_tool_calls(&input, "checking the time", None, &calls)?;
-    let seq = harness.tool_calls_seq("approved").await?;
-    harness
-        .log()
-        .append_event_async(&SessionLogEntry::HitlApprovalRequested {
-            tool_call_id: "approved".to_string(),
-            summary: "Check the time".to_string(),
-            fence_token: 0,
-        })
+    let seq = harness
+        .seed_saved_round(
+            &input,
+            "checking the time",
+            &calls,
+            &[("approved", "Check the time")],
+        )
         .await?;
 
     let result = harnx_runtime::continue_agent_loop_from_tool_round(
@@ -413,6 +439,100 @@ async fn an_approved_round_journals_its_calls_under_the_entry_that_made_them() -
 
     assert!(matches!(result, LoopResult::Completed));
     assert_eq!(harness.journaled_round("approved").await?, Some(seq));
+    harness.stop().await;
+    Ok(())
+}
+
+/// Recovery logic in agent_loop: preseed approvals before engine dispatch,
+/// deny synthetic blocked result, unresolved stay pending (D6).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_round_with_approved_and_denied_calls_completes_and_records_both() -> Result<()> {
+    let Some(harness) = RoundHarness::start().await? else {
+        return Ok(());
+    };
+    let calls = vec![time_call("call-approved"), time_call("call-denied")];
+    let input = harness.input();
+    let seq = harness
+        .seed_saved_round(
+            &input,
+            "mixed round",
+            &calls,
+            &[
+                ("call-approved", "Check time approved"),
+                ("call-denied", "Check time denied"),
+            ],
+        )
+        .await?;
+
+    let pending_round = PendingToolRound {
+        seq,
+        output: "mixed round".to_string(),
+        thought: None,
+        calls,
+    };
+
+    // 1. If any call remains unresolved in pending_interrupt_ids, stays pending
+    let pending_result = harnx_runtime::continue_agent_loop_from_tool_round(
+        &harness.loop_context(),
+        input.clone(),
+        pending_round.clone(),
+        vec![ToolApprovalDecision {
+            tool_call_id: "call-approved".to_string(),
+            approved: true,
+            reason: None,
+        }],
+        std::collections::BTreeSet::from(["call-approved".to_string(), "call-denied".to_string()]),
+    )
+    .await?;
+    assert!(matches!(
+        pending_result,
+        LoopResult::AwaitingHitlApproval { ref tool_call_id } if tool_call_id == "call-denied"
+    ));
+
+    // 2. When both approved and denied decisions are provided, round completes
+    let result = harnx_runtime::continue_agent_loop_from_tool_round(
+        &harness.loop_context(),
+        input,
+        pending_round,
+        vec![
+            ToolApprovalDecision {
+                tool_call_id: "call-approved".to_string(),
+                approved: true,
+                reason: None,
+            },
+            ToolApprovalDecision {
+                tool_call_id: "call-denied".to_string(),
+                approved: false,
+                reason: Some("operator denied call".to_string()),
+            },
+        ],
+        std::collections::BTreeSet::from(["call-approved".to_string(), "call-denied".to_string()]),
+    )
+    .await?;
+
+    assert!(matches!(result, LoopResult::Completed));
+    assert_eq!(harness.journaled_round("call-approved").await?, Some(seq));
+    let entries = harness.log().load_events_async().await?;
+    let tool_results = entries
+        .iter()
+        .find_map(|(_, entry)| match entry {
+            SessionLogEntry::ToolResults { results, .. } => Some(results),
+            _ => None,
+        })
+        .expect("persisted ToolResults");
+    assert_eq!(tool_results.len(), 2);
+    let approved_res = tool_results
+        .iter()
+        .find(|r| r.id.as_deref() == Some("call-approved"))
+        .expect("approved result");
+    assert!(approved_res.output.to_string().contains("time"));
+    let denied_res = tool_results
+        .iter()
+        .find(|r| r.id.as_deref() == Some("call-denied"))
+        .expect("denied result");
+    assert_eq!(denied_res.output["error"], "operator denied call");
+    assert_eq!(denied_res.output["blocked_by_hook"], true);
+
     harness.stop().await;
     Ok(())
 }

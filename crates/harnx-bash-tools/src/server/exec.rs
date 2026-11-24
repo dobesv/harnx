@@ -1,5 +1,6 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
 use super::*;
+use crate::tool_template::protocol::TOOL_PROTOCOL_ENV;
 use harnx_toolset_server::content::WithAudience;
 
 impl BashServer {
@@ -21,8 +22,10 @@ impl BashServer {
                 params.tail_lines,
                 params.max_output_bytes,
             ),
+            include_log_hints: true,
             template_sandbox: None,
             on_user_message: OnUserMessage::Ignore,
+            protocol: None,
         })
         .await
     }
@@ -44,12 +47,19 @@ impl BashServer {
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         let command = registered
             .template
-            .render_script(&bound)
+            .render_script(&bound.env)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
 
         // Parameter bindings take precedence over author-supplied top-level env.
         let mut extra_env = registered.template.env.clone().unwrap_or_default();
-        extra_env.extend(bound);
+        extra_env.extend(bound.env);
+        // Inserted last so a template cannot override the runtime-declared protocol.
+        if let Some(protocol) = registered.protocol {
+            extra_env.insert(
+                TOOL_PROTOCOL_ENV.to_string(),
+                protocol.env_value().to_string(),
+            );
+        }
         if !registered.sandbox_enabled {
             log::warn!("tool '{name}' runs UNSANDBOXED (sandbox.enabled=false)");
             if registered.ignored_grants {
@@ -60,10 +70,16 @@ impl BashServer {
         self.exec_pipeline(ExecPipelineParams {
             command: &command,
             on_user_message: registered.on_user_message,
+            protocol: registered.protocol,
             working_dir: None,
             extra_env: Some(&extra_env),
             timeout_secs: Some(timeout_secs),
-            truncate_opts: Self::truncate_opts_from(None, None, None),
+            truncate_opts: Self::truncate_opts_from(
+                bound.output.head_lines,
+                bound.output.tail_lines,
+                bound.output.max_output_bytes,
+            ),
+            include_log_hints: false,
             template_sandbox: Some(TemplateSandbox {
                 enabled: registered.sandbox_enabled,
                 read_paths: &registered.read_paths,
@@ -102,12 +118,7 @@ impl BashServer {
             stderr_file,
         } = self.setup_exec_log().await?;
 
-        let RunOutcome {
-            status,
-            kind,
-            stdout_str,
-            stderr_str,
-        } = self
+        let outcome = self
             .run_exec_command(
                 &params,
                 CommandBuildCtx {
@@ -125,19 +136,16 @@ impl BashServer {
             )
             .await?;
 
-        // exec does not expose a grep param; pass None
-        let (streams_block, stdout_lines, stderr_lines, stdout_bytes_len, stderr_bytes_len) =
-            render_streams_block(
-                &stdout_str,
-                &stderr_str,
-                &params.truncate_opts,
-                None,
-                &execution_id,
-                &stdout_log_path,
-                &stderr_log_path,
-            );
-        let total_lines = stdout_lines + stderr_lines;
-        let total_bytes = stdout_bytes_len + stderr_bytes_len;
+        let (streams_block, total_lines, total_bytes) = render_run_output(
+            &params,
+            &outcome,
+            StreamLogHints {
+                execution_id: &execution_id,
+                stdout_log_path: &stdout_log_path,
+                stderr_log_path: &stderr_log_path,
+            },
+        );
+        let RunOutcome { status, kind, .. } = outcome;
 
         if let ExitKind::TimedOut { deadline_secs } = kind {
             return self.build_timeout_result(TimeoutResultCtx {
@@ -147,9 +155,7 @@ impl BashServer {
                 timeout_secs: deadline_secs,
                 total_lines,
                 total_bytes,
-                stdout: &stdout_str,
-                stderr: &stderr_str,
-                truncate_opts: &params.truncate_opts,
+                streams_block: &streams_block,
                 stdout_log_path: &stdout_log_path,
                 stderr_log_path: &stderr_log_path,
             });
@@ -371,9 +377,7 @@ impl BashServer {
             timeout_secs: ctx.timeout_secs,
             total_lines: ctx.total_lines,
             total_bytes: ctx.total_bytes,
-            stdout: ctx.stdout,
-            stderr: ctx.stderr,
-            truncate_opts: ctx.truncate_opts,
+            streams_block: ctx.streams_block,
             stdout_log_path: ctx.stdout_log_path,
             stderr_log_path: ctx.stderr_log_path,
         }))
@@ -396,6 +400,32 @@ impl BashServer {
         }
         CallToolResult::success(contents)
     }
+}
+
+/// The result's output block with its line and byte totals. A protocol
+/// template's stdout carries progress messages, so only its stderr is shown
+/// and counted.
+fn render_run_output(
+    params: &ExecPipelineParams<'_>,
+    outcome: &RunOutcome,
+    log_hints: StreamLogHints<'_>,
+) -> (String, usize, usize) {
+    if params.protocol.is_some() {
+        return render_stderr_block(&outcome.stderr_str, &params.truncate_opts);
+    }
+    // exec does not expose a grep param; pass None
+    let (block, stdout_lines, stderr_lines, stdout_bytes, stderr_bytes) = render_streams_block(
+        &outcome.stdout_str,
+        &outcome.stderr_str,
+        &params.truncate_opts,
+        None,
+        params.include_log_hints.then_some(log_hints),
+    );
+    (
+        block,
+        stdout_lines + stderr_lines,
+        stdout_bytes + stderr_bytes,
+    )
 }
 
 /// The command deadline in seconds: the default when unset, otherwise the

@@ -94,8 +94,14 @@ This deletes the package directory. Session transcripts referencing the package'
     agents/                # .md files — one per agent
     tool_servers/          # .yaml files — tool server configs (native & bridged MCP)
     clients/               # .yaml files — client configs
+    script_tools/          # .yaml files — custom script tool definitions (one per file)
   my-agents.patch.yaml     # Optional local overrides (sibling to the dir)
 ```
+
+If package directories resolve to the same canonical path (for example, through
+symlink aliases), Harnx loads tool servers, clients, and script tools from that
+path once. The first package name in sorted order wins; aliases are skipped with
+a warning.
 
 ## Namespacing
 
@@ -134,8 +140,9 @@ The names of agents, servers, and clients are derived from their **filename stem
 - **Agents**: `agents/coder.md` becomes `coder`.
 - **Tool Servers**: `tool_servers/fs.yaml` becomes `fs`.
 - **Clients**: `clients/openai.yaml` becomes `openai`.
+- **Script Tools**: `script_tools/*.yaml` define custom in-process script tools. Unlike agents, tool servers, and clients, package script tools use their declared `name:` field directly and are not prefixed with the package name. See the [Script Tools Guide](script-tools.md).
 
-For package-provided entities, the name is prefixed with the package name: `<package>/<stem>`. For example, `my-pkg/openai`. Any `name:` field inside the configuration file is ignored.
+For agents, tool servers, and clients, the name is prefixed with the package name: `<package>/<stem>`. For example, `my-pkg/openai`. Any `name:` field inside those configuration files is ignored.
 
 Package clients inherit model limits, prices, capabilities, and request patches
 from the shared `crates/harnx/models.yaml` catalog. Name the block you want with
@@ -200,8 +207,8 @@ Patch files use **jq filter strings** to modify package configurations. Each ent
 
 ```yaml
 agents:
-  - '.model = "claude:claude-3-5-sonnet"'          # applies to every agent
-  - 'if .name == "coder" then .model_fallbacks = ["openai:gpt-4o"] end'
+  - '.model = "claude:claude-sonnet-5-5"'          # applies to every agent
+  - 'if .name == "coder" then .model_fallbacks = ["openai:gpt-6.2-sol"] end'
 
 clients:
   - 'if .name == "claude" then .api_key = "sk-..." end'

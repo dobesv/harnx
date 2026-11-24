@@ -1,4 +1,5 @@
 //! The NATS toolset path and the MCP path must advertise command templates identically.
+mod output;
 
 use harnx_bash_tools::server::BashServer;
 use harnx_bash_tools::{discover_tool_templates, BashToolset};

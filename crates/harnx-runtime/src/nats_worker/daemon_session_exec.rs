@@ -116,6 +116,7 @@ pub(super) struct SessionExecutionInputs {
     pub(super) control_task: JoinHandle<()>,
     pub(super) hitl_decision_rx:
         tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
+    pub(super) surface_actions: crate::surfaces::SurfaceActionQueue,
     pub(super) execution: super::execution_control::WorkerExecution,
     pub(super) shutdown: tokio_util::sync::CancellationToken,
 }
@@ -145,6 +146,7 @@ struct SessionRuntimeStartup {
     shutdown_relay: JoinHandle<()>,
     control_task: JoinHandle<()>,
     hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
+    surface_actions: crate::surfaces::SurfaceActionQueue,
     execution: WorkerExecution,
     shutdown: tokio_util::sync::CancellationToken,
     per_session: crate::config::GlobalConfig,
@@ -162,6 +164,7 @@ struct PreparedSessionRuntime {
     shutdown_relay: JoinHandle<()>,
     control_task: JoinHandle<()>,
     hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
+    surface_actions: crate::surfaces::SurfaceActionQueue,
     execution: WorkerExecution,
     shutdown: tokio_util::sync::CancellationToken,
     per_session: crate::config::GlobalConfig,
@@ -216,6 +219,43 @@ fn ensure_named_agent_has_model(
     );
     Ok(())
 }
+
+/// The interrupt stop a deadline expiry issues, named for the expired
+/// invocation so it also ends that invocation's outstanding steered drain
+/// (issue #2774). The interrupt append loop re-derives head ownership on
+/// every CAS attempt, so a successor invocation's rows are never cancelled.
+fn deadline_stop(
+    prompt_seq: u64,
+    record: &crate::nats_session_metadata::RunLimitsRecord,
+) -> crate::nats_session::interrupt::InvocationStop {
+    crate::nats_session::interrupt::InvocationStop {
+        prompt_seq,
+        owning_head: Some(record.invocation_id.as_str().to_owned()),
+    }
+}
+
+/// The interrupt request shared by every deadline expiry path: immediate
+/// expiry, the detached timer, and the recorded DeadlineExpired error.
+fn deadline_interrupt_request(
+    storage: String,
+    cluster: String,
+    replicas: usize,
+    record: &crate::nats_session_metadata::RunLimitsRecord,
+) -> crate::nats_session::InterruptRequest {
+    crate::nats_session::InterruptRequest {
+        session_id: storage,
+        cluster,
+        replicas,
+        cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
+        reason: "autonomous invocation deadline expired".into(),
+        // Every caller invokes this on a record with a finite deadline, so
+        // from_record is Some; the fallback only guards a corrupt record.
+        requested_by: crate::TimeoutTerminal::from_record(record)
+            .map(|terminal| terminal.message())
+            .unwrap_or_else(|| "autonomous invocation deadline expired".into()),
+    }
+}
+
 impl WorkerRuntime {
     pub(super) async fn count_activation_failure(
         &self,
@@ -345,6 +385,46 @@ impl WorkerRuntime {
         .with_metadata_store(Some(self.session_metadata.clone()))
     }
 
+    /// Load the canonical session metadata, or classify the failure after
+    /// stopping the control listener so the activation settles durably. The
+    /// control task is handed back on success for the runtime startup.
+    async fn metadata_or_pre_turn_failure(
+        &self,
+        activation: &SessionActivate,
+        activation_failure_key: &str,
+        lease: &NatsSessionLease,
+        control_task: JoinHandle<()>,
+    ) -> Result<(
+        crate::nats_session_metadata::SessionMetadata,
+        JoinHandle<()>,
+    )> {
+        match self.load_activation_metadata(&activation.session_id).await {
+            Ok(metadata) => Ok((metadata, control_task)),
+            Err(error) => {
+                Self::stop_execution_tasks([control_task]).await;
+                Err(self
+                    .classify_pre_turn_failure(activation, activation_failure_key, lease, error)
+                    .await)
+            }
+        }
+    }
+
+    /// The activation's event sink, wrapping the client and JetStream handle
+    /// so log reads observe what this runtime published.
+    async fn activation_event_sink(
+        &self,
+        activation: &SessionActivate,
+    ) -> Arc<crate::nats_event_sink::NatsEventSink> {
+        Arc::new(
+            crate::nats_event_sink::NatsEventSink::new(
+                self.client.clone(),
+                self.jetstream.clone(),
+                activation.session_id.clone(),
+            )
+            .await,
+        )
+    }
+
     async fn prepare_session_runtime(
         &self,
         inputs: SessionExecutionInputs,
@@ -356,18 +436,18 @@ impl WorkerRuntime {
             abort_signal,
             control_task,
             hitl_decision_rx,
+            surface_actions,
             execution,
             shutdown,
         } = inputs;
-        let metadata = match self.load_activation_metadata(&activation.session_id).await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                Self::stop_execution_tasks([control_task]).await;
-                return Err(self
-                    .classify_pre_turn_failure(&activation, &activation_failure_key, &lease, error)
-                    .await);
-            }
-        };
+        let (metadata, control_task) = self
+            .metadata_or_pre_turn_failure(
+                &activation,
+                &activation_failure_key,
+                &lease,
+                control_task,
+            )
+            .await?;
         self.record_web_session_url(&activation.session_id, &metadata)
             .await;
         let (execution_abort, abort_relay, shutdown_relay) =
@@ -383,14 +463,7 @@ impl WorkerRuntime {
         );
         let agent_setup = super::daemon::install_session_metadata_agent(&per_session, &metadata)
             .and_then(|()| ensure_named_agent_has_model(&per_session, &metadata));
-        let event_sink = Arc::new(
-            crate::nats_event_sink::NatsEventSink::new(
-                self.client.clone(),
-                self.jetstream.clone(),
-                activation.session_id.clone(),
-            )
-            .await,
-        );
+        let event_sink = self.activation_event_sink(&activation).await;
         let backend = self.session_backend(&activation, event_sink.after_seq_handle());
         let after_seq_observer = event_sink.after_seq_handle();
         let startup = SessionRuntimeStartup {
@@ -402,6 +475,7 @@ impl WorkerRuntime {
             shutdown_relay,
             control_task,
             hitl_decision_rx,
+            surface_actions,
             execution,
             shutdown,
             per_session,
@@ -421,6 +495,11 @@ impl WorkerRuntime {
     async fn freeze_run_policy(&self, startup: &SessionRuntimeStartup) -> Result<()> {
         self.freeze_activation_limits(&startup.activation, &startup.per_session)
             .await?;
+        // Store failures must not arm owner-loss/deadline cancellation for work
+        // we can't classify. Redelivery retries the checkpoint reads.
+        if super::agent_loop::parks_recovery(&startup.backend, &startup.per_session).await? {
+            return Ok(());
+        }
         super::agent_loop::recover_completed_before_deadline(
             &startup.backend,
             &startup.lease,
@@ -592,18 +671,13 @@ impl WorkerRuntime {
                 .invocation_prompt_seq(&storage, record.invocation_id.as_str(), &entries)
                 .await?
                 .context("expired admission has no prompt binding")?;
-            let request = crate::nats_session::InterruptRequest {
-                session_id: storage,
-                cluster,
-                replicas,
-                cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
-                reason: "autonomous invocation deadline expired".into(),
-                requested_by: crate::TimeoutTerminal::from_record(&record)
-                    .expect("finite worker deadline")
-                    .message(),
-            };
-            let outcome = crate::nats_session::interrupt::interrupt_invocation(
-                &js, &client, &route, request, prompt,
+            let request = deadline_interrupt_request(storage, cluster, replicas, &record);
+            let outcome = crate::nats_session::interrupt::interrupt_invocation_stop_steered(
+                &js,
+                &client,
+                &route,
+                request,
+                deadline_stop(prompt, &record),
             )
             .await?;
             if outcome.cancel_seq().is_some() {
@@ -646,18 +720,13 @@ impl WorkerRuntime {
                     return;
                 }
             };
-            let request = crate::nats_session::InterruptRequest {
-                session_id: storage.clone(),
-                cluster,
-                replicas,
-                cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
-                reason: "autonomous invocation deadline expired".into(),
-                requested_by: crate::TimeoutTerminal::from_record(&record)
-                    .expect("finite worker deadline")
-                    .message(),
-            };
-            match crate::nats_session::interrupt::interrupt_invocation(
-                &js, &client, &route, request, prompt,
+            let request = deadline_interrupt_request(storage.clone(), cluster, replicas, &record);
+            match crate::nats_session::interrupt::interrupt_invocation_stop_steered(
+                &js,
+                &client,
+                &route,
+                request,
+                deadline_stop(prompt, &record),
             )
             .await
             {
@@ -709,6 +778,7 @@ impl WorkerRuntime {
             shutdown_relay: startup.shutdown_relay,
             control_task: startup.control_task,
             hitl_decision_rx: startup.hitl_decision_rx,
+            surface_actions: startup.surface_actions,
             execution: startup.execution,
             shutdown: startup.shutdown,
             per_session: startup.per_session,
@@ -753,6 +823,7 @@ impl WorkerRuntime {
             lease: prepared.lease.clone(),
             abort_signal: prepared.execution_abort.clone(),
             hitl_decision_rx: prepared.hitl_decision_rx,
+            surface_actions: prepared.surface_actions,
             per_session: prepared.per_session.clone(),
             backend: prepared.backend.clone(),
             event_sink: prepared.event_sink,
@@ -804,22 +875,18 @@ impl WorkerRuntime {
                         )
                         .await
                     {
-                        let request = crate::nats_session::InterruptRequest {
-                            session_id: running.activation.session_id.clone(),
-                            cluster: self.cluster.clone(),
-                            replicas: self.lease.replicas,
-                            cancellation_id: format!("deadline:{}", record.invocation_id.as_str()),
-                            reason: "autonomous invocation deadline expired".into(),
-                            requested_by: crate::TimeoutTerminal::from_record(&record)
-                                .expect("finite worker deadline")
-                                .message(),
-                        };
-                        match crate::nats_session::interrupt::interrupt_invocation(
+                        let request = deadline_interrupt_request(
+                            running.activation.session_id.clone(),
+                            self.cluster.clone(),
+                            self.lease.replicas,
+                            &record,
+                        );
+                        match crate::nats_session::interrupt::interrupt_invocation_stop_steered(
                             &self.jetstream,
                             &self.client,
                             &self.activation_route,
                             request,
-                            prompt,
+                            deadline_stop(prompt, &record),
                         )
                         .await
                         {

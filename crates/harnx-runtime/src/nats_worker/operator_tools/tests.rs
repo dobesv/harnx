@@ -6,8 +6,6 @@ use crate::nats_worker::tests::{
 use crate::operator_tools::{request_command, OperatorToolCommand};
 use crate::{NatsSession, NatsSessionConfig, SessionActivationRoute, SessionInitializer};
 use harnx_core::instance::ServerScope;
-use harnx_hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
-use harnx_hookset::{FailPolicy, Hook, HookSpec};
 use harnx_toolset::{ToolInvocation, ToolInvokeError, ToolSpec, Toolset};
 use serde_json::{json, Value};
 use std::sync::{
@@ -87,7 +85,8 @@ impl FixtureTools {
                 if entries.iter().any(|(_, entry)| {
                     matches!(
                         entry,
-                        harnx_core::session::SessionLogEntry::HitlApprovalRequested { .. }
+                        harnx_core::session::SessionLogEntry::InteractionRequested { .. }
+                            | harnx_core::session::SessionLogEntry::HitlApprovalRequested { .. }
                     )
                 }) {
                     break;
@@ -148,54 +147,21 @@ impl FixtureTools {
     }
 }
 
-struct Policy {
-    calls: Arc<AtomicUsize>,
+/// A `fixture_echo` call carrying `args_json` verbatim and no input answers.
+fn echo_call(args_json: &str) -> OperatorToolCommand {
+    OperatorToolCommand::Call {
+        name: "fixture_echo".into(),
+        args_json: args_json.into(),
+        tool_input: None,
+    }
 }
-#[async_trait::async_trait]
-impl Hook for Policy {
-    fn name(&self) -> &str {
-        "operator-policy"
-    }
-    fn hooks(&self) -> Vec<HookSpec> {
-        vec![HookSpec {
-            event: "PreToolUse".into(),
-            matcher: Some("^fixture_".into()),
-            priority: 0,
-            timeout_secs: None,
-            fail_policy: FailPolicy::Closed,
-        }]
-    }
-    async fn handle_hook(&self, payload: harnx_core::hooks::HookPayload) -> HookOutcome {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        match payload.hook_event {
-            HookEvent::PreToolUse { tool_input, .. }
-                if tool_input.get("text") == Some(&json!("deny")) =>
-            {
-                HookOutcome {
-                    control: HookResultControl::Block {
-                        reason: "policy denied".into(),
-                    },
-                    result: Default::default(),
-                }
-            }
-            HookEvent::PreToolUse { tool_input, .. }
-                if tool_input.get("text") == Some(&json!("mutate")) =>
-            {
-                HookOutcome {
-                    control: HookResultControl::Ask { reason: None },
-                    result: HookResult {
-                        mutated_tool_input: Some(json!({"text":"mutated with spaces"})),
-                        ..Default::default()
-                    },
-                }
-            }
-            _ => HookOutcome {
-                control: HookResultControl::Ask {
-                    reason: Some("explicit Ask".into()),
-                },
-                result: Default::default(),
-            },
-        }
+
+/// A session-metadata tool call carrying `args_json` verbatim.
+fn session_meta_call(tool_name: &str, args_json: &str) -> OperatorToolCommand {
+    OperatorToolCommand::Call {
+        name: tool_name.into(),
+        args_json: args_json.into(),
+        tool_input: None,
     }
 }
 
@@ -222,11 +188,9 @@ struct LiveOperatorFixture {
     tools: Arc<FixtureTools>,
     global: crate::config::GlobalConfig,
     readiness: harnx_healthz::Readiness,
-    hooks_seen: Arc<AtomicUsize>,
     model_calls: Arc<AtomicUsize>,
     shutdown: CancellationToken,
     tool_server: AbortOnDropHandle<Result<()>>,
-    hook_server: AbortOnDropHandle<Result<()>>,
     worker: AbortOnDropHandle<Result<()>>,
     session: NatsSession,
     request: OperatorToolRequest,
@@ -252,14 +216,13 @@ impl LiveOperatorFixture {
         });
         let shutdown = CancellationToken::new();
         let tool_server = spawn_operator_tools(tools.clone(), scope.clone(), shutdown.clone());
-        let hooks_seen = Arc::new(AtomicUsize::new(0));
-        let hook_server = spawn_operator_policy(&client, &scope, &shutdown, hooks_seen.clone());
         let global = operator_config(config);
         let readiness = harnx_healthz::Readiness::default();
         let model_calls = Arc::new(AtomicUsize::new(0));
         let worker = spawn_operator_worker(&global, &readiness, &model_calls);
         let session = operator_session(&client, identity.id, identity.agent).await?;
         let request = OperatorToolRequest {
+            user_id: None,
             version: 1,
             session_key: session.storage_key().into(),
             use_tools: None,
@@ -274,11 +237,9 @@ impl LiveOperatorFixture {
             tools,
             global,
             readiness,
-            hooks_seen,
             model_calls,
             shutdown,
             tool_server,
-            hook_server,
             worker,
             session,
             request,
@@ -296,7 +257,6 @@ impl LiveOperatorFixture {
 
     async fn wait_ready(&self) -> Result<()> {
         let Self {
-            client,
             scope,
             global,
             readiness,
@@ -312,23 +272,17 @@ impl LiveOperatorFixture {
                     None,
                 )
                 .await?;
-                let hook = crate::nats_hook_provider::NatsHookProvider::discover_with_client(
-                    client.clone(),
-                    scope.clone(),
-                )
-                .await?;
                 let tools_ready = provider
                     .declarations()
                     .iter()
                     .filter(|tool| tool.name.starts_with("fixture_"))
                     .count()
                     == 5;
-                let hooks_ready = !hook.hooks().is_empty();
                 if !readiness.is_ready() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     continue;
                 }
-                if tools_ready && hooks_ready {
+                if tools_ready {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -418,43 +372,19 @@ impl LiveOperatorFixture {
         Ok(())
     }
 
-    async fn assert_root_hook_policy(&self) -> Result<()> {
+    async fn assert_root_middleware_policy(&self) -> Result<()> {
         let Self {
             client, request, ..
         } = self;
         let seen = &self.tools.seen;
-        let mutated = call(
-            client,
-            request,
-            OperatorToolCommand::Call {
-                name: "fixture_echo".into(),
-                args_json: r#"{"text":"mutate"}"#.into(),
-            },
-        )
-        .await;
+        let mutated = call(client, request, echo_call(r#"{"text":"mutate"}"#)).await;
         assert!(mutated.error.is_none(), "{mutated:?}");
         assert!(mutated.output.contains("mutated with spaces"));
         let count = seen.lock().unwrap().len();
-        let denied = call(
-            client,
-            request,
-            OperatorToolCommand::Call {
-                name: "fixture_echo".into(),
-                args_json: r#"{"text":"deny"}"#.into(),
-            },
-        )
-        .await;
+        let denied = call(client, request, echo_call(r#"{"text":"deny"}"#)).await;
         assert_eq!(denied.error.as_deref(), Some("policy denied"));
         assert_eq!(seen.lock().unwrap().len(), count);
-        let invalid = call(
-            client,
-            request,
-            OperatorToolCommand::Call {
-                name: "fixture_echo".into(),
-                args_json: r#"{"text":123}"#.into(),
-            },
-        )
-        .await;
+        let invalid = call(client, request, echo_call(r#"{"text":123}"#)).await;
         assert!(invalid.error.is_some());
         assert_eq!(seen.lock().unwrap().len(), count);
         Ok(())
@@ -469,20 +399,17 @@ impl LiveOperatorFixture {
         let written = call(
             client,
             request,
-            OperatorToolCommand::Call {
-                name: crate::session_meta_tool::WRITE_TOOL_NAME.into(),
-                args_json: r#"{"set":[{"name":"github_issue","value":2296}]}"#.into(),
-            },
+            session_meta_call(
+                crate::session_meta_tool::WRITE_TOOL_NAME,
+                r#"{"set":[{"name":"github_issue","value":2296}]}"#,
+            ),
         )
         .await;
         assert!(written.error.is_none(), "{written:?}");
         let read = call(
             client,
             request,
-            OperatorToolCommand::Call {
-                name: crate::session_meta_tool::READ_TOOL_NAME.into(),
-                args_json: "{}".into(),
-            },
+            session_meta_call(crate::session_meta_tool::READ_TOOL_NAME, "{}"),
         )
         .await;
         assert!(read.error.is_none(), "{read:?}");
@@ -501,7 +428,6 @@ impl LiveOperatorFixture {
             client,
             request,
             global,
-            hooks_seen,
             model_calls,
             ..
         } = self;
@@ -513,6 +439,7 @@ impl LiveOperatorFixture {
         waiting.command = OperatorToolCommand::Call {
             name: "fixture_wait".into(),
             args_json: r#"{"text":"wait"}"#.into(),
+            tool_input: None,
         };
         let waiting_task = tokio::spawn({
             let client = client.clone();
@@ -529,7 +456,6 @@ impl LiveOperatorFixture {
             .to_string()
             .contains("cancelled"));
         tokio::time::timeout(Duration::from_secs(30), cancelled.notified()).await?;
-        assert!(hooks_seen.load(Ordering::SeqCst) >= 5);
         assert_eq!(model_calls.load(Ordering::SeqCst), 0);
         assert!(global.read().tui_confirm_tool_use.is_none());
         Ok(())
@@ -551,6 +477,7 @@ impl LiveOperatorFixture {
             OperatorToolCommand::Call {
                 name: "fixture_delegate".into(),
                 args_json: r#"{"text":"delegate"}"#.into(),
+                tool_input: None,
             },
         )
         .await;
@@ -576,11 +503,13 @@ impl LiveOperatorFixture {
         let entries = child_log.load_events_async().await?;
         assert!(entries.iter().any(|(_, entry)| matches!(
             entry,
-            harnx_core::session::SessionLogEntry::HitlApprovalRequested { .. }
+            harnx_core::session::SessionLogEntry::InteractionRequested { .. }
+                | harnx_core::session::SessionLogEntry::HitlApprovalRequested { .. }
         )));
         assert!(!entries.iter().any(|(_, entry)| matches!(
             entry,
-            harnx_core::session::SessionLogEntry::HitlApprovalDecision { .. }
+            harnx_core::session::SessionLogEntry::InteractionResponse { .. }
+                | harnx_core::session::SessionLogEntry::HitlApprovalDecision { .. }
         )));
         assert!(global.read().tui_confirm_tool_use.is_none());
         Ok(())
@@ -589,7 +518,6 @@ impl LiveOperatorFixture {
     async fn close(self) -> Result<()> {
         self.shutdown.cancel();
         self.tool_server.await??;
-        self.hook_server.await??;
         drop(self.worker);
         Ok(())
     }
@@ -617,23 +545,6 @@ fn spawn_operator_tools(
         scope,
         connection,
         harnx_toolset_server::ServeLifecycle::new(shutdown, None),
-    )))
-}
-
-fn spawn_operator_policy(
-    client: &async_nats::Client,
-    scope: &ServerScope,
-    shutdown: &CancellationToken,
-    calls: Arc<AtomicUsize>,
-) -> AbortOnDropHandle<Result<()>> {
-    AbortOnDropHandle::new(tokio::spawn(harnx_hookset_server::serve_with_shutdown(
-        Arc::new(Policy { calls }),
-        scope.clone(),
-        harnx_nats_common::connect::NatsConnection {
-            client: client.clone(),
-            replicas: 1,
-        },
-        harnx_hookset_server::ServeLifecycle::new(shutdown.clone(), None),
     )))
 }
 
@@ -698,7 +609,7 @@ async fn operator_session(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn live_worker_operator_commands_preserve_active_identity_hooks_allowed_tools_and_cancel(
+async fn live_worker_operator_commands_preserve_active_identity_middleware_allowed_tools_and_cancel(
 ) -> Result<()> {
     let _lock = env_lock().await;
     let Some((url, mut nats, _store)) = spawn_test_nats().await else {
@@ -706,7 +617,37 @@ async fn live_worker_operator_commands_preserve_active_identity_hooks_allowed_to
     };
     let seeded = seed_remote_config(&url);
     let _env = subagent_test_env(&url, &seeded);
-    std::fs::write(seeded.config_dir().join("agents/metis.md"), "---\nmodel: test:test-model\nuse_tools: [fixture_echo, fixture_wait, fixture_delegate, harnx_read_session_meta, harnx_write_session_meta]\n---\nfixture agent\n")?;
+    let front = serde_yaml::to_string(&serde_json::json!({
+        "model": "test:test-model",
+        "use_tools": [
+            "fixture_echo",
+            "fixture_wait",
+            "fixture_delegate",
+            crate::session_meta_tool::READ_TOOL_NAME,
+            crate::session_meta_tool::WRITE_TOOL_NAME,
+        ],
+        "middleware": [{
+            "name": "operator-policy",
+            "match": "^fixture_",
+            "bash": r#"text=$(tool_input | jq -r '.arguments.text')
+if [ "$text" = "deny" ]; then
+  deny "policy denied"
+elif [ "$text" = "mutate" ]; then
+  confirm "mutate?"
+  printf '{"text":"mutated with spaces"}' | next
+elif [ "$text" = "nested execution must await consent" ]; then
+  confirm "nested consent?"
+  next
+else
+  next
+fi"#,
+            "on_error": "deny",
+        }],
+    }))?;
+    std::fs::write(
+        seeded.config_dir().join("agents/metis.md"),
+        format!("---\n{front}---\nfixture agent\n"),
+    )?;
     let scope = ServerScope::new();
     let _scope = TestEnvGuard::new("HARNX_SERVER_SCOPE", scope.as_str());
     let client = async_nats::connect(&url).await?;
@@ -726,7 +667,7 @@ async fn live_worker_operator_commands_preserve_active_identity_hooks_allowed_to
     fixture
         .assert_active_handler(seeded.parent_config.clone())
         .await?;
-    fixture.assert_root_hook_policy().await?;
+    fixture.assert_root_middleware_policy().await?;
     fixture.assert_session_meta_tools().await?;
     fixture.assert_bash_matrix().await?;
     fixture.assert_bash_cancellation().await?;
@@ -744,8 +685,7 @@ async fn live_worker_operator_commands_preserve_active_identity_hooks_allowed_to
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managed_operator_invocation_starts_active_agent_hooks_and_cleans_registrations(
-) -> Result<()> {
+async fn managed_operator_invocation_applies_agent_middleware() -> Result<()> {
     let _lock = env_lock().await;
     let Some((url, mut nats, _store)) = spawn_test_nats().await else {
         return Ok(());
@@ -785,6 +725,7 @@ async fn managed_operator_invocation_starts_active_agent_hooks_and_cleans_regist
     )
     .await?;
     let request = OperatorToolRequest {
+        user_id: None,
         version: 1,
         session_key: session.storage_key().into(),
         use_tools: None,
@@ -792,6 +733,7 @@ async fn managed_operator_invocation_starts_active_agent_hooks_and_cleans_regist
         command: OperatorToolCommand::Call {
             name: crate::session_history::TOOL_NAME.into(),
             args_json: "{}".into(),
+            tool_input: None,
         },
         json: true,
         bash_timeout_secs: None,
@@ -804,9 +746,8 @@ async fn managed_operator_invocation_starts_active_agent_hooks_and_cleans_regist
     );
     assert_eq!(
         serde_json::from_str::<Value>(&reply.output)?,
-        json!({"error":"agent policy denied", "blocked_by_hook":true})
+        json!({"is_error":true, "error":"agent policy denied", "blocked_by_middleware":"policy"})
     );
-    assert_hook_registrations_retired(&client).await?;
     assert!(global.read().tui_confirm_tool_use.is_none());
     drop(worker);
     nats.kill()?;
@@ -814,78 +755,24 @@ async fn managed_operator_invocation_starts_active_agent_hooks_and_cleans_regist
     Ok(())
 }
 
+/// The agent's tool policy runs via in-process middleware: the operator
+/// invocation must run the agent's middleware.
 fn install_managed_operator_policy(config_dir: &std::path::Path) -> Result<()> {
-    let bin = harnx_core::bin_dir_of_exe(&std::env::current_exe()?).join(format!(
-        "harnx-claude-compatible-hook-server{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    ensure!(
-        bin.is_file(),
-        "build workspace first: {} missing",
-        bin.display()
-    );
-    let command = managed_policy_command(
-        &bin,
-        json!({"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"agent policy denied"}}),
-    );
-    let ask_command = managed_policy_command(
-        &bin,
-        json!({"hookSpecificOutput":{"permissionDecision":"ask"}}),
-    );
-    let front = serde_yaml::to_string(
-        &serde_json::json!({"model":"test:test-model", "use_tools":[crate::session_history::TOOL_NAME], "hooks":{"entries":[{"command":ask_command}, {"command":command}]}}),
-    )?;
+    let front = serde_yaml::to_string(&serde_json::json!({
+        "model": "test:test-model",
+        "use_tools": [crate::session_history::TOOL_NAME],
+        "middleware": [{
+            "name": "policy",
+            "match": format!("^{}$", crate::session_history::TOOL_NAME),
+            "bash": "deny \"agent policy denied\"",
+            "on_error": "deny",
+        }],
+    }))?;
     std::fs::write(
         config_dir.join("agents/metis.md"),
         format!("---\n{front}---\noperator agent\n"),
     )?;
     Ok(())
-}
-
-async fn assert_hook_registrations_retired(client: &async_nats::Client) -> Result<()> {
-    let registry = async_nats::jetstream::new(client.clone())
-        .get_key_value(harnx_hookset::HOOK_REGISTRY_BUCKET)
-        .await?;
-    let mut keys = registry.keys().await?;
-    while let Some(key) = keys.next().await {
-        let key = key?;
-        assert!(
-            registry.get(&key).await?.is_none(),
-            "agent hook registration leaked: {key}"
-        );
-    }
-    Ok(())
-}
-
-fn managed_policy_command(bin: &std::path::Path, expression: Value) -> String {
-    // Hook commands use shell_words on every platform, including Windows paths.
-    shell_words::join([
-        bin.to_string_lossy().into_owned(),
-        "--event".into(),
-        "PreToolUse".into(),
-        "--jaq".into(),
-        expression.to_string(),
-    ])
-}
-
-#[test]
-fn managed_policy_command_preserves_windows_paths_spaces_and_json() {
-    let bin = std::path::Path::new(
-        r"D:\a\harnx workspace\target\debug\harnx-claude-compatible-hook-server.exe",
-    );
-    let expression = json!({"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"agent's policy denied"}});
-    let command = managed_policy_command(bin, expression.clone());
-    let words = shell_words::split(&command).unwrap();
-    assert_eq!(
-        words,
-        [
-            bin.to_string_lossy().into_owned(),
-            "--event".into(),
-            "PreToolUse".into(),
-            "--jaq".into(),
-            expression.to_string(),
-        ]
-    );
 }
 
 mod bash;

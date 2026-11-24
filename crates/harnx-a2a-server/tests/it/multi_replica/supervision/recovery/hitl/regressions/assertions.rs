@@ -14,9 +14,10 @@ pub(super) async fn assert_parked_deadline_cancellation(
     );
     let log = NatsSessionLog::new(t.h.jetstream.clone(), session.storage_key());
     let entries = log.load_events_latest_required_async().await?;
-    assert!(!entries
-        .iter()
-        .any(|(_, e)| matches!(e, SessionLogEntry::HitlApprovalDecision { .. })));
+    assert!(!entries.iter().any(|(_, e)| matches!(
+        e,
+        SessionLogEntry::HitlApprovalDecision { .. } | SessionLogEntry::InteractionResponse { .. }
+    )));
     assert_eq!(
         session
             .decide_hitl_approval_for(request, true, None)

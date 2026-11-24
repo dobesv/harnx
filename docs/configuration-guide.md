@@ -44,7 +44,7 @@ The `config.yaml` file contains global behavior and appearance settings.
 
 ### LLM
 
-- **model**: Specify the default model to use (e.g., `openai:gpt-4o`).
+- **model**: Specify the default model to use (e.g., `openai:gpt-6.2-sol`).
 
 ### Behavior
 
@@ -59,6 +59,7 @@ The `config.yaml` file contains global behavior and appearance settings.
 - **tool_use**: Set to `false` to disable all tool use globally.
 - **use_tools**: Which tools to enable by default (`*` for all).
 - **toolsets**: Group tools into named sets for easy assignment.
+- **script_tools**: Define custom in-process script tools backed by Bash or Python. See the [Script Tools Guide](script-tools.md).
 
 ## Clients (`clients/`)
 
@@ -66,7 +67,7 @@ Each LLM provider is configured in its own YAML file within the `clients/` direc
 
 For a complete list of supported providers and their specific configuration options, see the [**LLM Providers Reference**](providers.md).
 
-**Note:** The **filename** (without `.yaml`) is used as the client's ID in `model` settings (e.g., `openai:gpt-4`). Any `name` field inside the file is ignored.
+**Note:** The **filename** (without `.yaml`) is used as the client's ID in `model` settings (e.g., `openai:gpt-6.2-sol`). Any `name` field inside the file is ignored.
 
 ### General Client Options
 
@@ -104,18 +105,17 @@ To target specific models, use `if/then` within the expression:
 ```yaml
 type: openai
 patches:
-  chat_completions:
-    - 'if .body.model == "o4-mini" then .body.reasoning_effort = "low" end'
-    - 'if .body.model == "o3" then .body.reasoning_effort = "medium" end'
-    - 'if .body.model == "gpt-4.1" then .body.reasoning_effort = "high" end'
+  responses:
+    - 'if .body.model == "gpt-6.2-sol" then .body.reasoning = {"effort":"low","summary":"auto"} end'
+    - 'if .body.model == "gpt-6.2-astra" then .body.reasoning = {"effort":"xhigh","summary":"auto"} end'
 ```
 
 For prefix or pattern matching, use `test` within the expression:
 
 ```yaml
 patches:
-  chat_completions:
-    - 'if (.body.model | test("gpt-5.*")) then .body.reasoning_effort = "high" end'
+  responses:
+    - 'if (.body.model | test("^gpt-6\\.2-")) then .body.reasoning = {"effort":"high","summary":"auto"} end'
 ```
 
 ### Reasoning Summaries and Defaults
@@ -158,9 +158,21 @@ patches:
 
 ## Tool Servers (`tool_servers/`)
 
-Tool servers provide external tools to Harnx. Native toolset servers (such as `harnx-attachment-tools`, `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, and `harnx-grep-tools`) run directly without a bridge wrapper, while external stdio MCP servers run via `harnx-mcp-bridge`. Each server is defined in a file under `tool_servers/` (such as `tool_servers/fs.yaml` or `tool_servers/exa.yaml`).
+Tool servers provide external tools to Harnx. Native toolset servers (such as `harnx-attachment-tools`, `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, and `harnx-claude-hook-tools`) run directly without a bridge wrapper, while external stdio MCP servers run via `harnx-mcp-bridge`. Each server is defined in a file under `tool_servers/` (such as `tool_servers/fs.yaml` or `tool_servers/exa.yaml`).
 
 The **filename** (without `.yaml`) is used as the server name.
+
+### Per-User Credentials (`harnx-mcp-remote` native mode)
+
+Remote MCP servers can run so that every user connects their **own** account
+(OAuth or a pasted token) and sees only their own upstream tools. Run
+`harnx-mcp-remote` with `--credentials-key-file` (no bridge), and manage
+connections with `harnx credentials list|connect|disconnect` or the TUI
+`.credentials` command. See [Tool Server Credentials](tool-credentials.md)
+for setup; ready-made server configs are in
+[`example_config/tool_servers/jira-oauth.yaml`](../example_config/tool_servers/jira-oauth.yaml),
+[`github-token.yaml`](../example_config/tool_servers/github-token.yaml) and
+[`pendo-token.yaml`](../example_config/tool_servers/pendo-token.yaml).
 
 ### Native Tool Server Example
 
@@ -208,6 +220,12 @@ env:
 >   ```
 >
 >   Set the actual secret (`EXA_API_KEY=…`) in `~/.local/share/harnx/.env`.
+
+> **Tools that ask for input.** A bridged MCP server that speaks the MCP
+> 2026-07-28 protocol revision (MRTR) can suspend a tool call asking the user
+> for input; the answer resumes the call automatically. Nothing to configure:
+> servers that do not offer it keep working over the legacy handshake. See
+> [Tool-produced interactions](middleware-guide.md#tool-produced-interactions-input_required).
 
 ### Running Multiple Instances (`--name`)
 
@@ -262,6 +280,59 @@ tls_key: "/path/to/key"      # Optional client key
 ```
 
 See the [NATS HA Guide](nats-ha.md) for more details.
+
+## Agents (`agents/`)
+
+Agents are Markdown files with YAML front-matter in `<config-dir>/agents/<name>.md`. See the [Agent Guide](agent-guide.md) for complete agent configuration, built-in variables, tools, and handoffs.
+
+### Customizing Agents by Caller (`patches` and `__user__`)
+
+Agents can adapt their tools and system prompts based on the caller who created the session:
+
+- **`patches` front-matter field**: One jaq filter string or a YAML list of jaq filter strings that rewrites the agent's configuration at session activation, with the caller's principals bound as `$user`.
+- **`__user__` prompt variable**: A dynamic variable in prompt templates containing the creator's principals (`user_id`, `users`, `groups`, `roles`).
+
+#### `patches` Evaluation Semantics
+
+- **Input**: The agent configuration serialized as JSON (`use_tools`, `bash_tools`, `instructions`, `model`, etc.).
+- **Bound variable (`$user`)**: JSON object containing:
+  - `user_id`: Raw caller identity string or `null`.
+  - `users`: Expanded user aliases from `users.yaml` (includes `user_id`), or empty.
+  - `groups`: Resolved groups from headers and `users.yaml`, or empty.
+  - `roles`: Resolved roles from headers and `users.yaml`, or empty.
+- **Timing and frequency**: Evaluated once per session activation on the worker. Reconciled scratch installs also evaluate patches so MCP server demand reflects patched tool selectors.
+- **Evaluation order**:
+  1. Base agent configuration (including package patches)
+  2. Persisted session overrides (e.g. `.set use_tools`)
+  3. Agent `patches` (with `$user` bound)
+  4. Runtime resolution (re-resolving the model if changed, middleware validation, server selection, run limits)
+
+Because `patches` runs after session overrides, overrides cannot re-add tools removed by a patch. But removing tools by name does not block `*` or glob selectors (such as `fs_*`) in `use_tools` or `bash_tools`. A branch that needs a real restriction must set an explicit allowlist without wildcards.
+
+- **Invariants**: Serde-skipped runtime state (variables, agent-owned tools, unchanged model, middleware origin, hook package directories) is preserved. The baseline agent in memory and on disk is never modified.
+- **Strict single output**: The filter must output exactly one JSON object. Empty, multiple, or non-object outputs fail activation.
+- **Name preservation**: A patch must not modify the agent `name`.
+- **Fail closed**: Filter syntax is validated when the agent is loaded. At session activation, any compile error, runtime evaluation error, invalid output, changed name, or deserialization failure terminates the activation with an error naming the agent and filter. On upgraded workers, the session never runs unpatched.
+
+#### Example
+
+```yaml
+use_tools: [jira, confluence, coder, fs]
+patches:
+  - 'if ($user.groups | index("developers")) then . else .use_tools |= map(select(. != "coder" and . != "fs")) end'
+```
+
+Callers with `groups: [developers]` retain all four tools. Callers without that group see only `jira` and `confluence`.
+
+#### Caveats and Boundaries
+
+- **Fixed at creation**: Caller principals are captured once when the session is created. Subsequent callers prompting an existing session receive the creator's tailoring.
+- **Membership changes**: Updates to group or role memberships take effect in new sessions only.
+- **Inheritance**: Sub-agents and handoff sessions inherit the parent session's snapshot verbatim.
+- **Not an access-control boundary**: `use_tools` and `bash_tools` are independent selectors. If a tool is in both, removing it from `use_tools` does not remove it from script mode (`bash_tools`); a patch must update both selectors. Tool dispatch also does not yet reject model calls to undeclared tools ([issue #2770](https://github.com/dobesv/harnx/issues/2770)). Do not rely on `patches` for security authorization.
+- **Authorization uses live memberships**: Access control (`access.yaml` and A2A owner binding) always evaluates live request memberships, never the session customization snapshot.
+- **Rolling upgrade order**: Upgrade workers before `harnx-serve`, `harnx-a2a-server`, and other frontends. Deploy `patches` in agent definitions and expand user access last. Older workers do not recognize `patches` and run the unpatched configuration. Rollback requires removing `patches` before rolling back workers.
+- **Filter termination and determinism**: Patches must terminate; jaq filters have no execution timeout. Filters run more than once per activation (server reconciliation and turn install), so avoid non-deterministic built-ins like `now` or `env`. Avoid copying `$user` fields into config values that could be rejected and logged in server error diagnostics.
 
 ## Example Configuration
 
@@ -440,7 +511,7 @@ Override the local allowance for a target agent in its Markdown front matter (`<
 
 ```yaml
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 run_limits:
   timeout_secs: 7200
 ---
@@ -519,14 +590,15 @@ You can also override the title agent for a specific agent in its front matter:
 
 ```yaml
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 title_agent: title-writer
 ---
 ```
 
-**Do not configure a reasoning model** (e.g. OpenAI `o1`/`o3`, DeepSeek-R1) as
-the `title_agent`. Such models spend their token budget on internal reasoning
-and often return an empty or truncated title. Use a standard chat model.
+**Do not configure a model that reasons at length** (a `:high` or `:max`
+effort alias, DeepSeek-R1) as the `title_agent`. Such models spend their token
+budget on internal reasoning and often return an empty or truncated title. Use
+a small, fast model such as `openai:gpt-6-luna`.
 
 To set a title manually, use the [`.set title`](tui-guide.md) command in the
 TUI. A manually set title freezes automatic regeneration for the rest of the
@@ -604,7 +676,17 @@ Harnx can record an opaque user identity string (such as a username, email, or a
 
 Harnx treats user identity as an opaque string; it does not authenticate users itself. Upstream authentication proxies or callers provide the identity. `user_id` is visible in session listings to anyone who can list that agent's sessions; listing is not authorized per user. Don't configure secret-bearing cookies or headers (such as `_oauth2_proxy`, access tokens, or signed JWTs) as sources. Their values would be stored and exposed as-is.
 
-A trusted proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. Header sources use the first comma-separated value, so appending a trusted value still allows spoofing. Cookie identity values must also come from the trusted proxy. `header:NAME` and bare `NAME` select a header; `cookie:NAME` selects an exact, case-sensitive cookie name.
+A trusted proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. `header:NAME` and bare `NAME` select the whole trimmed value of the first header field, with commas and backslashes preserved. Repeated fields use only the first field, so appending a trusted field after an untrusted one still allows spoofing; comma-joining values changes the identity rather than selecting the trusted value. `cookie:NAME` selects an exact, case-sensitive cookie name, whose value must also come from the trusted proxy.
+
+For example, with `serve_user_id_sources: ["header:X-Amzn-Mtls-Clientcert-Subject"]` behind an AWS ALB in mTLS verify mode, `X-Amzn-Mtls-Clientcert-Subject: CN=alice,OU=eng,O=Acme Corp` resolves to the full identity `CN=alice,OU=eng,O=Acme Corp`. RFC 2253 escaped commas such as `CN=Smith\, Alice,OU=eng` remain unchanged; Harnx doesn't parse or unescape DNs. The same header semantics apply to `harnx-a2a-server --user-id-header header:X-Amzn-Mtls-Clientcert-Subject`.
+
+Comma handling is explicit and identical for user-id and group/role header specifications:
+
+- `header:NAME` or bare `NAME`: one opaque, trimmed item per field; no comma splitting or unquoting.
+- `header-csv:NAME`: a quoted comma-separated list. User IDs select the first item (legacy first-item behavior); memberships use every item. An empty first user-id item or any malformed list fails closed. User IDs inspect only the first repeated field; memberships collect all fields and join them with commas before list parsing.
+- Prefixes are case-insensitive. Identity sources also support `cookie:NAME`, `forge-fit`, and `bearer-claim:CLAIM` where available; these kinds are rejected for memberships at startup.
+
+**Migration:** Existing group/role configurations using comma-separated lists must change `X-Groups` to `header-csv:X-Groups` and `X-Roles` to `header-csv:X-Roles`. Bare names now preserve commas as part of a single membership. This applies to config keys, environment variables, and both servers' CLI flags. Use `header-csv:NAME` for user IDs only when the legacy first-list-item behavior is intended.
 
 - **user_id** (env: `HARNX_USER_ID`, including from `.env`): Global default user identity for new sessions.
 - **user_id** in `nats_servers/<cluster>.yaml`: Default user identity for new sessions created on that NATS cluster.
@@ -622,6 +704,24 @@ Nonblank explicit or inherited identities (for example, A2A caller identities, s
 
 Once metadata is written at session creation, the identity is immutable, including on handoff into an existing session. For concurrent creators, the first successful metadata creation wins. Promptless subscriptions and control commands don't bind session ownership.
 
+#### Caller Principals Snapshot (`user_principals`)
+
+When a session is created, Harnx snapshots the creator's resolved caller principals into the read-only session property `user_principals` in addition to `user_id`. This snapshot customizes prompt templates (`__user__`) and agent configuration (`patches`):
+
+- **Snapshot shape**:
+  - `user_id`: Raw caller identity string, or `null`.
+  - `users`: List of expanded user identities from `users.yaml` aliases (includes `user_id`), or empty.
+  - `groups`: List of group memberships resolved from request headers and `users.yaml`, or empty.
+  - `roles`: List of role memberships resolved from request headers and `users.yaml`, or empty.
+- **Sources**:
+  - `harnx-serve`: Resolved from `serve_user_id_sources`, `serve_group_headers`, `serve_role_headers`, and `users.yaml`.
+  - `harnx-a2a-server`: Resolved from `--user-id-header`, `--group-header`, `--role-header`, and `users.yaml`. The snapshot is stored with the initial message reservation and retained during recovery.
+  - Local CLI, TUI, and ACP: Sessions run without request headers and receive `user_id`-only or anonymous principals (`user_id: null`, empty lists).
+  - Legacy sessions: Existing sessions without a stored snapshot fall back to `user_id`-only principals (or anonymous).
+- **Inheritance**: Sub-agent and handoff sessions inherit the parent session's `user_principals` property verbatim.
+- **Fixed for session life**: Principals are captured once at session creation. If another caller prompts the session, the session keeps the creator's tailoring. Group membership updates apply to new sessions only.
+- **Customization, not access control**: `user_principals` customizes prompts and tools. It is not an authorization boundary: tool dispatch does not yet reject calls outside the completion's declared tools ([issue #2770](https://github.com/dobesv/harnx/issues/2770)). Authorization checks (`access.yaml` and A2A owner binding) continue to use live request memberships.
+
 Example `config.yaml`:
 
 ```yaml
@@ -634,20 +734,20 @@ serve_user_id_sources:
   - "header:X-Forwarded-Email"
   - "cookie:session_user"
 
-# Trusted raw group membership headers for harnx-serve (all values contribute)
+# Trusted group lists for harnx-serve (all items contribute)
 serve_group_headers:
-  - "X-Forwarded-Groups"
+  - "header-csv:X-Forwarded-Groups"
 
-# Trusted raw role membership headers for harnx-serve (all values contribute)
+# Trusted role lists for harnx-serve (all items contribute)
 serve_role_headers:
-  - "X-Forwarded-Roles"
+  - "header-csv:X-Forwarded-Roles"
 ```
 
 ## Access Control (`access.yaml`)
 
 `harnx-serve` and `harnx-a2a-server` support optional, identity-based access control rules defined in `access.yaml`.
 
-When access rules are enabled, incoming requests are matched against the rules by caller identity. The servers decide which agents the caller can see, which sessions they can create or access, and which attachments they can retrieve. When no rules file is configured, access control is disabled and servers remain open as before.
+When access rules are enabled, incoming requests are matched against the rules by caller identity. The servers decide which agents the caller can see, which sessions they can create or access, and which attachments they can retrieve or supply to a prompt. When no rules file is configured, access control is disabled and servers remain open as before.
 
 ### File Location and Options
 
@@ -686,19 +786,29 @@ At least one selector category (`users`, `groups`, or `roles`) must be non-empty
 #### Group and Role Memberships
 
 In addition to user identity, callers can supply group and role memberships via trusted HTTP headers configured on the server:
-- `harnx-serve`: `serve_group_headers` / `serve_role_headers` in `config.yaml`, environment variables `HARNX_SERVE_GROUP_HEADERS` / `HARNX_SERVE_ROLE_HEADERS` (comma-separated header names), or repeatable `--group-header <NAME>` / `--role-header <NAME>` CLI flags. Non-empty CLI flags replace config and environment settings.
+- `harnx-serve`: `serve_group_headers` / `serve_role_headers` in `config.yaml`, environment variables `HARNX_SERVE_GROUP_HEADERS` / `HARNX_SERVE_ROLE_HEADERS` (comma-separated header specs), or repeatable `--group-header <NAME>` / `--role-header <NAME>` CLI flags. Non-empty CLI flags replace config and environment settings.
 - `harnx-a2a-server`: repeatable `--group-header <NAME>` and `--role-header <NAME>` CLI flags.
 
 Header and membership rules:
 - **No defaults**: No trusted group or role headers are enabled by default. Unconfigured membership headers sent by clients are ignored.
-- **Header parsing**: Every configured header name is read from the request. When a header appears multiple times or contains comma-separated values, each comma-separated entry is trimmed and empty tokens are dropped. All configured membership headers contribute values.
-- **Fail closed on malformed values**: If any configured membership header contains invalid bytes that fail UTF-8 header value conversion, the request is rejected immediately with HTTP 401 Unauthorized without echoing header contents.
+- **Shared header specs**: `header:NAME` or bare `NAME` keeps each whole trimmed field as one opaque membership without splitting or unquoting. `header-csv:NAME` enables quoted comma lists. Prefixes are case-insensitive; non-header kinds such as `cookie:`, `forge-fit`, and `bearer-claim:` fail startup.
+- **List parsing (`header-csv:` only)**: All configured membership headers contribute values. Repeated fields of each name are comma-joined before parsing. Commas outside double quotes separate items, except backslash-escaped commas (`\,`), which stay literal. Unquoted items are trimmed, empty items (including `""`) are dropped, and order and duplicates are preserved.
+- **Quoted items**: Double-quote an entire item to include commas. Inside quotes, `\"` becomes `"` and `\\` becomes `\`; other escapes stay literal, so RFC 4514 `\,` survives. Whitespace inside quotes is preserved. After a closing quote, only whitespace and a comma or the end of the list are allowed.
+- **Fail closed on malformed values**: Invalid header bytes or malformed `header-csv:` lists (unterminated quotes or junk after a closing quote) reject the request immediately with HTTP 401 Unauthorized (JSON-RPC `-32000` for A2A) without echoing header contents.
 - **Distinct namespaces**: Users, groups, and roles occupy completely distinct namespaces. The same string value in different namespaces never matches across categories.
 - **OR within rules, union across rules**: A rule matches when its `agents` pattern matches AND at least one selector category (`users`, `groups`, or `roles`) matches the caller's request. Scopes are unioned across all matching rules.
-- **Request-local and non-persistent**: Groups and roles are evaluated per request and are never persisted in session metadata, task KV, or NATS properties. Revoking or changing a membership takes effect on the caller's next HTTP request.
+- **Request-local authorization**: Groups and roles are evaluated fresh per request for access control, and live authorization never relies on persisted memberships. Revoking or changing a membership takes effect on the caller's next HTTP request. For agent customization, the caller's resolved principals at session creation are snapshotted into the read-only `user_principals` session property (`__user__` in templates, `$user` in agent `patches`); access rules never consult that snapshot for authorization.
 - **User ownership unchanged**: Groups and roles grant access scopes, but they never satisfy session ownership. Sessions are owned solely by immutable user IDs. Callers with `prompt` scope can only access sessions where `user_id == caller.user_id`. Callers with `admin` scope (granted by any user, group, or role rule) can access sessions across all users.
 - **User identity required**: Memberships do not satisfy required caller authentication. When access rules are enabled, protected routes still require a valid user identity.
 - **Reverse proxy trust**: Upstream proxies must authenticate callers and replace or strip all configured user, group, and role headers before forwarding requests.
+
+To send two DN-format group IDs plus a plain group, configure `serve_group_headers: ["header-csv:X-Groups"]` or `--group-header header-csv:X-Groups`, then send:
+
+```http
+X-Groups: "CN=admins,OU=eng,O=Acme", "CN=ops,O=Acme", plain-group
+```
+
+The resulting group IDs are `CN=admins,OU=eng,O=Acme`, `CN=ops,O=Acme`, and `plain-group`. A `groups: ['CN=admins,OU=*,O=Acme']` access-rule selector matches the first full group ID. An unquoted `CN=Smith\, Alice` is also one item, with the backslash preserved. This quoting syntax applies to `header-csv:` for both user IDs and memberships, not opaque `header:` values or configured `users.yaml` memberships.
 
 #### Reusable Groups with YAML Anchors
 
@@ -734,6 +844,17 @@ rules:
     - "CN=alice,OU=dev,O=mycorp"
   ```
 
+  For Atlassian Forge Invocation Tokens (`forge-fit` identity source in `harnx-a2a-server`):
+  ```yaml
+  users:
+    # Match any authenticated user from a specific Jira/Confluence cloud instance:
+    - "CN=*,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+
+    # Match both user calls and automated/no-user calls from that instance:
+    - "*OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com"
+  ```
+  Because `*` spans commas, `*OU=...` matches both user identities (`CN=<principal>,OU=<cloudId>,O=atlassian.com`) and org-only automation identities (`OU=<cloudId>,O=atlassian.com`). See [Finding Cloud ID and Account ID in the A2A Server README](../crates/harnx-a2a-server/README.md#finding-cloud-id-and-account-id) for how to locate these IDs.
+
 ### Agent References
 
 - **`harnx-serve`**: Evaluated against the client display reference:
@@ -768,6 +889,7 @@ Attachments and plans addressed by canonical `cid:` URLs embed an owning session
 - The server checks the caller's session permissions before resolving the blob or updating activity timestamps.
 - Unauthorized callers receive HTTP `404 Not Found` (with no ETag leaked).
 - Temp or inline sessions without a named agent (`SessionRef.agent == None`) return `404`.
+- **Prompt attachment refs**: A `cid:media:` ref supplied to the JSON-RPC `session/prompt` control plane is authorized the same way, against the session that uploaded it (matching owner, alias expansion, or admin scope on that agent, normalized for the destination cluster), before the prompt is admitted. At most 32 `cid:media` refs are accepted per prompt; a longer list is rejected with `-32602` (HTTP 400) before any broker work. An unauthorized, unattributed, or undecodable source returns the generic JSON-RPC error `-32005` (`attachment not found`) for the whole ref list, with no session log append or turn activation; only confirmed broker unavailability during the check returns `-32003` (HTTP 503), logged server-side at `warn`. Prompts without `cid:media` refs do no extra broker work. Same-session refs, a caller's own cross-session refs, and admin callers work; without access rules a ref is a bearer capability.
 - **Cache policy**: Responses emit `Cache-Control: private, no-store`.
 - **Cache purge recommendation**: Enabling access rules does not invalidate entries previously cached by shared reverse proxies or CDNs. When turning on access rules in an existing deployment, purge shared HTTP caches for `/v1/cid/*`.
 
@@ -782,7 +904,7 @@ Access rules protect `/v1/agents` and `/v1/cid/*` routes. Other endpoints remain
 ### Not Yet Supported
 
 - **`harnx-mcp-server`**: Access rules apply only to `harnx-serve` and `harnx-a2a-server`.
-- **ALB JWT payload decoding**: Decoding signed `x-amzn-oidc-data` JWT claims into user DNs is deferred; use the raw identity header `x-amzn-oidc-identity`.
+- **ALB JWT payload decoding**: Decoding signed `x-amzn-oidc-data` JWT headers into user DNs is still not implemented; use the raw identity header `x-amzn-oidc-identity`. (`harnx-a2a-server` supports decoding and verification for `Authorization: Bearer` token sources like `forge-fit` and `bearer-claim:CLAIM`, but not `x-amzn-oidc-data` headers.)
 
 ## User Aliases (`users.yaml`)
 
@@ -862,7 +984,7 @@ When an authenticated caller makes a request, the server expands the caller's id
 
 #### Caller expansion only, stored ownership preserved
 Alias expansion applies **only** to the incoming caller during request authorization:
-- In `harnx-serve`, new sessions created via `POST /v1/agents/{agent}/sessions` record the caller's raw incoming identity (`user_id`) in session metadata, not an alias entry name or other identities in the group.
+- In `harnx-serve`, new sessions created via `POST /v1/agents/{agent}/sessions` record the caller's raw incoming identity (`user_id`) in session metadata, not an alias entry name or other identities in the group. The session's read-only `user_principals` property records the caller's principals snapshot (`user_id`, expanded `users`, `groups`, `roles`) for prompt and tool customization.
 - In `harnx-a2a-server`, new contexts and tasks record the caller's raw incoming identity as the stored owner in the A2A binding. Stored owner identities are never expanded.
 - When an authorized caller later accesses or resumes a session, their expanded caller identities are checked against the stored session owner. Configured groups and roles never grant session or context ownership.
 
@@ -872,9 +994,9 @@ Alias expansion applies **only** to the incoming caller during request authoriza
 
 #### Configured groups and roles
 In both `harnx-serve` and `harnx-a2a-server`, configured `groups` and `roles` on the matched alias entry participate in request authorization:
-- **Comma-separated values**: List items such as `"a, b"` are split on commas, like membership header values.
+- **Comma-separated values**: Configured list items such as `"a, b"` are split on commas. These values do not use the `header-csv:` quoting parser.
 - **Merged with header memberships**: When membership headers (`--group-header`, `--role-header`, `serve_group_headers`, `serve_role_headers`) are configured and present, header values come first and retain their exact order and duplicates. Configured values from `users.yaml` are normalized (split on commas, trimmed, empty tokens dropped) and appended without adding duplicates of values already present.
 - **Applies without membership headers**: If no membership headers are configured on the server (or none are supplied in the request), matching an alias entry still assigns its configured groups and roles to the caller.
 - **Header failures fail closed**: Malformed membership headers (such as non-UTF-8 bytes) fail closed immediately with HTTP 401 Unauthorized (or JSON-RPC `-32000`). Configured groups and roles do not bypass or mask header validation failures.
 - **Matched against access rules**: Effective groups and roles match `groups:` and `roles:` selectors in `access.yaml`. The user, group, and role namespaces remain completely distinct.
-- **No ownership or persistence**: Configured memberships grant access scopes (such as `prompt` or `admin`), but they never grant session ownership and are never stored in session metadata or NATS task KV. Anonymous and unmatched callers get no configured memberships.
+- **Access control evaluation and customization snapshot**: Configured memberships grant access scopes (such as `prompt` or `admin`), but they never grant session ownership and are evaluated live per request. At session creation, resolved identity and memberships are snapshotted into the read-only `user_principals` session property for prompt and tool tailoring (`__user__` and `patches`); access rules never consult that snapshot for authorization. Anonymous and unmatched callers get no configured memberships.

@@ -35,9 +35,9 @@ cargo install --path crates/harnx-serve
 | Option | Short | Description |
 | :--- | :--- | :--- |
 | `--addr <ADDRESS>` | `-a` | Listen address (default from `config.yaml` or `127.0.0.1:8000`). |
-| `--user-id-source <SOURCE>` | | Identity source (`header:NAME`, `cookie:NAME`, or bare `NAME`); repeat in priority order. Replaces `serve_user_id_sources` from config when supplied. |
-| `--group-header <NAME>` | | Trusted raw group header name; repeat to collect values from every header. Replaces `serve_group_headers` from config/environment when supplied. |
-| `--role-header <NAME>` | | Trusted raw role header name; repeat to collect values from every header. Replaces `serve_role_headers` from config/environment when supplied. |
+| `--user-id-source <SOURCE>` | | Identity source (`header:NAME`, `header-csv:NAME`, `cookie:NAME`, or bare `NAME`); repeat in priority order. Replaces `serve_user_id_sources` from config when supplied. |
+| `--group-header <NAME>` | | Trusted group header spec (`header:NAME`/bare `NAME` for one opaque item per field; `header-csv:NAME` for quoted lists); repeat to collect all items. Replaces `serve_group_headers` from config/environment when supplied. |
+| `--role-header <NAME>` | | Trusted role header spec (same syntax as `--group-header`); repeat to collect all items. Replaces `serve_role_headers` from config/environment when supplied. |
 | `--access-rules <PATH>` | | Access rules file (default: `access.yaml` in the harnx config directory; env `HARNX_ACCESS_RULES`). Enables identity-based access control. |
 | `--public-url <URL>` | | URL a browser uses to reach the Web UI (default from `config.yaml`; inferred from request when unset). |
 | `--model <MODEL>` | `-m` | Select a specific LLM model to use. |
@@ -97,6 +97,7 @@ never used as a persistence or routing key.
 | `GET` | `/v1/agents/:agent/sessions/:session/events` | `Accept: text/event-stream` | Notify passive clients when any frontend updates the session. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Accept: text/event-stream` | **Subscription Plane**: SSE event stream. |
 | `POST` | `/v1/agents/:agent/sessions/:session` | `Content-Type: application/json` | **Control Plane**: JSON-RPC 2.0 interface. |
+| `POST` | `/v1/agents/:agent/sessions/:session/attachments` | `multipart/form-data` | Upload attachments; returns `cid:media:` refs. |
 | `GET` | `/v1/agents/:agent/sessions/:session/attachments/:cid` | `image/*` | Retrieve attachment blob by content-ID. |
 | `GET` | `/v1/cid/:encoded_cid` | `*/*` | Resolve `cid:` URL (bearer capability when rules are off; session-authorized when rules are on). |
 
@@ -129,6 +130,16 @@ Errors: 400 for malformed CIDs, 404 if blob not found or caller is unauthorized.
 - Reads local content-addressed cache first, falls back to NATS ObjectStore.
 - MIME allowlist: `image/png`, `image/jpeg`, `image/webp`, `image/gif`. Returns `415 Unsupported Media Type` for other types.
 - Headers: `Content-Type: <mime>`, `X-Content-Type-Options: nosniff`, `Cache-Control: private, max-age=86400`.
+
+### Attachment Upload
+
+`POST /v1/agents/:agent/sessions/:session/attachments` accepts a `multipart/form-data` body of `attachment` parts (filename plus part `Content-Type`):
+- Accepted part types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `application/pdf`, `text/plain`; anything else is `415 Unsupported Media Type`. The whole request is capped at 20 MiB (`413 Payload Too Large`).
+- Success returns `200` with `{"attachment_refs": ["cid:media:...", ...], "attachments": [{"cid": "..."}, ...]}`.
+- Each accepted part is written to the shared `harnx_attachments` NATS object store before its ref is returned; the serving pod's local copy is only that pod's warm cache. Refs are usable on any replica and survive pod restarts.
+- Parts are processed in order and the first error wins; a failed request returns no refs even if earlier parts were stored (stored parts are content-addressed and harmless).
+- If the object-store write fails, the response is `503` (broker unreachable) or `500` (other store error) with an `{"error": ...}` body and no refs. With access rules on, the upload additionally re-reads the session's metadata before buffering the body to prove the session still exists; a session that was deleted or replaced by then returns `404` `{"error": "session no longer exists"}` with no refs, and that read does touch the broker even for requests that later fail validation. With access rules off, validation errors (`400`/`413`/`415`) that occur before the first accepted part never touch the broker, so they are returned unchanged even when the broker is down. Once a part is accepted, the broker has been used: a later part's validation error still wins (the request returns no refs), but a broker failure storing that part can surface first.
+- Sessions that have a metadata record (rules on or off) are also re-checked after each stored part: a session deleted or replaced between the put and that re-read returns `404` `{"error": "session no longer exists"}` with no refs, and the object version that part just wrote is removed from the object store (`purge_media_version`: its metadata message and that version's chunks — never a newer same-CID version and never a dedup hit). A failed re-read is not treated as deletion: it returns `503`/`500` and purges nothing. Sessions that were never created through the API store unrechecked and their blobs have no garbage collection.
 
 ### Session Listing and Pagination
 
@@ -321,6 +332,31 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello", "timeout_secs": 300 } }
   ```
+
+  Optional `attachment_refs` parameter supplies `cid:media:` attachment refs
+  (as returned by the upload endpoint) with the prompt:
+  ```json
+  { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "what is this?", "attachment_refs": ["cid:media:..."] } }
+  ```
+  When access rules are configured, each newly supplied `cid:media` ref is
+  authorized against its source session before anything is admitted: the
+  caller needs the same access to the session that uploaded the attachment
+  that the session routes require — matching owner (including alias
+  expansion) or admin scope on the source agent, with the source agent
+  normalized for the destination cluster (bare for the default cluster,
+  `agent@cluster` otherwise). At most 32 `cid:media` refs are accepted per
+  prompt; a longer list is rejected as `-32602` (HTTP 400) before any broker
+  work, and prompts without `cid:media` refs do no broker work at this layer
+  at all. An unauthorized or unattributable source (no record, no named agent,
+  or a record that cannot be decoded) returns the generic `-32005` error
+  below for the whole list, before the session log gains any entry or a turn
+  is activated. If the source session's metadata cannot be read because the
+  broker is unavailable — the open, or a read classified as broker
+  unavailability — the prompt fails closed with `-32003` (HTTP 503), logged
+  server-side at `warn`, so an outage is not mistaken for a denial.
+  Admitting an authorized ref lets the destination session use its content.
+  Same-session refs, a caller's own cross-session refs, and admin callers
+  keep working; without access rules a ref remains a bearer capability.
 - **`session/cancel`**: Interrupts the session's current turn by appending one
   durable `Cancel` to its session log. Takes no parameters — an interrupt always
   targets whatever turn is running. It returns as soon as that append is
@@ -349,9 +385,11 @@ Same canonical session URL, negotiated into programmatic control.
 
 **Error Codes:**
 - `-32001`: Unknown session (HTTP 404) for operations that require an existing session, such as `session/get`, `session/history`, `session/cancel`, `session/compact`, and read-state updates. `session/prompt` creates the session if absent.
-- `-32003`: Session actor or history storage unavailable (HTTP 503). Transient: retry the call.
+- `-32003`: Session actor or history storage unavailable (HTTP 503). Transient: retry the call. Also returned by `session/prompt` when attachment source metadata cannot be read because the broker is unavailable (the store open or an unavailable-classified read): the prompt is rejected before admission, fail closed.
+- `-32004`: Prompt rejected (HTTP 409), including a prompt whose attachment refs cannot be resolved or parsed.
+- `-32005`: Attachment not found (HTTP 404): with access rules configured, a `session/prompt` attachment ref whose source session the caller cannot access, or that has no readable, decodable owner record. Generic by design; it does not reveal whether the referenced object exists.
 - `-32601`: Method not found
-- Standard JSON-RPC 2.0 codes (-32700, -32600, -32602)
+- Standard JSON-RPC 2.0 codes (-32700, -32600, -32602); with access rules configured, `session/prompt` also returns `-32602` (HTTP 400) for more than 32 `cid:media` refs.
 
 `session/cancel` on an idle session is not an error; it returns
 `{ "outcome": "idle" }`.
@@ -604,14 +642,16 @@ Intentionally dropped today:
 - `Notice::Info` / `Notice::Warning` — not currently emitted in server flows worth surfacing; omitted to avoid custom-event spam.
 ## Operational Notes
 
-### Tool Approval Interrupts
+### Tool Confirmation and Interaction Interrupts
 
-When a `PreToolUse` hook returns `{"permissionDecision": "ask"}`, the lease-holding
-worker persists `HitlApprovalRequested`. The server derives `Interrupted` state
-from this durable log, including after reconnects and server restarts. Decisions
-are routed to the worker, which writes `HitlApprovalDecision` using lease fencing,
-stream-tail compare-and-set, and ownership revalidation. Only a winning durable
-decision can resume the tool round; the server does not retain a continuation.
+When tool middleware requests confirmation (`confirm`), or when replaying legacy
+tool approval requests, the lease-holding worker persists durable interaction
+requests (`InteractionRequested` or legacy `HitlApprovalRequested`). The server
+derives `Interrupted` state from this durable log, including after reconnects and
+server restarts. Decisions are routed to the worker, which writes `InteractionResponse`
+(or legacy `HitlApprovalDecision`) using lease fencing, stream-tail compare-and-set,
+and ownership revalidation. Only a winning durable decision can resume the tool
+round; the server does not retain a continuation.
 
 #### Wire format
 
@@ -673,6 +713,143 @@ so a reconnecting client sees the correct interrupt snapshot without a subscribe
   Live notifications are advisory; clients reload the authoritative transcript
   after each notification and on reconnect.
 
+### Middleware confirm interactions
+
+Middleware confirmations use a separate exact-generation API. The legacy
+`session/hitl_decision` method and `hitl_pending_approval` event are unchanged.
+
+The server emits an AG-UI `CUSTOM` event named `pending_interaction` only after
+its round's durable `SuspensionReady` manifest exists:
+
+```json
+{"type":"CUSTOM","name":"pending_interaction","value":{"interaction_id":"...","request_seq":42,"tool_call_id":"...","kind":"confirm","message":"Run this tool?","pending_count":1}}
+```
+
+`request_seq` is the sequence of `InteractionRequested`, not `SuspensionReady`.
+Only the first unresolved interaction in manifest order is exposed;
+`pending_count` counts further queued interactions. An accepted response exposes
+the next request. A null `value` clears the card when nothing remains. Reconnects
+rebuild this state from the log. A modal boundary ends the current AG-UI attachment
+with `RUN_FINISHED` without completing the suspended invocation. Session state is
+`awaiting_approval`, with metadata `{type: "interaction", pending: <event value>}`;
+this is not a legacy `tool_call` interrupt and must not use legacy resume routing.
+
+Submit a response to the owning session's JSON-RPC endpoint:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"session/interaction_response","params":{"interaction_id":"...","request_seq":42,"response":{"action":"approve","data":{},"note":"Checked the command"}}}
+```
+
+For `confirm` interactions, `action` is `approve` or `deny` with empty `data` and an optional string `note`. For `a2ui` interactions, `action` is any button action name declared on the surface with bound input `data` (or `deny` to dismiss) and an optional string `note`.
+The exact interaction ID and positive request sequence are required. Unknown
+fields and malformed responses return `-32602`. Normal session authorization
+runs before this method; clients never supply a worker fence.
+
+Acceptance uses the worker's durable first-wins CAS before waking the suspended
+call. A new answer returns `{applied: true, outcome: "applied"}`; an identical
+retry returns `{applied: true, outcome: "already_applied"}` without another append.
+Conflicting, mismatched or stale responses return JSON-RPC error `-32004`, message
+`interaction response rejected`, and data `{outcome: "conflicting" | "wrong_sequence"
+| "stale" | "after_complete" | "lease_lost"}`. Transport failures use `-32003`.
+Clients must show rejected answers as errors, not treat them as successful denials.
+When readable, a conflict includes the recorded answer in `error.data.response`
+(`{action, data, note?}`). A note change can conflict even when the action matches,
+so clients must not infer that the recorded action is the opposite of their answer.
+
+Web shows the message with Approve/Deny and an optional note. Unsupported kinds
+show `not supported by this client` and Deny only. Interactions queue behind any
+legacy approval card so only one request is shown at a time.
+
+### Answer a direct child from the parent page
+
+`sub_agent_progress` custom events carry optional `pending_interaction` summaries
+in live updates and durable catch-up. A nonterminal row with a summary is awaiting
+approval. The summary names the owning child agent, routing cluster and session,
+inner tool, bounded message and exact request identity. The child owns the request;
+the parent session doesn't suspend or proxy answers.
+
+For legacy approvals, post the displayed reference to the **child's** session URL:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"session/hitl_decision_exact","params":{"request":{"invocation_id":"...","tool_round_seq":10,"request_seq":11,"tool_call_id":"..."},"approved":true,"note":"Reviewed the request"}}
+```
+
+Normal agent/session access checks run against that child before any decision.
+The result has `applied` and a required `outcome`:
+
+- `applied`: `applied: true`; clear the row's pending state.
+- `already_applied`: `applied: true`, plus recorded `approved` and `note`. The same
+  boolean answer is a successful retry; a different answer is shown as answered
+  differently elsewhere.
+- `conflicting`: `applied: false`, plus recorded `approved`; show that answer.
+- `stale`: `applied: false`; this request is no longer pending. A newer request
+  that reuses the same tool-call ID is untouched.
+
+A missing or unrecognized outcome is an error, including `{applied: true}` alone.
+If the method is unknown, open the child session to answer there. Never fall back
+to `session/hitl_decision`, which intentionally selects the current generation
+for existing session-page callers. That legacy method and its `{applied}` result
+are unchanged.
+
+For middleware `confirm` summaries, use `session/interaction_response` on the
+child URL with the displayed `interaction_id` and `request_seq`. Other kinds have
+an open-session link but no parent-row answer buttons.
+
+### Non-modal A2UI surfaces and actions
+
+Non-modal A2UI surfaces accompany completed tool results (`ToolResults.user_surfaces`). Unlike modal interactions, non-modal surfaces do not suspend the session or block the composer; multiple surfaces can remain active simultaneously.
+
+#### `a2ui_surface` custom event
+
+During promptless attach and live catch-up, `harnx-serve` emits an AG-UI `CUSTOM` event named `a2ui_surface` for each surface published in durable tool results:
+
+```json
+{"type":"CUSTOM","name":"a2ui_surface","value":{"surface_id":"deploy-form","publish_seq":42,"tool_call_id":"call_1","payload":{"version":"1.0","createSurface":{}}}}
+```
+
+When an action on a surface is accepted, the server emits another `a2ui_surface` event carrying the resolution:
+
+```json
+{"type":"CUSTOM","name":"a2ui_surface","value":{"surface_id":"deploy-form","publish_seq":42,"action":"deploy","visibility":"note","note_text":"Deploying release"}}
+```
+
+The marker identity is `(surface_id, publish_seq)`. Frontends deduplicate live and replayed events using this pair.
+
+#### Submit a surface action (`session/surface_action`)
+
+Frontends submit actions by calling the JSON-RPC method `session/surface_action`:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"session/surface_action","params":{"surface_id":"deploy-form","publish_seq":42,"response":{"action":"deploy","data":{"target":"staging"},"note":"Deploy to staging"},"user_message":"Deploy to staging"}}
+```
+
+Parameters:
+- `surface_id`: non-empty string identifying the surface.
+- `publish_seq`: positive integer of the enclosing `ToolResults` log sequence.
+- `response`: `{ "action": string, "data": object, "note"?: string }` built through the shared response contract.
+- `user_message`: optional string used as model-facing text for `note` or `turn` visibility. The backend reads `user_message` and does not use `response.note` for model input.
+
+Outcomes:
+- On success: Returns `{ "applied": true, "outcome": "applied" | "already_applied" }`. A retry with identical action and data returns `already_applied` without appending a new record. Resubmitting identical action and data with a different note is also treated as `already_applied`, and the second note is dropped.
+- On rejection: Returns JSON-RPC error `-32004` (`surface action rejected`) with data `{ "outcome": "<reason>" }`, where `<reason>` is one of:
+  - `conflicting`: a different action was already recorded for this generation.
+  - `unknown_surface`: no published surface matches `surface_id` at `publish_seq`.
+  - `undeclared_action`: the action is not a declared button on the surface (`deny` is also rejected; non-modal surfaces have no dismissal action).
+  - `invalid_visibility`: the button declares an unknown visibility value.
+  - `invalid_tool`: the declared target tool is malformed.
+  - `invalid_data`: submitted data keys or types conflict with surface input bindings.
+  - `unauthorized_tool`: the direct tool target is not permitted for this session.
+  - `tool_failed`: the direct target tool executed and returned a failure.
+  - `lease_lost`: the worker lost its session lease during execution. A direct tool may have run; check the session before retrying.
+  - `append_failed`: the action record could not be confirmed after repeated CAS conflicts or a handler panic. A direct tool may have run, and the record may already be durable; check the session before retrying.
+- On malformed arguments: Returns JSON-RPC error `-32602` (`invalid params`).
+- On routing failure: Returns JSON-RPC error `-32003`.
+
+Execution semantics:
+- Direct tools follow an execute-then-record order: the tool runs before the action record is appended so its summary can be quoted in the note. If a crash happens after the tool runs but before the record lands, a retry will run the tool again (execute-then-record window).
+- At-most-once tool execution is owner-local: guaranteed by the active worker's in-memory gate. Submissions to an idle session without an active worker are not cross-process serialized; concurrent idle submissions may run a non-idempotent tool more than once before the first record commits.
+- Frontends and `harnx-serve` must upgrade before workers: older clients do not recognize the worker's early `Pending` acknowledgement and fall back to idle execution after 40 seconds, risking a duplicate tool run.
+
 ## Request Identity
 
 `harnx-serve` can associate incoming requests with an opaque user identity string, storing it in canonical session metadata (`user_id`).
@@ -682,7 +859,8 @@ so a reconnecting client sees the correct interrupt snapshot without a subscribe
 Identity sources can be configured via `serve_user_id_sources` in `config.yaml`, the `HARNX_SERVE_USER_ID_SOURCES` environment variable, or repeated `--user-id-source` CLI flags. CLI flags replace configuration file sources when supplied.
 
 Each source is an ordered entry:
-- `header:NAME` — reads HTTP request header `NAME` (case-insensitive header name).
+- `header:NAME` — reads one opaque, trimmed value from HTTP request header `NAME` (case-insensitive header name); no comma splitting or unquoting.
+- `header-csv:NAME` — parses a quoted comma-separated list and selects its first item (legacy first-item identity behavior). An empty first item or malformed list fails closed. See [Group and Role Memberships](#group-and-role-memberships) for quoting syntax; the parser is shared.
 - `cookie:NAME` — reads cookie `NAME` from `Cookie` request headers (case-sensitive cookie name).
 - `NAME` (bare name) — alias for `header:NAME`.
 
@@ -710,9 +888,20 @@ harnx-serve \
   --user-id-source "header:x-amzn-oidc-identity"
 ```
 
+#### AWS Application Load Balancer (ALB) mTLS
+
+For ALB mTLS verify mode, use the client certificate subject header:
+
+```bash
+harnx-serve \
+  --user-id-source "header:X-Amzn-Mtls-Clientcert-Subject"
+```
+
+`header:` and bare-name identity sources use the whole trimmed value of the first header field. Commas and backslashes remain intact: `X-Amzn-Mtls-Clientcert-Subject: CN=alice,OU=eng,O=Acme Corp` resolves to `CN=alice,OU=eng,O=Acme Corp`. Escaped commas, such as `CN=Smith\, Alice,OU=eng`, are preserved without DN parsing or unescaping. `header-csv:` explicitly selects the first list item instead. Both modes inspect only the first repeated field for user IDs; group/role headers collect all repeated fields.
+
 ### Security Warning
 
-`harnx-serve` does not authenticate identity headers or cookies; it treats resolved values as opaque strings. The upstream proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. Header sources use the first comma-separated value, so appending a trusted identity after an untrusted value still permits spoofing. Cookie sources must also contain only proxy-trusted identity values.
+`harnx-serve` does not authenticate identity headers or cookies; it treats resolved values as opaque strings. The upstream proxy must authenticate callers and **replace, not append to**, client-supplied identity headers. Appending a trusted field leaves an untrusted first field in control; comma-joining values changes the identity rather than selecting the trusted value. Cookie sources must also contain only proxy-trusted identity values.
 
 `user_id` is visible in session listings to callers permitted to view those sessions. When access rules are disabled, there is no per-user listing authorization. Use a non-secret account identifier, not access tokens, signed JWTs, or secret-bearing session cookies such as `_oauth2_proxy`. Values are stored as-is, not decrypted or verified; they remain in session metadata until the session is removed.
 
@@ -731,12 +920,23 @@ Session user identity is stored once when the session metadata is created. It is
 ### Group and Role Memberships
 
 In addition to user identity, `harnx-serve` can extract group and role memberships from trusted HTTP request headers for use in access rules:
-- Configured via `serve_group_headers` and `serve_role_headers` in `config.yaml`, the `HARNX_SERVE_GROUP_HEADERS` and `HARNX_SERVE_ROLE_HEADERS` environment variables (comma-separated header names), or repeated `--group-header` and `--role-header` CLI flags. Non-empty CLI flags replace configuration file and environment settings.
-- **Trusted raw headers**: Header names are validated at startup. By default, no group or role headers are trusted; unconfigured headers are ignored.
-- **Parsing**: Every configured header name contributes values. Repeated headers and comma-separated tokens are split, trimmed, and empty tokens are dropped. All configured membership headers contribute values.
-- **Fail closed**: If any configured membership header contains invalid bytes that fail UTF-8 header value conversion, `harnx-serve` immediately rejects the request with HTTP `401 Unauthorized` without echoing header contents.
-- **Request-local**: Memberships are evaluated on each request and are never persisted in session metadata or NATS properties. Membership changes or revocations take effect on the next HTTP request.
+- Configured via `serve_group_headers` and `serve_role_headers` in `config.yaml`, the `HARNX_SERVE_GROUP_HEADERS` and `HARNX_SERVE_ROLE_HEADERS` environment variables (comma-separated header specs), or repeated `--group-header` and `--role-header` CLI flags. Non-empty CLI flags replace configuration file and environment settings.
+- **Shared header specs**: `header:NAME` or bare `NAME` keeps each whole trimmed field as one opaque membership, without splitting commas or unquoting. `header-csv:NAME` enables quoted comma lists. Prefixes are case-insensitive. Unsupported source kinds (`cookie:`, `forge-fit`, `bearer-claim:`) and invalid names fail startup. By default, no membership headers are trusted.
+- **List parsing (`header-csv:` only)**: All configured headers contribute values. Repeated fields of each name are comma-joined before parsing. Commas outside double quotes separate items, except backslash-escaped commas (`\,`), which stay literal. Unquoted items are trimmed; empty items (including `""`) are dropped. Order and duplicates are preserved.
+- **Quoted items**: Double-quote an entire item to include DN commas. Inside quotes, `\"` becomes `"` and `\\` becomes `\`; other escapes stay literal, so RFC 4514 `\,` is preserved. Whitespace inside quotes is part of the value. After a closing quote, only whitespace and a comma or the end of the list are allowed.
+- **Fail closed**: Invalid header bytes or malformed `header-csv:` lists (unterminated quotes or junk after a closing quote) reject the request with HTTP `401 Unauthorized` without echoing header contents.
+- **Request-local authorization**: Memberships are evaluated on each request for access control and are not used for authorization persistence. Membership changes or revocations take effect on the next HTTP request. For prompt and tool tailoring, a snapshot of resolved caller principals (`user_id`, expanded `users`, `groups`, `roles`) is captured at session creation into the read-only `user_principals` session property (`__user__` in templates, `$user` in agent `patches`); access control never consults this snapshot. See [Customizing Agents by Caller](../../docs/configuration-guide.md#customizing-agents-by-caller-patches-and-__user__) and the [Agent Guide](../../docs/agent-guide.md#agent-patches-patches).
 - **User ownership**: Groups and roles do not satisfy required user identification, do not act as user aliases, and never satisfy session ownership. Sessions are owned solely by immutable user IDs. Admin scope granted by group or role rules retains administrative access across all sessions.
+
+**Migration:** Bare group/role names used to split comma lists. Change `X-Groups` to `header-csv:X-Groups` (and similarly for roles) wherever a proxy sends multiple memberships in one field. Use `header:X-Groups` for a single DN group with commas.
+
+For example, configure `serve_group_headers: ["header-csv:X-Groups"]` or pass `--group-header header-csv:X-Groups`; this header supplies two DN groups and one plain group:
+
+```http
+X-Groups: "CN=admins,OU=eng,O=Acme", "CN=ops,O=Acme", plain-group
+```
+
+The group values are `CN=admins,OU=eng,O=Acme`, `CN=ops,O=Acme`, and `plain-group`. Access-rule `groups:` globs match each full value. The same list syntax applies to `header-csv:` user-id sources, which select only the first item; `header:` and bare names never unquote or split commas.
 
 ### User Aliases (`users.yaml`)
 
@@ -745,7 +945,7 @@ In addition to user identity, `harnx-serve` can extract group and role membershi
 - **Startup loading**: Loaded once at startup via `config_paths::local_path("users.yaml")`. Missing `users.yaml` preserves default singleton identity behavior. An invalid present file fails startup immediately with path context. Modifying the file requires a server restart; there is no live reload.
 - **Caller authorization expansion**: An authenticated caller's identity expands into the first matching entry's `identities` list for agent access checks and session visibility under access rules. Overlapping entries do not merge (no transitive union).
 - **Configured groups and roles**: Entries can declare optional `groups` and `roles`. When a caller matches an entry, its configured memberships are merged into the request memberships (appended after header values and deduped) for matching against `access.yaml` rules. Configured values apply even when no membership headers are configured.
-- **Session ownership preserved**: Session creation (`POST /v1/agents/{agent}/sessions`) stores the incoming caller's raw `user_id` in session metadata, never an alias entry name or other group identities. Configured groups and roles never grant session ownership and are not stored in session metadata. Stored session owners are never expanded.
+- **Session ownership preserved**: Session creation (`POST /v1/agents/{agent}/sessions`) stores the incoming caller's raw `user_id` in session metadata, never an alias entry name or other group identities. Configured groups and roles never grant session ownership. (For prompt and tool tailoring, resolved caller principals are snapshotted into the read-only `user_principals` property, but access control never uses that snapshot to grant ownership). Stored session owners are never expanded.
 - **Behavior without access rules**: When `access.yaml` is absent, `harnx-serve` operates without access restrictions; `users.yaml` alone does not restrict endpoints or session access.
 - **Security notice**: Because alias mappings expand caller permissions, `users.yaml` should be modified only by trusted operators.
 
@@ -769,6 +969,7 @@ In addition to user identity, `harnx-serve` can extract group and role membershi
   - Callers holding only `admin` scope receive HTTP `403 Forbidden` (`session creation requires prompt scope`) when attempting to create a session.
 - **Pre-allocation Requirement**: Callers must reserve a session ID via `POST /v1/agents/{agent}/sessions` before prompting. Implicit session creation on unreserved session IDs returns HTTP `404 Not Found`.
 - **Session Listings**: `GET /v1/agents/{agent}/sessions` filters results before pagination, showing only sessions the caller is authorized to access.
+- **Prompt Attachment Refs**: `cid:media:` refs supplied to the JSON-RPC `session/prompt` are authorized against the session that uploaded them before the prompt is admitted — the caller needs the same access to that source session that the session routes require (matching owner, alias expansion, or admin scope on the source agent, normalized for the destination cluster). At most 32 `cid:media` refs are accepted per prompt (HTTP 400 / `-32602` over the cap). An unauthorized, unattributed, or otherwise unreadable source returns the generic `-32005` `attachment not found` (HTTP 404) for the whole list, before any log append or turn activation; only confirmed broker unavailability during the check returns `-32003` (HTTP 503). Prompts without `cid:media` refs do no extra broker work.
 - **CID Attachments**: `/v1/cid/*` validates caller access against the owning session embedded in the CID. Protected responses emit `Cache-Control: private, no-store`. Shared proxy caches should be purged when enabling rules.
 ## Quickstart
 

@@ -6,23 +6,48 @@ use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
     SessionId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
-use harnx_runtime::nats_tool_confirmation::{ToolConfirmationHandler, ToolConfirmationRequest};
+use harnx_runtime::nats_tool_confirmation::{
+    DeferredToolConfirmationHandler, ToolConfirmationRequest,
+};
 
 use crate::AcpConnection;
 
 pub const ALLOW_OPTION_ID: &str = "allow";
 pub const REJECT_OPTION_ID: &str = "reject";
+/// Option-ID prefix for an `a2ui` button action: `action:<event name>`.
+pub const A2UI_ACTION_OPTION_PREFIX: &str = "action:";
 
 pub(crate) fn tool_confirmation_handler(
     connection: Option<AcpConnection>,
     acp_session_id: String,
-) -> Arc<ToolConfirmationHandler> {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    probe: crate::interaction_permission::LegacyProbe,
+) -> Arc<DeferredToolConfirmationHandler> {
     Arc::new(move |request| {
         let connection = connection.clone();
         let acp_session_id = acp_session_id.clone();
-        Box::pin(
-            async move { request_permission(connection.as_ref(), acp_session_id, request).await },
-        )
+        let gate = Arc::clone(&gate);
+        let probe = probe.clone();
+        Box::pin(async move {
+            // Probe before the gate: the durable observer may hold it while acceptance
+            // waits for this worker to leave its synchronous confirmation callback.
+            match probe.is_interaction(request.tool_call_id.as_deref()).await {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(error) => {
+                    if let Some(connection) = &connection {
+                        crate::interaction_permission::report(
+                            connection,
+                            &acp_session_id,
+                            format!("cannot classify tool confirmation; deferring: {error:#}"),
+                        );
+                    }
+                    return None;
+                }
+            }
+            let _guard = gate.lock().await;
+            Some(request_permission(connection.as_ref(), acp_session_id, request).await)
+        })
     })
 }
 
@@ -70,7 +95,7 @@ fn acp_permission_request(
     )
 }
 
-fn permission_options() -> Vec<PermissionOption> {
+pub(crate) fn permission_options() -> Vec<PermissionOption> {
     vec![
         PermissionOption::new(ALLOW_OPTION_ID, "Allow", PermissionOptionKind::AllowOnce),
         PermissionOption::new(REJECT_OPTION_ID, "Reject", PermissionOptionKind::RejectOnce),

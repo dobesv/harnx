@@ -254,9 +254,10 @@ pub struct ConfigData {
     pub serve_public_url: Option<String>,
     /// Ordered header/cookie sources for the identity recorded on new HTTP sessions.
     pub serve_user_id_sources: Vec<String>,
-    /// Trusted raw HTTP header names for request-local groups. Empty by default.
+    /// Trusted group header specs: header:NAME (or NAME) is opaque;
+    /// header-csv:NAME parses quoted comma lists. Empty by default.
     pub serve_group_headers: Vec<String>,
-    /// Trusted raw HTTP header names for request-local roles. Empty by default.
+    /// Trusted role header specs, with the same syntax as serve_group_headers.
     pub serve_role_headers: Vec<String>,
     /// Default identity for newly created sessions, unless their cluster or caller supplies one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,7 +267,20 @@ pub struct ConfigData {
     pub sync_models_url: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<HooksConfig>,
+    // Boxed for the same reason as `AgentConfig::hooks`: `ConfigData` lives
+    // inline in `Config`, which every turn dispatch future copies by value.
+    pub hooks: Option<Box<HooksConfig>>,
+
+    #[serde(
+        default,
+        skip_serializing_if = "crate::middleware::MiddlewareConfig::is_empty"
+    )]
+    pub middleware: crate::middleware::MiddlewareConfig,
+
+    /// Agent-facing tools backed by in-process scripts. Package definitions are
+    /// kept in the runtime's resolved catalog, not merged into this source data.
+    #[serde(default)]
+    pub script_tools: Vec<crate::script_tool::ScriptToolDefinition>,
 
     /// Enable terminal/OS agent protocol emission. When false, the emitter
     /// suppresses all terminal-agent protocol output. Defaults to true.
@@ -303,6 +317,7 @@ impl ConfigData {
     }
 }
 impl Default for ConfigData {
+    // qual:allow(complexity, max_function_lines=62) reason: "Keep exhaustive config field defaults together; this initializer has no control flow."
     fn default() -> Self {
         Self {
             model_id: Default::default(),
@@ -351,6 +366,8 @@ impl Default for ConfigData {
             sync_models_url: None,
 
             hooks: None,
+            middleware: Default::default(),
+            script_tools: Vec::new(),
 
             terminal_status: default_terminal_status(),
 
@@ -459,7 +476,7 @@ compress_threshold: 100000
 rag_top_k: 3
 highlight: false
 hooks:
-  entries: []
+  max_resume: 2
 "#;
         let got: ConfigData = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(got.model_id, "claude-sonnet-4-6");

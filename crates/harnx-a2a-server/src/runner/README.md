@@ -28,6 +28,44 @@ context, repairs a settled predecessor if needed, captures one runtime predecess
 and CAS-reserves all task identities before prompt append. Contending candidates
 follow the same identity or return the existing Busy error for distinct work.
 
+A follow-up for a context whose task is still running steers into that task's live
+turn instead of returning Busy (issue #2774): the handler binds the message to the
+running invocation and appends it as a user row the worker folds in at its next
+tool-round seam, or answers in a continuation round under the same invocation when
+the turn has no seam. The reply is the same task, and streaming requests subscribe
+to that task's events. Retries dedupe by messageId on the same task; a different
+fingerprint under the same id still fails the fingerprint check. Parked
+`INPUT_REQUIRED` tasks keep their dedicated reply path and the Busy error, and so
+do legacy contexts without a steerable invocation.
+
+Dedupe ordering accepts one crash window, by design: the steered row is appended
+first and the messageId-to-task mapping is written after. Committing the mapping
+first would let a retry dedupe-hit a task whose steered row never landed (silent
+loss); the reverse order can only duplicate, never drop. While the task is live a
+same-id retry is still idempotent — the runtime replays the committed row by id and
+refuses a same-id retry with different content, even before the mapping lands —
+so the window only matters if the server dies between append and mapping and the
+task settles before the retry: the retried messageId then admits fresh work and
+answers the same content again on a new task. This matches the at-least-once
+behaviour of first-message reservations.
+
+Because steered rows can keep draining after a task's follow observed its boundary,
+the context can be idle at the authority while the runtime admission head is still
+active. A fresh admission waits that head out (bounded, with the candidate lease
+held) before capturing its runtime predecessor, and the detached publisher retries
+the head CAS while the drain finishes, so a steered continuation can neither fence
+out the next task nor leave the context wedged.
+
+Owner loss during that drain is accepted failover behavior, not a wedge: the
+recovery sweep holds the settlement for a bounded 30 s drain window so a live
+worker can still answer the outstanding steered rows, and if the window expires
+— the owner is gone and the continuation is slow or held — the sweep falls
+through to the ordinary owner-loss interrupt and settles the task `FAILED`
+(rather than `CANCELED`, which is reserved for an actual cancel intent). A
+slow-but-alive continuation is therefore cut at roughly 30 s plus one sweep
+batch after its owner disappears; ordinary live tasks are never subject to this
+budget.
+
 Local gates, LRUs and live handles aren't authority. Live presentation and local
 completion handles require a matching owner fence; a stale cached snapshot can't
 replace a recovered task. Active task mutations use `OwnedTask::update`, which
@@ -39,8 +77,9 @@ Legacy task CRUD is refused on activated contexts.
 A2A uses durable deferred approval, with no live confirmation route or automatic
 denial. `follow_admitted_prompt_until_boundary` always uses a `None` confirmation
 subject. An `InputRequired` boundary drains runtime text, reconciles persisted
-assistant output, flushes the answer artifact, then atomically stages the plain
-challenge, `HitlCheckpoint { phase: Waiting, ... }` and status event through one
+assistant output, flushes the answer artifact, then atomically stages the
+challenge (shared text plus a DataPart for `a2ui`),
+`HitlCheckpoint { phase: Waiting, ... }` and status event through one
 `OwnedTask::update`. Its event ID is `{task_id}:hitl:{request_seq}:input-required`.
 After publication/checkpoint, the detached supervisor CAS-releases the context
 owner, releases the scoped lease and removes only its own fenced local handle.
@@ -62,9 +101,12 @@ They must retain the exact original `ApprovalRef`; don't use a new prompt or cal
 
 For a caller already holding `OwnedTask` in a runner module:
 
-1. Deliver the saved decision with `session.decide_hitl_approval_for(&request,
-   approved, note)`. Query `fixed_prompt_progress(ticket)` after the outcome;
-   stale/conflicting decisions must not target a newer request.
+1. Deliver the exact saved message with `reply_delivery::deliver_saved(session,
+   authority)`. It verifies the receipt's history fingerprint, parses text or an
+   A2UI DataPart against the bound request, and calls `hitl::interaction::decide`
+   with those original parts. Query `hitl::interaction::fixed_progress(session,
+   ticket)` after the outcome; stale/conflicting decisions must not target a
+   newer request.
 2. Drain the old outbox, persist reply dedupe if applicable, then use
    `advance_hitl_to_following(storage, version, params)`. Refresh the
    owned context after this helper's CAS. It stages the `Working` event.
@@ -125,10 +167,14 @@ interruption of already admitted work. Missing active bindings aren't recreated;
 only a verified winning first reservation can initialize missing metadata.
 
 Recovery registrations keep the binding's original owner when an admin admits a
-follow-up, not that admin's current identity. Only owner/export/allocation facts are
-persisted, never request groups, roles, headers or credentials. `multi_replica/auth/`
-tests this split with revoked rules, paused first initialization and prompt append,
-stale owners, role-admin follow-ups and independent replica retries.
+follow-up, not that admin's current identity. Authorization decisions rely strictly
+on persisted owner/export/allocation facts and live request memberships, never
+persisted groups, roles, headers or credentials. (For prompt and tool customization,
+the initial caller's resolved principals snapshot is carried in recovery records and
+the session's read-only `user_principals` property, but authorization never consults
+that snapshot). `multi_replica/auth/` tests this split with revoked rules, paused
+first initialization and prompt append, stale owners, role-admin follow-ups and
+independent replica retries.
 
 ## Recovery never admits missing work
 
@@ -145,9 +191,11 @@ from the reservation, then closes it; that isn't prompt replay.
 - An undecided request reconstructs the challenge and stable status outbox, drains
   publication, and releases ownership without stop or terminal proof.
 - An accepted reply repairs durable dedupe first. Only its exact pending reference
-  can receive its decision. The full note is parsed from saved task history, never
-  from the bounded inline receipt. Missing or inconsistent history leaves intent
-  unresolved for a later sweep.
+  can receive its decision. The full response (including DataPart values and note)
+  is parsed from saved task history, never from the bounded inline receipt.
+  Missing or inconsistent history leaves intent unresolved for a later sweep.
+  An invalid response clears only its decision intent, keeps receipt dedupe, and
+  restores `Waiting` with a visible correction so a new message can answer.
 - A durable decision stages `Following`/`Working` and attaches the typed follower
   from `fixed_prompt_handle(original_ticket)`. Its normal activation is pinned to
   the original prompt. No new admission, message, run or deadline is created.
@@ -292,12 +340,22 @@ receipt note is truncated to 4096 bytes. Immediate delivery and recovery use
 `reply_note::saved_reply_note` to recover the full plain-text note, checking its
 fingerprint and approve/reject alignment against the receipt. Missing or mismatched
 history leaves the exact intent unresolved for retry, without delivering a decision.
-Delivery writes reply dedupe before runtime effects and calls
-`decide_hitl_approval_for` with the saved reference. The reply stays in task history;
+Delivery writes reply dedupe before runtime effects. `hitl::interaction::decide`
+resolves the saved exact request sequence, round and tool-call identity. Middleware
+requests call `decide_interaction` with that request's immutable `interaction_id`
+and sequence; legacy requests still call `decide_hitl_approval_for`. No checkpoint
+or receipt schema changes are needed. The reply stays in task history;
 it isn't a new session prompt. Approval notes remain audit-only; rejection
 notes become the blocked-tool reason under the runtime's existing semantics.
 
-After every decision outcome, query `fixed_prompt_progress` on the original ticket.
+After every decision outcome, query `hitl::interaction::fixed_progress` on the
+original ticket. It preserves runtime terminal proof and legacy progress. The
+runtime's mixed-version guard intentionally reports middleware-owned rounds as
+`Parked`, even when ready interactions exist. This A2A adapter derives the first
+ready interaction within the admitted prompt and checks completion again before
+projecting `InputRequired`. Missing manifests and round-start-only work stay parked.
+Accepted middleware responses aren't legacy `last_decision` receipts, so recovery
+resolves the exact checkpoint's durable `InteractionResponse` before following.
 The invocation may already be terminal or awaiting Q2. Applied decisions stage and
 publish Working/Following, then pass the same `OwnedTask` into
 `resume_owned_hitl`. Stale/conflicting outcomes with advanced runtime progress
@@ -321,7 +379,7 @@ through the progress classification above.
 
 Tests under `tests/it/` use real admission, JetStream and a worker, not only seeded
 context documents. `support.rs::Script::SameRoundTools` emits two native time-tool
-calls in one model completion and uses a real `PreToolUse` hook to defer them.
+calls in one model completion and uses middleware confirmation to defer them.
 
 - `unary/hitl.rs` covers approval, model-visible full rejection reasons, context-only
   replies, unrecognized messages, parked cancellation and same-round approval identity.

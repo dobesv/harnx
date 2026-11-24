@@ -184,8 +184,8 @@ async fn configured_memberships(rules: &str, aliases: &str, trust_headers: bool)
     let identity = if trust_headers {
         Identity::with_memberships(
             &["X-User-ID".into()],
-            &["X-Groups".into()],
-            &["X-Roles".into()],
+            &["header-csv:X-Groups".into()],
+            &["header-csv:X-Roles".into()],
         )?
     } else {
         Identity::new(&["X-User-ID".into()])?

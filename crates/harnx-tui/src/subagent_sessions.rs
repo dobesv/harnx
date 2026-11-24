@@ -102,6 +102,9 @@ impl Tui {
         if self.open_focused_root_handoff_session().await {
             return;
         }
+        if self.open_focused_root_surface() {
+            return;
+        }
         if !self.open_focused_root_subagent() {
             self.open_detail_view_for_focused_item();
         }

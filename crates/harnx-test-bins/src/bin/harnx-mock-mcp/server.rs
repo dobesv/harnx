@@ -72,11 +72,36 @@ pub struct MockMcpScript {
     pub initialize_error: Option<ErrorData>,
     #[serde(default)]
     pub disconnect_on_call: bool,
+    /// Pin the server to the pre-2026-07-28 protocol revisions, so a client
+    /// using the discover-first lifecycle falls back to the legacy
+    /// `initialize` handshake. Tests that assert the legacy sequence set
+    /// this; the default keeps the modern (MRTR-capable) behavior.
+    #[serde(default)]
+    pub legacy: bool,
+    /// MRTR `input_required` challenges, consumed one per `tools/call` in
+    /// order, before the canned results. Fakes a third-party MCP server
+    /// that suspends its call asking the user for input (SEP-2322).
+    #[serde(default)]
+    pub input_required: Vec<MockInputRequired>,
+}
+
+/// One scripted MRTR challenge: a confirm-style elicitation with optional
+/// opaque request state, like a third-party server would send.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MockInputRequired {
+    pub key: String,
+    pub message: String,
+    /// JSON value carried as the MRTR `requestState` string.
+    #[serde(default)]
+    pub request_state: Option<Value>,
 }
 
 pub struct MockMcpServer {
     script: MockMcpScript,
     cursor: AtomicUsize,
+    /// Cursor for scripted MRTR challenges, separate from `cursor` so
+    /// challenges do not consume canned responses.
+    challenge_cursor: AtomicUsize,
     request_log: Option<std::path::PathBuf>,
     audit_lock: std::sync::Mutex<()>,
 }
@@ -92,6 +117,7 @@ impl MockMcpServer {
         Self {
             script,
             cursor: AtomicUsize::new(0),
+            challenge_cursor: AtomicUsize::new(0),
             request_log: None,
             audit_lock: std::sync::Mutex::new(()),
         }
@@ -187,6 +213,36 @@ impl ServerHandler for MockMcpServer {
             .with_instructions("Deterministic, script-driven mock MCP server for demo recordings.")
     }
 
+    fn supported_protocol_versions(
+        &self,
+    ) -> std::borrow::Cow<'static, [rmcp::model::ProtocolVersion]> {
+        if self.script.legacy {
+            std::borrow::Cow::Borrowed(rmcp::model::ProtocolVersion::known_up_to(
+                &rmcp::model::ProtocolVersion::V_2025_11_25,
+            ))
+        } else {
+            std::borrow::Cow::Borrowed(rmcp::model::ProtocolVersion::KNOWN_VERSIONS)
+        }
+    }
+
+    /// A pre-2026 legacy server has no `server/discover` at all: answer with
+    /// method-not-found so discover-first clients classify the peer as legacy
+    /// and fall back to the `initialize` handshake.
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::DiscoverResult, ErrorData> {
+        if self.script.legacy {
+            return Err(ErrorData::method_not_found::<
+                rmcp::model::DiscoverRequestMethod,
+            >());
+        }
+        Ok(rmcp::model::DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
+    }
+
     async fn initialize(
         &self,
         request: rmcp::model::InitializeRequestParams,
@@ -221,24 +277,18 @@ impl ServerHandler for MockMcpServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.dispatch_call_tool(request, _context)
-            .await
-            .map(Into::into)
+        self.dispatch_call_tool(request, _context).await
     }
 }
 
 impl MockMcpServer {
-    /// The tool dispatch, which always finishes in a single step.
-    ///
-    /// `call_tool` must return `CallToolResponse`, whose other variants cover
-    /// elicitation and long-running tasks that this server does not use.
-    /// Dispatching separately keeps every arm returning a plain
-    /// `CallToolResult`.
+    /// The tool dispatch: an MRTR `input_required` challenge for the scripted
+    /// rounds, then a single-step result.
     async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         self.record(
             "tools/call",
             serde_json::to_value(&request).expect("call request JSON"),
@@ -250,8 +300,17 @@ impl MockMcpServer {
         if let Some(error) = &self.script.call_error {
             return Err(error.clone());
         }
+        // Scripted MRTR challenges consume one call each, before the canned
+        // results, from their own FIFO cursor.
+        if let Some(challenge) = self
+            .script
+            .input_required
+            .get(self.challenge_cursor.fetch_add(1, Ordering::SeqCst))
+        {
+            return Ok(mrtr_input_required(challenge));
+        }
         if let Some(result) = &self.script.call_result {
-            return Ok(result.clone());
+            return Ok(result.clone().into());
         }
         // Resolve the result first so an unknown tool errors without delay.
         let text = match self.next_response(request.name.as_ref()) {
@@ -262,8 +321,32 @@ impl MockMcpServer {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
     }
+}
+
+/// One scripted MRTR challenge as a protocol `input_required` result: a
+/// single confirm-style elicitation (empty schema) keyed by the script's
+/// key, with the script's state echoed as the opaque `requestState` string.
+fn mrtr_input_required(challenge: &MockInputRequired) -> CallToolResponse {
+    let mut requests = rmcp::model::InputRequests::new();
+    requests.insert(
+        challenge.key.clone(),
+        rmcp::model::InputRequest::Elicitation(rmcp::model::ElicitRequest::new(
+            rmcp::model::ElicitRequestParams::FormElicitationParams {
+                meta: None,
+                message: challenge.message.clone(),
+                requested_schema: rmcp::model::ElicitationSchema::new(Default::default()),
+            },
+        )),
+    );
+    // `Value::to_string` is the compact JSON encoding the protocol wants for
+    // the opaque state string.
+    let request_state = challenge
+        .request_state
+        .as_ref()
+        .map(|state| state.to_string());
+    rmcp::model::InputRequiredResult::new(Some(requests), request_state).into()
 }
 
 #[cfg(test)]

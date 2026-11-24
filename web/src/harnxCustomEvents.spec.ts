@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type HarnxCustomEventCallbacks } from './harnxCustomEvents';
+import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, parsePendingInteraction, parseA2uiSurface, type HarnxCustomEventCallbacks } from './harnxCustomEvents';
 
 const callbacks = (isForeground: boolean): HarnxCustomEventCallbacks => ({
   onStatus: () => {},
@@ -256,6 +256,343 @@ describe('harnx compaction events', () => {
       from_seq: 6,
       to_seq: 14,
       earlier_compaction: 5,
+    });
+  });
+});
+
+
+describe('pending_interaction events and parsing', () => {
+  it('is included in NAVIGATION_CONTROL_EVENTS', () => {
+    expect(NAVIGATION_CONTROL_EVENTS).toContain('pending_interaction');
+  });
+
+  describe('parsePendingInteraction', () => {
+    it('parses a valid pending_interaction object', () => {
+      const parsed = parsePendingInteraction({
+        interaction_id: 'int-123',
+        request_seq: 42,
+        tool_call_id: 'tool-call-abc',
+        kind: 'confirm',
+        message: 'Execute dangerous command?',
+        pending_count: 2,
+      });
+
+      expect(parsed).toEqual({
+        interactionId: 'int-123',
+        requestSeq: 42,
+        toolCallId: 'tool-call-abc',
+        kind: 'confirm',
+        message: 'Execute dangerous command?',
+        pendingCount: 2,
+      });
+    });
+
+    it('extracts the url for url interactions from payload or top-level field', () => {
+      const fromPayload = parsePendingInteraction({
+        interaction_id: 'int-url',
+        request_seq: 3,
+        tool_call_id: 'tool-connect',
+        kind: 'url',
+        message: 'Connect Jira',
+        pending_count: 0,
+        payload: { url: 'https://example.com/connect/abc', message: 'Connect Jira' },
+      });
+      expect(fromPayload).toMatchObject({
+        kind: 'url',
+        url: 'https://example.com/connect/abc',
+        payload: { url: 'https://example.com/connect/abc', message: 'Connect Jira' },
+      });
+
+      const topLevel = parsePendingInteraction({
+        interaction_id: 'int-url',
+        request_seq: 3,
+        tool_call_id: 'tool-connect',
+        kind: 'url',
+        message: 'Connect Jira',
+        pending_count: 0,
+        url: 'https://example.com/connect/abc',
+      });
+      expect(topLevel?.url).toBe('https://example.com/connect/abc');
+
+      // A url interaction without a usable link parses but leaves url unset.
+      const bare = parsePendingInteraction({
+        interaction_id: 'int-url',
+        request_seq: 3,
+        tool_call_id: 'tool-connect',
+        kind: 'url',
+        message: 'Connect Jira',
+        pending_count: 0,
+      });
+      expect(bare?.url).toBeUndefined();
+    });
+
+    it('returns null when value is null (authoritative clear signal)', () => {
+      expect(parsePendingInteraction(null)).toBeNull();
+    });
+
+    it('returns undefined for non-objects', () => {
+      expect(parsePendingInteraction(undefined)).toBeUndefined();
+      expect(parsePendingInteraction(123)).toBeUndefined();
+      expect(parsePendingInteraction('hello')).toBeUndefined();
+    });
+
+    it('returns undefined when required fields are missing or invalid', () => {
+      // Missing interaction_id
+      expect(
+        parsePendingInteraction({
+          request_seq: 1,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      // Blank interaction_id
+      expect(
+        parsePendingInteraction({
+          interaction_id: '  ',
+          request_seq: 1,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      expect(
+        parsePendingInteraction({
+          interaction_id: 'int-1',
+          request_seq: 0,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      // Negative request_seq
+      expect(
+        parsePendingInteraction({
+          interaction_id: 'int-1',
+          request_seq: -1,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      // Non-integer request_seq
+      expect(
+        parsePendingInteraction({
+          interaction_id: 'int-1',
+          request_seq: 1.5,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: 0,
+        }),
+      ).toBeUndefined();
+
+      // Negative pending_count
+      expect(
+        parsePendingInteraction({
+          interaction_id: 'int-1',
+          request_seq: 1,
+          tool_call_id: 'tool-1',
+          kind: 'confirm',
+          message: 'msg',
+          pending_count: -1,
+        }),
+      ).toBeUndefined();
+    });
+  });
+
+  describe('handleHarnxCustomEvent pending_interaction', () => {
+    it('dispatches parsed interaction to onPendingInteraction callback', () => {
+      const onPendingInteraction = vi.fn();
+      handleHarnxCustomEvent(
+        'pending_interaction',
+        {
+          interaction_id: 'int-456',
+          request_seq: 10,
+          tool_call_id: 'tool-xyz',
+          kind: 'confirm',
+          message: 'Allow file modification?',
+          pending_count: 0,
+        },
+        { ...callbacks(true), onPendingInteraction },
+      );
+
+      expect(onPendingInteraction).toHaveBeenCalledWith({
+        interactionId: 'int-456',
+        requestSeq: 10,
+        toolCallId: 'tool-xyz',
+        kind: 'confirm',
+        message: 'Allow file modification?',
+        pendingCount: 0,
+      });
+    });
+
+    it('dispatches null to onPendingInteraction callback when value is null', () => {
+      const onPendingInteraction = vi.fn();
+      handleHarnxCustomEvent(
+        'pending_interaction',
+        null,
+        { ...callbacks(true), onPendingInteraction },
+      );
+
+      expect(onPendingInteraction).toHaveBeenCalledWith(null);
+    });
+
+    it('does not dispatch onPendingInteraction when value is malformed', () => {
+      const onPendingInteraction = vi.fn();
+      handleHarnxCustomEvent(
+        'pending_interaction',
+        { invalid: true },
+        { ...callbacks(true), onPendingInteraction },
+      );
+
+      expect(onPendingInteraction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a2ui_surface events and parsing', () => {
+    it('is included in NAVIGATION_CONTROL_EVENTS', () => {
+      expect(NAVIGATION_CONTROL_EVENTS).toContain('a2ui_surface');
+    });
+
+    describe('parseA2uiSurface', () => {
+      it('parses a publication event', () => {
+        const payload = {
+          version: '1.0',
+          createSurface: { surfaceId: 'surf-1', components: [] },
+        };
+        const parsed = parseA2uiSurface({
+          surface_id: 'surf-1',
+          publish_seq: 7,
+          tool_call_id: 'call-1',
+          payload,
+        });
+
+        expect(parsed).toEqual({
+          surfaceId: 'surf-1',
+          publishSeq: 7,
+          toolCallId: 'call-1',
+          payload,
+        });
+      });
+
+      it('parses a resolution event with string action', () => {
+        const parsed = parseA2uiSurface({
+          surface_id: 'surf-1',
+          publish_seq: 7,
+          action: 'deploy',
+          visibility: 'note',
+          note_text: 'deployed to prod',
+        });
+
+        expect(parsed).toEqual({
+          surfaceId: 'surf-1',
+          publishSeq: 7,
+          action: {
+            action: 'deploy',
+            visibility: 'note',
+            noteText: 'deployed to prod',
+          },
+        });
+      });
+
+      it('parses a resolution event with object action', () => {
+        const parsed = parseA2uiSurface({
+          surface_id: 'surf-1',
+          publish_seq: 7,
+          tool_call_id: 'call-1',
+          payload: { version: '1.0' },
+          action: {
+            action: 'confirm',
+            visibility: 'turn',
+            note_text: 'confirmed',
+          },
+        });
+
+        expect(parsed).toEqual({
+          surfaceId: 'surf-1',
+          publishSeq: 7,
+          toolCallId: 'call-1',
+          payload: { version: '1.0' },
+          action: {
+            action: 'confirm',
+            visibility: 'turn',
+            noteText: 'confirmed',
+          },
+        });
+      });
+
+      it('handles null action', () => {
+        const parsed = parseA2uiSurface({
+          surface_id: 'surf-1',
+          publish_seq: 7,
+          payload: { version: '1.0' },
+          action: null,
+        });
+
+        expect(parsed).toEqual({
+          surfaceId: 'surf-1',
+          publishSeq: 7,
+          payload: { version: '1.0' },
+          action: null,
+        });
+      });
+
+      it('returns undefined for invalid surface payloads', () => {
+        expect(parseA2uiSurface(null)).toBeUndefined();
+        expect(parseA2uiSurface({})).toBeUndefined();
+        expect(parseA2uiSurface({ surface_id: '', publish_seq: 1 })).toBeUndefined();
+        expect(parseA2uiSurface({ surface_id: 's', publish_seq: 0 })).toBeUndefined();
+        expect(parseA2uiSurface({ surface_id: 's', publish_seq: -1 })).toBeUndefined();
+        expect(parseA2uiSurface({ surface_id: 's', publish_seq: 1 })).toBeUndefined(); // no payload or action
+      });
+    });
+
+    describe('handleHarnxCustomEvent a2ui_surface', () => {
+      it('dispatches to onA2uiSurface callback', () => {
+        const onA2uiSurface = vi.fn();
+        const payload = {
+          version: '1.0',
+          createSurface: { surfaceId: 'surf-1', components: [] },
+        };
+
+        handleHarnxCustomEvent(
+          'a2ui_surface',
+          {
+            surface_id: 'surf-1',
+            publish_seq: 3,
+            tool_call_id: 'call-99',
+            payload,
+          },
+          { ...callbacks(true), onA2uiSurface }
+        );
+
+        expect(onA2uiSurface).toHaveBeenCalledWith({
+          surfaceId: 'surf-1',
+          publishSeq: 3,
+          toolCallId: 'call-99',
+          payload,
+        });
+      });
+
+      it('ignores malformed a2ui_surface events', () => {
+        const onA2uiSurface = vi.fn();
+        handleHarnxCustomEvent(
+          'a2ui_surface',
+          { invalid: true },
+          { ...callbacks(true), onA2uiSurface }
+        );
+
+        expect(onA2uiSurface).not.toHaveBeenCalled();
+      });
     });
   });
 });

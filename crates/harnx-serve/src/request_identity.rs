@@ -45,6 +45,24 @@ impl RequestIdentity {
             .and_then(|id| id.user_id.clone())
     }
 
+    /// The principals snapshot for this request, as resolved at entry.
+    pub(super) fn principals(&self) -> harnx_core::user_principals::UserPrincipals {
+        harnx_core::user_principals::from_resolved(
+            self.user_id.as_deref(),
+            self.expanded_users.as_deref(),
+            &self.groups,
+            &self.roles,
+        )
+    }
+
+    /// The principals to stamp: none when the request is anonymous.
+    pub(super) fn stampable_principals(
+        &self,
+    ) -> Option<harnx_core::user_principals::UserPrincipals> {
+        let principals = self.principals();
+        (!principals.is_anonymous()).then_some(principals)
+    }
+
     /// Borrow authorization users and memberships from the request snapshot.
     pub(super) fn caller(&self) -> RequestCaller<'_> {
         RequestCaller {

@@ -36,14 +36,14 @@ pub fn build_context(
         usage_at_start: Default::default(),
         call_fn,
         on_tool_round,
-        on_hitl_approval_required: None,
         on_text_response: None,
         initial_with_embeddings: true,
         initial_resume_count: 0,
         max_resume: None,
         prepare_handoff_fn: None,
-        nats_hook_provider: None,
+
         pending_async_context: None,
+        surface_notes: None,
         working_dir,
         tool_loop_guard: Default::default(),
     }

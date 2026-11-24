@@ -1,9 +1,9 @@
 ---
 role: subagent
-model: codex:gpt-6.1-sol
+model: codex:gpt-6.2-sol
 model_fallbacks:
-- openai:gpt-6.1-sol
-- gemini:gemini-3.8-flash
+- openai:gpt-6.2-sol
+- gemini:gemini-4-hydrogen
 - claude:claude-sonnet-5-5
 - bedrock:us.zai.glm-5.3
 compaction_agent: compact-reviewer
@@ -31,7 +31,7 @@ use_tools:
 description: "Pragmatic engineer \u2014 evaluates code review findings through the\
   \ lens of real-world production impact, blast radius, and failure modes. Named after\
   \ Aeacus (EE-uh-kus), keeper of the Underworld's records who ensured completeness.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

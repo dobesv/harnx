@@ -24,7 +24,7 @@ impl ServerScope {
 
     /// Reconstruct an ID from `HARNX_SERVER_SCOPE`. Usually set by a worker
     /// for the children it launches, but an operator sets it directly too
-    /// when deploying tool/hook servers independently of any worker (see
+    /// when deploying tool servers independently of any worker (see
     /// `docs/nats-ha.md`).
     pub fn from_string(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -43,29 +43,18 @@ impl ServerScope {
     pub fn control_subject(&self) -> String {
         format!("harnx.v1.{self}.tools.control")
     }
-
-    /// Build the Core NATS subject for a hook event.
-    pub fn hook_subject(&self, server: &str, event: &str) -> String {
-        format!("harnx.v1.{self}.hook.{server}.{event}")
-    }
-
-    /// Build the per-server hook subject used for cancel.
-    pub fn hook_control_subject(&self, server: &str) -> String {
-        format!("harnx.v1.{self}.hook.{server}.control")
-    }
 }
 
 /// How a server binary can be run without a worker supplying its scope.
 ///
 /// The three ways to run standalone are fixed, so a free-form hint would let a
-/// caller pass text matching no real flag — an enum keeps the hint honest, and
-/// keeps this file under CodeScene's string-argument threshold.
+/// caller pass text matching no real flag — an enum keeps the hint honest.
 pub enum StandaloneMode {
     /// Toolset servers: serve MCP over stdio instead of registering over NATS.
     McpStdio,
     /// harnx-mcp-bridge: report the wrapped server's tools and exit.
     ListTools,
-    /// Hook servers: no standalone mode; the worker launches them from config.
+    /// Worker-managed servers without a standalone transport.
     WorkerLaunched,
 }
 
@@ -79,8 +68,8 @@ impl StandaloneMode {
             Self::McpStdio => "run it standalone with --mcp-stdio",
             Self::ListTools => "run it standalone with --list-tools",
             Self::WorkerLaunched => {
-                "configure a hooks entry in your config; there is no standalone \
-                 mode for hook servers, the worker always launches them"
+                "configure a tool_servers entry in your config; there is no standalone \
+                 mode for this server, the worker always launches it"
             }
         }
     }
@@ -160,14 +149,6 @@ mod tests {
         assert_eq!(
             instance_id.control_subject(),
             format!("harnx.v1.{instance_id}.tools.control")
-        );
-        assert_eq!(
-            instance_id.hook_subject("proxy-auth", "PreToolUse"),
-            format!("harnx.v1.{instance_id}.hook.proxy-auth.PreToolUse")
-        );
-        assert_eq!(
-            instance_id.hook_control_subject("proxy-auth"),
-            format!("harnx.v1.{instance_id}.hook.proxy-auth.control")
         );
     }
 }

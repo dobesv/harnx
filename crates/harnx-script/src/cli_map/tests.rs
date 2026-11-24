@@ -17,8 +17,8 @@ fn schema() -> Value {
         "settings":{"type":"object"},
         "records":{"type":"array", "items":{"type":"object"}},
         "matrix":{"type":"array", "items":{"type":"array", "items":{"type":"integer"}}},
-        "nullable":{"type":["string","null"]},
-        "choice":{"anyOf":[{"type":"string"},{"type":"null"}]},
+        "nullable":{"type":["string","integer","null"]},
+        "choice":{"anyOf":[{"type":"string"},{"type":"integer"},{"type":"null"}]},
         "reference":{"$ref":"#/$defs/thing"},
         "defaultValue":{"type":"integer", "default":42},
         "mode":{"type":"string", "enum":["json","text"]}
@@ -435,7 +435,7 @@ fn usage_errors_table() {
 
 #[test]
 fn required_fields_list_original_flags_and_accept_false_or_null() {
-    let schema = json!({"properties": {"filePath":{"type":"string"},"dry_run":{"type":"boolean"},"maybe":{"type":["string","null"]}}, "required":["filePath","dry_run","maybe"]});
+    let schema = json!({"properties": {"filePath":{"type":"string"},"dry_run":{"type":"boolean"},"maybe":{"type":["string","integer","null"]}}, "required":["filePath","dry_run","maybe"]});
     let error = parse_args(&schema, &[], None).unwrap_err();
     assert!(error.message.contains("--file-path, --dry-run, --maybe"));
     assert_eq!(
@@ -485,20 +485,10 @@ fn complex_schema_fallback_table() {
             json!("text"),
         ),
         (
-            json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
-            Value::Null,
-        ),
-        (
             json!({"oneOf":[{"type":"number"},{"type":"object"}]}),
             json!(42),
         ),
         (json!({"allOf":[{"type":"object"}]}), json!({})),
-        (json!({"type":["boolean","null"]}), json!(false)),
-        (json!({"type":"string", "nullable":true}), Value::Null),
-        (
-            json!({"type":"array", "items":{"type":["string","null"]}}),
-            json!(["a", null]),
-        ),
         (
             json!({"type":"array", "items":{"$ref":"#/$defs/item"}}),
             json!([{"x":1}]),
@@ -669,7 +659,7 @@ fn output_split_uses_the_same_value_boundaries_as_parser() {
     for shape in [
         json!({"type":"string"}),
         json!({"type":"array", "items":{"type":"string"}}),
-        json!({"type":["boolean","null"]}),
+        json!({"type":["boolean","integer","null"]}),
         json!({"$ref":"#/$defs/Options"}),
         json!({"type":"object"}),
     ] {
@@ -733,7 +723,7 @@ fn camel_case_round_trips_all_flag_kinds_and_json_overrides() {
         ),
         (
             "maybeValue",
-            json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+            json!({"anyOf":[{"type":"string"},{"type":"integer"},{"type":"null"}]}),
             vec!["--maybe-value=null"],
             Value::Null,
         ),
@@ -753,4 +743,123 @@ fn camel_case_round_trips_all_flag_kinds_and_json_overrides() {
         with_base.push(format!("--json={base}"));
         assert_eq!(parse_args(&schema, &with_base, None).unwrap(), parsed);
     }
+}
+
+fn nullable_schema() -> Value {
+    json!({"type":"object","properties":{
+        "path":{"type":["string","null"]},
+        "ignore_case":{"type":["null","boolean"]},
+        "max_results":{"type":["integer","null"],"minimum":0},
+        "mode":{"anyOf":[{"type":"string","enum":["a","b"]},{"type":"null"}]},
+        "include":{"type":["array","null"],"items":{"type":"string"}},
+        "legacy":{"type":"string","nullable":true},
+        "either":{"anyOf":[{"type":"string"},{"type":"integer"},{"type":"null"}]},
+        "wide":{"type":["string","integer","null"]}
+    }})
+}
+
+#[test]
+fn nullable_scalars_parse_as_plain_flags() {
+    let schema = nullable_schema();
+    assert_eq!(
+        parse_args(
+            &schema,
+            &argv(&[
+                "--path",
+                "crates/foo",
+                "--ignore-case",
+                "--max-results",
+                "5",
+                "--mode",
+                "a",
+                "--include",
+                "*.rs",
+                "--include",
+                "*.md",
+                "--legacy",
+                "x",
+            ]),
+            None
+        )
+        .unwrap(),
+        json!({"path":"crates/foo","ignore_case":true,"max_results":5,
+               "mode":"a","include":["*.rs","*.md"],"legacy":"x"})
+    );
+    assert_eq!(
+        parse_args(&schema, &argv(&["--no-ignore-case"]), None).unwrap(),
+        json!({"ignore_case":false})
+    );
+    // null stays valid in the base object for a property that accepts it.
+    assert_eq!(
+        parse_args(
+            &schema,
+            &argv(&[r#"--json={"path":null,"mode":null,"include":null}"#]),
+            None
+        )
+        .unwrap(),
+        json!({"path":null,"mode":null,"include":null})
+    );
+    // The word `null` is an ordinary string for a plain string flag.
+    assert_eq!(
+        parse_args(&schema, &argv(&["--path", "null"]), None).unwrap(),
+        json!({"path":"null"})
+    );
+    let tags = json!({"type":"object","properties":{
+        "tags":{"type":"array","items":{"type":["string","null"]}}
+    }});
+    assert_eq!(
+        parse_args(&tags, &argv(&["--tags", "a", "--tags", "b"]), None).unwrap(),
+        json!({"tags":["a","b"]})
+    );
+    let mode = parse_args(&schema, &argv(&["--mode", "c"]), None).unwrap_err();
+    assert!(mode.message.contains("expected one of"), "{mode}");
+    let count = parse_args(&schema, &argv(&["--max-results", "five"]), None).unwrap_err();
+    assert!(count.message.contains("expected integer"), "{count}");
+}
+
+#[test]
+fn null_is_rejected_for_non_nullable_properties() {
+    let schema = json!({"type":"object","properties":{"name":{"type":"string"}}});
+    assert!(parse_args(&schema, &argv(&[r#"--json={"name":null}"#]), None).is_err());
+}
+
+#[test]
+fn two_non_null_branches_stay_json_flags() {
+    let schema = nullable_schema();
+    for flag in ["--either", "--wide"] {
+        assert!(
+            parse_args(&schema, &argv(&[flag, "bare"]), None).is_err(),
+            "{flag}"
+        );
+        assert_eq!(
+            parse_args(&schema, &argv(&[flag, "\"x\""]), None).unwrap()[&flag[2..]],
+            json!("x")
+        );
+    }
+}
+
+#[test]
+fn nullable_flags_are_documented_with_their_type() {
+    let help = crate::help::help("tool", &nullable_schema(), "d", None);
+    for expected in [
+        "--path <string>",
+        "--ignore-case / --no-ignore-case",
+        "--max-results <integer>",
+        "--mode <string>",
+        "--include <string>",
+        "--legacy <string>",
+        "--either <json>",
+        "--wide <json>",
+    ] {
+        assert!(help.contains(expected), "missing {expected} in:\n{help}");
+    }
+    assert!(help.contains(r#"enum: ["a","b"]"#), "{help}");
+}
+
+#[test]
+fn nullable_boolean_takes_no_value_before_the_output_option() {
+    let (args, format) =
+        split_output_args(&nullable_schema(), &argv(&["--ignore-case", "-o", "json"])).unwrap();
+    assert_eq!(args, argv(&["--ignore-case"]));
+    assert_eq!(format, Some(OutputFormat::Json));
 }

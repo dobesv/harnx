@@ -28,6 +28,9 @@ pub(super) async fn seed_journaled_reply(
     let round = append_orphan_round(log).await?;
     let journal = InvocationJournal::ensure(js, 1).await?;
     let request = ToolRequest {
+        user_id: None,
+        input_responses: None,
+        request_state: None,
         call_id: "operation".into(),
         operation_id: "operation".into(),
         tool: "query".into(),
@@ -48,6 +51,7 @@ pub(super) async fn seed_journaled_reply(
         .complete(
             &request,
             ToolReply {
+                input_required: None,
                 call_id: request.call_id.clone(),
                 result: Ok(json!({"data": "x".repeat(8192)})),
                 final_progress: None,

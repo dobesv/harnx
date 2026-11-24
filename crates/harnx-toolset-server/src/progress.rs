@@ -189,6 +189,9 @@ mod tests {
             tool_call_id: None,
             capabilities,
             tool_round: None,
+            input_responses: None,
+            request_state: None,
+            user_id: None,
         }
     }
 

@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use harnx_core::abort::create_abort_signal;
 use harnx_time_tools::TimeToolset;
 use harnx_toolset::{CancelAcceptance, CancellationAcknowledgement, ToolInvokeError, Toolset};
+use harnx_toolset_server::registration_key;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

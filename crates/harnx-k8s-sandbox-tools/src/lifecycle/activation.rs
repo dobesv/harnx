@@ -1,6 +1,6 @@
 use super::status::ensure_waitable;
-use super::{assess, SandboxManager, SandboxRecord, WaitContext};
-use anyhow::{Context, Result};
+use super::{assess, SandboxManager, SandboxNotFoundError, SandboxRecord, WaitContext};
+use anyhow::Result;
 use chrono::Utc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -63,7 +63,7 @@ impl SandboxManager {
             state.record = self
                 .retry_api(&ready, || self.api.get(id))
                 .await?
-                .with_context(|| format!("sandbox not found: {id}"))?;
+                .ok_or_else(|| SandboxNotFoundError::new(id))?;
             state.woke = false;
         }
     }

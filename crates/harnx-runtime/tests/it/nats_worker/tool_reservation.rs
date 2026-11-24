@@ -65,6 +65,7 @@ fn build_fixture_config(
             description: None,
             package: None,
             hooks: None,
+            middleware: Default::default(),
         }];
     }
     config

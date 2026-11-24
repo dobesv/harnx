@@ -15,7 +15,7 @@ use std::time::Duration;
 // A convenience link must not hold up the session when metadata storage is slow.
 const RECORD_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Bundles arguments for URL construction to stay within CodeScene's argument limit.
+/// Bundles the parts of a web session URL so building one takes a single argument.
 struct UrlComponents<'a> {
     base: &'a str,
     name: &'a str,

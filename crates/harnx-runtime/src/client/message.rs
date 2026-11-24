@@ -139,6 +139,7 @@ mod tests {
 
     fn tool_result_with_content(content: Vec<MessageContentPart>) -> ToolResult {
         ToolResult {
+            user_surfaces: Vec::new(),
             call: ToolCall::new(
                 "read_media".to_string(),
                 json!({ "path": "image.png" }),

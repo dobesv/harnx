@@ -1,4 +1,3 @@
-use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use super::tool_registry::{
     ensure_registry_bucket, log_registry_contents, remove_registrations_for_config,
     wait_for_registration, RegistrationWait, SupervisedProcesses, SupervisedServer,
@@ -13,7 +12,7 @@ use harnx_core::child_process::ChildProcessManager;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::instance::{ServerScope, HARNX_SERVER_SCOPE};
 use harnx_core::sink::emit_agent_event;
-use harnx_hooks::executor::HARNX_PACKAGE_DIR_ENV;
+const HARNX_PACKAGE_DIR_ENV: &str = "HARNX_PACKAGE_DIR";
 use harnx_nats_common::connect::{
     format_bool_env, NatsEndpoint, HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV, HARNX_NATS_TLS_CA_ENV,
     HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV, HARNX_NATS_TLS_KEY_ENV,
@@ -109,29 +108,6 @@ impl ToolServerStartConfig {
         self.ignore_discovered_servers = endpoint.ignore_discovered_servers;
         self
     }
-
-    fn broker_settings_endpoint(&self) -> NatsEndpoint {
-        NatsEndpoint {
-            tls: self.tls,
-            tls_cert: self.tls_cert.clone(),
-            tls_key: self.tls_key.clone(),
-            tls_ca: self.tls_ca.clone(),
-            ignore_discovered_servers: self.ignore_discovered_servers,
-            ..Default::default()
-        }
-    }
-
-    fn hook_start_config(&self) -> HookServerStartConfig {
-        HookServerStartConfig::new(
-            self.client.clone(),
-            self.instance_id.clone(),
-            self.nats_url.clone(),
-            self.token.clone(),
-        )
-        .with_process_manager(self.process_manager.clone())
-        .with_replicas(self.replicas)
-        .with_broker_settings(&self.broker_settings_endpoint())
-    }
 }
 
 /// Owns local tool-server children for one worker process.
@@ -139,7 +115,6 @@ pub struct ToolServerSupervisor {
     _process_manager: ChildProcessManager,
     processes: SupervisedProcesses,
     tasks: Vec<JoinHandle<()>>,
-    hook_supervisors: Vec<HookServerSupervisor>,
     /// Enabled servers that have not registered yet. Retried in the background
     /// by the worker, so this shrinks as late registrations land.
     unregistered: Vec<SupervisedServer>,
@@ -176,7 +151,6 @@ impl ToolServerSupervisor {
             _process_manager: config.process_manager.clone(),
             processes: Arc::clone(&processes),
             tasks: Vec::new(),
-            hook_supervisors: Vec::new(),
             shutdown_signal: CancellationToken::new(),
             unregistered: Vec::new(),
         };
@@ -187,7 +161,6 @@ impl ToolServerSupervisor {
         supervisor
             .start_servers(&config, &enabled, readiness_timeout)
             .await;
-        start_co_located_hooks(&mut supervisor, &config, enabled).await;
         Ok(supervisor)
     }
 
@@ -301,21 +274,12 @@ impl ToolServerSupervisor {
             .collect()
     }
 
-    /// Kill every supervised child, wait for it to actually exit, and remove
-    /// its tool registration; then shut down every co-located hook
-    /// supervisor. Unlike letting this value simply drop, this is what
-    /// actually deregisters: each monitor task's own exit path (which calls
-    /// `remove_registrations_for_config`) only runs if the task is allowed to
-    /// observe its child's exit, and `HookServerSupervisor` has no `Drop` at
-    /// all — only its explicit `shutdown` removes registrations and
-    /// expectations.
+    /// Wait for monitors to stop children and remove their registrations.
+    /// Dropping tasks early would skip their deregistration paths.
     pub async fn shutdown(mut self) {
         self.shutdown_signal.cancel();
         for task in std::mem::take(&mut self.tasks) {
             let _ = task.await;
-        }
-        for mut hooks in std::mem::take(&mut self.hook_supervisors) {
-            hooks.shutdown().await;
         }
     }
 }
@@ -424,33 +388,6 @@ async fn spawn_enabled_tool_servers(
                 }));
             }
             Err(error) => warn_server_failure(&server.name, format!("{error:#}")),
-        }
-    }
-}
-
-async fn start_co_located_hooks(
-    supervisor: &mut ToolServerSupervisor,
-    config: &ToolServerStartConfig,
-    servers: Vec<&ToolServerConfig>,
-) {
-    for server in servers {
-        let Some(hooks) = &server.hooks else {
-            continue;
-        };
-        let mut hooks = hooks.clone();
-        let package_dir = tool_server_package_dir(server);
-        for hook in &mut hooks.entries {
-            if hook.package_dir.is_none() {
-                hook.package_dir = Some(package_dir.clone());
-            }
-        }
-        let scope = format!("tool-{}", server.name);
-        match HookServerSupervisor::start_local(config.hook_start_config(), &hooks, &scope).await {
-            Ok(hooks) => supervisor.hook_supervisors.push(hooks),
-            Err(error) => warn_server_failure(
-                &server.name,
-                format!("start co-located hook servers: {error:#}"),
-            ),
         }
     }
 }
@@ -696,6 +633,7 @@ mod tests {
 
     fn tool_server(package: Option<&str>) -> ToolServerConfig {
         ToolServerConfig {
+            middleware: Default::default(),
             name: "test".to_string(),
             command: "test".to_string(),
             args: Vec::new(),

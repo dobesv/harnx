@@ -33,7 +33,7 @@ impl Publisher {
             return false;
         };
         let Ok(PromptProgress::InputRequired(pending)) =
-            session.fixed_prompt_progress(&ticket).await
+            crate::hitl::interaction::fixed_progress(session, &ticket).await
         else {
             return false;
         };
@@ -105,10 +105,7 @@ impl Publisher {
         self.sync_suspension_output(pending.request_seq).await?;
         let request =
             pending.approval_ref(self.authority.ticket(&self.storage_key)?.invocation_id());
-        let challenge = status(
-            TaskState::InputRequired,
-            Some(&crate::hitl::render_challenge(pending)),
-        );
+        let challenge = crate::hitl::interaction::challenge_status(&self.session, pending).await?;
         let commit_id = format!(
             "{}:hitl:{}:input-required",
             self.record().task.id,

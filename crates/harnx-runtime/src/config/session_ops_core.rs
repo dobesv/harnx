@@ -266,6 +266,7 @@ mod tests {
 
     fn tool_results() -> SessionLogEntry {
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![],
             timestamp: None,
         }

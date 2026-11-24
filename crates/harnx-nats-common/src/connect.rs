@@ -17,13 +17,13 @@ use async_nats::{
     ConnectOptions,
 };
 
-/// Env var enabling TLS for a standalone tool/hook server's broker connection.
+/// Env var enabling TLS for a standalone tool server's broker connection.
 /// `"1"` or `"true"` enables it; see [`NatsEndpoint::has_tls_settings`] for
 /// how this combines with the client-certificate/CA settings below.
 ///
 /// Shared here (rather than declared separately per crate) because
 /// `harnx-runtime`'s worker-side discovery (`resolve_local_nats_server_config`)
-/// and the standalone tool/hook server binaries (`NatsEndpoint::from_env`)
+/// and the standalone tool server binaries (`NatsEndpoint::from_env`)
 /// both need the exact same env var names — a worker that reads a differently
 /// spelled variable than the child it spawns would silently never see TLS.
 pub const HARNX_NATS_TLS_ENV: &str = "HARNX_NATS_TLS";
@@ -40,7 +40,7 @@ pub const HARNX_NATS_TLS_CA_ENV: &str = "HARNX_NATS_TLS_CA";
 pub const HARNX_NATS_IGNORE_DISCOVERED_SERVERS_ENV: &str = "HARNX_NATS_IGNORE_DISCOVERED_SERVERS";
 /// Env var carrying the JetStream replica count for buckets harnx creates.
 ///
-/// Read by both [`NatsEndpoint::from_env`] (standalone tool/hook servers) and
+/// Read by both [`NatsEndpoint::from_env`] (standalone tool servers) and
 /// `harnx-runtime`'s `resolve_local_nats_server_config` (worker-side
 /// discovery) — the same name and the same parsing via [`parse_replicas_env`],
 /// so a typo can't make one side see a replicated bucket while the other
@@ -86,7 +86,7 @@ pub fn parse_replicas_env() -> Result<Option<usize>> {
 ///
 /// Built either from a `NatsServerConfig` (config-file clusters, see
 /// `harnx-runtime`) or from `HARNX_NATS_*` environment variables (standalone
-/// tool/hook servers, see [`NatsEndpoint::from_env`]).
+/// tool servers, see [`NatsEndpoint::from_env`]).
 #[derive(Debug, Clone, Default)]
 pub struct NatsEndpoint {
     pub name: String,
@@ -107,7 +107,7 @@ pub struct NatsEndpoint {
 
 /// A connected NATS client plus the JetStream replica count resolved for it.
 ///
-/// `serve_with_shutdown` (harnx-toolset-server, harnx-hookset-server) already
+/// `serve_with_shutdown` (harnx-toolset-server) already
 /// takes 4 arguments; bundling the replica count with the client it applies
 /// to avoids a fifth rather than growing past the repo's argument limit.
 #[derive(Debug, Clone)]
@@ -329,9 +329,11 @@ impl NatsEndpoint {
             // A `nats://` server can demand a TLS upgrade in its INFO even when
             // the endpoint has no TLS settings. Give async-nats an explicit
             // provider for that path too, but don't make platform-root loading
-            // a prerequisite for a broker that remains plaintext.
+            // a prerequisite for a broker that remains plaintext. Since
+            // async-nats 0.53 a TLS config means the server must offer TLS,
+            // so mark it optional: the config is used only if the server asks.
             match self.build_tls_client_config(client_certificate.as_ref()) {
-                Ok(config) => options = options.tls_client_config(config),
+                Ok(config) => options = options.tls_client_config(config).tls_optional(),
                 // Non-fatal on purpose: a plaintext connection never uses this
                 // config, so a broken trust store must not fail startup. Log it
                 // so a server that then demands a TLS upgrade — which would fail

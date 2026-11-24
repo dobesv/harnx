@@ -14,11 +14,21 @@ use unicode_width::UnicodeWidthStr;
 
 const TITLE_SEPARATOR: &str = "  ";
 const MIN_TITLE_WIDTH: usize = 4;
+const SHORT_SESSION_ID_CHARS: usize = 8;
 
 pub(super) fn render_subagent_row(
     item: &TranscriptItem,
     spinner_index: usize,
     width: u16,
+) -> RenderedEntry {
+    render_subagent_row_scoped(item, spinner_index, width, true)
+}
+
+fn render_subagent_row_scoped(
+    item: &TranscriptItem,
+    spinner_index: usize,
+    width: u16,
+    show_pending: bool,
 ) -> RenderedEntry {
     let TranscriptItem::SubAgentSession {
         key,
@@ -29,7 +39,11 @@ pub(super) fn render_subagent_row(
     else {
         unreachable!("sub-agent row renderer requires a sub-agent item");
     };
-    let short_id: String = key.session_id.chars().take(8).collect();
+    let short_id: String = key
+        .session_id
+        .chars()
+        .take(SHORT_SESSION_ID_CHARS)
+        .collect();
     let (icon, color) = status_icon(status, spinner_index);
     let metrics = progress.as_ref().map(format_progress).unwrap_or_default();
     let identity = format!("{icon} @ {}", key.agent);
@@ -43,16 +57,37 @@ pub(super) fn render_subagent_row(
         usize::from(width),
         prefix_width,
     );
-    RenderedEntry::from_lines(
-        vec![Line::from(vec![
-            Span::styled(identity, Style::default().fg(color)),
-            Span::styled(
-                format!("{status_metrics}{title}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])],
-        width,
-    )
+    let mut lines = vec![Line::from(vec![
+        Span::styled(identity, Style::default().fg(color)),
+        Span::styled(
+            format!("{status_metrics}{title}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])];
+    if let Some(pending) =
+        crate::interaction_confirmation::pending_for_progress(status, progress.as_ref())
+            .filter(|_| show_pending)
+    {
+        lines.push(pending_line(pending));
+    }
+    RenderedEntry::from_lines(lines, width)
+}
+
+fn pending_line(
+    pending: &harnx_core::pending_interaction::PendingInteractionSummary,
+) -> Line<'static> {
+    let key = if crate::interaction_confirmation::answerable(pending) {
+        "  a/answer"
+    } else {
+        "  open child session"
+    };
+    Line::from(Span::styled(
+        format!(
+            "⏸ Awaiting input: {}{key}",
+            sanitize_title(&pending.message)
+        ),
+        Style::default().fg(Color::Yellow),
+    ))
 }
 
 pub(super) fn render_subagent_detail(item: &TranscriptItem) -> Vec<Line<'static>> {
@@ -79,6 +114,11 @@ pub(super) fn render_subagent_detail(item: &TranscriptItem) -> Vec<Line<'static>
         field("cluster", &key.cluster),
         field("status", status.label()),
     ];
+    if let Some(pending) =
+        crate::interaction_confirmation::pending_for_progress(status, progress.as_ref())
+    {
+        lines.push(pending_line(pending));
+    }
     if let Some(progress) = progress.as_ref() {
         if let Some(title) = progress.snapshot.title.as_deref().map(sanitize_title) {
             lines.push(field("title", &title));
@@ -184,6 +224,7 @@ mod tests {
 
     fn progress(title: Option<&str>) -> SubAgentInvocationProgress {
         SubAgentInvocationProgress::new(SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "invocation".into(),
             agent: "worker".into(),
             session_id: "12345678abcdef".into(),
@@ -348,11 +389,11 @@ impl Tui {
 
     fn render_subagent_session_view(&mut self, frame: &mut Frame<'_>, size: Rect) {
         frame.render_widget(ratatui::widgets::Clear, size);
-        let Some(view) = self.app.subagent_view_stack.last().cloned() else {
+        let Some(view) = visible_child_view(&self.app.subagent_view_stack) else {
             return;
         };
         let key = view.key;
-        let header_height = if view.progress.is_some() { 2 } else { 1 };
+        let header_height = child_header_height(&view.status, view.progress.as_ref());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -464,9 +505,32 @@ struct ChildEntryRender<'a> {
     theme: Option<&'a syntect::highlighting::Theme>,
 }
 
+fn visible_child_view(stack: &[crate::types::SubAgentView]) -> Option<crate::types::SubAgentView> {
+    let mut view = stack.last()?.clone();
+    if stack.len() > 1 {
+        if let Some(progress) = &mut view.progress {
+            progress.snapshot.pending_interaction = None;
+        }
+    }
+    Some(view)
+}
+
+fn child_header_height(
+    status: &SubAgentStatus,
+    progress: Option<&SubAgentInvocationProgress>,
+) -> u16 {
+    let pending = crate::interaction_confirmation::pending_for_progress(status, progress).is_some();
+    1 + u16::from(progress.is_some()) + u16::from(pending)
+}
+
 fn render_child_header(frame: &mut Frame<'_>, area: Rect, header: ChildHeader<'_>) {
     let (icon, color) = status_icon(header.status, header.spinner_index);
-    let short_id: String = header.key.session_id.chars().take(8).collect();
+    let short_id: String = header
+        .key
+        .session_id
+        .chars()
+        .take(SHORT_SESSION_ID_CHARS)
+        .collect();
     let identity = format!(" {icon} @ {}", header.key.agent);
     let status = format!(" [{short_id}]  {}", header.status.label());
     let prefix_width = UnicodeWidthStr::width(identity.as_str())
@@ -491,6 +555,11 @@ fn render_child_header(frame: &mut Frame<'_>, area: Rect, header: ChildHeader<'_
             Style::default().fg(Color::DarkGray),
         )));
     }
+    if let Some(pending) =
+        crate::interaction_confirmation::pending_for_progress(header.status, header.progress)
+    {
+        lines.push(pending_line(pending));
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -506,15 +575,23 @@ fn render_child_entries(
         .iter_mut()
         .enumerate()
         .map(|(index, item)| {
-            let mut rendered = Tui::render_entry(
-                item,
-                render.options.show_seq,
-                render.options.show_ts,
-                render.options.use_utc,
-                render.width,
-                RenderEntryState::new(Some(index) == streaming_idx, render.options.spinner_index),
-                render.theme,
-            );
+            let mut rendered = if matches!(item, TranscriptItem::SubAgentSession { .. }) {
+                // Nested rows belong to descendants, not direct children of the parent view.
+                render_subagent_row_scoped(item, render.options.spinner_index, render.width, false)
+            } else {
+                Tui::render_entry(
+                    item,
+                    render.options.show_seq,
+                    render.options.show_ts,
+                    render.options.use_utc,
+                    render.width,
+                    RenderEntryState::new(
+                        Some(index) == streaming_idx,
+                        render.options.spinner_index,
+                    ),
+                    render.theme,
+                )
+            };
             if render.focus == Some(index) {
                 rendered.reverse_style();
             }

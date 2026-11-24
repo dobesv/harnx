@@ -1,4 +1,4 @@
-//! Background service startup: hooks, sub-agent toolsets, and the on-demand
+//! Background service startup: sub-agent toolsets and the on-demand
 //! tool-server reconciler.
 //!
 //! None of this is required for the worker to accept and run a session (see
@@ -7,7 +7,6 @@
 //! worker startup.
 
 use super::daemon::{WorkerDaemonConfig, WorkerStartup};
-use super::hook_supervisor::{HookServerStartConfig, HookServerSupervisor};
 use super::server_reconciler::{
     all_enabled_tool_servers, build_server_reconciler, ServerReconciler,
 };
@@ -62,8 +61,7 @@ pub(crate) fn tool_servers_matching_use_tools(
 ///
 /// A worker with nothing configured to spawn must not resolve a broker
 /// address, because resolving falls back to starting a shared NATS server.
-/// Mirrors `start_global_hooks`'s `hooks.entries.is_empty()` check. Pulled out
-/// of `start_local_tool_servers` so the decision itself — not a copy of it —
+/// Pulled out of `start_local_tool_servers` so the decision itself — not a copy of it —
 /// is what tests exercise.
 pub(super) fn should_start_tool_servers(
     manage_servers: bool,
@@ -116,7 +114,7 @@ pub async fn start_local_tool_servers_for_test(
     daemon: &WorkerDaemonConfig,
     config: &GlobalConfig,
 ) -> Option<ToolServerSupervisor> {
-    let (servers, _hooks) = configured_worker_services(config);
+    let servers = configured_worker_services(config);
     let server = resolve_local_nats_server_config().await.ok()?;
     let token = server.token.as_deref()?;
     let client = async_nats::ConnectOptions::new()
@@ -128,40 +126,14 @@ pub async fn start_local_tool_servers_for_test(
     start_local_tool_servers(daemon, client, &instance_id, &servers).await
 }
 
-async fn start_global_hooks(
-    daemon: &WorkerDaemonConfig,
-    client: async_nats::Client,
-    instance_id: &harnx_core::instance::ServerScope,
-    hooks: &harnx_core::hooks::HooksConfig,
-) -> Option<HookServerSupervisor> {
-    if !daemon.manage_servers || hooks.entries.is_empty() {
-        return None;
-    }
-    let result = async {
-        let server = resolve_local_nats_server_config().await?;
-        let token = server
-            .token
-            .as_deref()
-            .context("local NATS hook servers require HARNX_NATS_TOKEN")?;
-        let start = HookServerStartConfig::new(client, instance_id.clone(), &server.url, token)
-            .with_replicas(server.replicas)
-            .with_broker_settings(&harnx_nats_common::connect::NatsEndpoint::from(&server));
-        HookServerSupervisor::start_local(start, hooks, "global")
-            .await
-            .context("start global NATS hook servers")
-    }
-    .await;
-    match result {
-        Ok(supervisor) => Some(supervisor),
-        Err(error) => {
-            // Failures happen before the supervisor can own cleanup or while its KV
-            // route is unavailable. Publishing here would either reuse the failed
-            // route or leave an unowned rejector behind after worker shutdown. Keep
-            // the worker available; unreadable registries fail closed at discovery.
-            log::warn!("global NATS hook servers disabled: {error:#}");
-            None
-        }
-    }
+/// Test entry point for [`configured_worker_services`]: the same selection
+/// worker startup and session reconciliation apply, without standing up a
+/// worker daemon. Not part of the crate's real API — production code always
+/// goes through the daemon paths.
+// qual:test_helper — same selection as worker startup/reconciliation, exposed for the script-tools cold-start e2e.
+#[doc(hidden)]
+pub fn configured_worker_services_for_test(config: &GlobalConfig) -> Vec<ToolServerConfig> {
+    configured_worker_services(config)
 }
 
 fn optional_tool_server<T>(result: Result<T>) -> Option<T> {
@@ -270,18 +242,27 @@ pub(super) struct WorkerServices {
     pub(super) server_reconciler: Option<Arc<ServerReconciler>>,
 }
 
-/// Hooks and sub-agent toolsets, started after the worker has already
+/// Sub-agent toolsets, started after the worker has already
 /// announced readiness. Held only to keep the children alive for the
 /// worker's lifetime. Tool servers are no longer part of this: they start
 /// per session through `WorkerRuntime::server_reconciler`.
 pub(super) struct BackgroundServices {
-    _global_hook_supervisor: Option<HookServerSupervisor>,
     _subagent_tool_servers: Vec<JoinHandle<Result<()>>>,
 }
 
-pub(super) fn configured_worker_services(
-    config: &GlobalConfig,
-) -> (Vec<ToolServerConfig>, harnx_core::hooks::HooksConfig) {
+/// Tool servers this worker should run for the config it is holding.
+///
+/// Selection follows the active agent's `use_tools` (falling back to the
+/// global `use_tools`), its `bash_tools`, and the `tools:`
+/// selectors of every middleware entry active for that agent, so a server
+/// that only hosts middleware helper tools starts too. Middleware selectors
+/// go through `tool_servers_for_view` with the same agent package the
+/// middleware itself resolves tools with, and matching ignores middleware
+/// `match` patterns: the session can call a matching tool at any time, and
+/// the server should already be running when it does. A middleware
+/// resolution error warns and continues with the agent-derived servers; the
+/// failing turn still reports the middleware error through its own path.
+pub(super) fn configured_worker_services(config: &GlobalConfig) -> Vec<ToolServerConfig> {
     let config = config.read();
     let agent_package = config
         .agent
@@ -298,10 +279,33 @@ pub(super) fn configured_worker_services(
     // needs the tool servers behind its bash_tools selectors, or the
     // inner set resolves to nothing on the worker.
     if let Some(bash_tools) = config.agent.as_ref().and_then(|agent| agent.bash_tools()) {
-        selectors.extend(bash_tools);
+        selectors.extend(bash_tools.clone());
     }
-    let servers = tool_servers_for_view(&config, agent_package, &selectors);
-    (servers, config.hooks.clone().unwrap_or_default())
+    // Script tools (#2813, decision 13): a selected script tool wraps tools
+    // resolved through its own `tools:` selectors, so the servers behind
+    // those must start too. Unselected script tools contribute nothing.
+    selectors.extend(config.script_tool_inner_selectors_for(&selectors));
+    // #2796: middleware helper tools resolve with the same package context as
+    // the agent's own selectors (see middleware/wiring.rs), so their servers
+    // join the same selection instead of failing as not allowlisted.
+    match config.resolved_middleware() {
+        Ok(chain) => selectors.extend(
+            chain
+                .entries
+                .iter()
+                .flat_map(|entry| entry.tools.iter().cloned()),
+        ),
+        Err(error) => {
+            log::warn!("could not resolve middleware for tool-server selection: {error:#}")
+        }
+    }
+    match config.resolved_event_hooks() {
+        Ok(hooks) => selectors.extend(hooks.tool_selectors().map(str::to_owned)),
+        Err(error) => {
+            log::warn!("could not resolve event hooks for tool-server selection: {error:#}")
+        }
+    }
+    tool_servers_for_view(&config, agent_package, &selectors)
 }
 
 /// Configured servers that could supply tools for an explicit package/selector view.
@@ -347,7 +351,7 @@ pub(super) async fn launch_worker_services(
     let session_metadata =
         super::daemon::ensure_session_metadata(&startup.jetstream, startup.replicas).await?;
 
-    // Don't gate readiness on hooks or sub-agent toolsets: a broken server
+    // Don't gate readiness on sub-agent toolsets: a broken server
     // must not stall the frontend past its startup deadline. The daemon
     // announces readiness after its request subscriptions are flushed, while
     // these services start in the background. Tool servers start on demand
@@ -355,10 +359,8 @@ pub(super) async fn launch_worker_services(
 
     let background = Arc::new(Mutex::new(None));
     // Session-specific tool servers are awaited during activation, but the
-    // worker-wide sub-agent toolsets and global hooks still start in the
-    // background. Keep the first activation behind this barrier so neither
-    // tool discovery nor the one-shot SessionStart hook dispatch can race the
-    // corresponding registrations.
+    // worker-wide sub-agent toolsets still start in the background. Keep the
+    // first activation behind this barrier so discovery sees their registrations.
     let (background_services_tx, background_services_attempted) =
         tokio::sync::watch::channel(false);
 
@@ -450,7 +452,6 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
         } = ctx;
         // Tool servers aren't started here anymore — each session's own
         // servers start on demand through `WorkerRuntime::server_reconciler`.
-        let (_worker_tool_servers, global_hooks) = configured_worker_services(&config);
         let lease_acquisition_timeout =
             std::time::Duration::from_secs(config.read().nats_lease_acquisition_timeout_secs);
         let registrations = list_agents().into_iter().map(|agent| {
@@ -480,17 +481,9 @@ fn spawn_background_services(ctx: BackgroundServicesCtx) {
                 }
             }
         }
-        let global_hook_supervisor =
-            start_global_hooks(&daemon, client.clone(), &instance_id, &global_hooks).await;
-
-        // SessionStart is dispatched once, immediately after activation. Do
-        // not release that activation until global hook startup has either
-        // succeeded or reached its bounded failure path, or a cold worker can
-        // permanently miss the event.
         let _ = background_services_attempted.send(true);
 
         *slot.lock().await = Some(BackgroundServices {
-            _global_hook_supervisor: global_hook_supervisor,
             _subagent_tool_servers: subagent_tool_servers,
         });
     });
@@ -503,9 +496,12 @@ mod tests {
         tool_servers_for_view, tool_servers_matching_use_tools,
     };
     use crate::config::{Agent, AgentConfig, Config, ToolServerConfig};
+    use harnx_core::hooks::HooksConfig;
+    use harnx_core::middleware::{MiddlewareDefinition, MiddlewareEntry, MiddlewareSourceConfig};
 
     fn tool_server(name: &str) -> ToolServerConfig {
         ToolServerConfig {
+            middleware: Default::default(),
             name: name.to_string(),
             command: format!("harnx-{name}-server"),
             args: Vec::new(),
@@ -515,6 +511,51 @@ mod tests {
             package: None,
             hooks: None,
         }
+    }
+
+    fn middleware_with_tools(name: &str, tools: &[&str]) -> MiddlewareEntry {
+        MiddlewareEntry::Full(MiddlewareDefinition {
+            name: name.to_string(),
+            matcher: ".*".to_string(),
+            source: MiddlewareSourceConfig::Bash {
+                bash: "next".to_string(),
+            },
+            tools: tools.iter().map(|tool| tool.to_string()).collect(),
+            fetch: Vec::new(),
+            timeout: std::time::Duration::from_secs(30),
+            on_error: Default::default(),
+        })
+    }
+
+    fn disabled_middleware(name: &str) -> MiddlewareEntry {
+        MiddlewareEntry::Disable {
+            name: name.to_string(),
+            enabled: false,
+        }
+    }
+
+    fn worker_config_with_global_middleware(
+        agent_markdown: &str,
+        middleware: MiddlewareEntry,
+        tool_servers: Vec<ToolServerConfig>,
+    ) -> crate::config::GlobalConfig {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.middleware.entries.push(middleware);
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", agent_markdown).unwrap(),
+            ));
+            config.tool_servers = tool_servers;
+        }
+        config
+    }
+
+    fn configured_server_names(config: &crate::config::GlobalConfig) -> Vec<String> {
+        configured_worker_services(config)
+            .into_iter()
+            .map(|server| server.name)
+            .collect()
     }
 
     #[test]
@@ -544,7 +585,7 @@ mod tests {
             config.tool_servers = vec![tool_server("time"), tool_server("weather")];
         }
 
-        let (servers, _hooks) = configured_worker_services(&config);
+        let servers = configured_worker_services(&config);
 
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "time");
@@ -565,7 +606,7 @@ mod tests {
             config.tool_servers = vec![tool_server("time"), tool_server("weather")];
         }
 
-        let (servers, _hooks) = configured_worker_services(&config);
+        let servers = configured_worker_services(&config);
 
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "time");
@@ -674,7 +715,7 @@ mod tests {
                     .unwrap(),
             ));
         }
-        let (servers, _) = configured_worker_services(&config);
+        let servers = configured_worker_services(&config);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "fs");
         assert_eq!(servers[0].package.as_deref(), Some("coding"));
@@ -682,14 +723,242 @@ mod tests {
         config.write().agent = Some(Agent::new(
             AgentConfig::from_markdown("coding/worker", "Worker prompt").unwrap(),
         ));
-        let (servers, _) = configured_worker_services(&config);
+        let servers = configured_worker_services(&config);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "time");
 
         config.write().agent = Some(Agent::new(
             AgentConfig::from_markdown("coding/worker", "---\nuse_tools: []\n---\n").unwrap(),
         ));
-        assert!(configured_worker_services(&config).0.is_empty());
+        assert!(configured_worker_services(&config).is_empty());
+    }
+
+    #[test]
+    fn configured_worker_services_starts_servers_only_middleware_needs() {
+        // #2796: `plans` and `weather` are excluded from the agent's
+        // use_tools, but agent-front-matter and global middleware declare
+        // their tools, so both servers must start alongside `fs`.
+        let config = worker_config_with_global_middleware(
+            "---\nuse_tools: [fs_*]\nmiddleware: [{name: agent-helper, match: '.*', bash: next, tools: [plans_list]}]\n---\n",
+            middleware_with_tools("global-helper", &["weather_get_forecast"]),
+            vec![
+                tool_server("fs"),
+                tool_server("plans"),
+                tool_server("weather"),
+            ],
+        );
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "plans", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_starts_servers_needed_only_by_hooks_for_every_event() {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown(
+                    "worker",
+                    r#"---
+hooks:
+  SessionStart:
+    - {name: start, bash: next, tools: [fs_read]}
+  UserPromptSubmit:
+    - {name: prompt, bash: next, tools: [time_get_current_time]}
+  Stop:
+    - {name: stop, bash: next, tools: [plans_list]}
+  StopFailure:
+    - {name: failure, bash: next, tools: [weather_get_forecast]}
+---
+"#,
+                )
+                .unwrap(),
+            ));
+            config.tool_servers = vec![
+                tool_server("fs"),
+                tool_server("time"),
+                tool_server("plans"),
+                tool_server("weather"),
+                tool_server("unused"),
+            ];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "time", "plans", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_ignores_disabled_hook_tool_selectors() {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.hooks = Some(Box::new(
+                serde_yaml::from_str::<HooksConfig>(
+                    r#"Stop:
+  - {name: helper, bash: next, tools: [weather_get_forecast]}
+"#,
+                )
+                .unwrap(),
+            ));
+            config
+                .middleware
+                .entries
+                .push(middleware_with_tools("helper-middleware", &["plans_list"]));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown(
+                    "worker",
+                    r#"---
+use_tools: [fs_*]
+hooks:
+  Stop:
+    - {name: helper, enabled: false}
+---
+"#,
+                )
+                .unwrap(),
+            ));
+            config.tool_servers = vec![
+                tool_server("fs"),
+                tool_server("plans"),
+                tool_server("weather"),
+            ];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "plans"]);
+    }
+
+    #[test]
+    fn configured_worker_services_keeps_agent_and_middleware_servers_when_hook_resolution_fails() {
+        // A disable for an unknown hook makes hook resolution fail. The warning
+        // must not discard servers selected by the agent or middleware.
+        let config = worker_config_with_global_middleware(
+            r#"---
+use_tools: [fs_*]
+hooks:
+  Stop:
+    - {name: ghost, enabled: false}
+---
+"#,
+            middleware_with_tools("helper", &["weather_get_forecast"]),
+            vec![
+                tool_server("fs"),
+                tool_server("weather"),
+                tool_server("plans"),
+            ],
+        );
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_starts_a_server_declaring_its_own_middleware() {
+        // aws-creds shape (#2796): the middleware lives in the tool
+        // server's own file, so the server is needed only by middleware
+        // declared within it.
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            let mut weather = tool_server("weather");
+            weather.middleware.entries.push(middleware_with_tools(
+                "weather-auth",
+                &["weather_get_forecast"],
+            ));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", "---\nuse_tools: [fs_*]\n---\n").unwrap(),
+            ));
+            config.tool_servers = vec![tool_server("fs"), weather];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_ignores_middleware_removed_by_a_later_disable() {
+        // The agent disables the global entry, so it never reaches the
+        // resolved chain and its tools create no server demand.
+        let config = worker_config_with_global_middleware(
+            "---\nuse_tools: [fs_*]\nmiddleware: [{name: helper, enabled: false}]\n---\n",
+            middleware_with_tools("helper", &["weather_get_forecast"]),
+            vec![tool_server("fs"), tool_server("weather")],
+        );
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs"]);
+    }
+
+    #[test]
+    fn configured_worker_services_ignores_middleware_in_a_disabled_server_file() {
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            let mut weather = tool_server("weather");
+            weather.enabled = false;
+            weather.middleware.entries.push(middleware_with_tools(
+                "weather-auth",
+                &["weather_get_forecast"],
+            ));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", "---\nuse_tools: [fs_*]\n---\n").unwrap(),
+            ));
+            config.tool_servers = vec![tool_server("fs"), weather];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs"]);
+    }
+
+    #[test]
+    fn configured_worker_services_does_not_duplicate_middleware_selected_servers() {
+        // Agent and middleware selectors overlap on both servers; each
+        // configured server still appears at most once.
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.middleware.entries.push(middleware_with_tools(
+                "helper",
+                &["weather_get_forecast", "fs_*"],
+            ));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", "---\nuse_tools: [weather_*]\n---\n").unwrap(),
+            ));
+            config.tool_servers = vec![tool_server("fs"), tool_server("weather")];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs", "weather"]);
+    }
+
+    #[test]
+    fn configured_worker_services_keeps_agent_servers_when_middleware_resolution_fails() {
+        // Script paths are validated at config load, so the error is induced
+        // with a Disable naming an entry no earlier level declared —
+        // `apply_level` rejects it at resolution time. Selection must warn
+        // and fall back to the agent's servers instead of aborting.
+        let config = crate::config::GlobalConfig::default();
+        {
+            let mut config = config.write();
+            config.middleware.entries.push(disabled_middleware("ghost"));
+            config.agent = Some(Agent::new(
+                AgentConfig::from_markdown("worker", "---\nuse_tools: [fs_*]\n---\n").unwrap(),
+            ));
+            config.tool_servers = vec![tool_server("fs"), tool_server("weather")];
+        }
+
+        let names = configured_server_names(&config);
+
+        assert_eq!(names, ["fs"]);
     }
 
     #[test]

@@ -79,6 +79,7 @@ fn build_test_tool_config() -> GlobalConfig {
     config.write().tool_servers = ["slow", "healthy"]
         .into_iter()
         .map(|name| ToolServerConfig {
+            middleware: Default::default(),
             name: name.to_owned(),
             command: "unused-test-launcher".to_owned(),
             args: Vec::new(),

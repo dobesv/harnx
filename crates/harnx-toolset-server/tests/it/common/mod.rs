@@ -2,8 +2,7 @@
 //! tests: spawning a real `nats-server`, a stub `Toolset`, and a running
 //! `serve_with_shutdown` instance to exercise. Split out of `nats_server.rs`
 //! because this infrastructure shares no data with the test bodies
-//! themselves, and keeping it there pushed that file's cohesion (LCOM4) over
-//! CodeScene's threshold.
+//! themselves, and keeping it there left that file with unrelated halves.
 
 // Each integration-test binary includes only the subset of this shared
 // harness that it exercises.
@@ -397,6 +396,9 @@ pub(crate) async fn round_trip(client: &async_nats::Client) -> Result<()> {
 /// A session-scoped `echo` request whose operation ID matches its call ID.
 pub(crate) fn request(session: &str, call_id: &str) -> ToolRequest {
     ToolRequest {
+        user_id: None,
+        input_responses: None,
+        request_state: None,
         run_context: None,
         replay: None,
         operation_id: call_id.to_string(),
@@ -415,6 +417,8 @@ pub(crate) fn request(session: &str, call_id: &str) -> ToolRequest {
 /// [`request`] as the `ToolCalls` entry at sequence `round` made it.
 pub(crate) fn request_in_round(session: &str, call_id: &str, round: u64) -> ToolRequest {
     ToolRequest {
+        input_responses: None,
+        request_state: None,
         tool_round: Some(round),
         ..request(session, call_id)
     }

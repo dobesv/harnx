@@ -429,5 +429,5 @@ pub(super) fn tool_servers_for_activation(
         log::warn!("could not resolve session agent for tool-server selection: {error:#}");
         return Vec::new();
     }
-    configured_worker_services(&scratch).0
+    configured_worker_services(&scratch)
 }

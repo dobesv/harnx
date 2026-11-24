@@ -68,7 +68,7 @@ impl HarnxHandler {
     ) -> Result<Admission, A2AError> {
         let input = message_to_input(&request.message, self.limits)
             .map_err(|error| map_error(error.into()))?;
-        let candidate = self.reserve_first_candidate(request).await?;
+        let candidate = self.reserve_first_candidate(owner, request).await?;
         if !candidate.own {
             candidate.lease.release().await.map_err(map_error)?;
             return self
@@ -176,6 +176,8 @@ impl HarnxHandler {
         if actual != expected {
             return Err(not_found());
         }
+        // The reservation's stored snapshot, not the retrying request's current
+        // memberships, decides the session's recorded principals.
         self.backend
             .runner
             .allocated_session(
@@ -188,6 +190,7 @@ impl HarnxHandler {
                     abort: self.backend.abort.clone(),
                 },
                 &reservation.allocation,
+                reservation.principals.as_ref(),
             )
             .await
             .map_err(map_error)
@@ -197,6 +200,7 @@ impl HarnxHandler {
 impl HarnxHandler {
     async fn reserve_first_candidate(
         &self,
+        owner: &RequestIdentity,
         request: MessageAdmission,
     ) -> Result<FirstCandidate, A2AError> {
         let allocation = TaskAllocation::new(
@@ -215,6 +219,10 @@ impl HarnxHandler {
             fingerprint: request.fingerprint,
             message: request.message.clone(),
             allocation,
+            // The winning request's principals. The reservation key is
+            // create-only, so a retry of the same messageId never overwrites
+            // this with the retrying caller's current memberships.
+            principals: owner.stampable_principals(),
         };
         self.backend
             .store

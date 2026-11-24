@@ -25,6 +25,8 @@ pub(in crate::nats_worker::subagent_toolset) struct PromptScope {
     pub(in crate::nats_worker::subagent_toolset) start: u64,
     pub(in crate::nats_worker::subagent_toolset) end: u64,
     pub(in crate::nats_worker::subagent_toolset) status: SessionPromptStatus,
+    pub(in crate::nats_worker::subagent_toolset) pending_interaction:
+        Option<harnx_core::pending_interaction::PendingInteractionSummary>,
 }
 
 pub(in crate::nats_worker::subagent_toolset) enum PromptScopeError {
@@ -43,6 +45,7 @@ pub(in crate::nats_worker::subagent_toolset) enum PromptScopeError {
 pub(in crate::nats_worker::subagent_toolset) async fn resolve_prompt_scope(
     toolset: &SubagentToolset,
     storage: &str,
+    session_id: &str,
     prompt_id: &str,
 ) -> Result<PromptScope, PromptScopeError> {
     let admission = toolset
@@ -85,6 +88,12 @@ pub(in crate::nats_worker::subagent_toolset) async fn resolve_prompt_scope(
         start,
         end: snapshot.output_end(),
         status: snapshot.status(),
+        pending_interaction: snapshot.pending_interaction(
+            &toolset.agent,
+            toolset.route.cluster(),
+            session_id,
+            scope.admission.invocation_id.as_str(),
+        ),
     })
 }
 
@@ -218,6 +227,20 @@ impl WatchScan {
             #[cfg(test)]
             forced_refresh_failures: std::cell::Cell::new(take_forced_refresh_failures()),
         })
+    }
+
+    pub(in crate::nats_worker::subagent_toolset) fn pending_interaction(
+        &self,
+        agent: &str,
+        cluster: &str,
+        session_id: &str,
+    ) -> Option<harnx_core::pending_interaction::PendingInteractionSummary> {
+        self.snapshot.pending_interaction(
+            agent,
+            cluster,
+            session_id,
+            self.scope.admission.invocation_id.as_str(),
+        )
     }
 
     /// One bounded pass over the entries that landed since the previous one.

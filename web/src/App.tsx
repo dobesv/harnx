@@ -13,12 +13,18 @@ import { ReasoningPartAdapter } from './components/ReasoningPartAdapter';
 import { MessageTextPart } from './components/MessageTextPart';
 import { useAgUiInterrupts } from '@assistant-ui/react-ag-ui';
 import { ChatProvider, attachmentToMessageParts } from './ChatProvider';
+import type { PendingInteraction } from './harnxCustomEvents';
 import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import { MessageAttachments } from './MessageAttachments';
-import { sendPrompt, submitHitlDecision, uploadAttachment, markRead, markUnread } from './api';
+import { sendPrompt, submitHitlDecision, submitInteractionResponse, InteractionResponseError, uploadAttachment, markRead, markUnread } from './api';
+import { A2UIForm } from './a2ui/A2UIForm';
+import { UrlInteractionBody } from './UrlInteractionBody';
+import { A2uiSurfaceCard } from './a2ui/A2uiSurfaceCard';
+import { useA2uiSurfaces } from './a2ui/A2uiSurfacesContext';
+import { buildData, defaultValue, inputFields } from './a2ui/buildData';
 import { CancellationContext, type CancellationControl } from './CancellationContext';
 import { CompactionContext } from './CompactionContext';
 import { useCompactionMetadata } from './CompactionMetadataContext';
@@ -606,11 +612,13 @@ export const SendErrorIndicator = () => {
 function canAddInterrupt(
   toolCallId: string | undefined,
   seen: Set<string>,
-  resolved: Set<string>
+  resolved: Set<string>,
+  pendingInteractionToolCallId?: string
 ): toolCallId is string {
   if (!toolCallId) return false;
   if (seen.has(toolCallId)) return false;
   if (resolved.has(toolCallId)) return false;
+  if (pendingInteractionToolCallId && toolCallId === pendingInteractionToolCallId) return false;
   return true;
 }
 
@@ -635,10 +643,11 @@ function appendLiveInterrupts(
   items: Array<{ toolCallId: string; summary: string }>,
   seen: Set<string>,
   interrupts: ReadonlyArray<{ toolCallId?: string; message?: string; reason?: string }>,
-  resolvedToolCallIds: Set<string>
+  resolvedToolCallIds: Set<string>,
+  pendingInteractionToolCallId?: string
 ): void {
   for (const i of interrupts) {
-    if (!canAddInterrupt(i.toolCallId, seen, resolvedToolCallIds)) continue;
+    if (!canAddInterrupt(i.toolCallId, seen, resolvedToolCallIds, pendingInteractionToolCallId)) continue;
     items.push({ toolCallId: i.toolCallId, summary: getInterruptSummary(i as any) });
     seen.add(i.toolCallId);
   }
@@ -647,12 +656,13 @@ function appendLiveInterrupts(
 function collectPendingInterruptItems(
   hydratedApprovals: HydratedPendingApproval[],
   interrupts: ReadonlyArray<{ toolCallId?: string; message?: string; reason?: string }>,
-  resolvedToolCallIds: Set<string>
+  resolvedToolCallIds: Set<string>,
+  pendingInteractionToolCallId?: string
 ): Array<{ toolCallId: string; summary: string }> {
   const items: Array<{ toolCallId: string; summary: string }> = [];
   const seen = new Set<string>();
   appendHydratedApprovals(items, seen, hydratedApprovals, resolvedToolCallIds);
-  appendLiveInterrupts(items, seen, interrupts, resolvedToolCallIds);
+  appendLiveInterrupts(items, seen, interrupts, resolvedToolCallIds, pendingInteractionToolCallId);
   return items;
 }
 
@@ -663,19 +673,385 @@ function handleHitlDecisionError(err: unknown, setErrorText: (text: string | nul
   }
 }
 
+export const InteractionUI = ({
+  agentName,
+  sessionId,
+  interaction,
+  onResolved,
+}: {
+  agentName: string;
+  sessionId: string;
+  interaction: PendingInteraction;
+  onResolved?: (interactionId: string, requestSeq: number) => void;
+}) => {
+  const { setStatusText, setErrorText } = useContext(PendingContext);
+  const [submitting, setSubmitting] = useState(false);
+  const [note, setNote] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const isA2ui = interaction.kind === 'a2ui';
+  const isConfirm = interaction.kind === 'confirm';
+  const isUrl = interaction.kind === 'url';
+  const isSupported = isConfirm || isA2ui || isUrl;
+
+  const initFormValues = useCallback((): Record<string, unknown> => {
+    if (interaction.kind === 'a2ui' && interaction.payload) {
+      const initial: Record<string, unknown> = {};
+      for (const field of inputFields(interaction.payload)) {
+        initial[field.key] = defaultValue(
+          interaction.payload,
+          field.path,
+          field.kind === 'ChoicePicker'
+        );
+      }
+      return initial;
+    }
+    return {};
+  }, [interaction.kind, interaction.payload]);
+
+  const [formValues, setFormValues] = useState<Record<string, unknown>>(initFormValues);
+
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // In case the component is reused without unmounting, reset state on identity change
+  const activeIdentity = `${agentName}:${sessionId}:${interaction.interactionId}:${interaction.requestSeq}`;
+  const [renderedIdentity, setRenderedIdentity] = useState(activeIdentity);
+  if (renderedIdentity !== activeIdentity) {
+    setRenderedIdentity(activeIdentity);
+    setSubmitting(false);
+    setNote('');
+    setError(null);
+    setFormValues(initFormValues());
+  }
+
+  const scopeRef = useRef({
+    agentName,
+    sessionId,
+    interactionId: interaction.interactionId,
+    requestSeq: interaction.requestSeq,
+  });
+  scopeRef.current = {
+    agentName,
+    sessionId,
+    interactionId: interaction.interactionId,
+    requestSeq: interaction.requestSeq,
+  };
+
+  const handleResponse = async (action: string) => {
+    const submittingAgent = agentName;
+    const submittingSession = sessionId;
+    const submittingId = interaction.interactionId;
+    const submittingSeq = interaction.requestSeq;
+    setError(null);
+    setErrorText(null);
+    setSubmitting(true);
+    try {
+      const trimmedNote = note.trim();
+      let data: Record<string, unknown> = {};
+      if (action !== 'deny' && isA2ui && interaction.payload) {
+        data = buildData(interaction.payload, action, formValues);
+      }
+      const res = await submitInteractionResponse(submittingAgent, submittingSession, {
+        interactionId: submittingId,
+        requestSeq: submittingSeq,
+        response: {
+          action,
+          data,
+          // Decision 6: a url response carries the action alone — no note.
+          note: isUrl ? undefined : trimmedNote || undefined,
+        },
+      });
+
+      if (!mountedRef.current) return;
+      if (
+        scopeRef.current.agentName !== submittingAgent ||
+        scopeRef.current.sessionId !== submittingSession
+      ) {
+        return;
+      }
+
+      const stillCurrent =
+        scopeRef.current.interactionId === submittingId &&
+        scopeRef.current.requestSeq === submittingSeq;
+
+      if (stillCurrent) {
+        if (res && res.outcome === 'already_applied') {
+          setStatusText('This interaction was already resolved elsewhere.');
+        }
+        setNote('');
+        onResolved?.(submittingId, submittingSeq);
+      }
+    } catch (err: unknown) {
+      if (!mountedRef.current) return;
+      if (
+        scopeRef.current.agentName !== submittingAgent ||
+        scopeRef.current.sessionId !== submittingSession
+      ) {
+        return;
+      }
+
+      const stillCurrent =
+        scopeRef.current.interactionId === submittingId &&
+        scopeRef.current.requestSeq === submittingSeq;
+
+      if (stillCurrent && !isAbortError(err)) {
+        let msg: string;
+        if (err instanceof InteractionResponseError) {
+          msg = err.outcome
+            ? `Interaction response rejected: ${err.outcome}`
+            : err.message;
+        } else if (err instanceof Error) {
+          msg = err.message;
+        } else {
+          msg = String(err);
+        }
+        setError(msg);
+        setErrorText(msg);
+      }
+    } finally {
+      if (
+        mountedRef.current &&
+        scopeRef.current.agentName === submittingAgent &&
+        scopeRef.current.sessionId === submittingSession &&
+        scopeRef.current.interactionId === submittingId &&
+        scopeRef.current.requestSeq === submittingSeq
+      ) {
+        setSubmitting(false);
+      }
+    }
+  };
+
+  return (
+    <div className="aui-interrupts-batch" data-testid="pending-interaction-card">
+      <h4 className="aui-interrupts-title">Action Required: {isConfirm ? 'Confirm' : 'Interaction'}</h4>
+      <div className="aui-interrupt" data-testid="pending-interaction">
+        {isConfirm && (
+          <p className="aui-interrupt-message">
+            <strong>{interaction.message}</strong>
+          </p>
+        )}
+
+        {isUrl && (
+          <>
+            <p className="aui-interrupt-message">
+              <strong>{interaction.message}</strong>
+            </p>
+            <UrlInteractionBody interaction={interaction} />
+          </>
+        )}
+
+        {!isSupported && (
+          <>
+            <p className="aui-interrupt-message">
+              <strong>{interaction.message}</strong>
+            </p>
+            <div
+              className="aui-interrupt-unsupported"
+              role="alert"
+              style={{ color: '#c62828', marginTop: '8px', marginBottom: '8px', fontWeight: 500 }}
+            >
+              not supported by this client
+            </div>
+          </>
+        )}
+
+        {isA2ui &&
+          (interaction.payload ? (
+            <A2UIForm
+              payload={interaction.payload}
+              values={formValues}
+              onValueChange={(key, val) =>
+                setFormValues((prev) => ({ ...prev, [key]: val }))
+              }
+              onAction={(actionName) => handleResponse(actionName)}
+              disabled={submitting}
+            />
+          ) : (
+            <>
+              <p className="aui-interrupt-message">
+                <strong>{interaction.message}</strong>
+              </p>
+              <div
+                className="aui-interrupt-unsupported"
+                role="alert"
+                style={{ color: '#c62828', marginTop: '8px', marginBottom: '8px', fontWeight: 500 }}
+              >
+                Unable to render form
+              </div>
+            </>
+          ))}
+
+        {/* url interactions carry no note: the stored response is the action alone. */}
+        {!isUrl && (
+          <div style={{ marginTop: '10px' }}>
+            <label
+              htmlFor="interaction-optional-note"
+              style={{ display: 'block', fontSize: '0.9em', marginBottom: '4px' }}
+            >
+              Optional Note:
+            </label>
+            <input
+              id="interaction-optional-note"
+              type="text"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              disabled={submitting}
+              placeholder="Reason for approval or denial..."
+              style={{ width: '100%', padding: '6px', boxSizing: 'border-box' }}
+            />
+          </div>
+        )}
+
+        {error && (
+          <div
+            role="alert"
+            className="aui-interrupt-error"
+            style={{ color: '#c62828', marginTop: '8px', fontSize: '0.9em' }}
+          >
+            {error}
+          </div>
+        )}
+
+        <div className="aui-interrupt-actions" style={{ marginTop: '10px', display: 'flex', gap: '10px' }}>
+          {isConfirm && (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => handleResponse('approve')}
+              className="aui-interrupt-submit"
+              style={{
+                backgroundColor: '#2e7d32',
+                color: 'white',
+                padding: '6px 12px',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+              }}
+            >
+              Approve
+            </button>
+          )}
+          {isUrl && (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => handleResponse('continue')}
+              className="aui-interrupt-submit"
+              data-testid="url-interaction-continue"
+              style={{
+                backgroundColor: '#2e7d32',
+                color: 'white',
+                padding: '6px 12px',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+              }}
+            >
+              Continue
+            </button>
+          )}
+          {isUrl ? (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => handleResponse('cancel')}
+              className="aui-interrupt-submit a2ui-btn-deny"
+              data-testid="url-interaction-cancel"
+              style={{
+                backgroundColor: '#c62828',
+                color: 'white',
+                padding: '6px 12px',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+              }}
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => handleResponse('deny')}
+              className="aui-interrupt-submit a2ui-btn-deny"
+              style={{
+                backgroundColor: '#c62828',
+                color: 'white',
+                padding: '6px 12px',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+              }}
+            >
+              Deny
+            </button>
+          )}
+        </div>
+
+        {interaction.pendingCount > 0 && (
+          <p className="aui-interrupt-note" style={{ fontSize: '0.85em', color: '#666', marginTop: '10px' }}>
+            {interaction.pendingCount} more interaction{interaction.pendingCount !== 1 ? 's' : ''} awaiting response
+          </p>
+        )}
+      </div>
+    </div>
+  );
+};
+
 export const BatchInterruptUI = ({ agentName, sessionId }: { agentName: string; sessionId: string }) => {
   const interrupts = useAgUiInterrupts();
-  const { setStatusText, setErrorText, hydratedApprovals, removeHydratedApproval } = useContext(PendingContext);
+  const {
+    setStatusText,
+    setErrorText,
+    hydratedApprovals,
+    removeHydratedApproval,
+    pendingInteraction,
+    setPendingInteraction,
+    clearPendingInteractionIfMatch,
+  } = useContext(PendingContext);
   const [submitting, setSubmitting] = useState(false);
   const [note, setNote] = useState('');
   const [resolvedToolCallIds, setResolvedToolCallIds] = useState<Set<string>>(() => new Set());
 
   const pendingItems = useMemo(
-    () => collectPendingInterruptItems(hydratedApprovals, interrupts, resolvedToolCallIds),
-    [hydratedApprovals, interrupts, resolvedToolCallIds]
+    () =>
+      collectPendingInterruptItems(
+        hydratedApprovals,
+        interrupts,
+        resolvedToolCallIds,
+        pendingInteraction?.toolCallId
+      ),
+    [hydratedApprovals, interrupts, resolvedToolCallIds, pendingInteraction?.toolCallId]
   );
 
-  if (pendingItems.length === 0) return null;
+  if (pendingItems.length === 0) {
+    if (pendingInteraction) {
+      return (
+        <InteractionUI
+          key={`${agentName}:${sessionId}:${pendingInteraction.interactionId}:${pendingInteraction.requestSeq}`}
+          agentName={agentName}
+          sessionId={sessionId}
+          interaction={pendingInteraction}
+          onResolved={(id, seq) => {
+            if (clearPendingInteractionIfMatch) {
+              clearPendingInteractionIfMatch(id, seq);
+            } else {
+              setPendingInteraction?.((prev) =>
+                prev && prev.interactionId === id && prev.requestSeq === seq ? null : prev
+              );
+            }
+          }}
+        />
+      );
+    }
+    return null;
+  }
 
   const currentItem = pendingItems[0];
 
@@ -785,6 +1161,7 @@ const MyThread = ({
   updatePendingState: (update: (current: PendingPromptsState) => PendingPromptsState) => void;
 }) => {
   const threadMessages = useAuiState(s => s.thread.messages);
+  const { unattachedSurfaces } = useA2uiSurfaces();
   const isEmpty = threadMessages.length === 0;
   const userMessageIds = useMemo(
     () => pendingUserMessageIds(pendingState, threadMessages),
@@ -804,15 +1181,23 @@ const MyThread = ({
   }, [updatePendingState]);
 
   return (
-    <ThreadPrimitive.Root className={`aui-thread ${isEmpty && reconciled.prompts.length === 0 ? 'aui-thread-empty' : ''}`}>
+    <ThreadPrimitive.Root className={`aui-thread ${isEmpty && reconciled.prompts.length === 0 && unattachedSurfaces.length === 0 ? 'aui-thread-empty' : ''}`}>
       <RunStateMonitor onRunFinish={onRunFinish} />
       <div role="log" aria-label="Queued messages" aria-live="polite" aria-relevant="additions" className="aui-visually-hidden">
         {reconciled.prompts.map((prompt) => <div key={prompt.id}>Message accepted and queued.</div>)}
       </div>
 
-      {(!isEmpty || reconciled.prompts.length > 0) && (
+      {(!isEmpty || reconciled.prompts.length > 0 || unattachedSurfaces.length > 0) && (
         <ThreadPrimitive.Viewport className="aui-thread-viewport">
           <ThreadPrimitive.Messages components={{ Message: MyMessage }} />
+          {unattachedSurfaces.map((surface) => (
+            <A2uiSurfaceCard
+              key={`${surface.surfaceId}:${surface.publishSeq}`}
+              surface={surface}
+              agentName={agentName}
+              sessionId={sessionId}
+            />
+          ))}
           {reconciled.prompts.map((prompt) => (
             <div key={prompt.id} className="aui-message aui-user-message aui-queued-message">
               <div className="aui-message-content">{prompt.text}</div>

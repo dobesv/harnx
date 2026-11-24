@@ -12,7 +12,6 @@ use crate::bash_provider::{BashEvalContextSlot, BashProvider};
 use harnx_core::{
     abort::{create_abort_signal, AbortSignal},
     attachments::cid_for_data_url_with_session,
-    hooks::{HookOutcome, HookResult, HookResultControl},
     instance::ServerScope,
     partial_result::{error_with_partial_result, partial_result_of},
     tool::{ToolError, ToolProvider, ToolProviderOutput},
@@ -149,11 +148,33 @@ fn harness_with_post_hook(
         base_providers: vec![Arc::new(FakeTool { value, fail })],
         slot: Some(slot.clone()),
         payload_limit: None,
-        operator_inner_consent: false,
+        script_outputs: Default::default(),
+        full_payload: true,
     })
     .with_attachment_fetcher(fetcher)
     .with_media_store(store);
+    let middleware_fn: Option<Arc<harnx_engine::tool::ToolMiddlewareFn>> =
+        mutation.map(|mutated| {
+            let middleware: Arc<harnx_engine::tool::ToolMiddlewareFn> =
+                Arc::new(move |prep, _origin, next| {
+                    let mutated = mutated.clone();
+                    Box::pin(async move {
+                        let _ = next(prep.arguments).await?;
+                        Ok(harnx_engine::tool::ToolMiddlewareOutcome::Completed(
+                            harnx_engine::tool::MaterializedToolResult::new(
+                                harnx_core::tool::ToolResult::new(prep.call.clone(), mutated),
+                                harnx_engine::tool::InnerToolCallStatus::Ok,
+                            ),
+                        ))
+                    })
+                });
+            middleware
+        });
     let ctx = Arc::new(ToolEvalContext {
+        structured_results: false,
+        on_tool_call_completed: None,
+        on_interaction: None,
+        middleware_fn,
         work_boundary: None,
         instance_id: ServerScope::new(),
         tool_round: Some(1),
@@ -167,23 +188,6 @@ fn harness_with_post_hook(
         emit_tool_blocked_fn: Arc::new(|_, _| {}),
         emit_tool_update_fn: Arc::new(|_, _| {}),
         confirm_tool_use_fn: Arc::new(|_, _, _| panic!("no confirmation expected")),
-        dispatch_hook_fn: Arc::new(move |event| {
-            let mutated_tool_response =
-                if matches!(event, harnx_core::hooks::HookEvent::PostToolUse { .. }) {
-                    mutation.clone()
-                } else {
-                    None
-                };
-            Box::pin(async move {
-                HookOutcome {
-                    control: HookResultControl::Continue,
-                    result: HookResult {
-                        mutated_tool_response,
-                        ..Default::default()
-                    },
-                }
-            })
-        }),
         prepare_handoff_fn: None,
     });
     slot.set(&ctx);

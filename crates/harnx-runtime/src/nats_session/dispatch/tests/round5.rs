@@ -90,6 +90,7 @@ async fn freeze_candidate_before_recontent(
     // A busy reserve leaves candidate P/X while its caller holds the frozen X snapshot.
     let entries = session.load_durable_entries().await?;
     let authority = AdmissionAuthority::Inherited {
+        detached: false,
         parent: f.parent.clone(),
         edge: InvocationEdgeKind::Delegation,
         admitted_at: f.parent.admitted_at,
@@ -158,5 +159,58 @@ async fn late_steering_recovery_replays_a_row_committed_by_a_competing_retry() -
     let replay = steering.append_user_content(text("changed retry")).await?;
     assert_eq!(replay, delivered);
     assert_eq!(session.load_durable_entries().await?.len(), entries.len());
+    Ok(())
+}
+
+async fn coordinated_steer(
+    session: &NatsSession,
+    content: &str,
+) -> Result<crate::nats_session::AppendedPrompt> {
+    let input = crate::config::Input::new(
+        content.to_owned(),
+        (content.to_owned(), vec![]),
+        Default::default(),
+    );
+    session
+        .clone()
+        .with_external_admission()
+        .with_admission_id("steer-m".into())
+        .admit_input_steered(&input, "original")
+        .await
+}
+
+/// The coordinated steering path (A2A issue #2774) replays a committed
+/// same-id row only when the retry's content matches it: the frontend's
+/// changed-parts check lives in its dedupe mapping, which is written after
+/// the row, so a retry that arrives while the mapping is absent (a failed
+/// write, or the documented append-before-mapping crash window) must not be
+/// answered with — or recorded against — a row the caller never sent.
+#[tokio::test]
+async fn coordinated_steering_replay_refuses_a_changed_same_id_retry() -> Result<()> {
+    let f = Fixture::new().await?;
+    let session = f.session("steer-content", "original").await?;
+    session
+        .append_dispatch_content(text("original work"))
+        .await?;
+    let delivered = coordinated_steer(&session, "first parts").await?;
+    // A same-content retry replays the committed row.
+    let replay = coordinated_steer(&session, "first parts").await?;
+    assert_eq!(replay.user_msg_seq(), delivered.user_msg_seq());
+    // A changed retry under the same admission id is refused, not replayed.
+    let changed = coordinated_steer(&session, "changed parts")
+        .await
+        .unwrap_err();
+    assert!(
+        changed
+            .downcast_ref::<crate::nats_session::SteeredContentMismatch>()
+            .is_some(),
+        "a changed same-id retry must surface the typed content mismatch: {changed:#}"
+    );
+    let entries = session.load_durable_entries().await?;
+    assert_eq!(
+        user_messages(&entries, "steer-m"),
+        vec![&text("first parts")],
+        "no second row for the changed retry"
+    );
     Ok(())
 }

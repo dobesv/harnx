@@ -75,6 +75,7 @@ impl Publisher {
             warn!(%task_id, %error, "A2A final artifact persistence failed");
         }
     }
+    // qual:allow(iosp) reason: "Settlement reads the steered-extended completion proof, the cancel intent and the output limit before choosing one status; splitting scatters the decision inputs."
     async fn persist_failure_status(&mut self) -> Result<()> {
         let ticket = self.authority.ticket(&self.storage_key)?;
         let completed = self.session.fixed_prompt_completion(&ticket).await?;

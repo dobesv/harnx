@@ -32,6 +32,24 @@ mod completion;
 use completion::completion;
 
 pub const DEADLINE: Duration = Duration::from_secs(120);
+
+/// Wait until the fake LLM has recorded `count` requests. Each request
+/// notifies [`Llm::requested`], so this is deterministic even while rounds
+/// are held at the model seam: it is the way to release one held round and
+/// prove the next round's request registered before releasing it again (a
+/// `notify_one` permit does not stack, so back-to-back releases can be
+/// consumed by the wrong round).
+pub async fn llm_requested_count(h: &Harness, count: usize) -> anyhow::Result<()> {
+    loop {
+        if h.llm.requests.lock().len() >= count {
+            return Ok(());
+        }
+        tokio::time::timeout(DEADLINE, h.llm.requested.notified())
+            .await
+            .map_err(|_| anyhow::anyhow!("model round {count} never started"))?;
+    }
+}
+
 pub fn alice() -> Principal {
     Principal::User("alice".into())
 }
@@ -192,7 +210,41 @@ pub enum Script {
     Tool,
     SerialTool,
     SameRoundTools,
+    /// Counted bash_exec rounds with every non-counted round held at the model
+    /// seam. Only the unix-gated e2e replica tests construct it, so the other
+    /// platforms would otherwise flag the variant as never constructed.
+    #[cfg_attr(not(unix), allow(dead_code))]
     CountedTool,
+    Steering,
+    /// Steering with the root answer round and the steered continuation
+    /// round both held at the model seam: the root round's TurnEnd lands
+    /// while the steered row is still owed, so tests can place owner loss,
+    /// cancel intent or takeover inside the steered drain window. The
+    /// continuation answers with distinct text so recovery can be proven to
+    /// extract the steered answer, not the root round's. Only the
+    /// fault-injection multi-replica supervision tests construct it.
+    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
+    SteeringHeld,
+    /// Steering whose steered continuation round fails at the provider: the
+    /// root round answers plain text and holds, then the continuation
+    /// request answers HTTP 400 so the steered drain ends in a durable
+    /// Error.
+    SteeringFail,
+    /// Steering whose steered continuation round asks for HITL approval:
+    /// the root round answers plain text and holds while the test steers,
+    /// the continuation round issues a bash_exec call the confirmation
+    /// middleware parks, and the round after the approval answers plain
+    /// text so the steered drain completes with a distinguishable answer.
+    SteeringApproval,
+    ReadOnlyTool,
+    A2uiTool,
+    A2uiSerial,
+    A2uiSameRound,
+    ConfirmTool,
+    ConfirmHeld,
+    ConfirmSerial,
+    ConfirmSameRound,
+    ShippedDaedalus,
     Fail,
     Many,
     Large,
@@ -228,6 +280,7 @@ fn test_logs() -> Logs {
     let logs = Logs::default();
     let writer = logs.clone();
     tracing_subscriber::fmt()
+        .json()
         .with_max_level(tracing::Level::INFO)
         .with_ansi(false)
         .with_writer(move || writer.clone())
@@ -235,7 +288,6 @@ fn test_logs() -> Logs {
         .expect("test tracing subscriber");
     logs
 }
-
 async fn start_llm(
     script: Script,
 ) -> Result<(Arc<Llm>, std::net::SocketAddr, AbortOnDropHandle<()>)> {
@@ -319,7 +371,17 @@ fn write_fixture_support_configs(
     if matches!(script, Script::Large | Script::Boundary | Script::Overflow) {
         config_yaml.push_str("loop_detection:\n  output: false\n");
     }
-    if script == Script::CountedTool {
+    if matches!(
+        script,
+        Script::CountedTool
+            | Script::Steering
+            | Script::SteeringApproval
+            | Script::ConfirmTool
+            | Script::ConfirmHeld
+            | Script::ConfirmSerial
+            | Script::A2uiTool
+            | Script::A2uiSerial
+    ) {
         write_counted_tool_config(dir)?;
     }
     std::fs::write(dir.join("config.yaml"), config_yaml)?;
@@ -342,21 +404,51 @@ fn write_same_round_tools_agent(dir: &std::path::Path) -> Result<String> {
                 .context("time tool path")?
         ),
     )?;
-    let hook = binary("harnx-claude-compatible-hook-server")?;
-    let command = shell_words::join([hook.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^time_get_current_time$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve time lookup?\"}}"]);
-    Ok(format!("---\nmodel: mock:test\nuse_tools: [time_get_current_time]\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest same-round approvals\n"))
+    let middleware = serde_json::json!([{
+        "name": "confirmation",
+        "match": "^time_get_current_time$",
+        "bash": "if confirm --id first 'Approve time lookup?'; then next; else reason=\"$(answer first | jq -r '.note // empty')\"; deny \"${reason:-Denied by user}\"; fi",
+    }]);
+    Ok(format!("---\nmodel: mock:test\nuse_tools: [time_get_current_time]\nmiddleware: {middleware}\n---\nTest same-round approvals\n"))
 }
 
 fn write_tool_handoff_agent() -> Result<String> {
-    let binary = binary("harnx-claude-compatible-hook-server")?;
-    let command = shell_words::join([binary.to_str().context("hook path encoding")?, "--event", "PreToolUse", "--matcher", "^target_session_handoff$", "--jaq", "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Approve handoff?\"}}"]);
-    Ok(format!("---\nmodel: mock:test\nuse_tools:\n- target_session_handoff\nhooks:\n  entries:\n    - command: {command:?}\n---\nTest runner agent\n"))
+    let middleware = serde_json::json!([{
+        "name": "confirmation",
+        "match": "^target_session_handoff$",
+        "bash": "if confirm --id first 'Approve handoff?'; then next; else reason=\"$(answer first | jq -r '.note // empty')\"; deny \"${reason:-Denied by user}\"; fi",
+    }]);
+    Ok(format!("---\nmodel: mock:test\nuse_tools:\n- target_session_handoff\nmiddleware: {middleware}\n---\nTest runner agent\n"))
 }
 
+#[path = "support/a2ui.rs"]
+pub(crate) mod a2ui;
+#[path = "support/interaction.rs"]
+mod interaction;
+
 fn fixture_agent_content(script: Script, dir: &std::path::Path) -> Result<String> {
-    if script == Script::CountedTool {
+    if let Some(agent) = interaction::agent(script, dir)? {
+        return Ok(agent);
+    }
+    if matches!(script, Script::CountedTool | Script::Steering) {
         return Ok(
             "---\nmodel: mock:test\nuse_tools: [bash_exec]\n---\nTest counted tool agent\n".into(),
+        );
+    }
+    if script == Script::ReadOnlyTool {
+        std::fs::create_dir_all(dir.join("tool_servers"))?;
+        std::fs::write(
+            dir.join("tool_servers/time.yaml"),
+            format!(
+                "command: {:?}\n",
+                binary("harnx-time-tools")?
+                    .to_str()
+                    .context("time tool path")?
+            ),
+        )?;
+        return Ok(
+            "---\nmodel: mock:test\nuse_tools: [time_get_current_time]\nmiddleware:\n- name: pass\n  match: '^time_get_current_time$'\n  bash: next\n---\nTest runner agent\n"
+                .into(),
         );
     }
     if script == Script::SameRoundTools {
@@ -380,6 +472,10 @@ fn fixture_config(
     std::fs::write(
         dir.join("agents/target.md"),
         "---\nmodel: mock:test\n---\nHandoff target\n",
+    )?;
+    std::fs::write(
+        dir.join("agents/atlas.md"),
+        "---\nmodel: mock:test\n---\nAtlas target\n",
     )?;
     let config = Arc::new(ConfigLock::new(Config::load_from_file(
         &dir.join("config.yaml"),

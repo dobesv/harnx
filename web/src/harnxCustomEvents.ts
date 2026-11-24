@@ -4,6 +4,8 @@ import type { ToolCallUpdatePatch } from './toolUpdates';
 import { parseToolUpdateEvent } from './toolUpdates';
 import { parseCompactionMetadata, type CompactionMetadata } from './compactionMetadata';
 export { parseCompactionMetadata } from './compactionMetadata';
+import type { A2uiSurfaceEvent, A2uiSurfaceResolution } from './a2ui/surfaceState';
+export type { A2uiSurfaceEvent, A2uiSurfaceResolution } from './a2ui/surfaceState';
 
 /**
  * Internal Harnx control and metadata events that drive navigation, sequencing,
@@ -21,7 +23,21 @@ export const NAVIGATION_CONTROL_EVENTS = [
   'session_compacting_started',
   'session_compacting_completed',
   'session_compacting_failed',
+  'pending_interaction',
+  'a2ui_surface',
 ] as const;
+
+export interface PendingInteraction {
+  interactionId: string;
+  requestSeq: number;
+  toolCallId: string;
+  kind: string;
+  message: string;
+  pendingCount: number;
+  payload?: unknown;
+  /** Present for `url` interactions: the https or loopback-http link the user opens (decision 6). */
+  url?: string;
+}
 
 export interface MessageAttachmentMeta {
   partIndex: number;
@@ -55,6 +71,10 @@ export interface HarnxCustomEventCallbacks {
   onSessionCompaction?: (compaction: CompactionMetadata | null) => void;
   /** Called when a tool_update CUSTOM event is received. */
   onToolUpdate?: (patch: ToolCallUpdatePatch) => void;
+  /** Called when a pending_interaction CUSTOM event is received (or null to clear). */
+  onPendingInteraction?: (interaction: PendingInteraction | null) => void;
+  /** Called when an a2ui_surface CUSTOM event is received. */
+  onA2uiSurface?: (surface: A2uiSurfaceEvent) => void;
   /** Called when turn_interrupted is received. */
   onTurnInterrupted?: () => void;
   /**
@@ -166,6 +186,124 @@ function parseCompactionOutcome(value: unknown): CompactionOutcome | undefined {
   return undefined;
 }
 
+export function parsePendingInteraction(value: unknown): PendingInteraction | null | undefined {
+  if (value === null) return null;
+  if (typeof value !== 'object') return undefined;
+  const rec = value as Record<string, unknown>;
+  const interactionId = nonBlankString(rec.interaction_id);
+  const toolCallId = nonBlankString(rec.tool_call_id);
+  const kind = typeof rec.kind === 'string' && rec.kind.trim().length > 0 ? rec.kind : undefined;
+  const message = typeof rec.message === 'string' ? rec.message : undefined;
+  const requestSeq = validSeq(rec.request_seq) && rec.request_seq > 0 ? rec.request_seq : undefined;
+  const pendingCount =
+    typeof rec.pending_count === 'number' &&
+    Number.isSafeInteger(rec.pending_count) &&
+    rec.pending_count >= 0
+      ? rec.pending_count
+      : undefined;
+
+  if (
+    interactionId !== undefined &&
+    toolCallId !== undefined &&
+    kind !== undefined &&
+    message !== undefined &&
+    requestSeq !== undefined &&
+    pendingCount !== undefined
+  ) {
+    const interaction: PendingInteraction = {
+      interactionId,
+      requestSeq,
+      toolCallId,
+      kind,
+      message,
+      pendingCount,
+    };
+    if (rec.payload !== undefined) {
+      interaction.payload = rec.payload;
+    }
+    if (kind === 'url' && typeof rec.url === 'string' && rec.url.length > 0) {
+      interaction.url = rec.url;
+    } else if (kind === 'url') {
+      const payloadUrl = eventRecord(rec.payload).url;
+      if (typeof payloadUrl === 'string' && payloadUrl.length > 0) {
+        interaction.url = payloadUrl;
+      }
+    }
+    return interaction;
+  }
+  return undefined;
+}
+
+export function parseA2uiSurface(value: unknown): A2uiSurfaceEvent | undefined {
+  if (value === null || typeof value !== 'object') return undefined;
+  const rec = value as Record<string, unknown>;
+  const surfaceId = nonBlankString(rec.surface_id);
+  const publishSeq =
+    typeof rec.publish_seq === 'number' &&
+    Number.isSafeInteger(rec.publish_seq) &&
+    rec.publish_seq > 0
+      ? rec.publish_seq
+      : undefined;
+
+  if (surfaceId === undefined || publishSeq === undefined) {
+    return undefined;
+  }
+
+  const toolCallId = nonBlankString(rec.tool_call_id);
+  const payload = rec.payload;
+
+  let action: A2uiSurfaceResolution | null | undefined = undefined;
+
+  if (rec.action !== undefined) {
+    if (rec.action === null) {
+      action = null;
+    } else if (typeof rec.action === 'object') {
+      const actRec = rec.action as Record<string, unknown>;
+      const actionName = nonBlankString(actRec.action);
+      if (actionName) {
+        action = {
+          action: actionName,
+          visibility: nonBlankString(actRec.visibility),
+          noteText: nonBlankString(actRec.note_text ?? actRec.noteText),
+        };
+      }
+    } else if (typeof rec.action === 'string' && rec.action.trim().length > 0) {
+      action = {
+        action: rec.action.trim(),
+        visibility: nonBlankString(rec.visibility),
+        noteText: nonBlankString(rec.note_text ?? rec.noteText),
+      };
+    }
+  } else if (typeof rec.action === 'string' && (rec.action as string).trim().length > 0) {
+    action = {
+      action: (rec.action as string).trim(),
+      visibility: nonBlankString(rec.visibility),
+      noteText: nonBlankString(rec.note_text ?? rec.noteText),
+    };
+  }
+
+  // Must carry either payload or action resolution to be a valid surface event
+  if (payload === undefined && action === undefined) {
+    return undefined;
+  }
+
+  const result: A2uiSurfaceEvent = {
+    surfaceId,
+    publishSeq,
+  };
+  if (toolCallId !== undefined) {
+    result.toolCallId = toolCallId;
+  }
+  if (payload !== undefined) {
+    result.payload = payload;
+  }
+  if (action !== undefined) {
+    result.action = action;
+  }
+
+  return result;
+}
+
 const handlers: Record<string, CustomEventHandler> = {
   status: (callbacks, value) => callbacks.onStatus(stringField(value, 'text') || null),
   usage: (callbacks, value) => {
@@ -236,6 +374,18 @@ const handlers: Record<string, CustomEventHandler> = {
   tool_update: (callbacks, value) => {
     const patch = parseToolUpdateEvent(value);
     if (patch) callbacks.onToolUpdate?.(patch);
+  },
+  pending_interaction: (callbacks, value) => {
+    const parsed = parsePendingInteraction(value);
+    if (parsed !== undefined) {
+      callbacks.onPendingInteraction?.(parsed);
+    }
+  },
+  a2ui_surface: (callbacks, value) => {
+    const parsed = parseA2uiSurface(value);
+    if (parsed) {
+      callbacks.onA2uiSurface?.(parsed);
+    }
   },
   turn_interrupted: (callbacks) => {
     callbacks.onTurnInterrupted?.();

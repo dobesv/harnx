@@ -1,13 +1,10 @@
 //! Resolve replies before orphan reconciliation can treat a parked task as lost.
 use super::*;
-use crate::{
-    hitl::{parse_reply, render_unrecognized, ReplyParse},
-    store::{
-        context::{ActiveTask, AuthorityError, HitlCheckpoint, HitlPhase},
-        DedupeEntry, StoreError,
-    },
+use crate::store::{
+    context::{ActiveTask, AuthorityError, HitlCheckpoint, HitlPhase},
+    DedupeEntry, StoreError,
 };
-use a2a_lf::{Part, TaskState};
+use a2a_lf::TaskState;
 use harnx_runtime::{ApprovalRef, PromptProgress};
 
 mod dedupe;
@@ -78,16 +75,23 @@ impl HarnxHandler {
             request: checkpoint.request.clone(),
             boundary: active.snapshot.stream_seq,
         };
-        if matches!(
-            parse_reply(&request.message.parts),
-            ReplyParse::Unrecognized
-        ) {
+        let session = self.session(owner, Some(local_id)).await?;
+        if let Err(error) = crate::hitl::interaction::parse_response(
+            &session,
+            &bound.request,
+            &request.message.parts,
+        )
+        .await
+        {
+            if !error.is::<crate::hitl::interaction::InvalidReply>() {
+                return Err(map_error(error));
+            }
             let candidate = ReplyCandidate {
                 storage: &storage,
                 active,
             };
             return self
-                .unrecognized_reply(owner, local_id, candidate)
+                .unrecognized_reply(owner, local_id, candidate, &error.to_string())
                 .await
                 .map(Some);
         }

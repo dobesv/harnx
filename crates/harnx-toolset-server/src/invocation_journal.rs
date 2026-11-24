@@ -236,6 +236,38 @@ impl InvocationJournal {
         Ok(found)
     }
 
+    /// Exact lookup for a single physical invocation row by session, round,
+    /// transcript tool call ID, and physical wire invocation ID.
+    pub async fn exact(
+        &self,
+        session: &str,
+        round: u64,
+        tool_call_id: &str,
+        physical_id: &str,
+    ) -> Result<Option<RecordedInvocation>> {
+        let key = format!(
+            "{}.{round}.{}.{}",
+            session_prefix(session),
+            token(tool_call_id),
+            token(physical_id),
+        );
+        let record = self.read(&key).await?.filter(|record| {
+            record.answers(round, tool_call_id) && record.request.call_id == physical_id
+        });
+        Ok(record)
+    }
+
+    /// Alias for [`InvocationJournal::exact`].
+    pub async fn find_exact(
+        &self,
+        session: &str,
+        round: u64,
+        tool_call_id: &str,
+        physical_id: &str,
+    ) -> Result<Option<RecordedInvocation>> {
+        self.exact(session, round, tool_call_id, physical_id).await
+    }
+
     /// Every row this session holds.
     ///
     /// A row that will not deserialize is skipped with a warning: it cannot

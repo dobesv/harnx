@@ -2,7 +2,7 @@
 role: subagent
 model: bedrock:us.zai.glm-5.3
 model_fallbacks:
-- gemini:gemini-3.8-flash
+- gemini:gemini-4-hydrogen
 - codex:gpt-6.1-terra
 - openai:gpt-6.1-terra
 - claude:claude-sonnet-5-5
@@ -37,7 +37,7 @@ description: "Repository knowledge curator \u2014 reconciles verified learnings 
   \ current docs, scoped instructions, code comments, or tests so future\
   \ work can retrieve them. Named after Mnemosyne (neh-MOZ-ih-nee), Titan of Memory\
   \ and mother of the Muses.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

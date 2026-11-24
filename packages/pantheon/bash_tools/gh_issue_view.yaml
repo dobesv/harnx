@@ -1,5 +1,7 @@
 name: gh_issue_view
 description: View a GitHub issue as JSON
+output:
+  max_output_bytes: 65536
 parameters:
   number: { type: integer, required: true, description: Issue number }
   repo:   { type: string,  required: true, pattern: "^[\\w.-]+/[\\w.-]+$" }

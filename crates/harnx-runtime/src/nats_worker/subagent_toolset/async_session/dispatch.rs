@@ -55,10 +55,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
 ) -> Result<(DispatchedPrompt, Option<ResolvedWait>), ToolInvokeError> {
     let (args, wait) = parse_send_args(arguments).map_err(ToolInvokeError::Recoverable)?;
     let inherited = validate_send_context(&args, &context)?;
-    let budget = wait.as_ref().map_or(
-        super::super::session_read::DEFAULT_MAX_OUTPUT_BYTES as usize,
-        |wait| wait.read.max_output_bytes,
-    );
+    let budget = super::RESULT_MAX_BYTES;
     let requested_id = normalize_session_id(args.session_id.clone());
     // New IDs are six ASCII bytes. Include the diagnostic invocation identity
     // in preflight; Task1's handle-only reservation intentionally omits it.
@@ -70,15 +67,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
     check_cancel(&cancel)?;
     let session = checkpointed_session(toolset, &args, &inherited.parent_key, &context).await?;
     ensure_receipt_fits(session.session_id(), &context.call_id, budget)?;
-    let session = session
-        .with_inherited_admission(
-            inherited.parent.clone(),
-            context.call_id.clone(),
-            inherited.admitted_at,
-            InvocationEdgeKind::Delegation,
-            args.timeout_secs,
-        )
-        .with_execution_parent(inherited.parent_key.clone(), context.call_id.clone());
+    let session = inherited.admit_detached(session, &context, args.timeout_secs);
     // Replayed delivery never re-fetches attachments or replaces original
     // content, even if the referenced resource disappeared after admission.
     // A joined-dispatch record is authoritative here, including over a
@@ -111,8 +100,8 @@ pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
     };
     check_cancel(&cancel)?;
     record_child(toolset, &context, session.session_id()).await?;
-    // Parent observer cancellation is deliberately not installed on the child.
-    // Explicit parent cancellation and hard deadlines retain worker authority.
+    // Parent interruption and observer cancellation do not stop detached work.
+    // Explicit session_cancel and inherited hard deadlines still stop the child.
     let prompt = session
         .append_dispatch_content(content)
         .await
@@ -145,6 +134,26 @@ struct InheritedDispatch {
     parent_key: String,
     parent: RunLimitsRecord,
     admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl InheritedDispatch {
+    fn admit_detached(
+        &self,
+        session: NatsSession,
+        context: &ToolInvocationContext,
+        timeout_secs: Option<u64>,
+    ) -> NatsSession {
+        session
+            .with_inherited_admission(
+                self.parent.clone(),
+                context.call_id.clone(),
+                self.admitted_at,
+                InvocationEdgeKind::Delegation,
+                timeout_secs,
+            )
+            .with_detached_admission()
+            .with_execution_parent(self.parent_key.clone(), context.call_id.clone())
+    }
 }
 
 /// A joined-dispatch record is the caller's immutable dispatch identity. The
@@ -222,23 +231,21 @@ fn ensure_receipt_fits(
     budget: usize,
 ) -> Result<(), ToolInvokeError> {
     let receipt = SessionPromptResult {
-        session_id: session_id.into(),
-        prompt_id: prompt_id.into(),
         invocation_id: Some(prompt_id.into()),
         dispatch: Some(DispatchConfirmation::Unconfirmed),
         status: SessionPromptStatus::Cancelled,
-        terminal: false,
-        wait_expired: false,
-        stopped_by: None,
         elapsed_ms: u64::MAX,
-        output: Value::Null,
+        ..SessionPromptResult::empty(&super::PromptHandle {
+            session_id: session_id.into(),
+            prompt_id: prompt_id.into(),
+        })
     };
     let size = serde_json::to_vec(&receipt)
         .map_err(|error| ToolInvokeError::Fatal(error.to_string()))?
         .len();
     if size > budget {
         return Err(ToolInvokeError::Recoverable(format!(
-            "dispatch result metadata ({size} bytes) exceeds max_output_bytes budget {budget}"
+            "dispatch result metadata ({size} bytes) exceeds the {budget} byte result budget"
         )));
     }
     Ok(())

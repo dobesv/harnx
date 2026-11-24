@@ -205,9 +205,10 @@ mod stored {
         let Some((_server, js)) = setup().await? else {
             return Ok(());
         };
-        let medium_image = json!({"type": "image", "data": STANDARD.encode(vec![0; 15000]), "mimeType": "image/png"});
-        let medium_text = json!({"type": "text", "text": "x".repeat(20000)});
-        let large_image = json!({"type": "image", "data": STANDARD.encode(vec![0; 40000]), "mimeType": "image/png"});
+        let medium_image = json!({"type": "image", "data": STANDARD.encode(vec![0; DEFAULT_MAX_RESULT_BYTES / 2]), "mimeType": "image/png"});
+        let medium_text =
+            json!({"type": "text", "text": "x".repeat(DEFAULT_MAX_RESULT_BYTES * 2 / 3)});
+        let large_image = json!({"type": "image", "data": STANDARD.encode(vec![0; DEFAULT_MAX_RESULT_BYTES * 2]), "mimeType": "image/png"});
         for parts in [
             vec![medium_image, medium_text.clone()],
             vec![large_image, medium_text.clone(), medium_text],

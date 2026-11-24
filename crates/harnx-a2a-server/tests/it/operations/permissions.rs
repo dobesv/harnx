@@ -175,6 +175,7 @@ async fn backend_permissions_flow() -> Result<()> {
         fingerprint: "fp-1".into(),
         message: msg,
         allocation: allocation.clone(),
+        principals: None,
     };
 
     let (winner, is_new) = store
@@ -233,52 +234,54 @@ async fn backend_permissions_flow() -> Result<()> {
         error_rx.try_recv().is_err(),
         "no server error before negative consumer-create test"
     );
-    client
-        .publish(
-            "$JS.API.CONSUMER.CREATE.WORK_NOTIFY_runner.workers",
-            "{}".into(),
-        )
-        .await?;
-    client.flush().await?;
-
-    let violation = tokio::time::timeout(Duration::from_secs(5), error_rx.recv())
-        .await?
-        .context("consumer create violation event")?;
-    assert!(
-        violation.contains("Permissions Violation"),
-        "expected Permissions Violation for consumer create, got: {violation}"
-    );
+    expect_permissions_violation(
+        &client,
+        &mut error_rx,
+        "$JS.API.CONSUMER.CREATE.WORK_NOTIFY_runner.workers",
+        "{}",
+    )
+    .await?;
 
     // 8. Negative: Backend attempting to delete a stream
-    client
-        .publish(
-            format!("$JS.API.STREAM.DELETE.{TASK_STREAM_NAME}"),
-            "{}".into(),
-        )
-        .await?;
-    client.flush().await?;
-    let violation2 = tokio::time::timeout(Duration::from_secs(5), error_rx.recv())
-        .await?
-        .context("stream delete violation event")?;
-    assert!(
-        violation2.contains("Permissions Violation"),
-        "expected Permissions Violation for stream delete, got: {violation2}"
-    );
+    expect_permissions_violation(
+        &client,
+        &mut error_rx,
+        format!("$JS.API.STREAM.DELETE.{TASK_STREAM_NAME}"),
+        "{}",
+    )
+    .await?;
 
     // 9. Negative: Backend attempting unapproved subject
-    client
-        .publish("unapproved.arbitrary.subject", "denied".into())
-        .await?;
-    client.flush().await?;
-    let violation3 = tokio::time::timeout(Duration::from_secs(5), error_rx.recv())
-        .await?
-        .context("unapproved subject violation event")?;
-    assert!(
-        violation3.contains("Permissions Violation"),
-        "expected Permissions Violation for unapproved subject, got: {violation3}"
-    );
+    expect_permissions_violation(
+        &client,
+        &mut error_rx,
+        "unapproved.arbitrary.subject",
+        "denied",
+    )
+    .await?;
 
     lease.release().await?;
+    Ok(())
+}
+
+/// Publish to a forbidden subject and assert the broker answers with a
+/// permissions-violation event for it.
+async fn expect_permissions_violation(
+    client: &async_nats::Client,
+    error_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    subject: impl Into<String>,
+    payload: &'static str,
+) -> Result<()> {
+    let subject = subject.into();
+    client.publish(subject.clone(), payload.into()).await?;
+    client.flush().await?;
+    let violation = tokio::time::timeout(Duration::from_secs(5), error_rx.recv())
+        .await?
+        .context("permissions violation event")?;
+    assert!(
+        violation.contains("Permissions Violation"),
+        "expected Permissions Violation for {payload} on {subject:?}, got: {violation}"
+    );
     Ok(())
 }
 

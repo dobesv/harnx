@@ -29,8 +29,10 @@ Harnx can load environment variables from a `.env` file located in the data dire
 - **HARNX_TERMINAL_STATUS**: Enable/disable terminal status emission via OSC escape codes (boolean). Defaults to `true`. Set to `0` or `false` to disable. Emission is also suppressed when stdout is not a TTY, `TERM=dumb`, or `CI` is set. See [Configuration Guide](configuration-guide.md#terminal-status) for details on terminal support.
 - **HARNX_LOOP_DETECTION**: Enable/disable loop detection (boolean). Defaults to `true`. Set to `0` or `false` to turn off both guards: the one for repeated identical tool calls (`loop_detection.tool_calls`) and the one for repeated output (`loop_detection.output`). It sets the global values, so an agent whose front matter sets either key to `true` keeps that guard on. See [Configuration Guide](configuration-guide.md#loop-detection).
 - **HARNX_SERVE_ADDR**: The address to serve the API on.
+- **HARNX_HEALTHZ_ADDR**: Optional readiness listener address for long-running harnx binaries that support `--healthz-addr` (including `harnx-a2a-server`); `--healthz-addr` takes precedence. See [health checks](healthz.md).
 - **HARNX_SERVE_PUBLIC_URL**: The URL a browser uses to reach harnx-serve's Web UI, such as `https://harnx.example.com` (config key `serve_public_url`, flag `harnx-serve --public-url`). harnx-serve records each session's Web UI address from it, replacing addresses it inferred earlier. Workers also read this setting to record `web_session_url` for sessions they execute (such as handoffs, sub-agents, and A2A tasks) when no address exists yet. Unset, harnx-serve infers the address from each request's `X-Forwarded-Host`, `X-Forwarded-Proto` and `Host` headers, while workers record nothing. See [Session properties](nats-ha.md#session-properties).
-- **HARNX_SERVE_USER_ID_SOURCES**: Comma-separated list of request identity sources for `harnx-serve` (e.g. `header:X-Forwarded-User,cookie:session_user`). First present source wins. Overridden by CLI `--user-id-source` flags.
+- **HARNX_SERVE_USER_ID_SOURCES**: Comma-separated list of request identity sources for `harnx-serve` (e.g. `header:X-Forwarded-User,cookie:session_user`). `header:NAME` and bare `NAME` keep one opaque field; `header-csv:NAME` selects the first quoted-list item (legacy first-item behavior). First present source wins. Overridden by CLI `--user-id-source` flags.
+- **HARNX_SERVE_GROUP_HEADERS**, **HARNX_SERVE_ROLE_HEADERS**: Comma-separated header specs for trusted memberships. `header:NAME` or bare `NAME` keeps each field as one opaque membership; `header-csv:NAME` parses every quoted-list item. **Migration:** Replace `X-Groups` with `header-csv:X-Groups` if a proxy sends comma-separated groups (similarly for roles). Overridden by CLI `--group-header` / `--role-header`. See [Group and Role Memberships](configuration-guide.md#group-and-role-memberships) for DN quoting examples.
 - **HARNX_USER_AGENT**: The user agent string for API requests.
 - **HARNX_USER_ID**: Global default user identity string stored with new sessions when no request identity or cluster default is set. Also read from `.env`.
 - **HARNX_SAVE_SHELL_HISTORY**: Whether to save shell history (boolean).
@@ -73,16 +75,18 @@ Harnx can load environment variables from a `.env` file located in the data dire
 
 Every binary in this repo reads the same five variables, and every one of them
 is inherited by child processes — so setting `HARNX_LOG_LEVEL=debug` once raises
-the level for the front-end, the worker, and every tool and hook server it
+the level for the front-end, the worker, and every tool server it
 starts.
 
 - **HARNX_LOG_LEVEL**: `off`, `error`, `warn`, `info`, `debug`, or `trace`.
   Default `info`. Falls back to a bare level in `RUST_LOG` if unset.
 - **HARNX_LOG_FORMAT**: `text` (default) or `json`. JSON writes one object per
-  line: `{"ts","level","pid","target","message"}`. Parse the log leniently:
-  it also collects raw bytes from subprocesses that know nothing about the
-  format — `nats-server`'s startup banner, a panic message, a wrapped MCP
-  server's stderr.
+  line, normally `{"ts","level","pid","target","message"}`.
+  `harnx-a2a-server` tracing events use `{"timestamp","level","target","fields"}`
+  so request metadata remains structured; `fields.message` contains the event
+  text. Parse the log leniently: it also collects raw bytes from subprocesses
+  that know nothing about the format — `nats-server`'s startup banner, a panic
+  message, a wrapped MCP server's stderr.
 - **HARNX_LOG_FILTER**: Only log records whose target starts with this prefix.
   Default `harnx`, which matches every `harnx_*` crate. Narrow it to one crate
   with e.g. `HARNX_LOG_FILTER=harnx_mcp_bridge`.
@@ -97,7 +101,7 @@ starts.
 `harnx` owns the terminal, so it writes to a file; log lines on the terminal
 would overwrite the TUI and corrupt piped output from a one-shot invocation.
 
-Every other binary — `harnx-serve`, `harnx-worker`, the tool and hook servers,
+Every other binary — `harnx-serve`, `harnx-worker`, the tool servers,
 the MCP bridge — writes to **stderr** and ignores `HARNX_LOG_PATH`. Whoever
 spawned it decides where that goes, and one process per tree owns the file. In
 practice `harnx` points the worker's stdout and stderr at its own log file and
@@ -140,7 +144,7 @@ OpenTelemetry distributed tracing is off unless an OTLP endpoint environment var
 
 Prometheus metrics serving is off unless `--metrics-addr` or `HARNX_METRICS_ADDR` is set. See [Prometheus Metrics](metrics.md) for full documentation.
 
-- **HARNX_METRICS_ADDR**: Environment variable fallback for `--metrics-addr` on shared-entrypoint binaries (`harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-plans-tools`, `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, `harnx-mcp-bridge`). Address format is `IP:PORT` or `:PORT` (blank host binds `0.0.0.0`).
+- **HARNX_METRICS_ADDR**: Environment variable fallback for `--metrics-addr` on shared-entrypoint binaries (`harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-claude-hook-tools`, `harnx-plans-tools`, `harnx-mcp-remote`, `harnx-mcp-bridge`). Address format is `IP:PORT` or `:PORT` (blank host binds `0.0.0.0`).
 
 ## Tool filesystem allowlist envs
 
@@ -168,7 +172,7 @@ Variables used by `harnx-mcp-server`:
 
 ## NATS Transport Envs
 
-These are set for you in normal use. Tool and hook servers receive them from
+These are set for you in normal use. Tool servers receive them from
 whichever process launched them.
 
 - `HARNX_NATS_URL` — NATS server or cluster URL. `nats://` and `tls://` use the
@@ -183,7 +187,7 @@ whichever process launched them.
   advertises instead of adding them to the connection's server pool. Defaults to
   on for `ws://`/`wss://` URLs and off otherwise.
 - `HARNX_NATS_REPLICAS` — JetStream replica count for buckets harnx creates.
-- `HARNX_SERVER_SCOPE` — the scope a tool or hook server registers under.
+- `HARNX_SERVER_SCOPE` — the scope a tool server registers under.
 
 **Do not set `HARNX_SERVER_SCOPE` yourself unless you are deploying servers
 independently.** It namespaces every NATS subject and registry key. A worker

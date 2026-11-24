@@ -4,8 +4,8 @@ use harnx_runtime::{HitlDecisionOutcome, PromptProgress};
 
 use super::{advance, intent, target::ReplyTarget};
 use crate::{
-    runner::{authority::OwnedTask, reply_note::saved_reply_note, Runner},
-    store::context::{HitlAdvanceParams, ReplyReceipt},
+    runner::{authority::OwnedTask, Runner},
+    store::context::HitlAdvanceParams,
 };
 
 async fn prepare_and_persist_intent(
@@ -30,18 +30,22 @@ async fn deliver_and_evaluate_reply(
     target: &ReplyTarget<'_>,
     authority: &mut OwnedTask,
 ) -> Result<bool> {
-    let (receipt, note) = parse_accepted_receipt(authority)?;
-    let outcome = target
-        .session
-        .decide_hitl_approval_for(target.request, receipt.approved, note)
-        .await?;
+    let outcome = match super::super::reply_delivery::deliver_saved(target.session, authority).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            super::super::reply_delivery::reject_invalid(runner, target.session, authority, error)
+                .await?;
+            return Ok(false);
+        }
+    };
     #[cfg(feature = "fault-injection")]
     runner
         .hooks
         .checkpoint(crate::fault_injection::Boundary::HitlDecisionCommitted)
         .await;
     let ticket = authority.ticket(target.session.storage_key())?;
-    let progress = target.session.fixed_prompt_progress(&ticket).await?;
+    let progress = crate::hitl::interaction::fixed_progress(target.session, &ticket).await?;
     let evaluation = DecisionEvaluation {
         outcome: &outcome,
         progress: &progress,
@@ -98,27 +102,6 @@ async fn prepare_reply_delivery(
         checkpoint.phase != HitlPhase::Following
             && !active.snapshot.task.status.state.is_terminal(),
     )
-}
-
-fn parse_accepted_receipt(authority: &OwnedTask) -> Result<(ReplyReceipt, Option<String>)> {
-    let active = authority
-        .context
-        .document
-        .state
-        .active
-        .as_ref()
-        .context("reply task missing")?;
-    let checkpoint = active
-        .hitl_checkpoint
-        .as_ref()
-        .context("reply checkpoint missing")?;
-    let receipt = checkpoint
-        .reply
-        .as_ref()
-        .context("reply receipt missing")?
-        .clone();
-    let note = saved_reply_note(active.snapshot.task.history.as_deref(), &receipt)?;
-    Ok((receipt, note))
 }
 
 struct DecisionEvaluation<'a> {

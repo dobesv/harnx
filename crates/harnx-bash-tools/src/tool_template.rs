@@ -15,6 +15,11 @@ use serde_json::{json, Map, Value};
 
 use crate::server::{BUILTIN_TOOL_NAMES, COMMAND_TIMEOUT_ARG, COMMAND_TIMEOUT_MAX_SECS};
 
+pub(crate) mod output;
+pub(crate) mod protocol;
+use output::{add_output_controls, is_output_control, BoundTemplateArgs, TemplateOutputOptions};
+pub(crate) use protocol::ToolProtocol;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OnUserMessage {
@@ -29,12 +34,16 @@ pub struct ToolTemplate {
     pub(crate) description: Option<String>,
     #[serde(default)]
     pub(crate) parameters: BTreeMap<String, ParameterDef>,
+    #[serde(default)]
+    pub(crate) output: TemplateOutputOptions,
     pub(crate) env: Option<HashMap<String, String>>,
     pub(crate) sandbox: Option<SandboxConfig>,
     #[serde(default)]
     pub(crate) template: bool,
     #[serde(default)]
     pub(crate) on_user_message: OnUserMessage,
+    #[serde(default)]
+    pub(crate) protocol: Option<ToolProtocol>,
     pub(crate) script: String,
 }
 
@@ -64,6 +73,8 @@ impl ToolTemplate {
             }),
         );
 
+        add_output_controls(&mut properties, &self.output, self.protocol)?;
+
         Ok(json!({
             "type": "object",
             "properties": properties,
@@ -88,9 +99,10 @@ impl ToolTemplate {
     pub(crate) fn validate_and_bind(
         &self,
         args: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<HashMap<String, String>> {
+    ) -> Result<BoundTemplateArgs> {
+        let output = TemplateOutputOptions::from_args(args)?.with_defaults(&self.output);
         for name in args.keys() {
-            if !self.parameters.contains_key(name) {
+            if !self.parameters.contains_key(name) && !is_output_control(name) {
                 anyhow::bail!("unknown argument `{name}`: no parameter with that name");
             }
         }
@@ -139,7 +151,10 @@ impl ToolTemplate {
             bindings.insert(param_to_env_name(name)?, env_value);
         }
 
-        Ok(bindings)
+        Ok(BoundTemplateArgs {
+            env: bindings,
+            output,
+        })
     }
 
     pub(crate) fn render_script(&self, bound: &HashMap<String, String>) -> Result<String> {
@@ -385,6 +400,8 @@ fn default_true() -> bool {
 /// - `CDPATH`, `GLOBIGNORE`: path/glob behavior
 /// - `BASHOPTS`: shell options
 /// - `TIMEOUT_SECS`: harnx-owned command execution metadata
+/// - `HARNX_TOOL_PROTOCOL`: set by harnx for protocol templates, after the
+///   parameters, so a parameter of that name would never reach the script
 ///
 /// Anyone extending or relaxing this list must treat it as a security boundary,
 /// not an ergonomic convenience. A new entry should only be added after confirming
@@ -421,6 +438,7 @@ pub(crate) fn param_to_env_name(param: &str) -> Result<String> {
         "GLOBIGNORE",
         "BASHOPTS",
         "TIMEOUT_SECS",
+        protocol::TOOL_PROTOCOL_ENV,
     ];
     if CRITICAL_ENV_VARS.contains(&env_name.as_str()) {
         anyhow::bail!(
@@ -976,14 +994,16 @@ script: echo ok
                     .as_object()
                     .expect("arguments should be an object"),
             )
-            .expect("absent optional parameter should validate");
+            .expect("absent optional parameter should validate")
+            .env;
         let present = template
             .validate_and_bind(
                 present_args
                     .as_object()
                     .expect("arguments should be an object"),
             )
-            .expect("present optional parameter should validate");
+            .expect("present optional parameter should validate")
+            .env;
 
         assert_eq!(template.render_script(&absent).unwrap(), "");
         assert_eq!(template.render_script(&present).unwrap(), "--verbose");
@@ -999,7 +1019,8 @@ script: echo ok
         let args = json!({ "repo": "a'b" });
         let bindings = template
             .validate_and_bind(args.as_object().expect("arguments should be an object"))
-            .expect("repo should validate");
+            .expect("repo should validate")
+            .env;
 
         assert_eq!(template.render_script(&bindings).unwrap(), r#"'a'\''b'"#);
     }
@@ -1014,7 +1035,8 @@ script: echo ok
         let args = json!({ "repo": "dobesv/harnx" });
         let bindings = template
             .validate_and_bind(args.as_object().expect("arguments should be an object"))
-            .expect("repo should validate");
+            .expect("repo should validate")
+            .env;
 
         assert_eq!(template.render_script(&bindings).unwrap(), "dobesv/harnx|");
     }
@@ -1061,6 +1083,16 @@ script: echo ok
     }
 
     #[test]
+    fn parameter_name_rejects_tool_protocol_variable() {
+        let error = param_to_env_name("harnx_tool_protocol").unwrap_err();
+
+        assert!(
+            error.to_string().contains("`HARNX_TOOL_PROTOCOL` collides"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn parameter_name_rejects_shellshock_prefix() {
         let error = param_to_env_name("bash_func_x").unwrap_err();
 
@@ -1088,7 +1120,8 @@ script: echo ok
 
         let bindings = template
             .validate_and_bind(args.as_object().expect("arguments should be an object"))
-            .expect("canonical arguments should validate");
+            .expect("canonical arguments should validate")
+            .env;
 
         assert_eq!(
             bindings,
@@ -1243,7 +1276,8 @@ script: echo ok
 
         let bindings = template
             .validate_and_bind(args.as_object().expect("arguments should be an object"))
-            .expect("defaults should validate");
+            .expect("defaults should validate")
+            .env;
 
         assert_eq!(
             bindings,
@@ -1261,7 +1295,8 @@ script: echo ok
 
         let bindings = template
             .validate_and_bind(args.as_object().expect("arguments should be an object"))
-            .expect("shell metacharacters are valid inside an environment value");
+            .expect("shell metacharacters are valid inside an environment value")
+            .env;
 
         assert_eq!(bindings["MESSAGE"], payload);
     }
@@ -1274,10 +1309,54 @@ script: echo ok
 
         let bindings = template
             .validate_and_bind(args.as_object().expect("arguments should be an object"))
-            .expect("number and boolean arguments should validate");
+            .expect("number and boolean arguments should validate")
+            .env;
 
         assert_eq!(bindings["RATIO"], "1.25");
         assert_eq!(bindings["ENABLED"], "true");
+    }
+
+    #[test]
+    fn canonical_template_input_schema_includes_output_controls() {
+        let parsed = parse_template_str(CANONICAL_YAML, Path::new("gh_issue_view.yaml"))
+            .expect("canonical template should parse");
+
+        assert_eq!(
+            parsed.input_schema().expect("schema should build"),
+            json!({
+                "type": "object",
+                "properties": {
+                    "number": {
+                        "type": "integer",
+                        "description": "Issue number",
+                    },
+                    "repo": {
+                        "type": "string",
+                        "pattern": r"^[\w.-]+/[\w.-]+$",
+                    },
+                    "head_lines": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Return only the first N lines of each stream. Prefer this over `| head -N` in the command.",
+                    },
+                    "tail_lines": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Return only the last N lines of each stream. Prefer this over `| tail -N` in the command.",
+                    },
+                    "max_output_bytes": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window. Prefer this over `| head -c N` in the command.",
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 86400,
+                        "description": "Kill the command after this many seconds, 1 to 86400. Defaults to 86400 (24 hours).",
+                    },
+                },
+                "required": ["number", "repo"],
+                "additionalProperties": false,
+            })
+        );
     }
 
     #[test]
@@ -1306,31 +1385,6 @@ script: echo ok
         assert!(matches!(repo.ty, ParamType::String));
         assert!(repo.required);
         assert_eq!(repo.pattern.as_deref(), Some(r"^[\w.-]+/[\w.-]+$"));
-
-        assert_eq!(
-            parsed.input_schema().expect("schema should build"),
-            json!({
-                "type": "object",
-                "properties": {
-                    "number": {
-                        "type": "integer",
-                        "description": "Issue number",
-                    },
-                    "repo": {
-                        "type": "string",
-                        "pattern": r"^[\w.-]+/[\w.-]+$",
-                    },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 86400,
-                        "description": "Kill the command after this many seconds, 1 to 86400. Defaults to 86400 (24 hours).",
-                    },
-                },
-                "required": ["number", "repo"],
-                "additionalProperties": false,
-            })
-        );
 
         assert_eq!(
             parsed.env.as_ref().and_then(|env| env.get("GH_PAGER")),
@@ -1396,6 +1450,18 @@ script: echo ok
                         "type": "number",
                         "minimum": 0.25,
                         "maximum": 1.5,
+                    },
+                    "head_lines": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Return only the first N lines of each stream. Prefer this over `| head -N` in the command.",
+                    },
+                    "tail_lines": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Return only the last N lines of each stream. Prefer this over `| tail -N` in the command.",
+                    },
+                    "max_output_bytes": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Truncate output to this many bytes. Per-line clipping is off by default; long lines are bounded by the byte cap and line window. Prefer this over `| head -c N` in the command.",
                     },
                     "timeout_secs": {
                         "type": "integer",

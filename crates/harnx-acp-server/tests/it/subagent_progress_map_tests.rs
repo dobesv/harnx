@@ -13,6 +13,7 @@ fn subagent_progress_maps_to_tool_call_update() {
         cache_write_tokens: 5,
     };
     let progress = SubAgentProgress {
+        pending_interaction: None,
         invocation_id: "inv-123".to_string(),
         agent: "atlas".to_string(),
         session_id: "child-session-1".to_string(),
@@ -77,6 +78,7 @@ fn subagent_progress_falls_back_to_invocation_id_without_parent_tool_call_id() {
 /// the invocation and its status.
 fn child_progress(invocation_id: &str, status: SubAgentProgressStatus) -> SubAgentProgress {
     SubAgentProgress {
+        pending_interaction: None,
         invocation_id: invocation_id.to_string(),
         agent: "test".to_string(),
         session_id: "session-1".to_string(),
@@ -146,6 +148,7 @@ fn subagent_progress_done_keeps_parent_tool_in_progress() {
         cache_write_tokens: 0,
     };
     let progress = SubAgentProgress {
+        pending_interaction: None,
         invocation_id: "inv-done".to_string(),
         agent: "pytheas".to_string(),
         session_id: "child-session-done".to_string(),

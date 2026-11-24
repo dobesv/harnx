@@ -8,14 +8,10 @@ impl LiveOperatorFixture {
     /// but not fixture_hidden, which stays discoverable but unconfigured.
     pub(super) async fn assert_bash_matrix(&self) -> Result<()> {
         let Self {
-            tools,
-            hooks_seen,
-            model_calls,
-            ..
+            tools, model_calls, ..
         } = self;
         let FixtureTools { seen, .. } = tools.as_ref();
         let model_before = model_calls.load(Ordering::SeqCst);
-        let hooks_before = hooks_seen.load(Ordering::SeqCst);
         let seen_before = seen.lock().unwrap().len();
 
         self.assert_bash_session_output().await?;
@@ -23,8 +19,6 @@ impl LiveOperatorFixture {
         self.assert_bash_explicit_admission().await;
         self.assert_bash_shell_and_blocking().await;
         self.assert_bash_in_process_admission().await?;
-
-        assert!(hooks_seen.load(Ordering::SeqCst) > hooks_before);
         assert_eq!(model_calls.load(Ordering::SeqCst), model_before);
         assert_eq!(
             model_calls.load(Ordering::SeqCst),
@@ -148,13 +142,13 @@ impl LiveOperatorFixture {
             .await;
         assert!(shell.error.is_none(), "{shell:?}");
         assert!(shell.output.contains("hello"), "{shell:?}");
-        // Hook Block still blocks inner script calls.
+        // Middleware Block still blocks inner script calls.
         let blocked = self
             .run_bash("fixture_echo --text deny", BashToolSelection::Session)
             .await;
         assert!(
             blocked.error.is_some(),
-            "hook Block must fail the script: {blocked:?}"
+            "middleware Block must fail the script: {blocked:?}"
         );
         assert!(blocked.output.contains("policy denied"), "{blocked:?}");
     }
@@ -480,6 +474,7 @@ async fn assert_request_disabled_call_and_shell_parity(
         OperatorToolCommand::Call {
             name: "fixture_echo".into(),
             args_json: "{}".into(),
+            tool_input: None,
         },
     )
     .await;

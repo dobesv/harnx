@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 fn time_server_config(command: impl Into<String>) -> ToolServerConfig {
     ToolServerConfig {
+        middleware: Default::default(),
         name: "time".to_string(),
         command: command.into(),
         args: Vec::new(),

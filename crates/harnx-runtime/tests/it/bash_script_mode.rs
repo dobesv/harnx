@@ -30,10 +30,10 @@ use serde_json::json;
 
 const TOKEN: &str = "bash-script-mode-test-token";
 
-struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+pub(crate) struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
 impl EnvGuard {
-    fn install(values: &[(&'static str, &str)]) -> Self {
+    pub(crate) fn install(values: &[(&'static str, &str)]) -> Self {
         let old = values
             .iter()
             .map(|(name, _)| (*name, std::env::var_os(name)))
@@ -61,8 +61,9 @@ impl Drop for EnvGuard {
     }
 }
 
-fn time_server_config(command: &str) -> ToolServerConfig {
+pub(crate) fn time_server_config(command: &str) -> ToolServerConfig {
     ToolServerConfig {
+        middleware: Default::default(),
         name: "time".to_string(),
         command: command.into(),
         args: Vec::new(),
@@ -74,7 +75,7 @@ fn time_server_config(command: &str) -> ToolServerConfig {
     }
 }
 
-fn time_server_binary() -> Result<PathBuf> {
+pub(crate) fn time_server_binary() -> Result<PathBuf> {
     if let Some(path) = option_env!("CARGO_BIN_EXE_harnx-time-tools") {
         return Ok(PathBuf::from(path));
     }
@@ -109,6 +110,28 @@ fn time_server_binary() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Start `servers` under `instance_id` against a token-authenticated broker
+/// and wait for the time tool's registration. Both script-mode e2es and the
+/// script-tools cold-start e2e need this exact sequence; one copy keeps the
+/// fixtures identical.
+pub(crate) async fn start_time_server(
+    server_url: &str,
+    token: &str,
+    instance_id: &ServerScope,
+    servers: &[ToolServerConfig],
+) -> Result<ToolServerSupervisor> {
+    let client = async_nats::ConnectOptions::new()
+        .token(token.to_string())
+        .connect(server_url)
+        .await?;
+    let start = ToolServerStartConfig::new(client.clone(), instance_id.clone(), server_url, token);
+    let supervisor =
+        ToolServerSupervisor::start_local_with_timeout(start, servers, Duration::from_secs(5))
+            .await?;
+    wait_for_time_registration(&client, instance_id).await?;
+    Ok(supervisor)
+}
+
 /// Bash-only agent: `bash_tools: time_*` and no `use_tools`.
 fn script_mode_config() -> Arc<ConfigLock> {
     let mut agent = AgentConfig::from_prompt("test");
@@ -120,7 +143,7 @@ fn script_mode_config() -> Arc<ConfigLock> {
     Arc::new(ConfigLock::new(config))
 }
 
-async fn wait_for_time_registration(
+pub(crate) async fn wait_for_time_registration(
     client: &async_nats::Client,
     instance_id: &ServerScope,
 ) -> Result<()> {
@@ -171,18 +194,14 @@ async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
         (HARNX_NATS_URL_ENV, server.url()),
         (HARNX_NATS_TOKEN_ENV, TOKEN),
     ]);
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(server.url())
-        .await?;
     let instance_id = ServerScope::new();
-    let start =
-        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
-    let servers = [time_server_config(&binary)];
-    let supervisor =
-        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_secs(5))
-            .await?;
-    wait_for_time_registration(&client, &instance_id).await?;
+    let supervisor = start_time_server(
+        server.url(),
+        TOKEN,
+        &instance_id,
+        &[time_server_config(&binary)],
+    )
+    .await?;
 
     let config = script_mode_config();
     // The declaration cache is what bash_tools resolution reads; the agent
@@ -217,22 +236,25 @@ async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
     let output = &results[0].output;
     assert_eq!(output["status"], "ok", "{}", output);
     assert_eq!(output["exit_code"], 0);
-    assert_eq!(output["trace"][0]["name"], "time_get_current_time");
-    assert_eq!(output["trace"][0]["status"], "ok");
-    // One JSON result line through `wc -l`.
-    let stdout = output["stdout"].as_str().expect("stdout text");
-    assert_eq!(stdout.trim(), "1", "{}", output);
+    assert!(output.get("stdout").is_none(), "{}", output);
     let text = output["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("status: ok"), "{text}");
-    assert!(text.contains("<!-- start stdout -->"), "{text}");
+    assert!(text.contains("- time_get_current_time ok"), "{text}");
+    // One JSON result line through `wc -l`.
+    let stdout_block = text
+        .split("<!-- start stdout -->")
+        .nth(1)
+        .and_then(|rest| rest.split("<!-- end stdout -->").next())
+        .expect("stdout block");
+    assert!(stdout_block.contains('1'), "{text}");
     Ok(())
 }
 
 /// Recovery: after worker loss the engine replays the call across providers
 /// in order; an active BashProvider must answer `bash` with the interrupted
 /// report so the script is never rerun (J-RHAD-r2-1). Active means the
-/// agent's `bash_tools` actually resolve against registered declarations
-/// (PR3 review F9), so this test stands up the real NATS broker and time
+/// agent's `bash_tools` actually resolve against registered declarations,
+/// so this test stands up the real NATS broker and time
 /// tool server like the pipeline e2e above. It needs no dispatch: the
 /// provider answers from its own policy before any remote replay.
 #[tokio::test(flavor = "multi_thread")]
@@ -249,18 +271,14 @@ async fn interrupted_bash_replays_as_reported_not_rerun() -> Result<()> {
         (HARNX_NATS_URL_ENV, server.url()),
         (HARNX_NATS_TOKEN_ENV, TOKEN),
     ]);
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(server.url())
-        .await?;
     let instance_id = ServerScope::new();
-    let start =
-        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
-    let servers = [time_server_config(&binary)];
-    let supervisor =
-        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_secs(5))
-            .await?;
-    wait_for_time_registration(&client, &instance_id).await?;
+    let supervisor = start_time_server(
+        server.url(),
+        TOKEN,
+        &instance_id,
+        &[time_server_config(&binary)],
+    )
+    .await?;
 
     let config = script_mode_config();
     harnx_runtime::tool_context::refresh_nats_tool_declarations(&config, &instance_id).await;
@@ -305,8 +323,8 @@ async fn interrupted_bash_replays_as_reported_not_rerun() -> Result<()> {
     Ok(())
 }
 
-/// PR3 review F9: when no declarations resolve (script mode inactive), even
-/// a bare `bash` call must fall through replay untouched so a
+/// When no declarations resolve (script mode inactive), even a bare `bash`
+/// call must fall through replay untouched so a
 /// tool-server-native `bash` keeps normal NATS journal recovery. The
 /// provider-internal halves of both cases are covered in
 /// `bash_provider::tests`; this pins the engine-level fall-through.
@@ -353,8 +371,8 @@ async fn inactive_script_mode_leaves_bash_replay_to_other_providers() -> Result<
     Ok(())
 }
 
-/// PR3 round-2 review R4: the fall-through above must actually reach NATS
-/// journal recovery. Seeds the journal the way a completed tool-server-native
+/// The fall-through above must actually reach NATS journal recovery.
+/// Seeds the journal the way a completed tool-server-native
 /// `bash` call leaves it — one row under (session, round, tool-call id) with
 /// its final reply — and asserts replay hands back the saved reply instead
 /// of a synthetic interruption.
@@ -391,6 +409,7 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
     let instance_id = ServerScope::new();
     let mut params = BuildToolEvalContextParams::new(&config, &instance_id);
     params.bash_context_slot = Some(slot.clone());
+    // qual:allow(dry, fragment) reason: "the replay e2es share the ctx-build + ToolCall fixture by design and diverge in what they assert about replay; deduplicating it would hide the replay policy under a fixture"
     let ctx = Arc::new(harnx_runtime::tool::build_tool_eval_context(params).await);
     slot.set(&ctx);
     let call = ToolCall::new(
@@ -427,6 +446,9 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
 
 async fn seed_journaled_bash_reply(client: &async_nats::Client) -> Result<()> {
     let request = harnx_toolset::ToolRequest {
+        user_id: None,
+        input_responses: None,
+        request_state: None,
         run_context: None,
         replay: None,
         call_id: "wire-1".to_string(),
@@ -452,6 +474,7 @@ async fn seed_journaled_bash_reply(client: &async_nats::Client) -> Result<()> {
         .complete(
             &request,
             harnx_toolset::ToolReply {
+                input_required: None,
                 call_id: "wire-1".to_string(),
                 result: Ok(json!({"native": true})),
                 final_progress: None,

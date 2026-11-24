@@ -1,8 +1,7 @@
 //! Integration tests for harnx-attachment-tools.
 
-use async_nats::jetstream::object_store::ObjectStore;
 use harnx_attachment_tools::AttachmentToolset;
-use harnx_blob_store::media::{ensure_attachments_bucket, put_media};
+use harnx_blob_store::media::{ensure_attachments_bucket, put_media, AttachmentsBucket};
 use harnx_blob_store::media_cid_url;
 use harnx_blob_store::plans::{
     create_document, ensure_plans_bucket, serialize_plan, PlanDocument, PlanFrontMatter,
@@ -27,7 +26,7 @@ const HASH_B: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123
 struct TestContext {
     _nats: NatsServerHandle,
     toolset: AttachmentToolset,
-    store: ObjectStore,
+    store: AttachmentsBucket,
     jetstream: async_nats::jetstream::Context,
 }
 
@@ -491,12 +490,17 @@ async fn attachment_read_byte_paging_giant_single_line_json() {
 
 #[tokio::test]
 async fn attachment_read_byte_paging_uses_default_limit() {
-    let original = "x".repeat(100_000);
+    let original = "x".repeat(200_000);
     let Some(stored) = StoredAttachment::start(original.as_bytes(), "text/plain").await else {
         return;
     };
     let result = stored.read(json!({ "byte_offset": 0 })).await;
-    assert_page(&result, &original[..65_536], Some(65_536));
+    assert_page(&result, &original[..131_072], Some(131_072));
+    assert_page(
+        &stored.read(json!({ "byte_offset": 131_072 })).await,
+        &original[131_072..],
+        None,
+    );
 }
 
 #[tokio::test]

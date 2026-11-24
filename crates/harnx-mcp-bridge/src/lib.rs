@@ -10,7 +10,7 @@ use harnx_core::child_process::ChildProcessManager;
 use harnx_core::instance::HARNX_SERVER_SCOPE;
 use harnx_toolset::{ToolInvocation, ToolInvokeError, ToolSpec, Toolset};
 
-pub mod result_limits;
+pub use harnx_toolset_server::result_limits;
 use result_limits::ResultLimits;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
@@ -85,7 +85,7 @@ pub struct Args {
     pub tool_args: Option<String>,
 
     /// Maximum compact serialized JSON bytes per tool result (not per round).
-    #[arg(long, env = "HARNX_MCP_MAX_RESULT_BYTES", default_value = "32768", value_parser = result_limits::parse_max_result_bytes)]
+    #[arg(long, env = "HARNX_MCP_MAX_RESULT_BYTES", default_value_t = result_limits::DEFAULT_MAX_RESULT_BYTES, value_parser = result_limits::parse_max_result_bytes)]
     pub max_result_bytes: usize,
 }
 
@@ -112,9 +112,11 @@ pub struct BridgeToolset {
     peer: Peer<RoleClient>,
     child_died: CancellationToken,
     _service_watch: tokio::task::JoinHandle<()>,
-    child: Child,
+    // `None` only for bridges built from an already-connected client service
+    // (in-process tests): there is no child process to retire or reap.
+    child: Option<Child>,
     // Keep the stable spawning thread alive until after its child is retired.
-    process_manager: ChildProcessManager,
+    process_manager: Option<ChildProcessManager>,
     stderr_tail: StderrTail,
     result_limits: ResultLimits,
 }
@@ -310,9 +312,33 @@ async fn connect_and_list_tools(
 )> {
     let transport =
         rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(stdout, stdin);
+    // MRTR (SEP-2322) rides the 2026-07-28 protocol revision, which has no
+    // `initialize` handshake: a client reaches it through `server/discover`.
+    // Auto mode probes discover first and falls back to the legacy handshake
+    // for old servers, so MRTR-capable peers negotiate input_required while
+    // legacy peers keep working unchanged.
+    let lifecycle = rmcp::service::ClientLifecycleMode::Auto {
+        // Newest-first ladder. A server that answers `server/discover` with
+        // UNSUPPORTED_PROTOCOL_VERSION lists its supported revisions in the
+        // error, and rmcp's retry loop steps down this ladder until a
+        // candidate is accepted; without the ladder the first rejection
+        // would abort as a version mismatch. `select_protocol_version`
+        // still picks the newest shared revision for the session itself.
+        preferred_versions: vec![
+            rmcp::model::ProtocolVersion::LATEST,
+            rmcp::model::ProtocolVersion::V_2025_11_25,
+            rmcp::model::ProtocolVersion::V_2025_06_18,
+            rmcp::model::ProtocolVersion::V_2025_03_26,
+            rmcp::model::ProtocolVersion::V_2024_11_05,
+        ],
+        // A legacy peer has no discover, so the fallback `initialize` must
+        // request a handshake-era revision instead of the discover-era
+        // LATEST; the peer answers with its own version either way.
+        legacy_version: Some(rmcp::model::ProtocolVersion::V_2025_11_25),
+    };
     let service = match tokio::time::timeout(
         INITIALIZE_TIMEOUT,
-        rmcp::service::serve_client(BridgeClientHandler, transport),
+        rmcp::service::serve_client_with_lifecycle(BridgeClientHandler, transport, lifecycle),
     )
     .await
     {
@@ -333,6 +359,28 @@ async fn connect_and_list_tools(
         Ok(Ok(service)) => service,
     };
 
+    let cached_tools = list_and_map_tools(&service, server_name, stderr_tail).await?;
+    Ok((service, cached_tools))
+}
+
+/// List the wrapped server's tools and cache them as harnx `ToolSpec`s.
+///
+/// A server that negotiated the MCP 2026-07-28 revision can answer any
+/// `tools/call` with an MRTR `input_required` round (SEP-2322 declares the
+/// capability at server level, not per tool), so every tool of such a server
+/// is stamped `harnx:input_required` and the runtime opens the durable
+/// challenge path for them. Servers on older revisions never challenge, so
+/// their tools stay unstamped and a stray challenge would degrade to the
+/// compatibility error instead of suspending.
+async fn list_and_map_tools(
+    service: &rmcp::service::RunningService<RoleClient, BridgeClientHandler>,
+    server_name: &str,
+    stderr_tail: &StderrTail,
+) -> anyhow::Result<Vec<ToolSpec>> {
+    let mrtr_capable = service
+        .peer()
+        .peer_info()
+        .is_some_and(|info| info.protocol_version >= rmcp::model::ProtocolVersion::V_2026_07_28);
     let listed = match tokio::time::timeout(
         LIST_TOOLS_TIMEOUT,
         service.peer().list_tools(Default::default()),
@@ -355,9 +403,11 @@ async fn connect_and_list_tools(
         }
         Ok(Ok(result)) => result,
     };
-    let cached_tools = listed.tools.into_iter().map(map_tool).collect();
-
-    Ok((service, cached_tools))
+    Ok(listed
+        .tools
+        .into_iter()
+        .map(|tool| map_tool(tool, mrtr_capable))
+        .collect())
 }
 
 fn watch_service(
@@ -452,15 +502,54 @@ impl BridgeToolset {
             peer,
             child_died,
             _service_watch: service_watch,
-            child,
-            process_manager: manager,
+            child: Some(child),
+            process_manager: Some(manager),
+            stderr_tail,
+        })
+    }
+
+    /// Build a bridge from an already-initialized MCP client service, with no
+    /// child process to manage.
+    ///
+    /// Production bridges go through [`BridgeToolset::new`], which spawns and
+    /// owns the stdio child. This constructor serves in-process uses: tests
+    /// wire the client end of an in-memory MCP hop, and embedding code can
+    /// supply its own transport. The tool cache and MRTR opt-in stamping are
+    /// identical to `new`.
+    // qual:api reason: "In-process adoption seam for embedders that own the
+    // client transport; the shipped bridge binary uses `new` (child stdio),
+    // so the only in-repo callers are the in-memory MRTR hop tests."
+    pub async fn from_service(
+        service: rmcp::service::RunningService<RoleClient, BridgeClientHandler>,
+        server_name: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let server_name = server_name.into();
+        let stderr_tail: StderrTail = Arc::new(Mutex::new(VecDeque::new()));
+        let cached_tools = list_and_map_tools(&service, &server_name, &stderr_tail).await?;
+        let peer = service.peer().clone();
+        let (child_died, service_watch) =
+            watch_service(service, server_name.clone(), stderr_tail.clone());
+        Ok(Self {
+            result_limits: ResultLimits::default(),
+            server_name,
+            cached_tools,
+            peer,
+            child_died,
+            _service_watch: service_watch,
+            child: None,
+            process_manager: None,
             stderr_tail,
         })
     }
 
     /// Retire and reap the wrapped process before a standalone diagnostic exits.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
-        let result = retire_child(&self.process_manager, &mut self.child).await;
+        let result = match (&self.process_manager, &mut self.child) {
+            (Some(manager), Some(child)) => retire_child(manager, child).await,
+            // Bridges built with `from_service` own no child process.
+            (None, None) => Ok(()),
+            _ => anyhow::bail!("bridge child state is inconsistent"),
+        };
         self._service_watch.abort();
         result
     }
@@ -492,7 +581,7 @@ impl BridgeToolset {
 
     /// Process ID of the wrapped MCP server, when available.
     pub fn child_id(&self) -> Option<u32> {
-        self.child.id()
+        self.child.as_ref().and_then(Child::id)
     }
 
     /// Token cancelled when the wrapped server's MCP transport closes.
@@ -529,7 +618,9 @@ impl Toolset for BridgeToolset {
         args: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let result = self.dispatch(tool, args, cancel).await?;
+        let result = self
+            .dispatch(tool, args, Default::default(), Value::Null, cancel)
+            .await?;
         self.result_limits.normalize(result, None).await
     }
 
@@ -546,7 +637,13 @@ impl Toolset for BridgeToolset {
                 ToolInvokeError::Recoverable(format!("invalid caller session: {error}"))
             })?;
         let result = self
-            .dispatch(&invocation.tool, invocation.args, invocation.cancel)
+            .dispatch(
+                &invocation.tool,
+                invocation.args,
+                invocation.context.input_responses,
+                invocation.context.request_state,
+                invocation.cancel,
+            )
             .await?;
         self.result_limits.normalize(result, session.as_ref()).await
     }
@@ -559,10 +656,21 @@ impl BridgeToolset {
         self
     }
 
+    /// One `tools/call` round over MCP.
+    ///
+    /// A rerun after a tool challenge carries the latest challenge's accepted
+    /// responses and opaque state (MRTR `inputResponses` / `requestState`,
+    /// SEP-2322) beside the arguments, never inside them. An MRTR
+    /// `input_required` answer from the server suspends the call as a harnx
+    /// challenge; kinds harnx cannot show (sampling, roots, URL elicitation)
+    /// and multi-request results fail with a clear recoverable error instead
+    /// of a silent success.
     async fn dispatch(
         &self,
         tool: &str,
         args: Value,
+        input_responses: std::collections::BTreeMap<String, harnx_toolset::ToolInputResponse>,
+        request_state: Value,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
         let arguments = match args {
@@ -574,31 +682,28 @@ impl BridgeToolset {
                 ));
             }
         };
-        let params = prepare_call_tool_params(tool, arguments);
+        let mut params = prepare_call_tool_params(tool, arguments);
+        if !input_responses.is_empty() {
+            params.input_responses = Some(harnx_toolset_server::mrtr::responses_to_mrtr(
+                &input_responses,
+            ));
+        }
+        if !request_state.is_null() {
+            params.request_state =
+                harnx_toolset_server::mrtr::request_state_from_value(&request_state)
+                    .map_err(ToolInvokeError::Recoverable)?;
+        }
 
         if cancel.is_cancelled() {
             return Err(ToolInvokeError::Recoverable("call cancelled".into()));
         }
-        self.invoke_cancellable(params, cancel)
-            .await
-            .map_err(|err| match err {
-                ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
-                    harnx_toolset::cleanup::unconfirmed(
-                        "MCP transport lost; remote operation shutdown unconfirmed",
-                    );
-                    ToolInvokeError::Fatal(format!(
-                        "MCP server '{}' exited during call",
-                        self.server_name
-                    ))
-                }
-                err => ToolInvokeError::Recoverable(err.to_string()),
-            })
+        self.invoke_cancellable(params, cancel).await
     }
     async fn invoke_cancellable(
         &self,
         params: CallToolRequestParams,
         cancel: CancellationToken,
-    ) -> Result<Value, ServiceError> {
+    ) -> Result<Value, ToolInvokeError> {
         use rmcp::model::{CallToolRequest, ClientRequest, ServerResult};
         let mut request = self
             .peer
@@ -606,7 +711,8 @@ impl BridgeToolset {
                 ClientRequest::CallToolRequest(CallToolRequest::new(params)),
                 rmcp::service::PeerRequestOptions::no_options(),
             )
-            .await?;
+            .await
+            .map_err(map_service_error(self))?;
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -616,16 +722,45 @@ impl BridgeToolset {
                 // Sending the notification is not a remote shutdown receipt.
                 request.rx.close();
                 let _ = tokio::time::timeout(Duration::from_millis(250), request.cancel(Some("invocation cancelled".into()))).await;
-                return Err(ServiceError::Cancelled { reason: Some("invocation cancelled".into()) });
+                return Err(ToolInvokeError::Recoverable("invocation cancelled".into()));
             }
-            result = &mut request.rx => result.map_err(|_| ServiceError::TransportClosed)??,
+            result = &mut request.rx => result.map_err(|_| ToolInvokeError::Fatal(format!(
+                "MCP server '{}' exited during call",
+                self.server_name
+            ))).and_then(|result| result.map_err(map_service_error(self)))?,
         };
         match result {
-            ServerResult::CallToolResult(result) => {
-                serde_json::to_value(result).map_err(|_| ServiceError::UnexpectedResponse)
+            ServerResult::CallToolResult(result) => serde_json::to_value(result).map_err(|_| {
+                ToolInvokeError::Recoverable("MCP tool result is not serializable".into())
+            }),
+            ServerResult::InputRequiredResult(input_required) => {
+                harnx_toolset_server::mrtr::challenge_from_mrtr(&input_required)
+                    .map(|challenge| Err(ToolInvokeError::InputRequired(Box::new(challenge))))
+                    .unwrap_or_else(|error| Err(ToolInvokeError::Recoverable(error)))
             }
-            _ => Err(ServiceError::UnexpectedResponse),
+            _ => Err(ToolInvokeError::Recoverable(
+                "unexpected MCP response for tools/call".into(),
+            )),
         }
+    }
+}
+
+/// Map transport-level service errors onto harnx tool errors, with the
+/// transport-lost cleanup notice kept for the fatal arm.
+fn map_service_error<'a>(
+    bridge: &'a BridgeToolset,
+) -> impl Fn(rmcp::service::ServiceError) -> ToolInvokeError + 'a {
+    move |err| match err {
+        ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
+            harnx_toolset::cleanup::unconfirmed(
+                "MCP transport lost; remote operation shutdown unconfirmed",
+            );
+            ToolInvokeError::Fatal(format!(
+                "MCP server '{}' exited during call",
+                bridge.server_name
+            ))
+        }
+        err => ToolInvokeError::Recoverable(err.to_string()),
     }
 }
 
@@ -643,7 +778,7 @@ async fn retire_child(manager: &ChildProcessManager, child: &mut Child) -> anyho
     group_stop.context("stop MCP child process group")
 }
 
-fn map_tool(tool: Tool) -> ToolSpec {
+fn map_tool(tool: Tool, requests_input: bool) -> ToolSpec {
     let annotations = tool.annotations.as_ref();
     // MCP tool listings have no timeout field; harnx tool servers advertise
     // their request-timeout policy in `_meta`
@@ -654,7 +789,11 @@ fn map_tool(tool: Tool) -> ToolSpec {
         .meta
         .as_ref()
         .and_then(|meta| harnx_toolset::advertised_timeout_secs(&meta.0));
-    ToolSpec {
+    // MRTR is a server-level capability (SEP-2322): a server that negotiated
+    // the 2026-07-28 revision may challenge on any tool, so every tool of
+    // such a server declares `harnx:input_required` and the runtime opens
+    // the durable challenge path for it.
+    let spec = ToolSpec {
         cancellation_guarantee: Default::default(),
         name: tool.name.into(),
         description: tool
@@ -669,6 +808,11 @@ fn map_tool(tool: Tool) -> ToolSpec {
             .unwrap_or(false),
         timeout_secs,
         meta: tool.meta.map(|m| m.0),
+    };
+    if requests_input {
+        spec.with_input_required()
+    } else {
+        spec
     }
 }
 
@@ -696,6 +840,8 @@ impl ClientHandler for BridgeClientHandler {
     }
 }
 
+#[cfg(test)]
+mod mrtr_tests;
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -755,6 +901,18 @@ mod tests {
         ]);
         assert_eq!(args.enable_tool, vec!["search", "exec*"]);
         assert_eq!(args.child, vec!["echo"]);
+    }
+
+    #[test]
+    fn args_default_result_limit_is_128_kib() {
+        let args = Args::parse_from(["mcp-bridge", "--", "echo"]);
+        assert_eq!(super::result_limits::DEFAULT_MAX_RESULT_BYTES, 131_072);
+        assert_eq!(
+            args.max_result_bytes,
+            super::result_limits::DEFAULT_MAX_RESULT_BYTES
+        );
+        let args = Args::parse_from(["mcp-bridge", "--max-result-bytes", "262144", "--", "echo"]);
+        assert_eq!(args.max_result_bytes, 262_144);
     }
 
     #[test]
@@ -919,7 +1077,7 @@ mod tests {
         let tool =
             rmcp::model::Tool::new("echo", "Echo input", serde_json::Map::new()).with_meta(meta);
 
-        let spec = map_tool(tool);
+        let spec = map_tool(tool, false);
 
         assert_eq!(spec.name, "echo");
         assert_eq!(
@@ -944,48 +1102,68 @@ mod tests {
     #[test]
     fn map_tool_propagates_advertised_timeout_policy() {
         assert_eq!(
-            map_tool(tool_with_meta(serde_json::json!({
-                "call_template": "Spawn {{command}}",
-                "timeout_secs": 0
-            })))
+            map_tool(
+                tool_with_meta(serde_json::json!({
+                    "call_template": "Spawn {{command}}",
+                    "timeout_secs": 0
+                })),
+                false
+            )
             .timeout_secs,
             Some(0)
         );
         assert_eq!(
-            map_tool(tool_with_meta(serde_json::json!({ "timeout_secs": 45 }))).timeout_secs,
+            map_tool(
+                tool_with_meta(serde_json::json!({ "timeout_secs": 45 })),
+                false
+            )
+            .timeout_secs,
             Some(45)
         );
         // Servers that advertise nothing keep the caller's default backstop.
         assert_eq!(
-            map_tool(rmcp::model::Tool::new(
-                "echo",
-                "Echo input",
-                serde_json::Map::new()
-            ))
+            map_tool(
+                rmcp::model::Tool::new("echo", "Echo input", serde_json::Map::new()),
+                false
+            )
             .timeout_secs,
             None
         );
         assert_eq!(
-            map_tool(tool_with_meta(serde_json::json!({
-                "call_template": "x"
-            })))
+            map_tool(
+                tool_with_meta(serde_json::json!({
+                    "call_template": "x"
+                })),
+                false
+            )
             .timeout_secs,
             None
         );
         // Malformed policy values are ignored rather than disabling a deadline.
         assert_eq!(
-            map_tool(tool_with_meta(serde_json::json!({
-                "timeout_secs": "forever"
-            })))
+            map_tool(
+                tool_with_meta(serde_json::json!({
+                    "timeout_secs": "forever"
+                })),
+                false
+            )
             .timeout_secs,
             None
         );
         assert_eq!(
-            map_tool(tool_with_meta(serde_json::json!({ "timeout_secs": 1.5 }))).timeout_secs,
+            map_tool(
+                tool_with_meta(serde_json::json!({ "timeout_secs": 1.5 })),
+                false
+            )
+            .timeout_secs,
             None
         );
         assert_eq!(
-            map_tool(tool_with_meta(serde_json::json!({ "timeout_secs": -1 }))).timeout_secs,
+            map_tool(
+                tool_with_meta(serde_json::json!({ "timeout_secs": -1 })),
+                false
+            )
+            .timeout_secs,
             None
         );
     }

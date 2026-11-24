@@ -141,6 +141,10 @@ pub struct SessionPromptOptions {
     pub web_base_url: Option<String>,
     /// Identity resolved from this prompt's HTTP request. Used only when metadata is created.
     pub user_id: Option<String>,
+    /// Caller principals resolved from this prompt's HTTP request, recorded
+    /// read-only when metadata is created. Handoff dispatch copies the source
+    /// session's identity instead.
+    pub(crate) user_principals: Option<harnx_core::user_principals::UserPrincipals>,
     /// Maximum run duration in seconds. Omitted, null, zero, or negative inherit
     /// the target agent's run limits policy. Positive values shorten that policy;
     /// they cannot extend beyond the configured limit.
@@ -167,6 +171,24 @@ pub enum SessionCommand {
         approved: bool,
         note: Option<String>,
         reply: oneshot::Sender<Result<bool, String>>,
+    },
+    HitlApprovalDecisionExact {
+        request: harnx_runtime::ApprovalRef,
+        approved: bool,
+        note: Option<String>,
+        reply: oneshot::Sender<Result<harnx_runtime::HitlDecisionOutcome, String>>,
+    },
+    InteractionResponse {
+        interaction_id: String,
+        request_seq: u64,
+        response: harnx_core::interaction::InteractionResponse,
+        reply: oneshot::Sender<
+            Result<harnx_runtime::interactions::InteractionDecisionOutcome, String>,
+        >,
+    },
+    SurfaceAction {
+        submission: harnx_runtime::surfaces::SurfaceActionSubmission,
+        reply: oneshot::Sender<Result<harnx_runtime::surfaces::SurfaceActionOutcome, String>>,
     },
     Get {
         reply: oneshot::Sender<SessionInfo>,

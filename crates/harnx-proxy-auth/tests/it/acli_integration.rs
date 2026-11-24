@@ -4,17 +4,16 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::tempdir;
 
-#[test]
-fn acli_synthetic_config_written_from_host_yaml() {
+#[tokio::test]
+async fn acli_synthetic_config_written_from_host_yaml() {
     let Some(proxy_bin) = proxy_binary_path() else {
         eprintln!(
             "SKIP acli_synthetic_config_written_from_host_yaml: harnx-proxy-auth binary not found"
@@ -28,8 +27,8 @@ fn acli_synthetic_config_written_from_host_yaml() {
     std::fs::write(config_dir.join("jira_config.yaml"), sample_host_config())
         .expect("write host yaml");
 
-    let mut child = spawn_proxy(&proxy_bin, home.path());
-    let (proxy_port, _ca_cert_path) = read_readiness(&mut child);
+    let proxy = spawn_proxy(&proxy_bin, home.path()).await;
+    let proxy_port = proxy.proxy_port;
     assert!(proxy_port > 0, "proxy port should be non-zero");
 
     let rendered = find_rendered_config(home.path(), Duration::from_secs(5)).unwrap_or_else(|details| {
@@ -80,12 +79,12 @@ fn acli_synthetic_config_written_from_host_yaml() {
         "sandbox ACLI_CONFIG_DIR should point at --env-injected synthetic config root"
     );
 
-    kill_child(&mut child);
+    kill_proxy(proxy).await;
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires real acli binary, network, and real Atlassian credentials"]
-fn acli_status_smoke_test_with_real_binary_and_creds() {
+async fn acli_status_smoke_test_with_real_binary_and_creds() {
     let Some(proxy_bin) = proxy_binary_path() else {
         eprintln!("SKIP ignored smoke test: harnx-proxy-auth binary not found");
         return;
@@ -105,8 +104,9 @@ fn acli_status_smoke_test_with_real_binary_and_creds() {
     std::fs::write(config_dir.join("jira_config.yaml"), sample_host_config())
         .expect("write host yaml");
 
-    let mut child = spawn_proxy(&proxy_bin, home.path());
-    let (proxy_port, ca_cert_path) = read_readiness(&mut child);
+    let proxy = spawn_proxy(&proxy_bin, home.path()).await;
+    let proxy_port = proxy.proxy_port;
+    let ca_cert_path = proxy.ca_cert_path.clone();
     let rendered =
         find_rendered_config(home.path(), Duration::from_secs(5)).unwrap_or_else(|details| {
             panic!("find rendered acli config for smoke test; search details:\n{details}")
@@ -130,7 +130,7 @@ fn acli_status_smoke_test_with_real_binary_and_creds() {
         .status()
         .expect("run acli");
 
-    kill_child(&mut child);
+    kill_proxy(proxy).await;
     assert!(status.success(), "acli status exit code: {status:?}");
 }
 
@@ -162,7 +162,13 @@ fn jira_hook_path() -> PathBuf {
         .join("jira-auth-hook.py")
 }
 
-fn spawn_proxy(proxy_bin: &Path, home: &Path) -> Child {
+struct ProxySession {
+    session: super::mcp_stdio::Session,
+    proxy_port: u16,
+    ca_cert_path: PathBuf,
+}
+
+async fn spawn_proxy(proxy_bin: &Path, home: &Path) -> ProxySession {
     let cred_script = write_credential_script(home);
     let jira_hook = jira_hook_path();
     let host_config = home.join(".config/acli/jira_config.yaml");
@@ -173,8 +179,11 @@ fn spawn_proxy(proxy_bin: &Path, home: &Path) -> Child {
     std::fs::copy(&host_config, sandbox_config_dir.join("jira_config.yaml"))
         .expect("seed synthetic acli config path");
 
-    Command::new(proxy_bin)
+    let mut command = tokio::process::Command::new(proxy_bin);
+    command
         .args([
+            "--mcp-stdio",
+            "--name=proxy_fixture",
             "--env",
             r#"{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}"#,
             "--hook",
@@ -196,42 +205,35 @@ fn spawn_proxy(proxy_bin: &Path, home: &Path) -> Child {
         .env("ACLI_HOST_CONFIG", &host_config)
         .env("HARNX_JIRA_HOST_CONFIG", &host_config)
         .env("HARNX_JIRA_TEMP_ROOT", &temp_root)
-        .env("TEMP_FILE_ROOT", &temp_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn harnx-proxy-auth")
+        .env("TEMP_FILE_ROOT", &temp_root);
+
+    let mut session = super::mcp_stdio::Session::start(&mut command, "proxy_fixture", false)
+        .await
+        .expect("start MCP stdio session");
+    let env_output = session.environment().await.expect("environment tool call");
+    let http_proxy = env_output["env"]["HTTP_PROXY"]
+        .as_str()
+        .expect("HTTP_PROXY");
+    let proxy_port = http_proxy
+        .rsplit(':')
+        .next()
+        .expect("port")
+        .parse::<u16>()
+        .expect("parse port");
+    let ca_cert_path = PathBuf::from(
+        env_output["filesystem"]["ca_cert_path"]
+            .as_str()
+            .expect("ca_cert_path"),
+    );
+    ProxySession {
+        session,
+        proxy_port,
+        ca_cert_path,
+    }
 }
 
-fn read_readiness(child: &mut Child) -> (u16, PathBuf) {
-    let stdout = child.stdout.take().expect("stdout pipe");
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    let mut proxy_port = None;
-    let mut ca_cert_path = None;
-
-    for _ in 0..10 {
-        line.clear();
-        let bytes = reader.read_line(&mut line).expect("read readiness line");
-        assert!(bytes > 0, "proxy exited before readiness lines");
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("PROXY_PORT=") {
-            proxy_port = Some(value.parse::<u16>().expect("parse proxy port"));
-        }
-        if let Some(value) = trimmed.strip_prefix("CA_CERT_PATH=") {
-            ca_cert_path = Some(PathBuf::from(value));
-        }
-        if proxy_port.is_some() && ca_cert_path.is_some() {
-            break;
-        }
-    }
-
-    child.stdout = Some(reader.into_inner());
-    (
-        proxy_port.expect("PROXY_PORT readiness line"),
-        ca_cert_path.expect("CA_CERT_PATH readiness line"),
-    )
+async fn kill_proxy(proxy: ProxySession) {
+    let _ = proxy.session.shutdown().await;
 }
 
 fn find_rendered_config(home: &Path, timeout: Duration) -> Result<PathBuf, String> {
@@ -380,11 +382,6 @@ fn append_tree(path: &Path, depth: usize, out: &mut String) {
             out.push_str(&format!("{indent}{} <stat error: {err}>\n", path.display()));
         }
     }
-}
-
-fn kill_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn proxy_binary_path() -> Option<PathBuf> {

@@ -19,26 +19,26 @@ results, and a multi-agent code review pipeline.
 
 | Agent | Model | Best For |
 |-------|-------|----------|
-| `hephaestus` | gpt-6.1-sol:high | Large refactors, migrations, deep implementation |
-| `iris` | gemini-3.8-flash | UI, frontend, visual engineering |
-| `apollo` | gemini-3.8-flash | Creative solutions, novel UX |
+| `hephaestus` | gpt-6.2-sol:high | Large refactors, migrations, deep implementation |
+| `iris` | gemini-4-hydrogen | UI, frontend, visual engineering |
+| `apollo` | gemini-4-hydrogen | Creative solutions, novel UX |
 | `athena` | us.zai.glm-5.3 | Complex multi-file features, agent of last resort |
 | `hermes` | gpt-6-luna | Quick fixes, one-liners, config tweaks |
 | `hestia` | gpt-6-luna | Maintenance, dependency updates, linting |
-| `plato` | gpt-6-astra:max | Architecture, data modeling, complex algorithms |
-| `peitho` | gemini-3.8-flash | Documentation, READMEs, release notes |
+| `plato` | gpt-6.2-astra:max | Architecture, data modeling, complex algorithms |
+| `peitho` | gemini-4-hydrogen | Documentation, READMEs, release notes |
 
 ### Research & Quality
 
 | Agent | Model | Role |
 |-------|-------|------|
-| `pytheas` | gemini-3.8-flash | Reconnaissance — fast codebase + GitHub/issue context lookup |
-| `zosimus` | gpt-6.1-sol | Deep investigation — bug reproduction, hypothesis validation |
-| `librarian` | gemini-3.8-flash | External knowledge — web search, docs, GitHub |
-| `oracle` | gpt-6-astra:max | Architectural decisions and consultation |
-| `argus` | gemini-3.8-flash | Independent verification — PASS/FAIL with evidence |
+| `pytheas` | gemini-4-hydrogen | Reconnaissance — fast codebase + GitHub/issue context lookup |
+| `zosimus` | gpt-6.2-sol | Deep investigation — bug reproduction, hypothesis validation |
+| `librarian` | gemini-4-hydrogen | External knowledge — web search, docs, GitHub |
+| `oracle` | gpt-6.2-astra:max | Architectural decisions and consultation |
+| `argus` | gemini-4-hydrogen | Independent verification — PASS/FAIL with evidence |
 | `mnemosyne` | us.zai.glm-5.3 | Knowledge compounding — reconciles durable knowledge into the authoritative docs, instructions, comments and tests |
-| `clio` | gemini-3.8-flash | Git operations — squash, rebase, push |
+| `clio` | gemini-4-hydrogen | Git operations — squash, rebase, push |
 
 ### Code Review Pipeline (Aristarchus)
 
@@ -66,7 +66,7 @@ for retention priorities, research sources, and evaluation guidance.
 Install from GHCR (replace `v0.1.0` with the current release):
 
 ```sh
-harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.4.19
+harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.4.22
 ```
 
 Use a harnx build containing the model and client updates accompanying this package refresh.
@@ -139,8 +139,8 @@ entries (the `else .` is implicit when omitted).
 ```yaml
 agents:
   - '.model = "claude:claude-opus-5-5"'   # override model for every agent
-  - 'if .name == "hephaestus" then .model = "openai:o3" end'
-  - 'if .name == "zosimus" then .model = "openai:o3" end'
+  - 'if .name == "hephaestus" then .model = "openai:gpt-6.2-astra" end'
+  - 'if .name == "zosimus" then .model = "openai:gpt-6.2-astra" end'
 ```
 
 ### Use a different model
@@ -150,7 +150,7 @@ Override per-agent or set all at once:
 ```yaml
 # ~/.config/harnx/packages/pantheon.patch.yaml
 agents:
-  - '.model = "codex:gpt-6.1-sol"'   # replace every agent's model
+  - '.model = "codex:gpt-6.2-sol"'   # replace every agent's model
 ```
 
 ### Using the Bedrock client
@@ -200,14 +200,20 @@ The package includes ready-to-use tool server configs in `tool_servers/`. Bundle
 
 | Server | Namespace | Requires | Notes |
 |--------|-----------|----------|-------|
-| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution and the PR-stability waiter used after delivery. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Includes a native PreToolUse hook (`harnx-proxy-auth`) for GitHub/Atlassian credential injection. |
+| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution and the PR-stability waiter used after delivery. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Uses in-process tool middleware with `proxy_auth` for GitHub/Atlassian credential injection. |
+| `proxy_auth.yaml` | `proxy_auth_*` | None (bundled binary) | Long-lived GitHub/Atlassian auth proxy tool service. Provides `proxy_auth_environment` used by bash middleware. |
 | `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Opts into repository and development-tool allow batches. |
 | `plans.yaml` | `plans_*` | None (bundled binary) | NATS-backed plan/task/note management using canonical `cid:plan:` URLs. |
 | `time.yaml` | `time_*` | None (bundled binary) | Current time and wait/sleep utilities. |
-| `fetch.yaml` | `fetch_*` | None (bundled binary) | Fetches URLs as markdown or text. No API key. |
+| `fetch.yaml` | `fetch_*` | None (bundled binary) | Fetches URLs as markdown, text, or JSON, and PNG, JPEG, GIF, or WebP images up to 5 MiB. No API key. |
 | `exa.yaml` | `exa_*` | None (bundled binary) | Web search via Exa. Requires `EXA_API_KEY`. |
 | `context7.yaml` | `context7_*` | Node.js / npx | Library docs lookup. No API key. |
 | `grep.yaml` | `grep_*` | None (bundled binary) | GitHub code search via grep.app. No API key. |
+| `attachments.yaml` | `attachments_*` | None (bundled binary) | NATS-backed attachment storage using canonical `cid:media:` URLs. |
+
+### Optional credential tool servers (`example_config/credential-tools/`)
+
+AWS and Kubernetes credential providers are available as opt-in templates in `example_config/credential-tools/`. To enable scoped AWS or Kubernetes access in this package without mounting host credential directories, copy `aws_creds.yaml`/`aws-creds.py` or `k8s_creds.yaml`/`k8s-creds.py` into this package's `tool_servers/` and `middleware/` directories (see `example_config/credential-tools/README.md`).
 
 Add your Exa key to `~/.local/share/harnx/.env`:
 

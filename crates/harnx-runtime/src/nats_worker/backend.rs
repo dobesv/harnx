@@ -357,20 +357,6 @@ impl FencedSessionLogSink {
             .await
     }
 
-    /// Blocking form used by the synchronous agent-loop approval callback.
-    pub fn append_hitl_event_cas_blocking(
-        &self,
-        entry: &harnx_core::session::SessionLogEntry,
-        expected_last_sequence: u64,
-    ) -> Result<Option<u64>> {
-        let sink = self.clone();
-        let entry = entry.clone();
-        block_on_io(async move {
-            sink.append_hitl_event_cas(&entry, expected_last_sequence)
-                .await
-        })
-    }
-
     fn fenced_entry(
         &self,
         entry: &harnx_core::session::SessionLogEntry,
@@ -389,6 +375,18 @@ impl FencedSessionLogSink {
 }
 
 impl crate::config::session::SessionAppendSink for FencedSessionLogSink {
+    fn interaction_session(
+        &self,
+    ) -> Option<crate::interaction_checkpoint::live::InteractionSession> {
+        Some(
+            crate::interaction_checkpoint::live::InteractionSession::new(
+                self.backend.clone(),
+                self.lease.clone(),
+                self.backend.replicas,
+            ),
+        )
+    }
+
     fn append(&self, entry: &harnx_core::session::SessionLogEntry) -> Result<u64> {
         let fenced = self.fenced_entry(entry);
         self.backend
@@ -1068,9 +1066,11 @@ mod tests {
 
     fn results(ids: &[&str], stamp: i64) -> SessionLogEntry {
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: ids
                 .iter()
                 .map(|id| ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some((*id).to_string()),
                     name: "probe".into(),
                     output: serde_json::json!({"stamp": stamp}),

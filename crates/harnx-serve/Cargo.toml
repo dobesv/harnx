@@ -27,7 +27,6 @@ futures = "0.3"
 futures-util = { workspace = true }
 harnx-blob-store = { path = "../harnx-blob-store" }
 harnx-core = { path = "../harnx-core" }
-harnx-hooks = { path = "../harnx-hooks" }
 harnx-metrics = { workspace = true }
 harnx-nats-common = { workspace = true }
 harnx-rag = { path = "../harnx-rag" }
@@ -55,7 +54,6 @@ tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
-harnx-hookset = { path = "../harnx-hookset" }
 harnx-test-bins = { path = "../harnx-test-bins" }
 futures = "0.3"
 libc = "0.2"

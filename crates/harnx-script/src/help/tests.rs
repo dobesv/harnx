@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 
 use super::{help, synopsis};
+use crate::commands::OutputMapping;
 
 fn schema() -> Value {
     json!({"type":"object", "required":["filePath"], "properties":{
@@ -21,7 +22,12 @@ fn synopsis_is_one_line_required_first_with_original_key_lookup() {
 
 #[test]
 fn help_has_man_page_sections_and_property_metadata() {
-    let actual = help("fs_read", &schema(), "Read a file.\nReturns its contents.");
+    let actual = help(
+        "fs_read",
+        &schema(),
+        "Read a file.\nReturns its contents.",
+        None,
+    );
     let expected = concat!(
         "NAME\n    fs_read - Read a file.\n\n",
         "SYNOPSIS\n    fs_read --file-path <string> [--max-lines <integer>] [--mode <string>] [--options <json>] [--raw|--no-raw] [--tags <string>]... [--json <object>]\n\n",
@@ -69,14 +75,14 @@ fn first_sentence_and_whitespace_table() {
 fn json_fallback_documentation_matches_parser_types() {
     for shape in [
         json!({"$ref":"#/$defs/Thing"}),
-        json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
-        json!({"type":["string","null"]}),
+        json!({"anyOf":[{"type":"string"},{"type":"integer"},{"type":"null"}]}),
+        json!({"type":["string","integer","null"]}),
         json!({"type":"array","items":{"type":"object"}}),
         json!({}),
     ] {
         let schema = json!({"properties":{"camelCase":shape}, "required":["camelCase"]});
         assert!(synopsis("tool", &schema, "").contains("--camel-case <json>"));
-        assert!(help("tool", &schema, "").contains("type: json; required"));
+        assert!(help("tool", &schema, "", None).contains("type: json; required"));
     }
 }
 
@@ -88,7 +94,10 @@ fn deterministic_property_order_does_not_depend_on_schema_insertion_order() {
         synopsis("tool", &a, "Summary."),
         synopsis("tool", &b, "Summary.")
     );
-    assert_eq!(help("tool", &a, "Summary."), help("tool", &b, "Summary."));
+    assert_eq!(
+        help("tool", &a, "Summary.", None),
+        help("tool", &b, "Summary.", None)
+    );
 }
 
 #[test]
@@ -96,10 +105,10 @@ fn collisions_and_reserved_json_document_the_escape_hatch() {
     let collision =
         json!({"properties":{"aB":{"type":"string"},"a_b":{"type":"string"}}, "required":["aB"]});
     assert_eq!(synopsis("tool", &collision, ""), "tool --json <object>");
-    assert!(help("tool", &collision, "").contains("Conflicting schema flag names"));
+    assert!(help("tool", &collision, "", None).contains("Conflicting schema flag names"));
     let reserved = json!({"properties":{"json":{"type":"string"}}, "required":["json"]});
     assert_eq!(synopsis("tool", &reserved, ""), "tool --json <object>");
-    assert!(help("tool", &reserved, "").contains("(property \"json\")"));
+    assert!(help("tool", &reserved, "", None).contains("(property \"json\")"));
 }
 
 #[test]
@@ -115,7 +124,7 @@ fn unlisted_required_keys_require_json_in_synopsis_and_help() {
         let syntax = synopsis("tool", &schema, "");
         assert!(syntax.ends_with(" --json <object>"), "{syntax}");
         assert!(!syntax.contains("[--json"), "{syntax}");
-        assert!(help("tool", &schema, "").contains(&format!("    {syntax}\n")));
+        assert!(help("tool", &schema, "", None).contains(&format!("    {syntax}\n")));
         assert!(parse_args(&schema, &[], None).is_err());
         let args = vec!["--json".into(), r#"{"unlisted":1}"#.into()];
         assert_eq!(
@@ -123,4 +132,38 @@ fn unlisted_required_keys_require_json_in_synopsis_and_help() {
             json!({"unlisted": 1})
         );
     }
+}
+
+#[test]
+fn help_shows_output_section_for_a_mapped_tool() {
+    let mapping = OutputMapping {
+        stdout: Some("text".into()),
+        stderr: Some("notes".into()),
+        exit_code: Some("exit_code".into()),
+        summary: Some("file text, like cat".into()),
+        ..Default::default()
+    };
+    let text = help("fs_read", &schema(), "Read a file.", Some(&mapping));
+    let expected = concat!(
+        "\nOUTPUT\n",
+        "  file text, like cat\n",
+        "  stdout: the `text` field    stderr: the `notes` field    exit status: the `exit_code` field\n",
+        "  -o json prints every field.\n",
+    );
+    assert!(text.ends_with(expected), "{text}");
+}
+
+#[test]
+fn help_leaves_out_output_lines_for_absent_parts() {
+    let mapping = OutputMapping {
+        stdout: Some("text".into()),
+        ..Default::default()
+    };
+    let text = help("fs_read", &schema(), "Read a file.", Some(&mapping));
+    assert!(text.ends_with("\nOUTPUT\n  stdout: the `text` field\n  -o json prints every field.\n"));
+}
+
+#[test]
+fn help_has_no_output_section_without_a_mapping() {
+    assert!(!help("fs_read", &schema(), "Read a file.", None).contains("OUTPUT"));
 }

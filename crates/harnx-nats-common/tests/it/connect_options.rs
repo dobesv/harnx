@@ -287,7 +287,7 @@ fn an_explicit_discovery_setting_overrides_the_transport_default() {
     assert!(ep.resolved_ignore_discovered_servers());
 }
 
-/// The override reaches a standalone tool/hook server the same way every other
+/// The override reaches a standalone tool server the same way every other
 /// broker setting does, so a worker and the children it spawns agree.
 #[test]
 fn from_env_reads_the_discovery_override() {

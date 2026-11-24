@@ -62,11 +62,14 @@ Plan-Id: cid:plan:pantheon%2Fatlas/armDRA/token-refresh-race
 
 ## Squash Base Rule
 
-**Always use `origin/HEAD` as the squash base — NEVER `git merge-base`.**
+**Rebase onto the remote tip of the PR's base branch, then squash onto that same tip — NEVER onto `git merge-base`.**
 
-When squashing commits before a push, use `origin/HEAD` as the base. It always resolves to
-the current tip of the default branch on the remote, which is the correct boundary for what
-belongs in this PR.
+The base is `origin/HEAD`, the current tip of the default branch on the remote, unless the
+caller named a base branch because the work is stacked on another branch. Then it is
+`origin/<base>`: use it in place of `origin/HEAD` everywhere in this section, for the rebase,
+the squash and the sanity check. Squashing a stacked branch onto `origin/HEAD` folds the
+parent branch's commits into this PR's commit, so the PR against the parent shows the
+parent's changes as well.
 
 > **Prerequisite**: `origin/HEAD` must be set. If in doubt, run `git fetch origin` before
 > squashing. If `origin/HEAD` is not set (rare in some shallow clones), set it explicitly:
@@ -76,30 +79,44 @@ Using `git merge-base` is unreliable: when the default branch has been merged *i
 feature branch (common in merge-workflow teams), the merge-base drifts forward and captures
 too little history — the squash misses commits that should be included.
 
+**Rebase before you squash.** `git reset --soft` keeps the branch's files exactly as they
+are. If the base gained commits after the branch was cut, a squash made without rebasing
+first undoes those commits' changes inside this PR's commit, and no later rebase brings
+them back. Fetch once, then use that same base for every step:
+
 **Correct:**
 ```
+git fetch origin
+git rebase origin/HEAD
+git merge-base --is-ancestor origin/HEAD HEAD   # must succeed before the reset
 git reset --soft origin/HEAD
 git commit -m "..."
 ```
 
+If the rebase stops on a conflict you can't resolve with confidence, run `git rebase --abort`
+and report the conflicting files to the caller instead of guessing.
+
 ### Mandatory File-Count Sanity Check
 
-After squashing and before rebasing or pushing, verify the squash captured only this PR's changes:
+After squashing and before pushing, verify the squash captured only this PR's changes:
 
 ```
-git diff origin/HEAD... --name-only | wc -l
+git diff origin/HEAD... --name-only
 ```
 
-**If the count exceeds 200 files, STOP immediately.** Do NOT rebase or push.
+**If it lists more than 200 files, STOP immediately.** Do NOT push.
 This almost certainly means something is wrong with the squash — verify the branch is
 not accidentally including unrelated commits.
 
+Read the list as well. A file this work never touched means the squash picked up, or
+undid, someone else's change, even when the count is small.
+
 Report to the caller:
-- The file count observed
+- The file count observed, and any files this work didn't touch
 - That the squash result appears incorrect
 - That they should investigate and retry
 
-Only proceed with rebase and push if the file count is plausible for the PR.
+Only push if the file list is plausible for the PR.
 
 ## Standalone Commit Operations
 
@@ -134,6 +151,8 @@ pending, or failing. Return this existing pull request URL instead of a compare 
 
 Only when no open pull request exists for the branch, return a GitHub compare or
 new-pull-request link so the caller can open one. Never create the pull request yourself.
+When the caller named a base branch, build the compare link against it:
+`https://github.com/<owner>/<repo>/compare/<base>...<branch>?expand=1`.
 
 Always include enough structured delivery metadata for the caller to monitor the result:
 
@@ -143,11 +162,14 @@ delivery_kind: existing_pr | compare
 repository: <owner/name>
 branch: <head branch>
 head_owner: <fork owner, when known>
+base: <base branch, when the caller named one>
 ```
 
 The caller streams `delivery_url` to the user immediately. For an existing PR it monitors
-that URL directly; for a compare link it uses `repository`, `branch`, and `head_owner` to
-wait for the user to open the pull request.
+that URL directly; for a compare link it passes `repository`, `branch`, `head_owner`, and
+`base` to the waiter, which waits for the user to open the pull request.
+
+Include `base` only when the caller told you which branch the pull request targets.
 
 ## Issue Tracker Reference Detection
 

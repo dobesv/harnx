@@ -107,7 +107,7 @@ impl McpBridge {
     }
 }
 
-fn binary(name: &str) -> Result<PathBuf> {
+pub(in super::super) fn binary(name: &str) -> Result<PathBuf> {
     let mut path = std::env::current_exe()?;
     path = harnx_core::bin_dir_of_exe(&path);
     path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));

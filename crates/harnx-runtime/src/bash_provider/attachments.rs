@@ -3,7 +3,10 @@
 use std::{io, sync::Arc};
 
 use async_trait::async_trait;
-use harnx_blob_store::{media::media_size, touch_activity};
+use harnx_blob_store::{
+    media::{media_size, AttachmentsBucket},
+    touch_activity,
+};
 use harnx_core::cid_url::CidUrl;
 use harnx_script::{
     fs_attachments::{AttachmentFetcher, AttachmentFs},
@@ -17,7 +20,7 @@ pub(crate) fn fetcher(jetstream: async_nats::jetstream::Context) -> Arc<dyn Atta
     })
 }
 
-pub(super) fn mount(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> FsMount {
+pub(crate) fn mount(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> FsMount {
     AttachmentFs::new(fetcher.unwrap_or_else(|| Arc::new(Unavailable))).mount()
 }
 
@@ -26,13 +29,11 @@ struct NatsAttachmentFetcher {
     /// Bucket handle memoized after the first successful open. Only positive
     /// results are memoized: an absent bucket is looked up again so a store
     /// created later in the round is still seen.
-    bucket: std::sync::Mutex<Option<async_nats::jetstream::object_store::ObjectStore>>,
+    bucket: std::sync::Mutex<Option<AttachmentsBucket>>,
 }
 
 impl NatsAttachmentFetcher {
-    async fn bucket(
-        &self,
-    ) -> anyhow::Result<Option<async_nats::jetstream::object_store::ObjectStore>> {
+    async fn bucket(&self) -> anyhow::Result<Option<AttachmentsBucket>> {
         if let Some(store) = self.bucket.lock().expect("bucket cache poisoned").clone() {
             return Ok(Some(store));
         }

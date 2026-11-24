@@ -38,6 +38,14 @@ pub(crate) fn terminal_from_history(
     let Some((_, entry)) =
         harnx_core::session_reconstruct::prompt_terminal_entry(history, prompt_seq)
     else {
+        // A durable modal boundary ends this attachment, not the invocation.
+        // Hydration below publishes the request before RUN_FINISHED. A parked
+        // worker may release its lease; that isn't worker loss.
+        if harnx_core::session_reconstruct::pending_prompt_seq(history) == Some(prompt_seq)
+            && crate::ag_ui_interactions::pending_value(history).is_some()
+        {
+            return Some(RemoteFollowTerminal::Finished);
+        }
         // Retraction/rewind can settle input without a TurnEnd.
         return harnx_core::session_reconstruct::pending_prompt_seq(history)
             .is_none()

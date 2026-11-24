@@ -30,7 +30,7 @@ impl NatsSession {
         let orphaned = update.orphaned;
         driver.stream.refresh_generation().await?;
         let (observed_boundary, completion_visible) =
-            self.evaluate_completion_visibility(&entries, cx)?;
+            self.evaluate_completion_visibility(&entries, cx).await?;
         Self::sync_effective_log_advisories(&entries, cx, driver);
         Self::resolve_completion_effect(
             CompletionCandidate {
@@ -43,7 +43,7 @@ impl NatsSession {
         )
     }
 
-    fn evaluate_completion_visibility(
+    async fn evaluate_completion_visibility(
         &self,
         entries: &[(u64, SessionLogEntry)],
         cx: &FollowLoopContext<'_>,
@@ -53,7 +53,8 @@ impl NatsSession {
                 if cx.target.invocation_id.is_empty() {
                     anyhow::bail!("boundary follow has no invocation identity");
                 }
-                self.observe_follow_boundary(entries, cx.target, boundary_options)?
+                self.observe_follow_boundary(entries, cx.target, boundary_options)
+                    .await?
             }
             None => None,
         };
@@ -61,7 +62,12 @@ impl NatsSession {
         let completion_visible = if cx.boundary_options.is_some() {
             observed_boundary.is_some()
         } else {
-            Self::is_turn_completion_visible(entries, effective.as_deref(), cx.target.prompt_seq)
+            Self::is_follow_completion_visible(
+                entries,
+                effective.as_deref(),
+                cx.target.prompt_seq,
+                cx.wait_for_interactions,
+            )
         };
         Ok((observed_boundary, completion_visible))
     }

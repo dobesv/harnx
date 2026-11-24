@@ -20,6 +20,13 @@ pub trait SessionAppendSink: Send + Sync + Any {
     /// Append an entry and return its one-based durable sequence number.
     fn append(&self, entry: &SessionLogEntry) -> Result<u64>;
 
+    /// Durable middleware support is available only from a lease-owning NATS sink.
+    fn interaction_session(
+        &self,
+    ) -> Option<crate::interaction_checkpoint::live::InteractionSession> {
+        None
+    }
+
     /// Recheck exact sink authority before reporting a failed output append.
     fn validate_output(&self) -> Result<()> {
         Ok(())

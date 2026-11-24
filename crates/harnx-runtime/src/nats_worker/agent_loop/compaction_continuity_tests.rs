@@ -46,7 +46,9 @@ fn completed_compaction() -> Vec<(u64, SessionLogEntry)> {
             fence_token: None,
         },
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![harnx_core::session::ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some("edit-1".into()),
                 name: "edit".into(),
                 output: serde_json::json!({"ok": true}),

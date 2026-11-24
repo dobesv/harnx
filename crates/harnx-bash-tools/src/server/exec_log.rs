@@ -273,8 +273,6 @@ impl BashServer {
         TruncateOpts {
             head_lines: head_lines.unwrap_or(default_opts.head_lines),
             tail_lines: tail_lines.unwrap_or(default_opts.tail_lines),
-            line_head_bytes: default_opts.line_head_bytes,
-            line_tail_bytes: default_opts.line_tail_bytes,
             max_output_bytes: max_output_bytes.unwrap_or(default_opts.max_output_bytes),
             ..default_opts
         }

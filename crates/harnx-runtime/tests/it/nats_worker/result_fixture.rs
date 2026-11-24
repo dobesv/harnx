@@ -11,7 +11,7 @@ mod provider;
 #[path = "result_fixture/session.rs"]
 mod session;
 
-pub(super) use bridge::{BridgeScript, McpBridge};
+pub(super) use bridge::{binary, BridgeScript, McpBridge};
 pub(super) use provider::CapturedProvider;
 pub(super) use session::{ProviderSession, SessionSpec};
 

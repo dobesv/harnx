@@ -160,7 +160,7 @@ the prompt, you've gone too far — you might as well have done the work directl
 
 ## Task Verification (Argus)
 
- After EVERY delegation returns, delegate verification to `argus`.
+After every delegation returns, delegate verification to `argus`, except as noted below.
 NEVER trust subagent claims without independent verification.
 
 Delegate to `argus` with:
@@ -179,9 +179,13 @@ Argus will return a structured **PASS** or **FAIL** verdict with evidence.
 - Maximum 3 retry attempts per task. After 3 failures, document the problem
   and move to the next task — do not block the entire plan.
 
+Skip Argus on the final task before the Aristarchus review and on fixes for review
+findings, and never run it in parallel with Aristarchus. The quality gate below has the
+full rule, including when a change skips the review and still needs Argus.
+
 ## Incremental Commit & Push
 
-**After each task is verified (Argus PASS)** and **before requesting review** from Aristarchus, commit and push your work to protect against work loss if the session is interrupted:
+**After each task is verified** (Argus PASS, or for the final task and review fixes, once the pre-submit checks pass) and **before requesting review** from Aristarchus, commit and push your work to protect against work loss if the session is interrupted:
 
 1. Run the necessary git commands to stage and commit the verified work with a descriptive message.
 2. Push the branch to the remote repository.
@@ -240,6 +244,7 @@ the Mnemosyne knowledge-reconciliation step has run (or been intentionally skipp
 delegate to `clio` to squash, rebase, and push. Provide:
 - The full **plan URL** (`cid:plan:...`). Clio reads the plan via `plans_get_plan` to inspect structured issue metadata (`github_issue` paired with `github_owner_repo`, or `external_task_url`) or legacy plan notes to compose the commit message.
 - An optional **issue reference** override (e.g. `Issue: FDEV-1234`, `Issue: #123`, or repo-qualified `Issue: owner/repo#123` when target repository differs). Clio reads plan metadata first by default, so pass this only if overriding or supplying a reference not yet in plan metadata.
+- The **base branch**, when the work is stacked on another branch rather than the default branch.
 
 **Do NOT provide a pre-composed commit message.** Clio reads the full diff
 against the default branch and the plan metadata to compose a message
@@ -259,12 +264,12 @@ Every final PR delivery must remain active while the pull request is opened and 
    the response after printing the link.
 2. In that same response, call `bash_wait_for_pr_stable`. Pass `pr_url` for an existing
    pull request. For a compare link, pass Clio's `repository` value as `repo`, plus its
-   `branch` and `head_owner`, so the tool can wait for the user to open the PR. Use the
-   default 24-hour timeout unless
-   the plan calls for another limit.
+   `branch` and `head_owner`, plus `base` when Clio reported one, so the tool can wait for
+   the user to open the PR. Use the default 24-hour timeout unless the plan calls for
+   another limit.
 3. Let the tool perform its own GitHub polling instead of repeatedly waking the model.
 4. When it returns, inspect current checks, reviews, and comments. Failed checks or actionable
-   feedback resume specialist delegation, Argus verification, review, Clio delivery, and the
+   feedback resume specialist delegation, pre-submit checks, review, Clio delivery, and the
    stability wait. If everything is clear, report the stable PR status. If the wait timed out,
    was cancelled, or returned `activity_stalled`, report the remaining blocker precisely.
 

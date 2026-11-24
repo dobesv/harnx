@@ -9,13 +9,13 @@ members = [
     "crates/harnx-script",
     "crates/harnx-client",
     "crates/harnx-core",
+    "crates/harnx-credentials",
     "crates/harnx-engine",
     "crates/harnx-session",
     "crates/harnx-aws-creds",
     "crates/harnx-k8s-creds",
     "crates/harnx-k8s-sandbox-tools",
     "crates/harnx-fetch",
-    "crates/harnx-hooks",
     "crates/harnx-bash-tools",
     "crates/harnx-mcp-bridge",
     "crates/harnx-sandbox-common",
@@ -40,9 +40,7 @@ members = [
     "crates/harnx-spinner",
     "crates/harnx-test-bins",
     "crates/harnx-time-tools",
-    "crates/harnx-hookset",
-    "crates/harnx-hookset-server",
-    "crates/harnx-claude-compatible-hook-server",
+    "crates/harnx-claude-hook-tools",
     "crates/harnx-toolset",
     "crates/harnx-toolset-server",
     "crates/harnx-tui",
@@ -54,7 +52,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.34.20"
+version = "0.35.0"
 edition = "2021"
 authors = ["sigoden <sigoden@gmail.com>"]
 description = "All-in-one LLM CLI Tool"
@@ -88,6 +86,7 @@ debug = "line-tables-only"
 opt-level = "z"
 
 [workspace.dependencies]
+thiserror = "2"
 bashkit = { version = "=0.20.2", default-features = false, features = ["jq"] }
 anyhow = "1.0.69"
 bytes = "1.4.0"
@@ -103,6 +102,7 @@ ratatui = { version = "0.30.1", features = ["crossterm_0_29", "unstable-rendered
 regex = "1"
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = { version = "1.0.93", features = ["preserve_order"] }
+jsonschema = { version = "0.63.0", default-features = false }
 serde_yaml = "0.9.17"
 tokio = { version = "1.48", features = ["rt", "time", "macros", "signal", "rt-multi-thread", "io-util", "process"] }
 tonic = { version = "0.14", default-features = false }
@@ -117,7 +117,7 @@ chrono = { version = "0.4.23", features = ["serde"] }
 chrono-tz = "0.10"
 iana-time-zone = "0.1"
 bincode = { version = "2.0.1", features = ["serde", "std"], default-features = false }
-parking_lot = "0.12.1"
+parking_lot = "0.13.0"
 percent-encoding = "2.3.2"
 fancy-regex = "0.20.0"
 base64 = "0.23.0"
@@ -141,12 +141,12 @@ async-recursion = "1.1.1"
 http = "1.1.0"
 http-body = "1"
 http-body-util = "0.1"
-opentelemetry = "0.32"  # Cannot bump to 0.33 until tracing-opentelemetry 0.34 ships (0.33 depends on otel ^0.32)
-opentelemetry-http = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false }
-opentelemetry-proto = { version = "0.32", default-features = false }
-opentelemetry-semantic-conventions = "0.32"
-opentelemetry_sdk = "0.32"
+opentelemetry = "0.33"
+opentelemetry-http = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false }
+opentelemetry-proto = { version = "0.33", default-features = false }
+opentelemetry-semantic-conventions = "0.33"
+opentelemetry_sdk = "0.33"
 prost = "0.14"
 multer = "3"
 metrics = "0.24.6"
@@ -164,16 +164,17 @@ rustls-pemfile = "2"
 tokio-rustls = "0.26"
 time = { version = "0.3.36", features = ["macros"] }
 tracing = "0.1"
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
-jaq-all = { version = "0.3", features = ["formats"] }
+jaq-all = { version = "0.4", features = ["formats"] }
 indexmap = { version = "2.2.6", features = ["serde"] }
 hmac = "0.13.0"
+humantime = "2.3.0"
 aws-config = { version = "1", features = ["sso"] }
 aws-credential-types = "1"
 aws-smithy-eventstream = "0.61.0"
-kube = { version = "4.0.0", features = ["client", "config"] }
-k8s-openapi = { version = "0.28.0", features = ["v1_35"] }
+kube = { version = "5.1.0", features = ["client", "config"] }
+k8s-openapi = { version = "0.29.0", features = ["v1_35"] }
 secrecy = { version = "0.10" }
 urlencoding = "2.1.3"
 unicode-segmentation = "1.11.0"
@@ -194,10 +195,12 @@ which = "8.0.0"
 fuzzy-matcher = "0.3.7"
 terminal-colorsaurus = "1.0.3"
 duct = "1.0.0"
-rmcp = { version = "3.0", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
+ring = "0.17.14"
+oauth2 = { version = "5", default-features = false }
+rmcp = { version = "3.0", features = ["auth", "client", "server", "transport-child-process", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
 process-wrap = { version = "10", features = ["tokio1"] }
 libc = "0.2"
-async-nats = { version = "0.51", default-features = false, features = ["server_2_10", "server_2_11", "ring", "jetstream", "kv", "object-store", "websockets"] }
+async-nats = { version = "0.53", default-features = false, features = ["server_2_10", "server_2_11", "ring", "jetstream", "kv", "object-store", "websockets"] }
 glob = "0.3"
 globset = "0.4"
 shellexpand = "3.1.0"
@@ -205,9 +208,15 @@ schemars = "1.0"
 ratatui-textarea = "0.9.0"
 ratatui_widget_scrolling = "0.1.0"
 jiff = { version = "0.2.23", features = ["serde"] }
+# jsonwebtoken 11 panics on encode/decode unless feature unification enables
+# exactly one of its crypto backends (aws_lc_rs or rust_crypto). Keep aws_lc_rs
+# the only backend workspace-wide; if another crate needs jsonwebtoken, don't
+# let it enable the other backend (check: `cargo tree -e features -i jsonwebtoken`),
+# or call `crypto::CryptoProvider::install_default` first.
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
 harnx-core = { path = "crates/harnx-core" }
+harnx-credentials = { path = "crates/harnx-credentials" }
 harnx-nats-common = { path = "crates/harnx-nats-common" }
 harnx-telemetry = { path = "crates/harnx-telemetry" }
 harnx-toolset = { path = "crates/harnx-toolset" }

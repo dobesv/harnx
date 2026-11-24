@@ -1,5 +1,9 @@
 use super::*;
 use harnx_runtime::nats_session::AppendedPrompt;
+use harnx_runtime::nats_session_metadata::SessionBusy;
+
+/// Poll interval for the head-drain retry loop below.
+const HEAD_DRAIN_POLL: Duration = Duration::from_millis(50);
 
 impl Publisher {
     pub(super) async fn admit_fixed_prompt(
@@ -12,9 +16,8 @@ impl Publisher {
             .checkpoint(crate::fault_injection::Boundary::BeforeAdmission)
             .await;
         let ticket = self.authority.ticket(&self.storage_key)?;
-        let outcome = session
-            .append_fixed_prompt(&ticket, input.message_content())
-            .await?;
+        let outcome =
+            append_fixed_prompt_with_drain(session, &ticket, input.message_content()).await?;
         anyhow::ensure!(
             matches!(
                 outcome,
@@ -68,5 +71,33 @@ impl Publisher {
             .await;
         self.publish_snapshot();
         Ok(appended)
+    }
+}
+
+/// Append the fixed prompt, retrying `SessionBusy::ActiveInvocation` until
+/// the previous invocation's steered continuation rounds drain (see
+/// `HEAD_DRAIN_TIMEOUT`); every other error surfaces unchanged.
+async fn append_fixed_prompt_with_drain(
+    session: &NatsSession,
+    ticket: &harnx_runtime::nats_session::fixed_admission::FixedAdmissionTicket,
+    content: harnx_core::message::MessageContent,
+) -> Result<harnx_runtime::nats_session::fixed_admission::FixedAdmissionOutcome> {
+    let deadline = tokio::time::Instant::now() + super::HEAD_DRAIN_TIMEOUT;
+    loop {
+        match session.append_fixed_prompt(ticket, content.clone()).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<SessionBusy>(),
+                    Some(SessionBusy::ActiveInvocation { .. })
+                ) =>
+            {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+                tokio::time::sleep(HEAD_DRAIN_POLL).await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }

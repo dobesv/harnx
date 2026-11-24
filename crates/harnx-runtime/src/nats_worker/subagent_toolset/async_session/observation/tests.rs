@@ -6,9 +6,11 @@ use serde_json::json;
 mod budget_tests;
 mod deadline_tests;
 mod fixture;
+mod interaction_blocked_tests;
 mod joined_tests;
 mod lifecycle_tests;
 mod repair_tests;
+mod result_tests;
 mod wait_tests;
 mod watcher_tests;
 

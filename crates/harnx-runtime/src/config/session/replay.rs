@@ -49,6 +49,7 @@ pub(crate) fn interrupted_tool_outputs(
             }),
             markdown: None,
             content: Vec::new(),
+            user_surfaces: Vec::new(),
             switch_agent: None,
         })
         .collect()
@@ -236,11 +237,7 @@ impl<'a> ReplayState<'a> {
             SessionLogEntry::DataUrls { urls } => self.session.data_urls.extend(urls),
             SessionLogEntry::Compress { prompt } => self.compress(prompt)?,
             SessionLogEntry::Clear => self.clear(),
-            SessionLogEntry::Unknown => anyhow::ensure!(
-                allow_embedded_metadata,
-                "unsupported or legacy entry found in canonical NATS transcript '{}'",
-                self.name
-            ),
+            SessionLogEntry::Unknown => self.unknown_entry(allow_embedded_metadata)?,
             // Errors annotate the transcript; control state is hydrated separately.
             // None of these entries may break pending tool-call/result adjacency.
             // Runtime-note entries were handled before this dispatch.
@@ -251,12 +248,26 @@ impl<'a> ReplayState<'a> {
             | SessionLogEntry::HandoffCommitted { .. }
             | SessionLogEntry::HitlApprovalRequested { .. }
             | SessionLogEntry::HitlApprovalDecision { .. }
+            | SessionLogEntry::ToolCallCompleted { .. }
+            | SessionLogEntry::InteractionRequested { .. }
+            | SessionLogEntry::SuspensionReady { .. }
+            | SessionLogEntry::InteractionResponse { .. }
+            | SessionLogEntry::SurfaceAction { .. }
             | SessionLogEntry::CompactRequest { .. }
             | SessionLogEntry::CompactResult { .. }
             | SessionLogEntry::AdmissionClosed { .. }
             | SessionLogEntry::EditEntries { .. }
             | SessionLogEntry::Rewind { .. } => {}
         }
+        Ok(())
+    }
+
+    fn unknown_entry(&self, allow_embedded_metadata: bool) -> Result<()> {
+        let name = self.name;
+        anyhow::ensure!(
+            allow_embedded_metadata,
+            "unsupported or legacy entry found in canonical NATS transcript '{name}'"
+        );
         Ok(())
     }
 
@@ -440,6 +451,7 @@ fn assemble_synthetic_tool_message(pending: PendingToolCalls, error: &str) -> Me
         output: serde_json::json!({ "error": error }),
         markdown: None,
         content: Vec::new(),
+        user_surfaces: Vec::new(),
         switch_agent: None,
     };
     // Fabricate one lost-response per call, matched by id/position.
@@ -500,6 +512,7 @@ fn assemble_tool_message(
                     output: out.output,
                     markdown: out.markdown,
                     content: out.content,
+                    user_surfaces: out.user_surfaces,
                     switch_agent: out.switch_agent,
                     execution_context: None,
                 },

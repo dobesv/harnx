@@ -218,6 +218,44 @@ mod timing_fold_tests {
         assert_eq!(latest_seq, Some(3));
     }
 
+    /// Review F2: hook-added context rows carry a reserved hook-context id.
+    /// The mid-turn fold must not select them as fresh user messages — that
+    /// is what failed the first tool round with "injected user row has no
+    /// durable admission" (#2198 scenario). They reach the model through the
+    /// session's durable history instead.
+    #[test]
+    fn fold_new_user_messages_since_skips_hook_context_rows() {
+        let hook_context = |seq: u64, text: &str| {
+            (
+                seq,
+                SessionLogEntry::Message {
+                    id: Some(harnx_core::runtime_note::new_hook_context_message_id()),
+                    role: MessageRole::User,
+                    content: MessageContent::Text(text.to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            )
+        };
+        let entries: Vec<(u64, SessionLogEntry)> = vec![
+            user_prompt(1, "admitted prompt"),
+            hook_context(2, "context added by an event hook"),
+        ];
+
+        let (messages, latest_seq) = fold_new_user_messages_since(&entries, None);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.to_text())
+                .collect::<Vec<_>>(),
+            vec!["admitted prompt".to_string()],
+            "the hook-context row must not fold in as an injected prompt"
+        );
+        // The cursor tracks executable prompts only; the skipped row is
+        // re-examined and re-skipped by id on every later fold.
+        assert_eq!(latest_seq, Some(1));
+    }
+
     #[test]
     fn fold_timing_notice_with_concurrent_user_preserves_real_user() {
         // Timing notice interleaved with concurrent real user messages

@@ -41,6 +41,48 @@ fn remote_agent_configs(servers: &[NatsServerConfig]) -> HashMap<String, AgentCo
         .collect()
 }
 
+/// Keep canonical top-level references explicitly absolute while package
+/// patches run. Otherwise an unchanged `local:small` is indistinguishable
+/// from a newly assigned package-relative target with the same spelling.
+fn prepare_patch_model_ids(agent: &mut Agent) {
+    if harnx_core::package_namespace::pkg_from_qualified(agent.name()).is_none() {
+        return;
+    }
+    let file_form = |id: &str| {
+        let client = id.split_once(':').map_or(id, |(client, _)| client);
+        if client.contains('/') {
+            id.to_string()
+        } else {
+            format!("/{id}")
+        }
+    };
+    let model_id = agent.model_id().map(file_form);
+    let fallbacks = agent
+        .model_fallbacks()
+        .iter()
+        .map(|id| file_form(id))
+        .collect();
+    agent.set_model_id(model_id);
+    agent.set_model_fallbacks(fallbacks);
+}
+
+fn resolve_patched_agent_variables(
+    agent: &mut Agent,
+    baseline: &Agent,
+    variables: &AgentVariables,
+) -> Result<()> {
+    // Compare the declared shape, excluding serde-skipped scratch values.
+    if serde_json::to_value(agent.defined_variables())?
+        != serde_json::to_value(baseline.defined_variables())?
+    {
+        self::agent::resolve_session_variables(agent, variables)?;
+    }
+    // Validate against session inputs, not cached defaults, even for an
+    // unchanged agent. Required values may only be supplied by the final shape.
+    self::agent::require_agent_variables(agent.defined_variables(), variables)?;
+    Ok(())
+}
+
 impl Config {
     /// Set the agent and cluster for the active session.
     pub fn set_remote_agent(&mut self, agent: String, cluster: String) {
@@ -77,16 +119,134 @@ impl Config {
     pub fn use_prompt(&mut self, prompt: &str) -> Result<()> {
         let mut agent = Agent::new(AgentConfig::from_prompt(prompt));
         agent.set_model(self.current_model().clone());
-        if agent.temperature().is_none() {
-            agent.set_temperature(self.temperature);
-        }
-        if agent.top_p().is_none() {
-            agent.set_top_p(self.top_p);
-        }
-        if agent.use_tools().is_none() {
-            agent.set_use_tools(self.use_tools.clone());
-        }
+        self.inherit_agent_defaults(&mut agent);
         self.use_agent_obj(agent)
+    }
+
+    fn inherit_agent_defaults(&self, agent: &mut Agent) {
+        Self::apply_agent_default_overrides(
+            agent,
+            self.temperature,
+            self.top_p,
+            self.use_tools.clone(),
+        );
+    }
+
+    /// The `inherit_agent_defaults` logic without a config borrow, so callers
+    /// holding a mutable agent borrow can snapshot the fallbacks first.
+    fn apply_agent_default_overrides(
+        agent: &mut Agent,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        use_tools: Option<Vec<String>>,
+    ) {
+        let temperature = agent.temperature().or(temperature);
+        let top_p = agent.top_p().or(top_p);
+        let use_tools = agent.use_tools().or(use_tools);
+        agent.set_temperature(temperature);
+        agent.set_top_p(top_p);
+        agent.set_use_tools(use_tools);
+    }
+
+    /// Turn the active agent into the session's effective agent: stamp the
+    /// caller-principals snapshot onto it and run the agent's `patches` with
+    /// `$user` bound to that snapshot.
+    ///
+    /// The caller runs this after session overrides (so an override cannot
+    /// re-add what a patch removed) and before anything reads the agent —
+    /// server selection, hooks, middleware, run limits, prompt rendering. All
+    /// of those read `Config.agent`, so the patched agent is what they see.
+    /// `variables` must be the original session inputs, not the resolved map,
+    /// so changed declarations can supply new defaults without losing explicit values.
+    ///
+    /// Fail-closed (G6): the error already names the agent and the failing
+    /// filter, and the caller must fail the activation; running the unpatched
+    /// config is never allowed.
+    // qual:allow(iosp) — atomic activation pipeline: patch, resolve, validate, then publish; keeping the steps together makes failure leave the active config untouched
+    pub fn apply_session_agent_patches(
+        &mut self,
+        user: &harnx_core::user_principals::UserPrincipals,
+        variables: &AgentVariables,
+    ) -> Result<()> {
+        let Some(baseline) = self.agent.as_ref() else {
+            bail!("cannot apply session agent `patches`: no active agent");
+        };
+        // Publish only after resolution and validation succeed, including
+        // variable defaults introduced by a patch.
+        let mut agent = baseline.clone();
+        agent.set_user_principals(Some(user.clone()));
+        let has_patches = !agent.patches().is_empty();
+        if has_patches {
+            prepare_patch_model_ids(&mut agent);
+            agent.apply_user_patches(user)?;
+            self.resolve_patched_agent_model(&mut agent, baseline)
+                .with_context(|| {
+                    format!("agent '{}': resolve model after `patches`", agent.name())
+                })?;
+        }
+        resolve_patched_agent_variables(&mut agent, baseline, variables).with_context(|| {
+            if has_patches {
+                format!(
+                    "agent '{}': resolve variables after `patches`",
+                    agent.name()
+                )
+            } else {
+                format!("agent '{}': resolve variables", agent.name())
+            }
+        })?;
+        // Re-validate middleware against the patched agent, mirroring
+        // `use_agent_obj`: a patch that adds an invalid middleware entry must
+        // fail the activation, not the first tool call.
+        self.resolved_middleware_for_agent(Some(&agent))
+            .with_context(|| {
+                if has_patches {
+                    format!(
+                        "agent '{}': validate middleware after `patches`",
+                        agent.name()
+                    )
+                } else {
+                    format!("agent '{}': validate middleware", agent.name())
+                }
+            })?;
+        self.agent = Some(agent);
+        Ok(())
+    }
+
+    /// Re-resolve the model after `patches` changed the agent's `model` id,
+    /// mirroring [`Config::retrieve_agent`]. An unchanged id keeps the runtime
+    /// model the patch already restored; a cleared id falls back to the
+    /// global model and inherited defaults.
+    fn resolve_patched_agent_model(&self, agent: &mut Agent, baseline: &Agent) -> Result<()> {
+        let package = harnx_core::package_namespace::pkg_from_qualified(agent.name());
+        let model_id = agent
+            .model_id()
+            .map(|id| self::agent::resolve_package_model_id(id, package));
+        let fallbacks = agent
+            .model_fallbacks()
+            .iter()
+            .map(|id| self::agent::resolve_package_model_id(id, package))
+            .collect();
+        agent.set_model_id(model_id);
+        agent.set_model_fallbacks(fallbacks);
+        if agent.model_id() == baseline.model_id() {
+            // The patch's file-form id may differ from the canonical id even
+            // when both name the same model. Keep its resolved runtime data.
+            agent.set_resolved_model(baseline.model().clone());
+            return Ok(());
+        }
+        match agent.model_id() {
+            Some(model_id) => {
+                let model =
+                    crate::client::retrieve_model(&self.clients, model_id, ModelType::Chat)?;
+                agent.set_model(model);
+            }
+            None => {
+                // current_model() would read the active agent, not the global fallback.
+                agent.set_model(self.model.clone());
+                self.inherit_agent_defaults(agent);
+            }
+        }
+        Ok(())
     }
 
     pub fn retrieve_agent(&self, name: &str) -> Result<Agent> {
@@ -96,6 +256,8 @@ impl Config {
         } else {
             self::agent::builtin(name)?
         };
+        self.resolved_middleware_for_agent(Some(&agent))?;
+        self.resolved_event_hooks_for_agent(Some(&agent))?;
         let current_model = self.current_model().clone();
         match agent.model_id() {
             Some(model_id) => {
@@ -109,15 +271,7 @@ impl Config {
             }
             None => {
                 agent.set_model(current_model);
-                if agent.temperature().is_none() {
-                    agent.set_temperature(self.temperature);
-                }
-                if agent.top_p().is_none() {
-                    agent.set_top_p(self.top_p);
-                }
-                if agent.use_tools().is_none() {
-                    agent.set_use_tools(self.use_tools.clone());
-                }
+                self.inherit_agent_defaults(&mut agent);
             }
         }
         Ok(agent)
@@ -176,11 +330,17 @@ impl Config {
     }
 
     pub fn use_agent_obj(&mut self, agent: Agent) -> Result<()> {
+        self.resolved_middleware_for_agent(Some(&agent))?;
+        self.resolved_event_hooks_for_agent(Some(&agent))?;
+        self.exit_active_agent()?;
+        self.set_active_agent(agent);
+        Ok(())
+    }
+
+    fn exit_active_agent(&mut self) -> Result<()> {
         if self.agent.is_some() {
             self.exit_agent()?;
         }
-
-        self.set_active_agent(agent);
         Ok(())
     }
 

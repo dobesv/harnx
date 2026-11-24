@@ -24,6 +24,33 @@ fn plain_values_become_text() {
 }
 
 #[test]
+fn input_required_fails_closed_with_the_compatibility_error() {
+    // A tool challenge reaching this server has no driver that can show the
+    // interaction or replay the call with answers: it must surface the
+    // documented compatibility error, never a silent success.
+    let output = ToolProviderOutput {
+        value: serde_json::Value::Null,
+        execution_context: None,
+        input_required: Some(harnx_core::tool::ToolInputRequired {
+            producer: "tool:server/tool".into(),
+            key: "k".into(),
+            kind: "confirm".into(),
+            message: Some("Proceed?".into()),
+            surface: None,
+            url: None,
+            summary: String::new(),
+            request_state: serde_json::Value::Null,
+        }),
+    };
+    let result = tool_result(Ok(output));
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        serde_json::to_value(&result).unwrap()["content"],
+        json!([{"type":"text","text": harnx_toolset::INPUT_REQUIRED_COMPAT_ERROR}])
+    );
+}
+
+#[test]
 fn all_mcp_content_blocks_and_result_metadata_survive() {
     let envelope = json!({
         "content": [

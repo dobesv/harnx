@@ -11,6 +11,14 @@ pr_url="${PR_URL:-}"
 repo="${REPO:-}"
 branch="${BRANCH:-}"
 head_owner="${HEAD_OWNER:-}"
+base="${BASE:-}"
+
+# In protocol mode stdout carries only progress lines, so everything meant for
+# the model goes to stderr, which becomes the tool result.
+jsonl=0
+if [[ "${HARNX_TOOL_PROTOCOL:-}" == "jsonl" ]]; then
+  jsonl=1
+fi
 
 stderr_file=$(mktemp "${TMPDIR:-/tmp}/harnx-wait-pr.XXXXXX")
 cleanup() {
@@ -28,6 +36,79 @@ candidate_activity=""
 candidate_since=0
 candidate_observations=0
 
+json_string() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+  printf '"%s"' "$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')"
+}
+
+emit_progress() {
+  ((jsonl)) || return 0
+  printf '{"progress":{"title":%s,"markdown":%s}}\n' \
+    "$(json_string "$1")" "$(json_string "$2")"
+}
+
+# Progress patches merge, so a title-only patch leaves the last markdown (the
+# link) on screen.
+emit_title() {
+  ((jsonl)) || return 0
+  printf '{"progress":{"title":%s}}\n' "$(json_string "$1")"
+}
+
+say() {
+  if ((jsonl)); then
+    printf '%s\n' "$1" >&2
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# Percent-encodes a branch name for a URL path. Git allows `#`, `%` and `&` in
+# branch names, and a bare `#` would cut the link short. `/` stays as it is, so
+# the link reads like the ones GitHub shows.
+url_path_encode() (
+  LC_ALL=C
+  s=$1 out=""
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case $c in
+      [A-Za-z0-9._~/-]) out+=$c ;;
+      *) out+=$(printf '%%%02X' "'$c") ;;
+    esac
+  done
+  printf '%s' "$out"
+)
+
+# Page where the user can open the PR for the branch being waited on. The head
+# is owner-qualified only for forks; a branch in the repo itself needs no prefix.
+compare_url() {
+  local head
+  head=$(url_path_encode "$branch")
+  if [[ -n "$head_owner" && "$head_owner" != "${repo%%/*}" ]]; then
+    head="${head_owner}:${head}"
+  fi
+  local range="$head"
+  if [[ -n "$base" ]]; then
+    range="$(url_path_encode "$base")...${head}"
+  fi
+  printf 'https://%s/%s/compare/%s?expand=1' "${GH_HOST:-github.com}" "$repo" "$range"
+}
+
+report_checks() {
+  local trimmed="${pr_url%/}"
+  local number="${trimmed##*/}"
+  local markdown
+  markdown=$(printf '[PR #%s](%s): %s passed, %s failed, %s pending.' \
+    "$number" "$pr_url" "$checks_pass" "$checks_fail" "$checks_pending")
+  if [[ -n "$candidate_reason" ]]; then
+    markdown+=" Waiting ${settle_seconds}s for quiet activity."
+  fi
+  emit_progress \
+    "PR #${number} · ${checks_pass} passed · ${checks_fail} failed · ${checks_pending} pending" \
+    "$markdown"
+}
+
 retry_or_fail() {
   local operation="$1"
   local status="$2"
@@ -37,6 +118,7 @@ retry_or_fail() {
   consecutive_errors=$((consecutive_errors + 1))
   printf 'GitHub query failed (%s, attempt %s/%s, exit %s): %.240s\n' \
     "$operation" "$consecutive_errors" "$max_errors" "$status" "$first_line" >&2
+  emit_title "GitHub query failed, retry ${consecutive_errors}/${max_errors}"
   if ((consecutive_errors >= max_errors)); then
     printf 'Stopping after %s consecutive GitHub query failures.\n' "$consecutive_errors" >&2
     exit 1
@@ -58,18 +140,20 @@ print_result() {
   local state="$2"
   local elapsed=$((SECONDS - started_at))
 
-  printf 'PR_STABLE\n'
-  printf 'url=%s\n' "$pr_url"
-  printf 'reason=%s\n' "$reason"
-  printf 'state=%s\n' "$state"
-  printf 'head=%s\n' "$head_oid"
-  printf 'checks_total=%s\n' "$checks_total"
-  printf 'checks_pass=%s\n' "$checks_pass"
-  printf 'checks_fail=%s\n' "$checks_fail"
-  printf 'checks_pending=%s\n' "$checks_pending"
-  printf 'checks_skipping=%s\n' "$checks_skipping"
-  printf 'checks_cancel=%s\n' "$checks_cancel"
-  printf 'elapsed_secs=%s\n' "$elapsed"
+  {
+    printf 'PR_STABLE\n'
+    printf 'url=%s\n' "$pr_url"
+    printf 'reason=%s\n' "$reason"
+    printf 'state=%s\n' "$state"
+    printf 'head=%s\n' "$head_oid"
+    printf 'checks_total=%s\n' "$checks_total"
+    printf 'checks_pass=%s\n' "$checks_pass"
+    printf 'checks_fail=%s\n' "$checks_fail"
+    printf 'checks_pending=%s\n' "$checks_pending"
+    printf 'checks_skipping=%s\n' "$checks_skipping"
+    printf 'checks_cancel=%s\n' "$checks_cancel"
+    printf 'elapsed_secs=%s\n' "$elapsed"
+  } | if ((jsonl)); then cat >&2; else cat; fi
 }
 
 if ! command -v gh >/dev/null 2>&1; then
@@ -100,7 +184,14 @@ if [[ -z "$pr_url" ]]; then
     exit 1
   fi
 
-  printf 'Waiting for an open pull request for %s:%s...\n' "$repo" "$branch"
+  waiting_link=$(compare_url)
+  waiting_note="Waiting for an open pull request for ${repo}:${branch}..."
+  if ((jsonl)); then
+    waiting_note+=" Open one at ${waiting_link}"
+  fi
+  say "$waiting_note"
+  emit_progress "Waiting for a PR · ${repo}:${branch}" \
+    "No pull request yet. [Open pull request](${waiting_link})"
 fi
 
 while true; do
@@ -126,6 +217,8 @@ while true; do
     done <<<"$matches"
 
     if ((${#matching_urls[@]} == 0)); then
+      emit_progress "Waiting for a PR · ${repo}:${branch}" \
+        "No pull request yet. [Open pull request](${waiting_link})"
       sleep_until_next_poll
       continue
     fi
@@ -136,7 +229,7 @@ while true; do
     fi
 
     pr_url="${matching_urls[0]}"
-    printf 'Monitoring %s\n' "$pr_url"
+    say "Monitoring $pr_url"
   fi
 
   if pr_info=$(gh pr view "$pr_url" \
@@ -244,15 +337,14 @@ while true; do
       candidate_since=$now
       candidate_observations=1
       if [[ "$reason" == "checks_terminal" ]]; then
-        printf 'All %s status checks are terminal; waiting %ss for quiet activity.\n' \
-          "$checks_total" "$settle_seconds"
+        say "All ${checks_total} status checks are terminal; waiting ${settle_seconds}s for quiet activity."
       else
-        printf 'Head and checks are unchanged; waiting %ss for quiet activity.\n' \
-          "$settle_seconds"
+        say "Head and checks are unchanged; waiting ${settle_seconds}s for quiet activity."
       fi
     fi
   fi
 
+  report_checks
   previous_status="$status_fingerprint"
   previous_activity="$activity_fingerprint"
   sleep_until_next_poll

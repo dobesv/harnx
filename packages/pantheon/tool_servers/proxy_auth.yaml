@@ -1,0 +1,16 @@
+command: harnx-proxy-auth
+description: Long-lived GitHub/Atlassian auth proxy, used by bash middleware
+# Deploy alongside bash in the same filesystem/network namespace. An unmanaged
+# worker still runs middleware, but operators must start both tool services.
+args:
+  - --tool-server
+  - --hook
+  - 'if .host == "github.com" and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Basic \(["x-access-token", (env.GITHUB_TOKEN // env.GH_TOKEN)] | join(":") | @base64)" end'
+  - --hook
+  - 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)" end'
+  - --fs
+  - '{"harnx-fs-acli/acli/.keep": ""}'
+  - --env
+  - '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+  - --hook
+  - $HARNX_PACKAGE_DIR/hooks/jira-auth-hook.py

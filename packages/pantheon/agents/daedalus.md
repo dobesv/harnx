@@ -2,9 +2,9 @@
 role: assistant
 model: claude:claude-opus-5-5
 model_fallbacks:
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
-- gemini:gemini-4-argon
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
+- gemini:gemini-4-neon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-researcher
 use_tools:
@@ -63,20 +63,21 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 - attachments_attachment_create
-hooks:
-  entries:
-  - command: >-
-      harnx-claude-compatible-hook-server
-      --event PreToolUse
-      --matcher '^atlas_session_handoff$'
-      --jaq
-      '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Hand off this plan to Atlas for execution?"}}'
+middleware:
+- name: confirm-atlas-handoff
+  match: '^atlas_session_handoff$'
+  bash: |
+    if confirm --id handoff 'Hand off this plan to Atlas for execution?'; then
+      next --id dispatch
+    else
+      deny 'Atlas handoff denied by the user.'
+    fi
 description: "Strategic planner \u2014 researches with Metis and Pytheas before adaptive\
   \ clarification, produces detailed plans reviewed by Momus,\
   \ then hands off to Atlas for execution. Named after Daedalus (DED-uh-lus), the\
   \ master architect of Greek myth. The single entry point for the full plan-to-execution\
   \ pipeline.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: async_delegation
   description: Preferred async delegation protocol (session_send/session_wait)

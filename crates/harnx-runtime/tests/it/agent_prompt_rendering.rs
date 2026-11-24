@@ -743,8 +743,46 @@ fn planning_prompts_do_not_restore_question_quotas_or_early_approval_gates() {
     }
 }
 
+/// Argus is the between-task check; Aristarchus is the final review. The
+/// assembled coordinator prompts must not ask for Argus right before or
+/// alongside the review (#2728), but must keep it for review-exempt changes.
 #[test]
-fn daedalus_research_and_review_tools_keep_the_execution_approval_hook() {
+fn coordinator_prompts_skip_argus_before_and_alongside_aristarchus() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    for name in ["pantheon/atlas", "pantheon/sisyphus"] {
+        let prompt = render_agent_prompt(name, &[]).expect("render coordinator agent");
+        let normalized = prompt
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        for rule in [
+            "don't run argus on the final task before review, on fixes for review findings, or alongside aristarchus",
+            "verify the final task with argus as usual",
+            "without an argus pass in between",
+        ] {
+            assert!(normalized.contains(rule), "{name}: missing rule: {rule}");
+        }
+        for obsolete in [
+            "individually verified by argus",
+            "verify each fix via argus",
+            "argus verification, review",
+        ] {
+            assert!(
+                !normalized.contains(obsolete),
+                "{name}: assembled prompt restores obsolete Argus step: {obsolete}"
+            );
+        }
+    }
+}
+
+#[test]
+fn daedalus_research_and_review_tools_keep_the_execution_approval_middleware() {
     harnx_core::require_nextest();
     let Some(workspace_root) = workspace_root() else {
         return;
@@ -769,28 +807,39 @@ fn daedalus_research_and_review_tools_keep_the_execution_approval_hook() {
             "missing {required}"
         );
     }
-    let hooks = agent.hooks().expect("execution approval hook");
-    let hook = hooks
+    assert!(
+        agent.hooks().is_none_or(|hooks| {
+            harnx_core::hooks::HookEventKind::ALL.iter().all(|event| {
+                hooks.list(*event).entries.iter().all(|entry| match entry {
+                    harnx_core::hooks::EventHookEntry::Full(definition) => !matches!(
+                        &definition.source,
+                        harnx_core::middleware::MiddlewareSourceConfig::Bash { bash }
+                            if bash.contains("^atlas_session_handoff$")
+                    ),
+                    harnx_core::hooks::EventHookEntry::Disable { .. } => true,
+                })
+            })
+        }),
+        "Atlas handoff approval must not use an event hook"
+    );
+    let config = Config {
+        agent: Some(agent),
+        ..Config::default()
+    };
+    let middleware = config.resolved_middleware().expect("resolved middleware");
+    let approval = middleware
         .entries
         .iter()
-        .find(|hook| hook.command.contains("^atlas_session_handoff$"))
-        .expect("Atlas handoff hook");
-    assert_ne!(hook.async_hook, Some(true));
-    let args = shell_words::split(&hook.command).expect("valid hook command quoting");
-    assert_eq!(args.len(), 7);
-    assert_eq!(
-        args[..6],
-        [
-            "harnx-claude-compatible-hook-server",
-            "--event",
-            "PreToolUse",
-            "--matcher",
-            "^atlas_session_handoff$",
-            "--jaq",
-        ]
-    );
-    let output: serde_json::Value = serde_json::from_str(&args[6]).expect("literal hook output");
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "ask");
+        .find(|entry| entry.name == "confirm-atlas-handoff")
+        .expect("Atlas handoff approval middleware");
+    assert!(approval.matcher.is_match("atlas_session_handoff").unwrap());
+    assert!(!approval.matcher.is_match("unrelated_tool").unwrap());
+    let harnx_core::middleware::MiddlewareSource::Bash(bash) = &approval.source else {
+        panic!("Atlas handoff approval must use Bash middleware")
+    };
+    let confirm = bash.find("confirm --id handoff").expect("confirm step");
+    let dispatch = bash.find("next --id dispatch").expect("dispatch step");
+    assert!(confirm < dispatch, "approval must precede dispatch");
 }
 
 /// Target agents that should declare `sandbox_connect` in their front-matter `use_tools`.
@@ -998,9 +1047,10 @@ fn shared_sandbox_workflow_fragments_are_pure_markdown_and_harnx_native() {
     );
 }
 
-const COMPACTION_PROMPT_PHRASES: [&str; 2] = [
+const COMPACTION_PROMPT_PHRASES: [&str; 3] = [
     "someone reading only the summary should be able to tell what the user last asked and what the agent last answered",
     "If the latest user prompt isn't kept verbatim after the summary, quote it",
+    "Only `<user>` elements are the user's own words",
 ];
 
 fn compaction_prompt_paths(workspace_root: &Path) -> Vec<PathBuf> {
@@ -1088,10 +1138,11 @@ const ASYNC_DELEGATION_HEADING: &str = "Async Sub-Agent Delegation (session_send
 /// inherited hard policy, durable handle, re-wait safety, explicit
 /// next_index→read.index_min paging, and cancellation only when the tool is
 /// available.
-const ASYNC_DELEGATION_PHRASES: [&str; 8] = [
+const ASYNC_DELEGATION_PHRASES: [&str; 9] = [
     "Send with `wait: {}` to wait up to 240 seconds",
     "hard execution deadline stays inherited from the target agent's policy",
     "durable handle: `session_id` + `prompt_id`",
+    "the child's final reply is in `response`",
     "Repeated waits recover the same result and never consume it",
     "returned `next_index` as `read.index_min`",
     "If a `{agent}_session_cancel` tool is available to you",

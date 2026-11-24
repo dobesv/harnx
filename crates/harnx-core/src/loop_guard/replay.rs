@@ -442,7 +442,9 @@ mod tests {
 
     fn results(id: &str) -> SessionLogEntry {
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some(id.to_string()),
                 name: "fs_read".into(),
                 output: json!("same"),
@@ -615,9 +617,11 @@ mod tests {
     /// The stored results of `fs_read` calls, by call id.
     fn outputs(results: Vec<(&str, Value)>) -> SessionLogEntry {
         SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: results
                 .into_iter()
                 .map(|(id, output)| ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some(id.to_string()),
                     name: "fs_read".into(),
                     output,

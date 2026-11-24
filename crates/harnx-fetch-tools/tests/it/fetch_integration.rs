@@ -1,7 +1,14 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
+use harnx_core::crypto::base64_decode;
 use harnx_fetch_tools::server::{FetchParams, FetchServer, YoutubeTranscriptParams};
-use harnx_fetch_tools::MAX_RESPONSE_BYTES;
+use harnx_fetch_tools::{FetchToolset, MAX_RESPONSE_BYTES};
+use harnx_toolset::Toolset;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -15,23 +22,254 @@ fn params(url: String) -> FetchParams {
 }
 
 fn text(result: &rmcp::model::CallToolResult) -> &str {
-    result
-        .content
-        .iter()
-        .find_map(|content| content.as_text().map(|text| text.text.as_str()))
-        .expect("tool result contains text")
+    assert_eq!(result.content.len(), 1);
+    &result.content[0].as_text().expect("text result").text
 }
 
 async fn server_with(path_name: &str, body: &str, content_type: &str) -> (MockServer, String) {
+    server_with_response(
+        path_name,
+        ResponseTemplate::new(200).set_body_raw(body, content_type),
+        1,
+    )
+    .await
+}
+
+async fn server_with_response(
+    path_name: &str,
+    response: ResponseTemplate,
+    expected_requests: u64,
+) -> (MockServer, String) {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(path_name))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(body, content_type))
-        .expect(1)
+        .respond_with(response)
+        .expect(expected_requests)
         .mount(&mock)
         .await;
     let url = format!("{}{path_name}", mock.uri());
     (mock, url)
+}
+
+// Signature fixtures: classification doesn't parse or decode the rest of the file.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\xFF";
+const IMAGE_FIXTURES: [(&str, &[u8]); 5] = [
+    ("image/png", PNG),
+    ("image/jpeg", b"\xFF\xD8\xFF\xE0\0\x10JFIF\0"),
+    ("image/gif", b"GIF87a\x01\0\x01\0"),
+    ("image/gif", b"GIF89a\x01\0\x01\0"),
+    ("image/webp", b"RIFF\x04\0\0\0WEBP"),
+];
+
+async fn fetch_image_reply(toolset: &FetchToolset, name: &str, url: &str) -> Value {
+    toolset
+        .invoke(
+            name,
+            json!({"url": url, "start_index": 1000, "max_length": 1, "max_output_bytes": 1}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{name} failed for {url}: {error}"))
+}
+
+fn assert_image_reply(reply: Value, final_url: &str, mime: &str, bytes: &[u8]) {
+    assert_ne!(reply["isError"], true);
+    let content = reply["content"]
+        .as_array()
+        .expect("top-level content array");
+    assert_eq!(content.len(), 2);
+    let data = content[0]["data"].as_str().expect("base64 image data");
+    assert_eq!(base64_decode(data).unwrap(), bytes);
+    assert_eq!(
+        content[0],
+        json!({"type": "image", "data": data, "mimeType": mime, "annotations": {"audience": ["assistant"]}})
+    );
+    let summary = format!(
+        "Fetched image '{final_url}' ({mime}, {} bytes)",
+        bytes.len()
+    );
+    assert_eq!(
+        content[1],
+        json!({"type": "text", "text": summary, "annotations": {"audience": ["user"]}})
+    );
+}
+
+#[tokio::test]
+async fn all_page_fetchers_return_supported_images_with_audience_summary() {
+    let tools = [
+        "fetch_html",
+        "fetch_markdown",
+        "fetch_txt",
+        "fetch_json",
+        "fetch_readable",
+    ];
+    let toolset = FetchToolset::with_allow_private_ip(true);
+    for (mime, body) in IMAGE_FIXTURES {
+        let (_mock, url) = server_with_response(
+            "/image",
+            ResponseTemplate::new(200).set_body_raw(body, mime),
+            tools.len() as u64,
+        )
+        .await;
+        for tool in tools {
+            let reply = fetch_image_reply(&toolset, tool, &url).await;
+            assert_image_reply(reply, &url, mime, body);
+        }
+    }
+}
+
+#[tokio::test]
+async fn detects_png_with_octet_stream_or_absent_content_type() {
+    let toolset = FetchToolset::with_allow_private_ip(true);
+    for response in [
+        ResponseTemplate::new(200).set_body_raw(PNG, "Application/Octet-Stream; ignored=1"),
+        ResponseTemplate::new(200).set_body_bytes(PNG),
+    ] {
+        let (_mock, url) = server_with_response("/blob", response, 1).await;
+        let reply = fetch_image_reply(&toolset, "fetch_markdown", &url).await;
+        assert_image_reply(reply, &url, "image/png", PNG);
+    }
+}
+
+#[tokio::test]
+async fn image_result_uses_sniffed_mime_and_final_url() {
+    let (mock, final_url) = server_with_response(
+        "/asset",
+        ResponseTemplate::new(200).set_body_raw(PNG, "IMAGE/JPEG; ignored=1"),
+        1,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/download"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/asset"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let reply = fetch_image_reply(
+        &FetchToolset::with_allow_private_ip(true),
+        "fetch_html",
+        &format!("{}/download", mock.uri()),
+    )
+    .await;
+    assert_image_reply(reply, &final_url, "image/png", PNG);
+}
+
+#[tokio::test]
+async fn explicit_text_type_keeps_lossy_text_even_with_png_magic() {
+    let (_mock, url) = server_with_response(
+        "/text.png",
+        ResponseTemplate::new(200).set_body_raw(PNG, "text/html"),
+        1,
+    )
+    .await;
+    let result = FetchServer::new(true)
+        .fetch_html_impl(params(url))
+        .await
+        .unwrap();
+    // The existing text path sanitizes replacement characters and most controls.
+    assert_eq!(text(&result), "PNG\r\n\n");
+}
+
+#[tokio::test]
+async fn rejects_unsupported_image_signatures_and_html_labelled_as_png() {
+    let server = FetchServer::new(true);
+    let fixtures: [(&str, &[u8]); 3] = [
+        (
+            "image/svg+xml",
+            b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+        ),
+        ("image/avif", b"\0\0\0\x18ftypavif\0\0\0\0avifmif1"),
+        ("image/png", b"<html>Not an image</html>"),
+    ];
+    for (mime, body) in fixtures {
+        let (_mock, url) = server_with_response(
+            "/image.png",
+            ResponseTemplate::new(200).set_body_raw(body, mime),
+            1,
+        )
+        .await;
+        let error = server.fetch_html_impl(params(url)).await.unwrap_err();
+        assert!(
+            error.message.contains("unsupported image format"),
+            "{error}"
+        );
+        assert!(error.message.contains(mime), "{error}");
+        assert!(error.message.contains("PNG, JPEG, GIF, WebP"), "{error}");
+    }
+}
+
+fn png_at_size(size: usize) -> Vec<u8> {
+    let mut body = PNG.to_vec();
+    body.resize(size, 0);
+    body
+}
+
+#[tokio::test]
+async fn image_size_limit_accepts_five_mib_and_rejects_six_mib() {
+    let body = png_at_size(5 * 1024 * 1024);
+    let (_mock, url) = server_with_response(
+        "/limit",
+        ResponseTemplate::new(200).set_body_raw(body.clone(), "image/png"),
+        1,
+    )
+    .await;
+    let toolset = FetchToolset::with_allow_private_ip(true);
+    let reply = fetch_image_reply(&toolset, "fetch_txt", &url).await;
+    assert_image_reply(reply, &url, "image/png", &body);
+
+    let (_mock, url) = server_with_response(
+        "/too-large",
+        ResponseTemplate::new(200).set_body_raw(png_at_size(6 * 1024 * 1024), "image/png"),
+        1,
+    )
+    .await;
+    let error = FetchServer::new(true)
+        .fetch_txt_impl(params(url))
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("image at"), "{error}");
+    assert!(error.message.contains("too large"), "{error}");
+    assert!(error.message.contains("6291456 bytes"), "{error}");
+    assert!(error.message.contains("5 MiB"), "{error}");
+}
+
+#[tokio::test]
+async fn image_over_stream_cap_is_rejected_before_end_of_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/big.png", listener.local_addr().unwrap());
+    let sender = tokio::spawn(serve_unfinished_png(listener));
+    let server = FetchServer::new(true);
+    let result =
+        tokio::time::timeout(Duration::from_secs(10), server.fetch_html_impl(params(url))).await;
+    sender.abort();
+    let error = result
+        .expect("must reject before the server ends the body")
+        .unwrap_err();
+    assert!(
+        error.message.contains(&format!(
+            "response body exceeds {MAX_RESPONSE_BYTES} byte limit"
+        )),
+        "{error}"
+    );
+}
+
+async fn serve_unfinished_png(listener: TcpListener) {
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut stream = BufReader::new(stream);
+    let mut line = String::new();
+    while stream.read_line(&mut line).await.unwrap() != 0 && line != "\r\n" {
+        line.clear();
+    }
+    let mut stream = stream.into_inner();
+    let size = MAX_RESPONSE_BYTES + 1;
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\n\r\n{size:x}\r\n"
+    );
+    stream.write_all(headers.as_bytes()).await.unwrap();
+    stream.write_all(&png_at_size(size)).await.unwrap();
+    stream.write_all(b"\r\n").await.unwrap();
+    // Keep the response open without the terminating chunk. Buffering the whole body would hang.
+    std::future::pending::<()>().await;
 }
 
 #[tokio::test]
@@ -109,9 +347,18 @@ async fn readable_extracts_article_fixture() {
 
 #[tokio::test]
 async fn youtube_direct_path_fetches_selected_caption_track() {
+    assert_youtube_transcript("text/html", "text/xml").await;
+}
+
+#[tokio::test]
+async fn youtube_transcript_ignores_image_content_type_on_watch_and_captions() {
+    assert_youtube_transcript("image/png", "image/jpeg").await;
+}
+
+async fn assert_youtube_transcript(watch_type: &str, caption_type: &str) {
     let mock = MockServer::start().await;
     let caption_url = format!("{}/captions?lang=en", mock.uri());
-    let player = serde_json::json!({
+    let player = json!({
         "captions": {
             "playerCaptionsTracklistRenderer": {
                 "captionTracks": [
@@ -124,7 +371,7 @@ async fn youtube_direct_path_fetches_selected_caption_track() {
     let watch = format!("<script>ytInitialPlayerResponse = {player};</script>");
     Mock::given(method("GET"))
         .and(path("/watch"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(watch))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(watch, watch_type))
         .expect(1)
         .mount(&mock)
         .await;
@@ -134,7 +381,7 @@ async fn youtube_direct_path_fetches_selected_caption_track() {
         .and(query_param("fmt", "srv1"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_raw(include_str!("../fixtures/transcript.xml"), "text/xml"),
+                .set_body_raw(include_str!("../fixtures/transcript.xml"), caption_type),
         )
         .expect(1)
         .mount(&mock)

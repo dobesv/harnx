@@ -51,8 +51,10 @@ uuid = { workspace = true }
 crossterm = { workspace = true, features = ["use-dev-tty"] }
 
 [dev-dependencies]
+harnx-toolset-server = { path = "../harnx-toolset-server" }
 insta = { workspace = true, features = ["yaml"] }
 pretty_assertions = "1.4.0"
 rand = "0.10.0"
 tokio-test = "0.4"
+tokio-util = { workspace = true }
 which = { workspace = true }

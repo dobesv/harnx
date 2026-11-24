@@ -17,25 +17,26 @@ The response returns only HTTP status codes with no response body. The healthz l
 
 You can enable the healthz listener using either the CLI flag or an environment variable fallback:
 
-- `--healthz-addr <ADDR>`: Available as a CLI argument on all 16 in-scope binaries. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--healthz-addr :8081`) binds `0.0.0.0`, allowing scrapers or Kubernetes probes to reach the endpoint. Passing `127.0.0.1:8081` restricts the listener to loopback.
-- `HARNX_HEALTHZ_ADDR`: Environment variable fallback honored by shared-entrypoint binaries: `harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-plans-tools` (non-HTTP mode), `harnx-claude-compatible-hook-server`, `harnx-mcp-remote`, and `harnx-mcp-bridge`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
+- `--healthz-addr <ADDR>`: Available as a CLI argument on all 18 in-scope binaries. Accepts `IP:PORT` or `:PORT`. Passing a blank host (e.g. `--healthz-addr :8081`) binds `0.0.0.0`, allowing scrapers or Kubernetes probes to reach the endpoint. Passing `127.0.0.1:8081` restricts the listener to loopback.
+- `HARNX_HEALTHZ_ADDR`: Environment variable fallback honored by `harnx-a2a-server` and shared-entrypoint binaries: `harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-claude-hook-tools`, `harnx-plans-tools` (non-HTTP mode), `harnx-mcp-remote`, and `harnx-mcp-bridge`. If both the CLI flag and environment variable are set, the CLI flag takes precedence.
 
 ## Binary Coverage
 
-Healthz support is available across 17 long-running binaries:
+Healthz support is available across 18 long-running binaries:
 
-- **Core runtime & proxies**: `harnx-serve`, `harnx-worker`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`
-- **Tool & hook servers**: `harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-plans-tools`, `harnx-time-tools`, `harnx-claude-compatible-hook-server`
+- **Core runtime & proxies**: `harnx-serve`, `harnx-worker`, `harnx-a2a-server`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`
+- **Tool servers**: `harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-plans-tools`, `harnx-time-tools`, `harnx-claude-hook-tools`
 - **MCP bridges & servers**: `harnx-mcp-bridge`, `harnx-mcp-remote`
 
-Unlike `--metrics-addr` (where CLI flag support varied on `harnx-claude-compatible-hook-server`), `--healthz-addr` is supported as a CLI flag across all 17 binaries.
+`--healthz-addr` is supported as a CLI flag across all 18 binaries.
 
 ## Readiness Semantics & Lifecycle
 
 Readiness is tracked per process and transitions from `503` to `200` once initialization completes:
 
 - **HTTP servers** (`harnx-serve`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`, `harnx-plans-tools` HTTP mode): Become ready as soon as their HTTP listener binds.
-- **NATS-consumer servers** (`harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-claude-compatible-hook-server`): Become ready after NATS subscriptions connect and initial queue requests are flushed. The Kubernetes sandbox gateway waits until all three of its toolset registrations are visible.
+- **NATS-consumer servers** (`harnx-attachment-tools`, `harnx-bash-tools`, `harnx-fs-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, `harnx-k8s-sandbox-tools`, `harnx-time-tools`, `harnx-claude-hook-tools`): Become ready after NATS subscriptions connect and initial queue requests are flushed. The Kubernetes sandbox gateway waits until all three of its toolset registrations are visible.
+- **A2A server** (`harnx-a2a-server`): Becomes ready only after agent validation, NATS/JetStream connection, coordination provisioning, backend initialization and the A2A listener bind succeed. This tracks startup/shutdown, not ongoing broker health or worker capacity. Example ports are `3020` for A2A, `8081` for healthz and `8456` for metrics; the optional listeners have no default ports.
 - **Worker daemon** (`harnx-worker`): Becomes ready once NATS worker services and activation streams are live.
 - **Stdio MCP bridge & remote** (`harnx-mcp-bridge`, `harnx-mcp-remote`): Become ready once their transport setup finishes.
 
@@ -51,7 +52,8 @@ Two binaries (`harnx-aws-creds` and `harnx-k8s-creds`) operate as ready-only ser
 
 - **HTTP and AG-UI servers (`harnx-serve`)**: Readiness flips to `503`. The server stops accepting new connections. In-flight HTTP requests complete within the grace window. Active AG-UI and SSE client streams close over an independent random 1–20s jitter window (each stream calls `finalize_open_lifecycles()` and emits `RUN_ERROR` to settle client UIs without cancelling backend worker turns). Backend turns running in the worker continue undisturbed. The process exits under a configurable drain ceiling (`--drain-timeout-seconds`, default 25s).
 - **Worker daemon (`harnx-worker`)**: Readiness flips to `503`. The daemon stops pulling activations and NAKs unstarted activations. In-flight local LLM and tool waits abort without writing a durable `Cancel` entry to the session log. The worker releases the session lease (revision-conditional against active renewal) and immediately NAKs the activation (`Nak(None)`), allowing a replacement worker to claim the lease and resume immediately from the journal. After a bounded client flush, the process exits under an internal ~25s ceiling (`WORKER_SHUTDOWN_TIMEOUT`).
-- **Tool and hook servers**: Deregister from discovery or NATS, then drain in-flight invocations up to their drain timeout.
+- **A2A server (`harnx-a2a-server`)**: Readiness flips to `503` on SIGTERM or Ctrl-C before aborting/draining runners and finishing HTTP shutdown. This isn't proof that admitted tasks have settled and doesn't add a drain ceiling; follow [A2A operations](a2a-operations.md#upgrade-and-rollback-without-mixed-writers) when replacing writers.
+- **Tool servers**: Deregister from discovery or NATS, then drain in-flight invocations up to their drain timeout.
 
 #### Deployment Guidance
 
@@ -66,7 +68,7 @@ While both listeners use HTTP, they serve distinct operational purposes:
 | **Purpose** | Traffic routing & pod readiness | Telemetry & performance monitoring |
 | **Default Path** | `/healthz` | `/metrics` |
 | **CLI Flag** | `--healthz-addr` | `--metrics-addr` |
-| **Env Var** | `HARNX_HEALTHZ_ADDR` | `HARNX_METRICS_ADDR` |
+| **Env Var** | `HARNX_HEALTHZ_ADDR` | `HARNX_METRICS_ADDR` on selected binaries only; not `harnx-a2a-server` |
 | **Response Format** | Status code (`200` or `503`), no body | Prometheus text format exposition |
 
 Do not configure `--healthz-addr` and `--metrics-addr` to use the same port, as each feature runs a dedicated listener.

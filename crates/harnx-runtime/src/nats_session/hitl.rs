@@ -17,6 +17,8 @@ pub struct PendingHitlApproval {
     pub tool_name: String,
     pub arguments: serde_json::Value,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<String>,
 }
 
 impl PendingHitlApproval {
@@ -31,15 +33,7 @@ impl PendingHitlApproval {
     }
 }
 
-/// Durable identity of one approval request. A provider's tool call ID alone
-/// isn't unique across rounds or invocations.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalRef {
-    pub invocation_id: String,
-    pub tool_round_seq: u64,
-    pub request_seq: u64,
-    pub tool_call_id: String,
-}
+pub use harnx_core::pending_interaction::ApprovalRef;
 
 /// Last decision observed for an invocation, including its exact request identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +70,9 @@ pub enum PromptProgress {
         last_decision: Option<HitlDecisionReceipt>,
     },
     InputRequired(PendingHitlApproval),
+    /// A newer worker owns recovery. No legacy approval exists to answer, and
+    /// owner-loss recovery must not cancel or settle this invocation.
+    Parked,
     Terminal(NatsTurnResult),
 }
 
@@ -93,6 +90,7 @@ impl NatsSession {
         prompt_sequence: u64,
         session_id: &str,
         entries: &[(u64, SessionLogEntry)],
+        steered_live: bool,
     ) -> Result<PromptProgress> {
         let scope = InvocationProgressScope {
             invocation_id: ticket.invocation_id(),
@@ -100,20 +98,58 @@ impl NatsSession {
             prompt_sequence,
             session_id,
         };
-        Self::invocation_progress_from_entries(&scope, entries)
+        Self::invocation_progress_from_entries(&scope, entries, steered_live)
     }
 
+    /// Whether `invocation_id` still holds this session's admission head:
+    /// rows appended past its own terminator can only be its steered drain
+    /// (issue #2774) while it owns the head. A superseded invocation must
+    /// treat those rows as later invocations' work.
+    pub(super) async fn steered_live_head(&self, invocation_id: &str) -> Result<bool> {
+        Ok(self
+            .metadata_store()
+            .admission_head(&self.storage_key)
+            .await?
+            .as_deref()
+            == Some(invocation_id))
+    }
+
+    /// `steered_live` marks the prompt as the invocation this caller is
+    /// following: rows appended past its own terminator are its steered drain
+    /// (issue #2774), keeping the invocation in progress until they are
+    /// answered. A historical prompt must not treat later invocations' rows
+    /// the same way — for it the first terminator's proof wins, exactly as
+    /// before.
     pub(super) fn invocation_progress_from_entries(
         scope: &InvocationProgressScope<'_>,
         entries: &[(u64, SessionLogEntry)],
+        steered_live: bool,
     ) -> Result<PromptProgress> {
         // Fixed admission excludes a new invocation until this one has a raw
         // terminator. Check that proof before looking at any later approval.
         if let Some(terminal) = super::invocation_terminal_seq(entries, scope.prompt_sequence) {
-            return Ok(terminal_progress(scope, entries, terminal));
+            if steered_live && super::steered_rows_outstanding(entries, scope.prompt_sequence)? {
+                // A continuation round waiting for approval still surfaces
+                // InputRequired, so the follow can park the task instead of
+                // holding a completed-looking prompt.
+                if let Some(pending) =
+                    pending_approval_for_invocation(entries, scope.prompt_sequence)?
+                {
+                    return Ok(PromptProgress::InputRequired(pending));
+                }
+                return Ok(PromptProgress::Running {
+                    last_decision: None,
+                });
+            }
+            return Ok(terminal_progress(scope, entries, terminal, steered_live));
         }
+        let effective = apply_log_mutations_nats(entries)?;
+        let start = effective.partition_point(|(seq, _)| *seq <= scope.prompt_sequence);
         if let Some(pending) = pending_approval_for_invocation(entries, scope.prompt_sequence)? {
             return Ok(PromptProgress::InputRequired(pending));
+        }
+        if crate::interaction_checkpoint::guard::log_is_parked(&effective[start..]) {
+            return Ok(PromptProgress::Parked);
         }
         let last_decision =
             last_decision_receipt(scope.invocation_id, scope.prompt_sequence, entries)?;
@@ -125,17 +161,36 @@ fn terminal_progress(
     scope: &InvocationProgressScope<'_>,
     entries: &[(u64, SessionLogEntry)],
     terminal: u64,
+    steered_live: bool,
 ) -> PromptProgress {
-    let (response, error) = NatsSession::extract_turn_outcome(entries, scope.prompt_sequence);
+    // Steered continuation rounds extend the invocation past the prompt's
+    // own terminator; the invocation's answer is the last one through that
+    // extended bound (issue #2774). A historical prompt stops at its first
+    // terminator, so later invocations cannot contaminate its result.
+    // Known limitation: once the invocation loses the head, the log alone
+    // cannot attribute post-terminator rows to it (a successor's prompt row
+    // is indistinguishable from a steered row without binding reads), so a
+    // late read of a settled historical prompt reports the root answer and
+    // drops its own completed continuation answers. Callers that need the
+    // extended answer read it while the invocation still holds the head,
+    // which A2A's settle-before-next-admission ordering guarantees for the
+    // active task.
+    let end = if steered_live {
+        super::steered_terminal_seq(entries, scope.prompt_sequence).unwrap_or(terminal)
+    } else {
+        terminal
+    };
+    let (response, error) =
+        NatsSession::extract_turn_outcome_bounded(entries, scope.prompt_sequence, end);
     PromptProgress::Terminal(NatsTurnResult {
         response,
         error,
         session_id: scope.session_id.into(),
         user_msg_id: scope.prompt_id.into(),
         user_msg_seq: scope.prompt_sequence,
-        was_cancelled: entries.iter().any(|(seq, entry)| {
-            *seq == terminal && matches!(entry, SessionLogEntry::Cancel { .. })
-        }),
+        was_cancelled: entries
+            .iter()
+            .any(|(seq, entry)| *seq == end && matches!(entry, SessionLogEntry::Cancel { .. })),
     })
 }
 

@@ -143,6 +143,7 @@ async fn a_consuming_worker_launches_no_child_servers() {
             description: None,
             package: None,
             hooks: None,
+            middleware: Default::default(),
         }];
     }
     let daemon = harnx_runtime::nats_worker::WorkerDaemonConfig::new("prod", "w1");
@@ -193,7 +194,7 @@ async fn a_managing_worker_with_no_tool_servers_configured_spawns_none() {
 
 /// The regression this task exists to prevent: the local orchestrator must
 /// keep passing `--manage-servers` so local users don't silently lose every
-/// tool and hook server. Asserts on the constructed command's argv rather
+/// tool server. Asserts on the constructed command's argv rather
 /// than spawning a worker or standing up a broker.
 #[test]
 fn local_orchestrator_spawns_the_worker_with_manage_servers() {

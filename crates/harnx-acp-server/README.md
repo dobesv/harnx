@@ -20,11 +20,50 @@ ACP (Agent Client Protocol) server front-end for harnx agents.
   - Supported content blocks: text, embedded text resources, resource links.
   - Unsupported content blocks: images, audio, embedded binary blobs (rejected with explicit errors; never silently dropped).
 - `session/cancel` — Stops the local prompt follower and durably cancels the NATS turn and any pending permission request.
-- `session/request_permission` — Bridges worker tool confirmation callbacks to client allow/reject single-turn choices.
+- `session/request_permission` — Presents worker tool confirmations and ready middleware `confirm`/`a2ui` interactions as client single-turn choices.
 - Committed handoffs report target agent, session ID, cluster, and instructions to switch agent servers.
 - All logging goes to stderr; stdout carries only protocol frames.
 
 See the [ACP v1 Support Matrix](#acp-v1-support-matrix) for capability details, content handling, and deferred feature rationales.
+
+## Middleware permissions
+
+An attached session observes durable middleware interactions, including after
+`session/load` or `session/resume`. A permission request appears only after the
+worker commits `SuspensionReady`. The client sees the public confirmation message,
+not checkpoint references or private middleware inputs.
+
+Permissions are shown one at a time in suspension-manifest order. Middleware and
+legacy tool permissions share a per-session queue. `confirm` offers Allow and
+Reject. `a2ui` interactions are rendered with the shared plain-text fallback
+(headline, inputs with their options and defaults, actions) and offer one
+Allow option per declared button action — labelled by its button text, option
+ID `action:<event name>` — plus Reject, which denies. ACP's permission reply
+carries only an option ID, so ACP cannot collect input values: every bound
+input is answered with its declared default (the surface's `dataModel` value,
+else the kind's empty default) through the shared response builder, and the
+dialog text says so and points at the Web UI, TUI, or
+`harnx interact answer` for structured input. Other interaction kinds explain
+that this client doesn't support them and offer Reject only. Closing a
+permission dialog denies it. Cancelling the turn abandons the dialog, and a
+late Allow can't approve the cancelled turn.
+
+Each middleware reply is bound to its exact interaction ID and request sequence
+(also exposed in request `_meta` as `harnx:interaction_id` and
+`harnx:request_seq`). Acceptance failures, including stale or conflicting replies,
+appear in `session/update` warning text. A rejected response isn't retargeted to
+the next interaction. If the head is still pending, failed acceptance can be retried
+without skipping it. A transport disconnect leaves middleware permission pending
+for a replacement client; it isn't a durable denial. Repeated load/resume calls
+share the existing permission queue.
+
+ACP v1 `SelectedPermissionOutcome` contains only `optionId`. It has no free-form
+note field, so middleware responses from ACP store no note. Existing legacy HITL
+allow/reject behavior is unchanged.
+
+### Non-modal surfaces
+
+ACP does not render or accept actions for non-modal user-audience surfaces (`ToolResult.user_surfaces`). The ACP protocol lacks an out-of-band user-audience channel: ACP session prompts are model-facing turn inputs (which would leak user surfaces to model text), and `session/request_permission` is reserved for turn-suspending requests. Non-modal surfaces intentionally do not suspend turns. They are omitted from the ACP stream without interrupting prompts. Users can inspect and act on published surfaces from the Web UI, TUI, or CLI (`harnx surface list|act`) for the same session.
 
 ## ACP v1 Support Matrix
 
@@ -43,7 +82,7 @@ The tables and descriptions below document ACP v1 method and capability support 
 | `session/close` | `sessionCapabilities.close: {}` | Shipped | Cancels active turns (local prompt follower and remote NATS worker) and removes in-memory session context. Preserves durable JetStream transcripts, attachments, and listing visibility. Idempotent. |
 | `session/prompt` | Standard core method | Shipped | Streams in-order assistant text chunks, thought chunks, tool lifecycle updates (`ToolCallUpdate`), notices, and model errors. Handles turn completion and stop reasons. |
 | `session/cancel` | Standard core method | Shipped | Cancels in-flight prompt turns and any pending tool permission requests across local guards and remote NATS workers. |
-| `session/request_permission` | Client capability requested by server | Shipped | Bridges worker tool confirmation callbacks to client single-turn choices (`allow` or `reject`). Denies tool call if the client rejects, disconnects, or errors. |
+| `session/request_permission` | Client capability requested by server | Shipped | Bridges worker tool confirmation callbacks and durable middleware interactions to client single-turn choices (`allow`/`reject` for `confirm`; one option per declared `a2ui` button action plus reject). Denies tool call if the client rejects, disconnects, or errors. |
 
 #### Detailed Handler Behaviors
 
@@ -56,7 +95,7 @@ The tables and descriptions below document ACP v1 method and capability support 
 - **`session/close`**: Cancels active turns across both local prompt follower and remote NATS worker, then drops in-memory session state. Durable transcripts, metadata, attachments, and session listing visibility are preserved. Closing an unknown or already-closed session succeeds idempotently.
 - **`session/prompt`**: Validates content blocks and streams assistant text chunks, thought chunks, tool call lifecycle updates (`ToolCallUpdate`), notices, and model errors. Handles turn completion, stop reasons, and error mapping.
 - **`session/cancel`**: Stops the local prompt follower and sends a durable cancel signal to the NATS worker turn. Also denies and clears any pending tool permission request.
-- **`session/request_permission`**: When a backend tool requires human-in-the-loop approval, the server calls the client's `session/request_permission` method with `allow` (`AllowOnce`) and `reject` (`RejectOnce`) choices. If the client approves, the tool proceeds; if the client rejects, disconnects, or times out, the tool call is denied.
+- **`session/request_permission`**: Legacy tool approvals and durable middleware confirmations use `allow` (`AllowOnce`) and `reject` (`RejectOnce`) choices. `a2ui` interactions render as text and offer one `AllowOnce` option per declared button action (option ID `action:<event name>`) plus `reject`; ACP cannot collect input values, so inputs are answered with their declared defaults. Unsupported interaction kinds offer Reject only. Rejection, client cancellation, and transport errors never approve a call. Human responses have no timeout. Middleware acceptance errors are reported through session updates; see [Middleware permissions](#middleware-permissions).
 
 #### Supported Prompt Content Blocks
 

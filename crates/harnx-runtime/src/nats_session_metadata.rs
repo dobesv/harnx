@@ -46,10 +46,11 @@ pub use run_limits::{
     ParentInvocationLink, RunIdentity, RunLimitsError, RunLimitsPolicySource, RunLimitsRecord,
 };
 pub use session_properties::{
-    property_definition, session_properties, Inheritance, PropertyAssignment, PropertyDefinition,
-    PropertySource, SessionProperties, SessionPropertiesUpdate, SessionProperty,
-    CUSTOM_PROPERTIES_MAX, LABELS_PROPERTY, PROPERTY_DEFINITIONS, SESSION_LABELS_MAX,
-    SESSION_PROPERTIES_NAMESPACE, WEB_SESSION_URL_PROPERTY,
+    property_definition, session_properties, user_principals, Inheritance, PropertyAssignment,
+    PropertyDefinition, PropertySource, SessionProperties, SessionPropertiesUpdate,
+    SessionProperty, CUSTOM_PROPERTIES_MAX, LABELS_PROPERTY, PROPERTY_DEFINITIONS,
+    SESSION_LABELS_MAX, SESSION_PROPERTIES_NAMESPACE, USER_PRINCIPALS_PROPERTY,
+    WEB_SESSION_URL_PROPERTY,
 };
 pub use store::{
     a2a_message_key, a2a_session_prefix, a2a_task_index_key, a2a_task_key, a2a_tasks_prefix,
@@ -58,7 +59,8 @@ pub use store::{
     SessionMetadataStore, TaskIndex, TaskIndexEntry, TaskState,
 };
 pub use tool_context::{
-    tool_context, ToolContext, ToolContextEntry, TOOL_CONTEXT_NAMESPACE, TOOL_CONTEXT_VERSION,
+    store_context, tool_context, ToolContext, ToolContextEntry, TOOL_CONTEXT_NAMESPACE,
+    TOOL_CONTEXT_VERSION,
 };
 pub use view::{
     repository_contexts, ListedSession, MetadataRecord, RedactedAgentSource,

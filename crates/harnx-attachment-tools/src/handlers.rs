@@ -3,8 +3,7 @@
 //! Implements `attachment_read` and `attachment_create` operations over NATS.
 
 use anyhow::{Context, Result};
-use async_nats::jetstream::object_store::ObjectStore;
-use harnx_blob_store::{media_cid_url, put_media, resolve};
+use harnx_blob_store::{media::AttachmentsBucket, media_cid_url, put_media, resolve};
 use harnx_core::cid_url::CidUrl;
 use harnx_core::crypto::hex_encode;
 use harnx_core::safety::{format_size, truncate_output, TruncateOpts};
@@ -17,7 +16,7 @@ const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024; // 5 MiB
 
 /// Default byte limit when byte_offset is provided without byte_limit.
 /// This prevents unbounded reads while still allowing reasonably large pages.
-const DEFAULT_BYTE_LIMIT: usize = 64 * 1024; // 64 KiB
+pub(crate) const DEFAULT_BYTE_LIMIT: usize = harnx_core::safety::DEFAULT_MAX_BYTES;
 
 /// Image MIME types that return as image content blocks.
 const IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
@@ -65,7 +64,7 @@ pub struct AttachmentReadParams {
     pub byte_offset: Option<usize>,
     /// Maximum number of bytes to return from byte_offset.
     /// Cannot be used with line selectors.
-    /// Defaults to 64 KiB when byte_offset is provided without byte_limit.
+    /// Defaults to 128 KiB when byte_offset is provided without byte_limit.
     #[serde(default)]
     pub byte_limit: Option<usize>,
 }
@@ -301,7 +300,7 @@ fn decode_attachment_content(content: String, encoding: Option<&str>) -> Result<
 
 /// Create a text or base64-encoded binary attachment in NATS object store.
 pub async fn attachment_create(
-    store: &ObjectStore,
+    store: &AttachmentsBucket,
     caller_session: Option<&harnx_toolset::SessionRef>,
     params: AttachmentCreateParams,
 ) -> Result<CallToolResult> {
@@ -528,6 +527,15 @@ mod tests {
             assert_eq!(has_line_selectors(&params), line_mode, "{selector}");
             assert_eq!(has_byte_selectors(&params), !line_mode, "{selector}");
         }
+    }
+
+    #[test]
+    fn byte_paging_default_limit_is_128_kib() {
+        assert_eq!(DEFAULT_BYTE_LIMIT, 131_072);
+        let bytes = vec![b'x'; DEFAULT_BYTE_LIMIT + 1];
+        let params = serde_json::from_value(json!({"url": "test", "byte_offset": 0})).unwrap();
+        let page = BytePage::new(&bytes, &params).unwrap();
+        assert_eq!((page.start, page.end), (0, DEFAULT_BYTE_LIMIT));
     }
 
     #[test]

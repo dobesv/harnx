@@ -13,13 +13,20 @@ import { PendingContext, type HydratedPendingApproval } from './PendingContext';
 import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
 import { RuntimeSessionSubscriber } from './RuntimeSessionSubscriber';
-import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type MessageAttachmentMeta, type CompactionOutcome } from './harnxCustomEvents';
+import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, type MessageAttachmentMeta, type CompactionOutcome, type PendingInteraction } from './harnxCustomEvents';
 import { SubAgentNotesContext } from './SubAgentNotesContext';
 import { INITIAL_SUB_AGENT_NOTES_STATE, reduceSubAgentNotes } from './subAgentNotes';
 import { SessionNavigationContext } from './SessionNavigationContext';
 import { MessageAttachmentsContext } from './MessageAttachmentsContext';
 import { reduceMessageAttachments } from './messageAttachments';
 import { reduceToolUpdates, type ToolUpdatesState, type ToolCallUpdatePatch } from './toolUpdates';
+import { A2uiSurfacesContext } from './a2ui/A2uiSurfacesContext';
+import {
+  reduceSurfaces,
+  type A2uiSurfacesState,
+  type A2uiSurfaceEvent,
+  type A2uiSurfaceResolution,
+} from './a2ui/surfaceState';
 import { isAbortError, observedFetch } from './httpClient';
 import { connection } from './connection';
 import { formatUnchangedReason } from './compactionApi';
@@ -106,6 +113,8 @@ export interface HarnxHttpAgentOptions {
   onHandoff?: (agent: string, sessionId: string) => void;
   onSubAgentEvent: (event: unknown) => void;
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  onPendingInteraction?: (interaction: PendingInteraction | null) => void;
+  onA2uiSurface?: (surface: A2uiSurfaceEvent) => void;
   onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
   onCompactingStarted?: (compactionId?: string) => void;
   onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
@@ -143,6 +152,8 @@ export class HarnxHttpAgent extends HttpAgent {
   private readonly onHandoff?: (agent: string, sessionId: string) => void;
   private readonly onSubAgentEvent: (event: unknown) => void;
   private readonly onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
+  private readonly onPendingInteractionCb?: (interaction: PendingInteraction | null) => void;
+  private readonly onA2uiSurfaceCb?: (surface: A2uiSurfaceEvent) => void;
   private readonly onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
   private readonly onCompactingStarted?: (compactionId?: string) => void;
   private readonly onCompactingCompleted?: (outcome: CompactionOutcome, compactionId?: string) => void;
@@ -163,6 +174,8 @@ export class HarnxHttpAgent extends HttpAgent {
     this.onHandoff = options.onHandoff;
     this.onSubAgentEvent = options.onSubAgentEvent;
     this.onHitlPendingApproval = options.onHitlPendingApproval;
+    this.onPendingInteractionCb = options.onPendingInteraction;
+    this.onA2uiSurfaceCb = options.onA2uiSurface;
     this.onMessageAttachments = options.onMessageAttachments;
     this.onCompactingStarted = options.onCompactingStarted;
     this.onCompactingCompleted = options.onCompactingCompleted;
@@ -190,6 +203,8 @@ export class HarnxHttpAgent extends HttpAgent {
         }
       },
       onHitlPendingApproval: this.onHitlPendingApproval,
+      onPendingInteraction: this.onPendingInteractionCb,
+      onA2uiSurface: this.onA2uiSurfaceCb,
       onMessageAttachments: this.onMessageAttachments,
       onCompactingStarted: this.onCompactingStarted,
       onCompactingCompleted: this.onCompactingCompleted,
@@ -319,8 +334,29 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     reduceToolUpdates,
     new Map() as ToolUpdatesState,
   );
+  const [surfacesState, dispatchSurfaces] = useReducer(
+    reduceSurfaces,
+    new Map() as A2uiSurfacesState,
+  );
   // Hydrated HITL pending approvals from durable log (hitl_pending_approval CUSTOM events)
   const [hydratedApprovals, setHydratedApprovals] = useState<HydratedPendingApproval[]>([]);
+  const [pendingInteraction, setPendingInteraction] = useState<PendingInteraction | null>(null);
+
+  const clearPendingInteraction = useCallback(() => {
+    setPendingInteraction(null);
+  }, []);
+
+  const clearPendingInteractionIfMatch = useCallback(
+    (interactionId: string, requestSeq: number) => {
+      setPendingInteraction((prev) => {
+        if (prev && prev.interactionId === interactionId && prev.requestSeq === requestSeq) {
+          return null;
+        }
+        return prev;
+      });
+    },
+    [],
+  );
   
   const addHydratedApproval = useCallback((approval: HydratedPendingApproval) => {
     setHydratedApprovals((prev) => {
@@ -385,60 +421,100 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     async remove() {}
   }), [agentName, sessionId]);
 
-  const agent = useMemo(() => new HarnxHttpAgent({
-    url: `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}`,
-    onStatus: (text) => setStatusText(text),
-    onRunFailed: (message) => setErrorText(message),
-    onUsage: (newUsage) => setUsage(newUsage),
-    onToolSummary: (id, summary) => {
-      if (id && summary) {
-        setToolSummaries((prev) => {
-          const next = new Map(prev);
-          next.set(id, summary);
-          return next;
+  const currentSessionRef = useRef({ agentName, sessionId });
+  currentSessionRef.current = { agentName, sessionId };
+  const currentAgentRef = useRef<HarnxHttpAgent | null>(null);
+
+  const agent = useMemo(() => {
+    const boundAgentName = agentName;
+    const boundSessionId = sessionId;
+    const agentInstance: HarnxHttpAgent = new HarnxHttpAgent({
+      url: `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}`,
+      onStatus: (text) => setStatusText(text),
+      onRunFailed: (message) => setErrorText(message),
+      onUsage: (newUsage) => setUsage(newUsage),
+      onToolSummary: (id, summary) => {
+        if (id && summary) {
+          setToolSummaries((prev) => {
+            const next = new Map(prev);
+            next.set(id, summary);
+            return next;
+          });
+        }
+      },
+      onHandoff,
+      isForeground: true,
+      onHitlPendingApproval: (toolCallId, summary) => {
+        cancellationRef.current?.reset?.();
+        addHydratedApproval({ toolCallId, summary });
+      },
+      onPendingInteraction: (interaction) => {
+        if (
+          currentAgentRef.current !== agentInstance ||
+          currentSessionRef.current.agentName !== boundAgentName ||
+          currentSessionRef.current.sessionId !== boundSessionId
+        ) {
+          return;
+        }
+        cancellationRef.current?.reset?.();
+        setPendingInteraction(interaction);
+      },
+      onA2uiSurface: (surface) => {
+        if (
+          currentAgentRef.current !== agentInstance ||
+          currentSessionRef.current.agentName !== boundAgentName ||
+          currentSessionRef.current.sessionId !== boundSessionId
+        ) {
+          return;
+        }
+        dispatchSurfaces({ type: 'SURFACE_EVENT', event: surface });
+      },
+      onRunTerminal: () => {
+        cancellationRef.current?.reset?.();
+        setCompactionPhase(compactionAfterRunTerminal);
+      },
+      onMessageAttachments: (messageId, attachments) => {
+        dispatchAttachments({
+          type: 'SET_ATTACHMENTS',
+          agent: agentName,
+          session: sessionId,
+          messageId,
+          attachments,
         });
+      },
+      onSubAgentEvent: (event: any) => dispatchSubAgentEvent(event),
+      onCompactingStarted: (compactionId) => {
+        setCompactionPhase({ phase: 'compacting', compactionId });
+      },
+      onCompactingCompleted: (outcome, _compactionId) => {
+        setCompactionPhase({ phase: 'idle' });
+        if (outcome.status === 'unchanged') {
+          setStatusMessage(formatUnchangedReason(outcome.detail));
+        }
+      },
+      onCompactingFailed: (error, _compactionId) => {
+        setCompactionPhase({ phase: 'failed' });
+        setErrorText(error);
+      },
+      onSessionCompaction: (metadata) => {
+        setCompactionMetadata(metadata);
+      },
+      onToolUpdate: (patch: ToolCallUpdatePatch) => {
+        dispatchToolUpdate({ type: 'TOOL_UPDATE', patch });
+      },
+    });
+    currentAgentRef.current = agentInstance;
+    return agentInstance;
+  }, [agentName, sessionId, onHandoff, addHydratedApproval]);
+
+  useEffect(() => {
+    currentAgentRef.current = agent;
+    return () => {
+      if (currentAgentRef.current === agent) {
+        currentAgentRef.current = null;
       }
-    },
-    onHandoff,
-    isForeground: true,
-    onHitlPendingApproval: (toolCallId, summary) => {
-      cancellationRef.current.reset?.();
-      addHydratedApproval({ toolCallId, summary });
-    },
-    onRunTerminal: () => {
-      cancellationRef.current.reset?.();
-      setCompactionPhase(compactionAfterRunTerminal);
-    },
-    onMessageAttachments: (messageId, attachments) => {
-      dispatchAttachments({
-        type: 'SET_ATTACHMENTS',
-        agent: agentName,
-        session: sessionId,
-        messageId,
-        attachments,
-      });
-    },
-    onSubAgentEvent: (event: any) => dispatchSubAgentEvent(event),
-    onCompactingStarted: (compactionId) => {
-      setCompactionPhase({ phase: 'compacting', compactionId });
-    },
-    onCompactingCompleted: (outcome, _compactionId) => {
-      setCompactionPhase({ phase: 'idle' });
-      if (outcome.status === 'unchanged') {
-        setStatusMessage(formatUnchangedReason(outcome.detail));
-      }
-    },
-    onCompactingFailed: (error, _compactionId) => {
-      setCompactionPhase({ phase: 'failed' });
-      setErrorText(error);
-    },
-    onSessionCompaction: (metadata) => {
-      setCompactionMetadata(metadata);
-    },
-    onToolUpdate: (patch: ToolCallUpdatePatch) => {
-      dispatchToolUpdate({ type: 'TOOL_UPDATE', patch });
-    },
-  }), [agentName, sessionId, onHandoff, addHydratedApproval]);
+    };
+  }, [agent]);
 
   const runtime = useAgUiRuntime({
     agent,
@@ -456,8 +532,10 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     dispatchSubAgentEvent({ type: 'RESET' });
     dispatchAttachments({ type: 'RESET', agent: agentName, session: sessionId });
     dispatchToolUpdate({ type: 'RESET' });
+    dispatchSurfaces({ type: 'RESET' });
     clearHydratedApprovals();
-  }, [agentName, sessionId, clearHydratedApprovals]);
+    clearPendingInteraction();
+  }, [agentName, sessionId, clearHydratedApprovals, clearPendingInteraction]);
 
   const subAgentContext = useMemo(() => ({
     notes: subAgentState.notes,
@@ -481,6 +559,30 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     session: sessionId,
   }), [compactionMetadata, agentName, sessionId]);
 
+  const a2uiSurfacesContextValue = useMemo(() => {
+    const allSurfaces = Array.from(surfacesState.values());
+    return {
+      agentName,
+      sessionId,
+      surfaces: surfacesState,
+      getSurfacesForToolCall: (toolCallId: string) =>
+        allSurfaces.filter((s) => s.toolCallId === toolCallId),
+      unattachedSurfaces: allSurfaces.filter((s) => !s.toolCallId),
+      updateSurfaceResolution: (
+        surfaceId: string,
+        publishSeq: number,
+        resolution: A2uiSurfaceResolution
+      ) => {
+        dispatchSurfaces({
+          type: 'SURFACE_RESOLVED',
+          surfaceId,
+          publishSeq,
+          resolution,
+        });
+      },
+    };
+  }, [agentName, sessionId, surfacesState]);
+
   return (
     <CancellationContext.Provider value={cancellation}>
     <CompactionContext.Provider value={compactionPhase}>
@@ -488,10 +590,12 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
     <SessionNavigationContext.Provider value={sessionNavigationContext}>
     <SubAgentNotesContext.Provider value={subAgentContext}>
     <MessageAttachmentsContext.Provider value={messageAttachmentsContext}>
+    <A2uiSurfacesContext.Provider value={a2uiSurfacesContextValue}>
       <PendingContext.Provider value={{ 
         statusText, setStatusText, errorText, setErrorText,
         statusMessage, setStatusMessage,
-        hydratedApprovals, addHydratedApproval, clearHydratedApprovals, removeHydratedApproval
+        hydratedApprovals, addHydratedApproval, clearHydratedApprovals, removeHydratedApproval,
+        pendingInteraction, setPendingInteraction, clearPendingInteraction, clearPendingInteractionIfMatch
       }}>
         <UsageContext.Provider value={{ usage, toolSummaries, toolUpdates: toolUpdatesState }}>
           <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
@@ -507,6 +611,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({
           </AssistantRuntimeProvider>
         </UsageContext.Provider>
       </PendingContext.Provider>
+    </A2uiSurfacesContext.Provider>
     </MessageAttachmentsContext.Provider>
     </SubAgentNotesContext.Provider>
     </SessionNavigationContext.Provider>

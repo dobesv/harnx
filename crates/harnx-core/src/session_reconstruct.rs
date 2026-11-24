@@ -414,6 +414,11 @@ struct ReplayAccumulator {
     /// window), so compaction copies of the same admission are skipped
     /// instead of resurfacing as pending input.
     seen_user_ids: std::collections::HashSet<String>,
+    /// The last user message before the replay barrier. A steered
+    /// continuation round (issue #2774) runs below the barrier's terminator
+    /// but is initiated by that row, so an in-flight round whose window has
+    /// no user message resumes with it.
+    last_pre_barrier_user: Option<Message>,
 }
 
 impl ReplayAccumulator {
@@ -438,11 +443,13 @@ impl ReplayAccumulator {
                 if crate::timing_identity::is_timing_notice(&content.to_text()) {
                     return;
                 }
-                // Runtime notes (sub-agent starts, cancels) are context too.
-                // Replay synthesized them from control events; a compaction
-                // re-log persists them as user rows, and they must not be
+                // Runtime notes (sub-agent starts, cancels) and
+                // hook-added context rows are context too. Replay
+                // synthesized the notes from control events and event hooks
+                // appended the context mid-turn; a compaction re-log
+                // persists both as user rows, and they must not be
                 // executed or queued as pending input.
-                if crate::runtime_note::is_runtime_note_id(id.as_deref()) {
+                if crate::runtime_note::is_runtime_context_id(id.as_deref()) {
                     return;
                 }
                 self.on_user_message_with_seq(log_seq, entry)
@@ -584,14 +591,42 @@ impl ReplayAccumulator {
     /// model through `active_context_window`, which replays the post-Compress
     /// window; this set only keeps the copy out of `next_turn_messages`.
     fn seed_settled_user_ids(&mut self, entries: &[(Option<usize>, SessionLogEntry)]) {
-        for (_, entry) in entries {
-            if let SessionLogEntry::Message {
-                id: Some(id), role, ..
+        for (log_seq, entry) in entries {
+            let SessionLogEntry::Message {
+                id, role, content, ..
             } = entry
-            {
-                if role.is_user() {
-                    self.seen_user_ids.insert(id.clone());
+            else {
+                continue;
+            };
+            if !role.is_user() {
+                continue;
+            }
+            // Every user id is seeded, settled or not: a compaction copy of
+            // any pre-barrier row must not resurface as pending input. The
+            // initiating-user fallback below is different: it must name an
+            // executable row, so it applies the same timing-notice and
+            // runtime-context filters as the normal user-message path, and
+            // skips non-executable rows instead of adopting them.
+            if let Some(id) = id {
+                if !self.seen_user_ids.insert(id.clone()) {
+                    // Already seen: this is a re-logged copy, and the
+                    // original occurrence stays the seeded fallback —
+                    // first occurrence wins, matching the live path's
+                    // dedupe.
+                    continue;
                 }
+            }
+            if crate::timing_identity::is_timing_notice(&content.to_text())
+                || crate::runtime_note::is_runtime_context_id(id.as_deref())
+            {
+                continue;
+            }
+            if let Some(message) = cloned_message(entry) {
+                // The resume path keys the initiating user row by its
+                // durable sequence, so keep it attached.
+                let mut message = message;
+                message.log_seq = *log_seq;
+                self.last_pre_barrier_user = Some(message);
             }
         }
     }
@@ -666,6 +701,12 @@ impl ReplayAccumulator {
         if let Some(last_user) = self.next_turn_messages.last().cloned() {
             self.resumable_last_user = Some(last_user);
             self.next_turn_messages.clear();
+        } else if self.resumable_last_user.is_none() {
+            // A steered continuation round (issue #2774) starts below the
+            // replay barrier's terminator: its initiating user row was
+            // seeded, not queued, so resume with that row instead of
+            // refusing the in-flight round.
+            self.resumable_last_user = self.last_pre_barrier_user.clone();
         }
         self.resumable_last_assistant = Some(AssistantTurn::ToolCalls {
             text: text.clone(),
@@ -793,7 +834,9 @@ fn cancel_after_orphan_tool_call(trailing_user: bool) -> Vec<(u64, SessionLogEnt
 #[cfg(test)]
 fn tool_result_ok() -> SessionLogEntry {
     SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results: vec![ToolOutput {
+            user_surfaces: Vec::new(),
             id: Some("c1".to_string()),
             name: "bash".to_string(),
             output: serde_json::json!({"ok": true}),
@@ -1661,6 +1704,7 @@ mod timing_non_executable_tests {
             (
                 3,
                 SessionLogEntry::ToolResults {
+                    handoff_selection: None,
                     results: vec![],
                     timestamp: None,
                 },
@@ -1820,6 +1864,173 @@ mod timing_non_executable_tests {
 /// under their original ids. A keep plan can retain an answered prompt without
 /// its assistant reply; without id dedup, replay returned that stale copy in
 /// `next_turn_messages` and the next invocation silently re-executed it.
+#[cfg(test)]
+mod steered_resume_tests {
+    use super::*;
+    use crate::message::{MessageContent, MessageRole};
+    use serde_json::json;
+
+    fn user_with_id(id: &str, text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: Some(id.to_string()),
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn nats_entries(entries: Vec<SessionLogEntry>) -> Vec<(u64, SessionLogEntry)> {
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| ((i + 1) as u64, entry))
+            .collect()
+    }
+
+    fn final_assistant(text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn tool_calls_assistant(fence_token: u64) -> SessionLogEntry {
+        SessionLogEntry::ToolCalls {
+            text: "working".to_string(),
+            thought: Some("thinking".to_string()),
+            calls: vec![ToolCall::new(
+                "tool-a".to_string(),
+                json!({"arg": 1}),
+                Some("call-1".to_string()),
+                None,
+            )],
+            timestamp: None,
+            fence_token: Some(fence_token),
+        }
+    }
+
+    /// A steered continuation round (issue #2774) starts below the replay
+    /// barrier's terminator, so its initiating user row was seeded pre-barrier
+    /// rather than queued: the round must resume with that row, keyed by id
+    /// and durable sequence. The barrier keys on the assistant Message, not
+    /// `TurnEnd`, so the continuation's `ToolCalls` stay post-barrier.
+    #[test]
+    fn resumable_continuation_below_the_barrier_resumes_with_the_seeded_initiating_user() {
+        let entries = nats_entries(vec![
+            user_with_id("steer-row", "steer me"),
+            final_assistant("root answer"),
+            tool_calls_assistant(7),
+        ]);
+
+        assert_seeded_steer_row(&reconstruct_state_from_nats(&entries));
+    }
+
+    /// Both steered-resume fixtures resume with the same seeded initiating
+    /// row: id, text and durable sequence must all survive the barrier.
+    fn assert_seeded_steer_row(state: &ReconstructedState) {
+        assert!(matches!(
+            state.turn_status,
+            TurnStatus::InFlightResumable { .. }
+        ));
+        let ctx = state
+            .resumable_ctx
+            .as_ref()
+            .expect("resumable continuation ctx");
+        let user = ctx.last_user.as_ref().expect("seeded initiating user");
+        assert_eq!(user.id.as_deref(), Some("steer-row"));
+        assert_eq!(user.content.to_text(), "steer me");
+        assert_eq!(user.log_seq, Some(1));
+    }
+
+    fn timing_notice_row() -> SessionLogEntry {
+        let origin: chrono::DateTime<chrono::Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+        let receipt =
+            crate::timing_identity::TimingReceipt::initial(origin, "inv-replay-test".to_string());
+        user_with_id(
+            "timing-row",
+            &format!(
+                "{}{}{}Elapsed: 0s, Budget: 1h",
+                crate::timing_identity::TIMING_HEADER,
+                receipt.to_json(),
+                crate::timing_identity::TIMING_CONTEXT_SEPARATOR
+            ),
+        )
+    }
+
+    /// The seeded initiating-user fallback must name an executable row: a
+    /// timing notice or runtime note before the barrier is context, never
+    /// the resumed round's initiating user.
+    #[test]
+    fn seeded_initiating_user_skips_timing_notices_and_runtime_notes() {
+        let entries = nats_entries(vec![
+            user_with_id("steer-row", "steer me"),
+            user_with_id("runtime-note-v1-abc", "sub-agent bookkeeping"),
+            timing_notice_row(),
+            final_assistant("root answer"),
+            tool_calls_assistant(7),
+        ]);
+
+        assert_seeded_steer_row(&reconstruct_state_from_nats(&entries));
+    }
+
+    /// Only non-executable user rows before the barrier: the fallback adopts
+    /// none of them, so the resumable round has no initiating user to resume
+    /// with rather than a bogus one.
+    #[test]
+    fn seeded_initiating_user_stays_unset_when_only_notices_precede_the_barrier() {
+        let entries = nats_entries(vec![
+            user_with_id("runtime-note-v1-abc", "sub-agent bookkeeping"),
+            timing_notice_row(),
+            final_assistant("root answer"),
+            tool_calls_assistant(7),
+        ]);
+
+        let state = reconstruct_state_from_nats(&entries);
+        assert!(matches!(
+            state.turn_status,
+            TurnStatus::InFlightResumable { .. }
+        ));
+        let ctx = state.resumable_ctx.expect("resumable continuation ctx");
+        assert!(
+            ctx.last_user.is_none(),
+            "a non-executable row must not become the initiating user"
+        );
+    }
+
+    /// A compaction re-log of a pre-barrier row must not displace the latest
+    /// first-occurrence row as the seeded fallback: `user-a`'s copy at seq 3
+    /// is skipped, and the resume stays keyed to `user-b` by id and
+    /// sequence.
+    #[test]
+    fn seeded_initiating_user_survives_a_compaction_relog() {
+        let entries = nats_entries(vec![
+            user_with_id("user-a", "first task"),
+            user_with_id("user-b", "steer me"),
+            user_with_id("user-a", "first task"),
+            final_assistant("root answer"),
+            tool_calls_assistant(7),
+        ]);
+
+        let state = reconstruct_state_from_nats(&entries);
+        assert!(matches!(
+            state.turn_status,
+            TurnStatus::InFlightResumable { .. }
+        ));
+        let ctx = state
+            .resumable_ctx
+            .as_ref()
+            .expect("resumable continuation ctx");
+        let user = ctx.last_user.as_ref().expect("seeded initiating user");
+        assert_eq!(user.id.as_deref(), Some("user-b"));
+        assert_eq!(user.content.to_text(), "steer me");
+        assert_eq!(user.log_seq, Some(2));
+    }
+}
+
 #[cfg(test)]
 mod compaction_copy_dedup_tests {
     use super::*;

@@ -96,8 +96,10 @@ impl BudgetPasses {
     pub(super) fn finish(
         self,
         timestamp: Option<chrono::DateTime<chrono::Utc>>,
+        handoff_selection: Option<String>,
     ) -> Result<SessionLogEntry> {
         let bounded = SessionLogEntry::ToolResults {
+            handoff_selection,
             results: self.results,
             timestamp,
         };

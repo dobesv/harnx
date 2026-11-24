@@ -41,7 +41,7 @@ struct ServerOutcome {
 
 /// Start this worker's tool servers and report which ones registered.
 pub async fn diagnose_tool_servers(config: &GlobalConfig) -> Result<String> {
-    let (servers, _hooks) = configured_worker_services(config);
+    let servers = configured_worker_services(config);
     if servers.is_empty() {
         return Ok("No tool servers are enabled for this configuration.\n".to_string());
     }

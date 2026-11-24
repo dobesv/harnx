@@ -1,7 +1,7 @@
 //! Recovery boundaries shared by all NATS roles. Retry transport work only
 //! when replay is safe; never retry a handler with unknown side effects.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_nats::jetstream::{self, kv};
 use futures_util::{stream, Stream, StreamExt};
 use std::{fmt::Display, future::Future, pin::Pin, time::Duration};
@@ -9,6 +9,22 @@ use tokio::time::{sleep, timeout_at, Instant};
 
 pub const RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// The retry window closed before the operation confirmed completion.
+/// Typed, not an anyhow message, so availability classification can match
+/// it without error text; `Display` keeps the message the deadline used to
+/// carry as a context string.
+#[derive(Debug)]
+pub struct RecoveryDeadlineExceeded;
+
+// qual:allow(dry, boilerplate) reason: "the marker's Display keeps the exact message the deadline used to carry as a context string; derive_more is not a workspace dependency and a macro for one impl is more boilerplate than the impl."
+impl std::fmt::Display for RecoveryDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NATS recovery deadline exceeded; completion unconfirmed")
+    }
+}
+
+impl std::error::Error for RecoveryDeadlineExceeded {}
 
 /// Retry a read without interpreting a failed read as absence. Parsing and
 /// application validation belong outside this closure and are never retried.
@@ -34,13 +50,12 @@ where
     Fut: Future<Output = std::result::Result<T, E>>,
 {
     loop {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "NATS recovery deadline exceeded; completion unconfirmed"
-        );
+        if Instant::now() >= deadline {
+            return Err(anyhow::Error::new(RecoveryDeadlineExceeded));
+        }
         let result = timeout_at(deadline, operation())
             .await
-            .context("NATS recovery deadline exceeded; completion unconfirmed")?;
+            .map_err(|_| anyhow::Error::new(RecoveryDeadlineExceeded))?;
         match result {
             Ok(value) => return Ok(value),
             Err(error) if retryable(&error) && Instant::now() + RETRY_DELAY < deadline => {

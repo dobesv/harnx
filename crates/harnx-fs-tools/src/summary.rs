@@ -1,6 +1,4 @@
-use harnx_core::safety::{
-    format_size, truncate_output, TruncateOpts, DEFAULT_MAX_BYTES, LS_SCAN_HARD_LIMIT,
-};
+use harnx_core::safety::{format_size, truncate_output, TruncateOpts, LS_SCAN_HARD_LIMIT};
 use harnx_toolset_server::content::WithAudience;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData, Role};
 use std::fmt::Write as _;
@@ -16,19 +14,24 @@ pub(crate) fn render_read_result(
     file_bytes: usize,
     mut notices: Vec<String>,
 ) -> Result<CallToolResult, ErrorData> {
+    let numbered = params.line_numbers != Some(false);
     let shown_content_bytes: usize = numbered_lines.iter().map(|(_, l)| l.len() + 1).sum();
     let raw_output = numbered_lines
         .into_iter()
-        .map(|(n, l)| format!("{n}: {l}"))
+        .map(|(n, l)| {
+            if numbered {
+                format!("{n}: {l}")
+            } else {
+                l.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let d = TruncateOpts::default();
     let opts = TruncateOpts {
         head_lines: params.head_lines.unwrap_or(d.head_lines),
         tail_lines: params.tail_lines.unwrap_or(d.tail_lines),
-        max_output_bytes: params
-            .max_output_bytes
-            .unwrap_or(d.max_output_bytes.min(DEFAULT_MAX_BYTES)),
+        max_output_bytes: params.max_output_bytes.unwrap_or(d.max_output_bytes),
         ..d
     };
     let (output, byte_truncated) = truncate_with_notices(
@@ -77,16 +80,16 @@ fn truncate_with_notices(
     (output, byte_truncated)
 }
 
-struct ReadSlice {
-    total_lines: usize,
-    shown_start: usize,
-    shown_end: usize,
-    shown_content_bytes: usize,
-    file_bytes: usize,
-    byte_truncated: bool,
+pub(crate) struct ReadSlice {
+    pub(crate) total_lines: usize,
+    pub(crate) shown_start: usize,
+    pub(crate) shown_end: usize,
+    pub(crate) shown_content_bytes: usize,
+    pub(crate) file_bytes: usize,
+    pub(crate) byte_truncated: bool,
 }
 
-fn read_file_summary(path: &str, s: &ReadSlice) -> String {
+pub(crate) fn read_file_summary(path: &str, s: &ReadSlice) -> String {
     let all = s.shown_start == 1 && s.shown_end == s.total_lines;
     let lines_part = if all {
         format!("{} lines", s.total_lines)
@@ -200,6 +203,20 @@ pub(crate) fn find_summary(path_count: usize, max_results: usize, limit_reached:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_core::safety::DEFAULT_MAX_BYTES;
+
+    #[test]
+    fn read_defaults_preserve_content_up_to_shared_byte_budget() {
+        let params: ReadFileParams =
+            serde_json::from_value(serde_json::json!({"path": "large.txt"})).unwrap();
+        // Include line-number formatting in the budget and exceed the old 50 KiB clamp.
+        let line = "x".repeat(DEFAULT_MAX_BYTES - "1: ".len());
+        let result =
+            render_read_result(&params, vec![(1, &line)], 1, 1, 1, line.len(), Vec::new()).unwrap();
+        let text = &result.content[0].as_text().unwrap().text;
+        assert_eq!(text, &format!("1: {line}"));
+        assert!(!text.contains("truncated"));
+    }
 
     #[test]
     fn read_file_summary_complete() {

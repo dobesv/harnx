@@ -9,34 +9,12 @@ use rmcp::ServerHandler;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 
-use crate::format;
+use crate::{client::FetchedPage, format};
 
+use super::image::try_image_result;
 use super::model::PlayerResponse;
-use super::{FetchParams, FetchServer, YoutubeTranscriptParams};
-
-pub(crate) const TOOL_DESCRIPTIONS: [(&str, &str); 6] = [
-    ("fetch_html", "Fetch a URL and return its raw HTML."),
-    (
-        "fetch_markdown",
-        "Fetch a URL and convert its HTML content to Markdown.",
-    ),
-    (
-        "fetch_txt",
-        "Fetch a URL and return plain DOM text with scripts and styles removed.",
-    ),
-    (
-        "fetch_json",
-        "Fetch a URL, validate its JSON response, and return pretty-printed JSON.",
-    ),
-    (
-        "fetch_readable",
-        "Fetch a URL and extract its main readable article as Markdown.",
-    ),
-    (
-        "fetch_youtube_transcript",
-        "Fetch a YouTube watch page and return its timestamped caption transcript.",
-    ),
-];
+use super::params::DEFAULT_MAX_LENGTH;
+use super::{FetchParams, FetchServer, YoutubeTranscriptParams, TOOL_DESCRIPTIONS};
 
 fn domain_error(message: impl Into<String>) -> ErrorData {
     ErrorData::internal_error(format!("❌ Error: {}", message.into()), None)
@@ -68,9 +46,9 @@ fn metric_tool_name(tool: &str) -> &'static str {
         .unwrap_or("unknown")
 }
 
-fn output(value: &str, params: &FetchParams, disable_line_clipping: bool) -> String {
+fn output(value: &str, params: &FetchParams) -> String {
     let (window, _) = params.compatibility_window(value);
-    truncate_output(&window, &params.truncation_opts(disable_line_clipping))
+    truncate_output(&window, &params.truncation_opts())
 }
 
 fn json_output(value: &str, params: &FetchParams) -> String {
@@ -80,14 +58,11 @@ fn json_output(value: &str, params: &FetchParams) -> String {
     } else {
         window
     };
-    truncate_output(&preview, &params.truncation_opts(true))
+    truncate_output(&preview, &params.truncation_opts())
 }
 
 impl FetchServer {
-    async fn fetch_page(
-        &self,
-        params: &FetchParams,
-    ) -> Result<crate::client::FetchedPage, ErrorData> {
+    async fn fetch_page(&self, params: &FetchParams) -> Result<FetchedPage, ErrorData> {
         params.validate().map_err(domain_error)?;
         self.client
             .fetch(&params.url, &params.headers, params.proxy.as_deref())
@@ -95,46 +70,62 @@ impl FetchServer {
             .map_err(domain_error)
     }
 
+    async fn fetch_page_result(
+        &self,
+        params: &FetchParams,
+        render_text: impl FnOnce(&str, &str) -> Result<String, ErrorData>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let page = self.fetch_page(params).await?;
+        if let Some(image) = try_image_result(&page).map_err(domain_error)? {
+            return Ok(image);
+        }
+        let body = String::from_utf8_lossy(&page.body);
+        render_text(&body, page.final_url.as_str()).map(text_result)
+    }
+
     pub async fn fetch_html_impl(&self, params: FetchParams) -> Result<CallToolResult, ErrorData> {
-        let page = self.fetch_page(&params).await?;
-        Ok(text_result(output(&page.body, &params, true)))
+        self.fetch_page_result(&params, |body, _| Ok(output(body, &params)))
+            .await
     }
 
     pub async fn fetch_markdown_impl(
         &self,
         params: FetchParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let page = self.fetch_page(&params).await?;
-        Ok(text_result(output(
-            &format::html_to_md(&page.body),
-            &params,
-            false,
-        )))
+        self.fetch_page_result(&params, |body, _| {
+            Ok(output(&format::html_to_md(body), &params))
+        })
+        .await
     }
 
     pub async fn fetch_txt_impl(&self, params: FetchParams) -> Result<CallToolResult, ErrorData> {
-        let page = self.fetch_page(&params).await?;
-        let text = format::html_to_text(&page.body).map_err(domain_error)?;
-        Ok(text_result(output(&text, &params, false)))
+        self.fetch_page_result(&params, |body, _| {
+            let text = format::html_to_text(body).map_err(domain_error)?;
+            Ok(output(&text, &params))
+        })
+        .await
     }
 
     pub async fn fetch_json_impl(&self, params: FetchParams) -> Result<CallToolResult, ErrorData> {
-        let page = self.fetch_page(&params).await?;
-        let parsed: Value = serde_json::from_str(&page.body)
-            .map_err(|error| domain_error(format!("response is not valid JSON: {error}")))?;
-        let pretty = serde_json::to_string_pretty(&parsed)
-            .map_err(|error| domain_error(format!("failed to serialize JSON: {error}")))?;
-        Ok(text_result(json_output(&pretty, &params)))
+        self.fetch_page_result(&params, |body, _| {
+            let parsed: Value = serde_json::from_str(body)
+                .map_err(|error| domain_error(format!("response is not valid JSON: {error}")))?;
+            let pretty = serde_json::to_string_pretty(&parsed)
+                .map_err(|error| domain_error(format!("failed to serialize JSON: {error}")))?;
+            Ok(json_output(&pretty, &params))
+        })
+        .await
     }
 
     pub async fn fetch_readable_impl(
         &self,
         params: FetchParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let page = self.fetch_page(&params).await?;
-        let markdown =
-            format::readable_markdown(&page.body, page.final_url.as_str()).map_err(domain_error)?;
-        Ok(text_result(output(&markdown, &params, false)))
+        self.fetch_page_result(&params, |body, url| {
+            let markdown = format::readable_markdown(body, url).map_err(domain_error)?;
+            Ok(output(&markdown, &params))
+        })
+        .await
     }
 
     pub async fn fetch_youtube_transcript_impl(
@@ -143,7 +134,8 @@ impl FetchServer {
     ) -> Result<CallToolResult, ErrorData> {
         params.validate().map_err(domain_error)?;
         let watch_page = self.fetch_page(&params.fetch).await?;
-        let player_json = format::player_response_json(&watch_page.body).map_err(domain_error)?;
+        let watch_text = String::from_utf8_lossy(&watch_page.body);
+        let player_json = format::player_response_json(&watch_text).map_err(domain_error)?;
         let player: PlayerResponse = serde_json::from_str(player_json)
             .map_err(|error| domain_error(format!("invalid YouTube player response: {error}")))?;
         let tracks = player
@@ -182,8 +174,9 @@ impl FetchServer {
             )
             .await
             .map_err(domain_error)?;
-        let transcript = format::transcript_lines(&captions.body).map_err(domain_error)?;
-        Ok(text_result(output(&transcript, &params.fetch, false)))
+        let transcript = format::transcript_lines(&String::from_utf8_lossy(&captions.body))
+            .map_err(domain_error)?;
+        Ok(text_result(output(&transcript, &params.fetch)))
     }
 }
 
@@ -285,7 +278,7 @@ pub(crate) fn tool_schema(name: &str) -> Map<String, Value> {
     );
     properties.insert(
         "max_length".to_owned(),
-        json!({"type":"integer","minimum":0,"default":5000,"description":"Compatibility character limit applied before smart truncation. Zero means unlimited."}),
+        json!({"type":"integer","minimum":0,"default":DEFAULT_MAX_LENGTH,"description":"Compatibility character limit applied before smart truncation. Zero means unlimited."}),
     );
     properties.insert(
         "start_index".to_owned(),
@@ -325,7 +318,11 @@ mod tests {
         for (name, _) in TOOL_DESCRIPTIONS {
             let schema = Value::Object(tool_schema(name));
             assert_eq!(schema["required"], json!(["url"]));
-            assert_eq!(schema["properties"]["max_length"]["default"], 5000);
+            assert_eq!(DEFAULT_MAX_LENGTH, 131_072);
+            assert_eq!(
+                schema["properties"]["max_length"]["default"],
+                DEFAULT_MAX_LENGTH
+            );
             assert!(schema["properties"].get("max_output_bytes").is_some());
         }
     }

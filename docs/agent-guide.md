@@ -20,7 +20,7 @@ Here's a complete example showing all available front-matter fields:
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 temperature: 0
 top_p: 0.9
 use_tools:
@@ -48,8 +48,9 @@ documents:
 
 hooks:
   max_resume: 3
-  entries:
-    - command: harnx-claude-compatible-hook-server --event Stop -- /path/to/hook.sh
+  Stop:
+    - name: keep-going
+      bash: resume "finish the checklist first"
 ---
 
 You are a helpful coding assistant working on the {{project_dir}} project.
@@ -64,7 +65,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | `string` | global default | LLM model ID (e.g. `openai:gpt-4o`, `claude:claude-3-5-sonnet`). If omitted, uses the globally configured model. |
+| `model` | `string` | global default | LLM model ID (e.g. `openai:gpt-6.2-sol`, `claude:claude-sonnet-5-5`). If omitted, uses the globally configured model. |
 | `role` | `string` | `assistant` | Agent purpose: `assistant` (interactive agent shown in menus), `subagent` (internal agent invoked via delegation), or `compaction` (session compaction agent). |
 | `temperature` | `float` | global default | Controls randomness (0 = deterministic, 1 = creative). Inherited from global config when `model` is omitted. |
 | `top_p` | `float` | global default | Nucleus sampling parameter. Alternative to temperature. Inherited from global config when `model` is omitted. |
@@ -76,7 +77,9 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | `conversation_starters` | `list` | `[]` | Suggested prompts shown when starting the agent in TUI mode. |
 | `documents` | `list` | `[]` | Document paths for RAG integration. See [Documents](#documents-rag). |
 | `instructions` | `string` | none | If set, overrides the Markdown body as the system prompt. |
-| `hooks` | `object` | none | Per-agent hook configuration. See [Hooks](#hooks). |
+| `patches` | `string` or `list` | none | jaq filters that rewrite the agent config at session activation with caller principals bound as `$user`. See [Agent Patches (`patches`)](#agent-patches-patches). |
+| `middleware` | `list` | `[]` | In-process tool-call scripts, including durable confirmations. See [Tool middleware and confirmation](#tool-middleware-and-confirmation). |
+| `hooks` | `object` | none | Per-agent lifecycle event hooks. See [Hooks](#hooks). |
 
 ## Variables
 
@@ -142,8 +145,9 @@ Harnx provides built-in variables that are always available, without needing to 
 | `{{__locale__}}` | System locale | `en-US`, `ja-JP` |
 | `{{__now__}}` | Current date and time | `2025-01-15 14:30:00` |
 | `{{__cwd__}}` | Current working directory | `/home/user/project` |
+| `{{__user__}}` | Caller principals snapshot | `{user_id: "alice", users: ["alice"], groups: ["developers"], roles: ["admin"]}` |
 
-Built-in variables are interpolated after custom variables, so they work everywhere custom variables do.
+Built-in variables are interpolated after custom variables, so they work everywhere custom variables do. Agent and session variables cannot override `__user__`. See [Dynamic Variables in Prompts](#dynamic-variables-in-prompts) for conditional prompt examples with `__user__`.
 
 ## Prompt Body
 
@@ -151,7 +155,7 @@ The Markdown body below the front-matter `---` fence is the agent's system promp
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 ---
 You are a helpful assistant that explains things clearly and concisely.
 ```
@@ -196,11 +200,44 @@ This design draws on three primary sources reviewed for [issue #2495](https://gi
 
 Harnx supplies a sanitized, budgeted transcript as the compaction request's input
 (`config/compaction/request.rs` and `transcript.rs` in `harnx-runtime`); no
-`{conversation_history}` placeholder is needed in the agent prompt. Kept messages
-are excluded from that transcript. Tool results may already be shortened, so a
-prompt cannot recover missing details; it should identify consequential gaps
-instead of inventing them. The built-in fallback used without a configured
-`compaction_agent` is separate and still requests about 200 words.
+`{conversation_history}` placeholder is needed in the agent prompt. The input is
+tagged by speaker:
+
+```xml
+<transcript>
+<earlier_summary>…previous compaction summary…</earlier_summary>
+<user>…</user>
+<assistant>…</assistant>
+<tool_call name="bash_exec">{"command":"…"}</tool_call>
+<tool_result name="bash_exec" status="completed">…</tool_result>
+<runtime_note>…</runtime_note>
+</transcript>
+
+<kept_after_summary>
+<user>…latest prompt…</user>
+<tool_call name="bash_exec"/>
+</kept_after_summary>
+```
+
+`<transcript>` holds the messages the summary replaces. `<kept_after_summary>`
+lists the messages replayed verbatim after the summary, with tool arguments and
+results left out, so the summarizer can see the user's latest prompt without
+summarizing it; it is `<kept_after_summary/>` when nothing is kept. The block
+takes at most half the summarizer's budget. Long bodies are excerpted first, and
+when the tags alone still overflow, as with a round of many tool calls, tool
+calls, then other messages, then user prompts are left out, oldest first, behind
+a `[N replayed elements not listed]` line. Only `<user>`
+holds the user's words. Text inside `<tool_call>` and `<tool_result>` is the
+agent's actions and tool output, including instructions the agent sent to a
+delegate and a delegate's transcript echoed back as `role: user`, so a prompt
+should tell the summarizer never to record it as a user requirement. Our own
+tag names inside message text are escaped (`&lt;/user>`), so content cannot
+close or forge an element.
+
+Tool results may already be shortened, so a prompt cannot recover missing
+details; it should identify consequential gaps instead of inventing them. The
+built-in fallback used without a configured `compaction_agent` is separate and
+still requests about 200 words.
 
 When evaluating prompt changes, use transcripts with an earlier summary, a
 partially completed plan, changed files, a failed check, and a later user
@@ -348,6 +385,7 @@ When `bash_tools` is configured and resolves to a non-empty set of tools, Harnx 
 - **Selector syntax**: Uses the same list, comma-separated string, glob, brace expansion, and toolset syntax as `use_tools`.
 - **Independent tool sets**: `bash_tools` is independent of `use_tools`. A tool can be exposed directly in `use_tools`, inside `bash_tools`, or in both.
 - **Excluded tools**: Control-flow tools (`switch_agent`, `*_session_handoff`, `ask_user`) and `bash` itself cannot be placed inside `bash_tools`; they remain at the direct conversation boundary.
+- **Script tools**: [Script tools](script-tools.md) are selectable in `bash_tools` like any other tool; a script-mode script then calls them as commands. They still cannot call `bash` or each other.
 - **Reserved name and migration**: While `bash_tools` resolves to tools, the bare name `bash` belongs to script mode. If a tool server registers a native bare `bash` tool, it is replaced while script mode is active. Qualified names like `<server>_bash` continue to work normally.
 - **No glob shadowing**: `use_tools` wildcard globs like `*` or `bash*` never match or synthesize the script-mode `bash` tool.
 - **Session override**: `.set bash_tools <selectors>` updates the active session's record; tool selection overlays that record on the active agent, so the change takes effect immediately but stays scoped to the session — switching sessions (the TUI picker keeps the agent) does not carry the override into other sessions. `.set bash_tools null` disables script mode for the session; unlike `use_tools`, the clear persists as an empty selector list rather than an unset override, so a restarted worker keeps script mode off instead of falling back to the agent file's `bash_tools`.
@@ -364,7 +402,7 @@ bash_tools:
 - **In-process shell**: Scripts run in an in-process BashKit subshell with an isolated virtual filesystem. Working directory is `/tmp`. Scripts have no host filesystem access and no network access.
 - **Embedded Python (`python` / `python3`)**: Scripts can invoke embedded Python using `python` or `python3` (`-c`, a virtual script file, or stdin/heredoc). It runs Monty Python, an in-process interpreter subset, not CPython.
   - **Environment and filesystem**: Code runs within the virtual filesystem (`/tmp` and read-only `/attachments`). It has no access to the host filesystem, host network, or host environment variables.
-  - **Tool isolation**: Python cannot call tools. There is no external tool bridge or tool global inside the interpreter; scripts run tool commands in Bash and pass results via `/tmp`.
+  - **Tool isolation**: Python cannot call tools. There is no external tool bridge or tool global inside the interpreter; scripts run tool commands in Bash and pass results via `/tmp`. For Python that calls tools directly, define a [script tool](script-tools.md) with a `python:` body — its `call_tool(name, args)` goes through the same allowlisted inner-call path as Bash.
   - **Language subset**: Simple classes work, but inheritance, metaclasses, third-party packages, and the `re` module are not supported.
   - **Resource limits**: Python is constrained only by cooperative VM limits, not hard OS-level process or memory isolation. Each invocation has a default 64 MiB ceiling for heap allocations and collected print buffers, plus the script's remaining wall-clock time (the default run timeout is 86,400 seconds). Exceeding memory within VM-tracked allocations yields exit 1 with a `MemoryError` diagnostic on stderr rather than a typed limit hit. While bytecode loops respond to cancellation, native operations and unpolled result exports do not stop cleanly and can block or crash the worker. Each Python call is also charged against a shared script work budget, capping a single script at approximately 95 Python invocations (failing on the 96th); batch per-item loops into a single Python invocation rather than re-running the interpreter in a shell loop.
   - **Known crash risks and host impact**: Under BashKit 0.20.2 / Monty 0.0.19, several operations allocate outside the 64 MiB VM budget or ignore timeouts, causing host memory exhaustion or an unrecoverable `SIGABRT` that terminates the entire worker host process. Confirmed failure examples include (non-exhaustive):
@@ -375,21 +413,20 @@ bash_tools:
     - Untracked native preallocations in `str` and `bytes` `join`/`split` allocate directly on the host heap and abort on allocation failure.
     No newer compatible BashKit release is known to resolve these issues. Python cannot be disabled separately in this version. Use script mode with Python only where a crashed worker is acceptable. For untrusted prompts, leave `bash_tools` unset so the script-mode `bash` tool is not exposed.
 - **Attachments**: `/attachments` is a read-only mount of session media. Read a file at `/attachments/<full-media-cid>` (for example `/attachments/cid:media:<agent>/<session>/<sha256>`); bytes are fetched on first read and cached for the rest of the run. Files over 10 MB fail rather than truncate, listings are empty, and writes fail with a read-only error. `test -f` and other metadata probes answer from object metadata alone — they never download or consume the cache. If the cache is full, subsequent reads fail fast before downloading any content. Images, audio and embedded resources returned by inner tools are stored as attachments before the script sees them, so commands print `[attachment: <cid> (<mime>, <size>)] path=/attachments/<cid>` in place of the inline image, audio or resource blocks. Data URIs embedded inside ordinary text are left as they are. If an upload fails after retries, the inner call fails as a tool error with the inline media discarded; scripts running `set +e` continue.
-- **Attachment access**: Reading from `/attachments` doesn't go through the `attachment_read` tool, so it isn't limited by `use_tools`/`bash_tools` and doesn't fire `PreToolUse` hooks. A script can read any media CID it names that the worker's broker credentials can read, which is the same rule `attachment_read` applies. If an agent must not read attachments, don't give it script mode.
+- **Attachment access**: Reading from `/attachments` doesn't go through the `attachment_read` tool, so it isn't limited by `use_tools`/`bash_tools` and doesn't run tool middleware. A script can read any media CID it names that the worker's broker credentials can read, which is the same rule `attachment_read` applies. If an agent must not read attachments, don't give it script mode.
 - **Error handling**: `set -e` is enabled by default: the script stops when a command fails, following POSIX `set -e` rules — failures of non-final pipeline members, commands guarded with `&&`/`||` or `if`, and background jobs don't stop the run. Scripts can use `set +e` to handle non-zero exit codes.
-- **Command mappings**: Each inner tool becomes a command with the same name. Tool parameters map to kebab-case long options (e.g. `--file-path`, `--max-output-bytes`). Scalar values accept `--flag value` or `--flag=value`; booleans accept `--flag` / `--no-flag`; repeated arrays accept multiple flags. Complex or nested objects take JSON literals or `--json '<json>'` (or `--json -` for stdin).
+- **Command mappings**: Each inner tool becomes a command with the same name. Tool parameters map to kebab-case long options (e.g. `--file-path`, `--max-output-bytes`). Scalar values accept `--flag value` or `--flag=value`; booleans accept `--flag` / `--no-flag`; repeated arrays accept multiple flags. Optional parameters declared nullable (`type: ["string", "null"]`, `nullable: true`, or `anyOf` of one type and null) take plain values like other optional parameters, and a nullable array of scalars repeats its flag; passing `null` for them requires `--json`. Complex or nested objects, and values with two or more non-null types, take JSON literals or `--json '<json>'` (or `--json -` for stdin).
 - **Discovery**: Scripts can run `tools [pattern]` to list available commands and their synopses, `help <tool>` for full parameter documentation, or `<tool> --help`.
-- **Output formatting**: Commands default to JSON when the tool produces structured content, or plain text otherwise. Passing `-o json` or `-o text` overrides this per command.
+- **Shell-style output for file tools**: `fs_read` prints file text like `cat`, `fs_ls` one entry per line like `ls -1`, `fs_find` one path per line like `find`, and `fs_grep` `path:line:text` rows like `grep -n`. Data goes to stdout, notes about cut-off results go to stderr as `fs_read: <note>`, and the exit status follows the tool: `fs_grep` exits 1 when nothing matched (a bare call then ends the script under the default `set -e`; use `if`, `||` or `|| true`) and 2 on an error, including a `--path` that can't be read, is over the search size limit or is a binary file. The paths `fs_find` and `fs_grep` print start with the `--path` you gave, so they can be passed to `fs_read --path`. `fs_read` adds no line-number prefixes in a script unless you pass `--line-numbers` (a direct model call numbers lines by default). `fs_read` adds no final newline to a file that has none (unless a line or byte cap cuts the output, which a note on stderr reports), and `fs_grep --path` may name a file. The shell form applies to natively registered tool servers; tools reached through MCP (a bridge or the sandbox gateway) print the same text a direct call gets. `-o json` prints the tool's fields instead, and `help <tool>` shows an OUTPUT section. Example: `fs_find --pattern '*.rs' --path src | while read -r p; do fs_read --path "$p" | grep -n TODO | head -3; done`. A tool opts in with `ToolSpec::with_script_output`; see the [harnx-script README](../crates/harnx-script/README.md#shell-style-tool-output).
+- **Output formatting**: Without a shell form, commands default to JSON when the tool produces structured content, or plain text otherwise. Passing `-o json` or `-o text` overrides this per command. Text output leaves out content blocks whose `annotations.audience` is an array that doesn't include `assistant`, such as one-line summaries meant for the person watching. An error message applies the same filter but falls back to all of its text when nothing else is left. `-o json` on a result without `structuredContent` still prints every block.
 - **Exit codes**:
   - `0`: Success (rendered output on stdout).
   - `1`: Tool error (message on stderr; partial results on stdout if available).
   - `2`: Usage error (flag or schema mismatch on stderr; command is not dispatched).
-  - `3`: Approval required (`needs approval: <tool>; call it directly instead of from bash`). Tools requiring human approval fail fast rather than hanging the script.
-  - `4`: Blocked by policy or hook.
-  - `5`: Rejected.
+  - `126`: The command exists but may not run: approval required (`needs approval: <tool>; call it directly instead of from bash`; tools requiring human approval fail fast rather than hanging the script), blocked by policy, middleware, or hook (`blocked: <reason>`), or rejected (`rejected: <reason>`).
   - `127`: Unknown command (with did-you-mean suggestions).
-- **Hooks and concurrency**: Inner tool calls invoke standard tool hooks (`PreToolUse`, `PostToolUse`). Parallel jobs (`&` and pipelines) are supported up to a concurrency cap of 8 simultaneous inner calls per script.
-- **Trace and persistence**: The `bash` result includes a compact inner-call trace whose argument summaries show only keys and value shapes (type and length), so the generated trace, live progress, and `failed_call` summaries don't repeat values a script piped in from content the model hasn't seen. Usage errors and tool error messages on stderr can still quote the values they reject. Inner calls get no session-log rows of their own; the transcript records only the outer `bash` call. The NATS invocation journal still records each inner call's full request for retry and recovery.
+- **Middleware and concurrency**: Inner tool calls pass through configured tool middleware. Parallel jobs (`&` and pipelines) are supported up to a concurrency cap of 8 simultaneous inner calls per script.
+- **Trace and persistence**: The `bash` result carries the script's output once, inside the rendered report (`content`); the separate `stdout`, `stderr` and `trace` fields appear only in `harnx call bash --json`. The report includes a compact inner-call trace whose argument summaries show only keys and value shapes (type and length), so the generated trace, live progress, and `failed_call` summaries don't repeat values a script piped in from content the model hasn't seen. Usage errors and tool error messages on stderr can still quote the values they reject. A run with more than 10 inner calls groups its `## inner call trace` by tool and status, one line each with the call count, outcome, output bytes and elapsed time, and then names the first failing call in full (`first failure: <call>`) when one failed. Runs with 10 or fewer calls list each call on its own line. Inner calls get no session-log rows of their own; the transcript records only the outer `bash` call. The NATS invocation journal still records each inner call's full request for retry and recovery.
 - **Worker interruption**: If a worker restarts while a script runs, the invocation is reported as interrupted and never automatically re-run, avoiding duplicate side effects.
 
 ### Attachment Tools
@@ -439,7 +476,8 @@ Each property holds a value and an `inherit` flag. A sub-agent session started f
 
 | Property | Value | Copied to sub-agent sessions |
 |---|---|---|
-| `user_id` | The user the session acts for. Read-only for agents; Harnx doesn't record one yet. | by default |
+| `user_id` | The user the session acts for. Read-only for agents. | by default |
+| `user_principals` | Caller principals snapshot (`user_id`, `users`, `groups`, `roles`). Read-only for agents. | by default |
 | `github_owner_repo` | GitHub repository as `owner/repo` | by default |
 | `git_branch` | Git branch | by default |
 | `github_issue` | Issue number in `github_owner_repo` | by default |
@@ -464,6 +502,109 @@ Any other name that starts with a lowercase letter and uses only lowercase lette
 
 A blank value, `0` for a number, or an empty list removes a property. When `inherit` is omitted an existing property keeps its flag and a new one takes the default above; asking to copy `web_session_url` is an error. Writing a property only records it: it doesn't check out a branch, change directory or contact GitHub.
 
+## Agent Patches (`patches`)
+
+The `patches` front-matter field lets an agent rewrite its own configuration at session activation based on the caller who created the session. For example, an agent can offer developer tools to engineering staff while presenting a restricted tool set to others.
+
+### Configuration
+
+`patches` accepts a single jaq filter string or a YAML list of jaq filter strings:
+
+```yaml
+patches:
+  - 'if ($user.groups | index("developers")) then . else .use_tools |= map(select(. != "coder" and . != "fs")) end'
+```
+
+### How Patches Run
+
+- **Input**: The filter receives the agent's serialized configuration as a JSON object (including `use_tools`, `bash_tools`, `instructions`, `model`, and other front-matter fields).
+- **Bound variable (`$user`)**: The session creator's caller principals are bound to `$user` as a JSON object with four keys:
+  - `user_id`: The raw resolved user identity string, or `null`.
+  - `users`: List of expanded user identities from `users.yaml` aliases (includes `user_id`), or empty.
+  - `groups`: List of group memberships resolved from request headers and `users.yaml`, or empty.
+  - `roles`: List of role memberships resolved from request headers and `users.yaml`, or empty.
+- **Evaluation timing**: The worker evaluates `patches` once per session activation when installing the effective agent. Scratch installs for MCP server reconciliation also evaluate it so server demand matches the patched selectors.
+- **Evaluation order**:
+  1. Base agent configuration (including package patches)
+  2. Persisted session overrides (such as `.set use_tools`)
+  3. Agent `patches` (with `$user` bound)
+  4. Runtime resolution (re-resolving the model if `model` changed, re-validating middleware, server selection, and run limits)
+
+Because `patches` runs after session overrides, a session override cannot re-add tools that the patch removes. But removing tools by name does not block `*` or glob selectors (such as `fs_*`) in `use_tools` or `bash_tools`. A branch that needs a real restriction must set an explicit allowlist without wildcards.
+
+### Invariants and Runtime State
+
+- **State preservation**: Serde-skipped runtime state (agent-owned tools, shared and session variables, resolved model when the model ID is unchanged, middleware package origin, hook package directories, and the stamped principal snapshot) is preserved across the patch round-trip. If a patch changes the `model` ID, the worker re-resolves the new model from its client catalog.
+- **Base agent immutable**: The baseline agent definition in memory and on disk is never modified. Each activation derives its effective configuration fresh from the baseline agent and that session's stored snapshot.
+- **Single object output**: Each filter must produce exactly one JSON object. Empty output, multiple outputs, or non-object output are errors.
+- **Name preservation**: A patch must not modify the agent `name`.
+
+### Validation and Fail-Closed Behavior
+
+Harnx compiles and validates `patches` filters at agent load time, catching syntax errors and references to undeclared variables before a session runs.
+
+At session activation, patch execution fails closed:
+- Compilation or runtime filter errors
+- Empty or multiple filter outputs
+- Non-object output
+- Modifying the agent `name`
+- Output that fails AgentConfig deserialization
+
+Any of these conditions terminates the activation with an error naming the agent and filter. On upgraded workers, the session never falls back to the unpatched (more permissive) configuration.
+
+### Filter Termination and Determinism
+
+- **Filter termination**: jaq filters run synchronously on worker threads without a timeout or step limit. Filters must terminate; a non-terminating filter (such as `repeat(1) | select(false)`) will hang worker activation indefinitely.
+- **Multiple evaluations**: The worker evaluates `patches` more than once per activation: first during scratch installation for MCP server reconciliation (to determine server demand), and again during real installation before turn execution. Authors should avoid non-deterministic jaq built-ins such as `now` or `env`, which could cause those evaluations to diverge.
+- **Diagnostics and sensitive data**: When a patch produces invalid configuration or fails to deserialize, error diagnostics log the failing fields. Avoid copying sensitive `$user` values into configuration fields that could fail validation or be exposed in error sinks.
+
+### Example: Role-Based Tool Tailoring
+
+This agent gives coding tools and delegation instructions only to callers in the `developers` group:
+
+```markdown
+---
+model: openai:gpt-6.2-sol
+use_tools:
+  - jira
+  - confluence
+  - coder
+  - fs
+patches:
+  - 'if ($user.groups | index("developers")) then . else .use_tools |= map(select(. != "coder" and . != "fs")) end'
+---
+You are a Jira assistant.
+{% if "developers" in __user__.groups %}You may delegate coding work to coder.{% endif %}
+```
+
+- When a caller in the `developers` group starts a session, the filter leaves `use_tools` untouched. The model receives all four tools, and the prompt includes the delegation instruction.
+- When a caller outside `developers` starts a session, the filter removes `coder` and `fs` from `use_tools`. The prompt omits the delegation instruction.
+- For local CLI and TUI sessions, `__user__.groups` is empty, so the prompt renders the non-developer branch. But local sessions do not run `patches`, so `use_tools` keeps its full declared set. Only NATS worker sessions apply `patches`.
+
+### Where Caller Principals Come From
+
+- **HTTP (`harnx-serve`)**: Resolved from configured identity headers/cookies (`serve_user_id_sources`), group headers (`serve_group_headers`), and role headers (`serve_role_headers`), merged with alias identities and configured groups/roles from `users.yaml`.
+- **A2A (`harnx-a2a-server`)**: Resolved from `--user-id-header`, `--group-header`, and `--role-header`, merged with `users.yaml`. The snapshot is stored with the initial message reservation and retained during crash recovery.
+- **CLI / TUI / ACP**: Local sessions run without request membership headers. They receive `user_id`-only or anonymous principals (`user_id: null`, empty lists).
+- **Legacy sessions**: Sessions created before principal snapshots were introduced fall back to `user_id`-only principals (or anonymous).
+
+### Caveats and Boundaries
+
+- **Fixed at creation**: Caller principals are captured once when the session is created. If another user prompts an existing session, the session retains the creator's tailoring.
+- **Membership changes**: Updates to group or role memberships apply to new sessions only.
+- **Inheritance**: Sub-agents (`*_session_new`, `*_session_prompt`, `*_session_send`) and handoffs inherit the parent session's snapshot verbatim.
+- **Not an access-control boundary**: `use_tools` and `bash_tools` are independent selectors. If a tool is in both, removing it from `use_tools` does not remove it from script mode (`bash_tools`); a patch must update both selectors. Tool dispatch also does not yet reject model calls to undeclared tools ([issue #2770](https://github.com/dobesv/harnx/issues/2770)). Do not treat `patches` as an authorization boundary.
+- **Authorization uses live memberships**: Access control (`access.yaml` rules and A2A context owner bindings) continues to evaluate live request memberships on every call, never the session's customization snapshot.
+
+### Rolling Upgrades and Fleet Deployment
+
+When deploying `patches` across an existing cluster:
+
+1. **Upgrade workers first**: Older worker binaries do not recognize the `patches` front-matter field and run the unpatched, more permissive configuration. They also treat `user_principals` as an unknown custom property rather than a read-only system property.
+2. **Upgrade servers and frontends**: Update `harnx-serve`, `harnx-a2a-server`, and other property-writing replicas so they capture caller principals at session creation. Sessions created by replicas that were not upgraded have no principal snapshot and keep the `user_id`-only fallback after rollout. Recreate those sessions once every property-writing replica is upgraded to get membership-based tailoring.
+3. **Enable `patches` and widen access last**: Add `patches` to agent definitions and grant broader access only after all cluster workers run the new release.
+4. **Rollback sequence**: If rolling back, remove or revert `patches` from agent definitions before rolling back workers.
+
 ## Documents (RAG)
 
 The `documents` field lists files or URLs to include as retrieval-augmented generation (RAG) context. When an agent with documents starts, Harnx offers to initialize a RAG index.
@@ -477,38 +618,83 @@ documents:
 
 Relative paths are resolved from the agent's data directory.
 
+## Tool middleware and confirmation
+
+Add `middleware:` in agent front matter to wrap matching tool calls with BashKit
+Bash or Monty Python. Global and tool-server/package middleware runs before agent
+middleware. Scripts run inside the worker, including unmanaged/cloud deployments.
+Package `script:` paths resolve from the package directory; inline `bash:` needs
+no separate file.
+
+Daedalus uses this shipped policy before handing a plan to Atlas:
+
+```yaml
+middleware:
+- name: confirm-atlas-handoff
+  match: '^atlas_session_handoff$'
+  bash: |
+    if confirm --id handoff 'Hand off this plan to Atlas for execution?'; then
+      next --id dispatch
+    else
+      deny 'Atlas handoff denied by the user.'
+    fi
+```
+
+An unanswered `confirm` durably suspends the call, not a live interpreter. TUI,
+serve/web, A2A and ACP can answer; ACP permissions have no note field. Accepted
+responses rerun only that call's chain from the start. Completed siblings aren't
+repeated, and handoffs activate only after the whole round finishes. `answer KEY`
+reads runtime-accepted responses, never model arguments. Explicit step keys keep
+identity stable across changed traversal order; each `next` is still fresh. Use
+`save`/`saved` before a post-tool confirm to restore the earlier result instead of
+running the tool twice. See the [tested save/restore example](middleware-guide.md#keep-a-downstream-result-without-running-the-tool-twice).
+
+Inner model-script calls pass through middleware but can't suspend. A confirm
+there returns `interaction required, can't be answered inside a script`; call the
+protected tool directly instead. Operator root calls auto-approve confirms under
+scoped operator consent, while denial and rewriting remain enforced. Middleware's
+allowlisted helper calls bypass the chain to prevent recursion.
+
+A worker crash during an unfinished dispatch can return **interrupted, outcome
+unknown** rather than repeat effects. Check external state before retrying.
+Cluster deployment requires **T2.1 readers before T2.2 durable writers**, a
+checkpoint store reachable by every resuming worker, and no rollback below T2.1
+after any T2.2 worker has run. Drain in-flight middleware turns when upgrading
+Phase 1 or T2.1 workers to T2.2. The [Middleware Guide](middleware-guide.md#cluster-rollout-and-rollback)
+explains those compatibility boundaries and recovery rules; the
+[Tool Confirmation Guide](tool-confirmation-guide.md) covers each frontend.
+
 ## Hooks
 
-Hooks let you run external commands at specific points during agent execution. They're configured under the `hooks` front-matter field. For a complete reference, see [Hooks Guide](hooks-guide.md).
+Lifecycle event hooks (`SessionStart`, `UserPromptSubmit`, `Stop`, `StopFailure`) run short Bash or Python scripts inside the worker process. They're configured under the `hooks` front-matter field. For a complete reference, see [Hooks Guide](hooks-guide.md).
 
 ### Configuration
 
 ```yaml
 hooks:
   max_resume: 3
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --matcher shell
-        --timeout 15
-        -- /path/to/approve-tool.sh
-    - command: harnx-claude-compatible-hook-server --event Stop -- /path/to/on-stop.sh
-      status_message: "Running stop hook..."
-      async: true
+  Stop:
+    - name: keep-going
+      bash: resume "finish the checklist first"
+  UserPromptSubmit:
+    - name: approve
+      script: hooks/approve.py
+      on_error: deny
 ```
 
 ### Hook Fields
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `command` | `string` | yes | — | Shell command to run as a hook server. For hooks that need event/matcher, use `harnx-claude-compatible-hook-server --event <E> --matcher <M>` with either `--jaq <FILTER>` or `-- <child-command>`. |
-| `status_message` | `string` | no | none | Message to display while the hook runs |
-| `async` | `boolean` | no | none | Whether to run the hook asynchronously |
-
-The `command` field specifies a hook server binary. Options:
-- **Generic runner**: `harnx-claude-compatible-hook-server --event <EVENT> [--matcher <REGEX>] [--timeout <SECS>] [--priority <N>] [--fail-policy <closed|open>] (--jaq <FILTER> | [--persistent] -- <child-command>)`. `--jaq` uses Harnx's embedded jaq engine; `--persistent` keeps a child command alive across requests.
-- **Native hooks** (e.g., `harnx-proxy-auth`): Self-declare their event/matcher and need no runner flags.
+| `name` | `string` | yes | — | Entry name; a later entry with the same name replaces an earlier one |
+| `bash` | `string` | one of `bash`/`python`/`script` | — | Inline Bash script |
+| `python` | `string` | one of `bash`/`python`/`script` | — | Inline Python script |
+| `script` | `path` | one of `bash`/`python`/`script` | — | Script file, resolved relative to the agent file |
+| `tools` | `list` | no | none | Tool selectors the script may call |
+| `timeout` | `duration` | no | `30s` | Wall-clock limit per run |
+| `on_error` | `allow`/`deny` | no | `allow` | `deny` fails the event on a script error; not valid for `Stop`/`StopFailure` |
+| `fetch` | `list` | no | none | Exact HTTP(S) hosts the script may request |
+| `enabled` | `boolean` | no | `true` | `false` marks a disable entry that removes an earlier same-name hook |
 
 ### Top-level Hook Settings
 
@@ -518,10 +704,10 @@ The `command` field specifies a hook server binary. Options:
 
 ### Merge Behavior
 
-Agent hooks extend global hooks (defined in the main config). The merge rules are:
+Agent hooks resolve on top of global and tool-server/package hooks, per event:
 
-- Agent entries are combined with global entries
-- If an agent entry has the same `event` and `matcher` as a global entry, the agent entry replaces it
+- An agent entry with the same `name` as an earlier entry replaces it in place
+- An entry with `enabled: false` removes the earlier entry with that name
 - `max_resume`: agent value overrides global if set; otherwise the global value is used
 
 ## Using Agents
@@ -604,7 +790,7 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
   - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
   - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. `attachments` is a list of `cid:` attachment URLs passed to the sub-agent; repeated URLs are ignored. The parent session ID is propagated internally.
   - `{agent}_session_send`: Asynchronously dispatches a prompt (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `wait`) and returns a durable `{session_id, prompt_id}` handle immediately instead of waiting for the child to finish. Omit `wait` (or pass `null`) for dispatch-only; pass `wait: {}` (240 seconds) or `wait: {seconds: N}` or `wait: {forever: true}` for a soft observation window.
-  - `{agent}_session_wait`: Soft-waits on a previously dispatched prompt (`session_id`, `prompt_id`, and top-level `seconds` (1 to 240, default 240) or `forever: true`, plus optional `include_partial` and `read`). Repeated waits recover the same result and never consume it. The wait never cancels the child or extends its execution deadline.
+  - `{agent}_session_wait`: Soft-waits on a previously dispatched prompt (`session_id`, `prompt_id`, and top-level `seconds` (1 to 240, default 240) or `forever: true`, plus optional `include_partial`). A settled prompt returns the child's final reply as `response`; a running one returns a short `activity` sample. Repeated waits recover the same result and never consume it. The wait never cancels the child or extends its execution deadline.
   - `{agent}_session_load`: Reads a bounded, filterable page of prior event history for an existing sub-agent session log. Omitted or truncated material can be recovered with continuation metadata; loading never resumes, activates, or repairs a session.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
 - **Route-aware execution**: On persistent clusters, sub-agent turns use the
@@ -612,7 +798,7 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
   any available worker. A frontend-owned local worker targets nested
   activations back to its own worker ID. Distributed `harnx_leases` still
   ensure exactly one active holder per session in either topology.
-- **Lease-backed liveness**: Sub-agent tool calls run synchronously from the
+- **Lease-backed liveness**: `session_new` and `session_prompt` run synchronously from the
   parent agent's perspective without an implicit idle or elapsed-time deadline.
   The child worker renews its session lease independently of model and tool
   activity; if that worker disappears without writing a durable result, the
@@ -699,6 +885,14 @@ send with an explicit soft wait and leave the hard execution policy inherited:
 {"message": "research the topic and report findings", "wait": {}}
 ```
 
+- Newly admitted `session_send` work is detached from the parent invocation. Parent cancellation or failure,
+  including cancellation during send's inline wait or server restart recovery, doesn't stop
+  the child or prevent worker resumes. Cancelling a `session_send` or `session_wait` tool call
+  stops observation only. Explicit `session_cancel` and inherited hard deadlines still stop
+  the child. Synchronous `session_new` and `session_prompt` children still stop when their parent is cancelled.
+  Messages joined to an existing invocation keep that invocation's admission policy.
+  In a mixed-version deployment, an older worker that resumes a detached child after its parent
+  stopped still cancels it, so the guarantee holds once every worker runs the new version.
 - The wait is an observation budget only, never execution time. `seconds` is 1 to 240 and defaults to 240, or pass `forever: true`; it never cancels the child or extends its deadline.
 - Any caller with access to an agent's `session_wait` or `session_load` can observe a known session and prompt in that agent's namespace, even when another caller sent the prompt. Dispatch replay still requires the original caller's identity.
 - A wait that returns `stopped_by: "new_message"` ended because a new message arrived for the caller; read it before waiting again. `stopped_by: "caller_deadline"` means the caller's own run deadline is near; report what you have instead of waiting again.
@@ -707,8 +901,16 @@ send with an explicit soft wait and leave the hard execution policy inherited:
   shortened run limit. Inherited deadlines can shorten the effective allowance, but the caller
   never widens it.
 - The send result is a durable handle: `session_id` + `prompt_id`, plus `dispatch`
-  (`confirmed`/`unconfirmed`), `status`, `terminal`, and bounded partial output while waiting.
-  Keep the handle; every later wait and load keys off it.
+  (`confirmed`/`unconfirmed`), `status` and `terminal`. Keep the handle; every later wait and
+  load keys off it.
+- A wait that sees the prompt settle returns the child's final reply as `response`, with
+  thinking stripped, the same text `session_prompt` returns. A `failed` turn also carries the
+  worker's error as `failure`. A reply too long for the 128 KiB result is cut short and marked
+  `response_truncated: true`; read the rest with `{agent}_session_load`.
+- A wait that ends while the child is still `pending` or `blocked` returns `activity`: the
+  child's tool call count, token usage and title, plus `latest`, its most recent tool step
+  (the first 300 bytes of its narration and up to four calls with trimmed arguments). It never
+  includes the child's transcript or thinking. Pass `include_partial: false` to leave it out.
 
 **Workflows with the handle:**
 
@@ -719,7 +921,8 @@ send with an explicit soft wait and leave the hard execution policy inherited:
   the same result and never consume it; the child was never cancelled by the expiry.
 - **Poll**: check status without waiting with `{agent}_session_load` and `prompt_id`; it returns `status` and `terminal` immediately. For bash processes use `bash_status`.
 - **Inspect**: `{agent}_session_load` returns a bounded page of the child's session log
-  (default limit 100 events, 16384 output bytes). Page forward by passing the returned
+  (default limit 100 events, 131072 output bytes; per-event preview 250 head lines
+  and 750 tail lines; `max_output_bytes` range 1024–307200). Page forward by passing the returned
   `next_index` as `read.index_min` on the next call,
   or recover a single oversized event with the `read` object's `entry_index` + `byte_offset`
   continuation. Earlier unbounded whole-log loads are intentionally gone: a default load can
@@ -944,7 +1147,7 @@ A minimal agent at `<config-dir>/agents/grammar-genie.md`:
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 temperature: 0
 ---
 Your task is to take the text provided and rewrite it into a clear,
@@ -959,7 +1162,7 @@ An agent with access to filesystem and shell tools:
 
 ```markdown
 ---
-model: claude:claude-3-5-sonnet
+model: claude:claude-sonnet-5-5
 use_tools:
   - fs_*
   - bash_exec
@@ -1003,7 +1206,7 @@ An agent that uses RAG to answer questions from project docs:
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 documents:
   - project-docs/architecture.md
   - project-docs/api-reference.md
@@ -1019,9 +1222,16 @@ documentation. If the docs don't cover something, say so clearly.
 
 Agent prompts are rendered using [MiniJinja](https://github.com/mitsuhiko/minijinja). In addition to the custom variables defined in front-matter, several dynamic variables are available:
 
-- `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-4o`). This updates automatically if the agent falls back to a different model.
+- `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-6.2-sol`). This updates automatically if the agent falls back to a different model.
 - `{{ tools }}`: A list of available tools. You can iterate over them: `{% for t in tools %}- {{ t.name }}: {{ t.description }}{% endfor %}`.
 - `{{ __os__ }}`, `{{ __arch__ }}`, `{{ __shell__ }}`, `{{ __cwd__ }}`, `{{ __now__ }}`, `{{ __locale__ }}`: Environment and system information.
+- `__user__`: The session creator's caller-principals snapshot, with exactly four fields: `user_id`, `users` (expanded user aliases), `groups`, and `roles`. When a session has no stored snapshot but does have a `user_id` (such as a legacy session), Harnx returns user-id-only principals (`user_id` set, `users: [user_id]`, empty `groups` and `roles`). Only an anonymous session gets a null `user_id` (`none`) and empty lists. Agent and session variables cannot override `__user__`. The snapshot stays fixed for the session and is inherited by subagents and handoffs; it customizes prompts, not access checks. See [Agent Patches (`patches`)](#agent-patches-patches) for tool tailoring and caveats.
+
+Use group membership to conditionally include instructions:
+
+```jinja
+{% if "developers" in __user__.groups %}You may delegate coding work to coder.{% endif %}
+```
 
 ### Detecting Environment-Specific Tooling
 

@@ -9,6 +9,7 @@
 //! `docs/superpowers/specs/2026-04-19-monorepo-refactor-design.md`
 //! (§3 Engine API, §4 I/O discipline).
 
+pub mod a2ui;
 pub mod chat_completions;
 pub mod engine;
 pub mod input;

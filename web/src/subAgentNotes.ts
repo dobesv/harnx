@@ -1,3 +1,4 @@
+import { type SubAgentPendingInteraction, parseSubAgentPendingInteraction, getPendingInteractionKey } from './subAgentPendingInteraction';
 export type SubAgentNoteStatus =
   | 'running'
   | 'done'
@@ -23,6 +24,8 @@ export interface SubAgentNote {
   toolCallCount: number;
   updatedAtMs: number;
   startedAtMs?: number;
+  pendingInteraction?: SubAgentPendingInteraction;
+  progressSeq?: number;
 }
 
 export interface SubAgentNotesState {
@@ -56,6 +59,7 @@ interface SubAgentProgressValue extends SubAgentIdentity {
   outputTokens: number;
   cachedTokens: number;
   toolCallCount: number;
+  pendingInteraction?: SubAgentPendingInteraction;
 }
 
 type ProgressMetrics = Pick<
@@ -161,12 +165,16 @@ function subAgentProgress(value: unknown): SubAgentProgressValue | undefined {
   if (!status) return undefined;
   const metrics = progressMetrics(progress);
   if (!metrics) return undefined;
+  const pendingInteraction = parseSubAgentPendingInteraction(
+    progress.pending_interaction ?? progress.pendingInteraction,
+  );
   return {
     ...identity,
     ...metrics,
     title: typeof progress.title === 'string' ? progress.title : undefined,
     invocationId: identity.invocationId,
     status,
+    pendingInteraction,
   };
 }
 
@@ -239,6 +247,7 @@ function snapshotNote(
     status: progress?.status ?? (failedChild ? 'failed' : 'done'),
     ...metrics,
     updatedAtMs: Date.now(),
+    pendingInteraction: progress?.pendingInteraction,
   };
 }
 
@@ -326,6 +335,8 @@ function noteFromProgress(
     toolCallCount: progress.toolCallCount,
     updatedAtMs: Date.now(),
     startedAtMs: noteStartedAtMs(progress, existingNote),
+    pendingInteraction: progress.pendingInteraction,
+    progressSeq: (existingNote?.progressSeq ?? 0) + 1,
   };
 }
 
@@ -440,6 +451,7 @@ function freezeNote(note: SubAgentNote, status: Exclude<SubAgentNoteStatus, 'run
     status,
     elapsedMs: localElapsed,
     updatedAtMs: Date.now(),
+    pendingInteraction: undefined,
   };
 }
 
@@ -576,6 +588,33 @@ function childRunning(state: SubAgentNotesState, event: EventRecord): SubAgentNo
     ...newNotes[targetIndex],
     status: 'running',
     updatedAtMs: Date.now(),
+    pendingInteraction: undefined,
+  };
+
+  return { ...state, notes: newNotes };
+}
+
+function clearPendingInteraction(state: SubAgentNotesState, event: EventRecord): SubAgentNotesState {
+  const targetIndex = findChildNoteIndex(
+    state,
+    event,
+    (s) => s === 'running' || s === 'awaiting_approval',
+  );
+  if (targetIndex === -1) return state;
+
+  const currentNote = state.notes[targetIndex];
+  if (!currentNote.pendingInteraction) return state;
+
+  const expectedPendingKey = event.expectedPendingKey;
+  if (typeof expectedPendingKey !== 'string' ||
+      getPendingInteractionKey(currentNote.pendingInteraction) !== expectedPendingKey) {
+    return state;
+  }
+
+  const newNotes = [...state.notes];
+  newNotes[targetIndex] = {
+    ...currentNote,
+    pendingInteraction: undefined,
   };
 
   return { ...state, notes: newNotes };
@@ -593,6 +632,7 @@ const EVENT_REDUCERS: Record<string, EventReducer> = {
   CHILD_TERMINAL: childTerminal,
   CHILD_AWAITING_APPROVAL: childAwaitingApproval,
   CHILD_RUNNING: childRunning,
+  CLEAR_PENDING_INTERACTION: clearPendingInteraction,
 };
 
 export function reduceSubAgentNotes(

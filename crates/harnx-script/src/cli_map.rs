@@ -40,8 +40,10 @@ mod output;
 ///
 /// Top-level properties become `--kebab-name value` flags mapped back to their
 /// original schema keys. Booleans produce `--flag` and `--no-flag` switches.
-/// Repeated flags append to an array. Object, complex, or nullable properties
-/// take a single JSON string argument: `--settings '{"indent": 2}'`.
+/// Repeated flags append to an array. A nullable scalar (`Option<T>`) is an
+/// ordinary flag of type `T`; `null` is still accepted in the `--json` base.
+/// Object and complex properties take a single JSON string argument:
+/// `--settings '{"indent": 2}'`.
 ///
 /// `--json` supplies a base object; flags override it regardless of ordering.
 /// Repeated scalar-array flags replace the base array, then append in argv order.
@@ -50,7 +52,8 @@ mod output;
 /// positional arguments: `--` ends options, and any subsequent token is an error.
 /// Numbers use JSON numeric syntax; integers require i64/u64 syntax without a
 /// decimal point or exponent. Type and enum mismatches are usage errors, including
-/// in the final merged base object. Complex/nullable/reference schemas use a JSON
+/// in the final merged base object. Complex and reference schemas, and unions of several
+/// non-null types, use a JSON
 /// flag rather than guessing a branch. Full schema validation (refs, unions,
 /// nested object constraints, ranges, formats, etc.) remains the provider's job.
 pub fn parse_args(

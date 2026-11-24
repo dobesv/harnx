@@ -6,9 +6,10 @@
 //! garbage-collect exactly the blobs owned by that session.
 
 use anyhow::{bail, Context, Result};
-use async_nats::jetstream::{self, object_store};
+use async_nats::jetstream::{self, object_store::ObjectInfo};
 use harnx_blob_store::media::{
-    ensure_attachments_bucket, get_media, optional_attachments_bucket, put_media,
+    ensure_attachments_bucket, get_media, leader_media_info, media_content_type,
+    optional_attachments_bucket, put_media, read_media_from_leader, AttachmentsBucket,
 };
 use harnx_core::attachments::{
     cid_for_data_url, cid_for_data_url_with_session, collect_cid_refs, read_attachment_async,
@@ -185,7 +186,7 @@ impl ExternalizedAttachment {
 }
 
 pub(crate) async fn externalize_data_url(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     session: &SessionRef,
     data_url: &str,
 ) -> Result<ExternalizedAttachment> {
@@ -201,25 +202,52 @@ pub(crate) async fn externalize_data_url(
 }
 
 async fn externalize_cid_url(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     source_dir: Option<&Path>,
     cid: &str,
 ) -> Result<ExternalizedAttachment> {
     let cid_url = parse_media_url(cid)?;
-    let stored = get_media(store, &cid_url).await?;
-    let (bytes, mime_type) = match stored {
+    let stored = get_media(store, &cid_url)
+        .await?
+        .map(|(bytes, mime_type)| (bytes.len(), mime_type));
+    let (size, mime_type) = match stored {
         Some(stored) => stored,
-        None => read_and_upload_local_attachment(store, source_dir, cid, &cid_url).await?,
+        None => externalize_cid_miss(store, source_dir, cid, &cid_url).await?,
     };
     Ok(ExternalizedAttachment {
         cid: cid.to_string(),
         mime_type,
-        size: bytes.len(),
+        size,
     })
 }
 
+async fn externalize_cid_miss(
+    store: &AttachmentsBucket,
+    source_dir: Option<&Path>,
+    cid: &str,
+    cid_url: &CidUrl,
+) -> Result<(usize, String)> {
+    // A follower may not have applied the upload yet. Only the marker
+    // needs to be built here; the worker will read the bytes if needed.
+    if let Some(info) = leader_live_attachment_info(store, cid_url).await? {
+        return Ok((info.size, media_content_type(&info).to_owned()));
+    }
+    let (bytes, mime_type) =
+        read_and_upload_local_attachment(store, source_dir, cid, cid_url).await?;
+    Ok((bytes.len(), mime_type))
+}
+
+async fn leader_live_attachment_info(
+    store: &AttachmentsBucket,
+    cid: &CidUrl,
+) -> Result<Option<ObjectInfo>> {
+    Ok(leader_media_info(store, &cid.kv_key())
+        .await?
+        .filter(|info| !info.deleted))
+}
+
 async fn read_and_upload_local_attachment(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     source_dir: Option<&Path>,
     cid: &str,
     cid_url: &CidUrl,
@@ -232,7 +260,7 @@ async fn read_and_upload_local_attachment(
 }
 
 async fn externalize_part(
-    store: &object_store::ObjectStore,
+    store: &AttachmentsBucket,
     session: &SessionRef,
     source_dir: Option<&Path>,
     part: &mut MessageContentPart,
@@ -322,7 +350,7 @@ pub async fn hydrate_attachment_refs(
 }
 
 struct AttachmentHydration<'a> {
-    store: &'a object_store::ObjectStore,
+    store: &'a AttachmentsBucket,
     dir: &'a Path,
 }
 
@@ -334,13 +362,26 @@ async fn hydrate_attachment_ref(hydration: &AttachmentHydration<'_>, cid: &str) 
         return put_media(hydration.store, &cid_url, &bytes, &mime_type).await;
     }
 
-    let (bytes, mime_type) = get_media(hydration.store, &cid_url)
-        .await?
-        .with_context(|| format!("download attachment '{cid}'"))?;
+    let (bytes, mime_type) = download_attachment(hydration.store, &cid_url, cid).await?;
     // Validate before writing, so corrupt remote data never enters the cache.
     validate_attachment_digest(&local_cid, &bytes, &mime_type)?;
     store_attachment_bytes_async(hydration.dir, &bytes, &mime_type).await?;
     Ok(())
+}
+
+async fn download_attachment(
+    store: &AttachmentsBucket,
+    cid_url: &CidUrl,
+    cid: &str,
+) -> Result<(Vec<u8>, String)> {
+    if let Some(stored) = get_media(store, cid_url).await? {
+        return Ok(stored);
+    }
+    let info = leader_live_attachment_info(store, cid_url)
+        .await?
+        .with_context(|| format!("download attachment '{cid}'"))?;
+    let bytes = read_media_from_leader(store, &info).await?;
+    Ok((bytes, media_content_type(&info).to_owned()))
 }
 
 fn validate_attachment_digest(expected: &str, bytes: &[u8], mime_type: &str) -> Result<()> {

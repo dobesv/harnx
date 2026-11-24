@@ -100,14 +100,14 @@ child session again does not overwrite the earlier invocation's summary.
 ### `.model` - change the current LLM
 
 ```
-openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
-|                 |            |             |       |     |  └─ support function callings
-|                 |            |             |       |     └─ support vision
-|                 |            |             |       └─ output price ($/1M)
-|                 |            |             └─ input price ($/1M)
-|                 |            |
-|                 |            └─ max output tokens
-|                 └─ max input tokens
+openai:gpt-6.2-sol  922000 /   128000  |       2 /     10    👁 ⚒
+|                   |            |             |       |     |  └─ support function callings
+|                   |            |             |       |     └─ support vision
+|                   |            |             |       └─ output price ($/1M)
+|                   |            |             └─ input price ($/1M)
+|                   |            |
+|                   |            └─ max output tokens
+|                   └─ max input tokens
 └─ model id
 ```
 
@@ -258,12 +258,12 @@ Inspect available tools and execute tools directly without triggering an LLM inf
   - **Raw remainder parsing**: Consumes the entire line after `.call bash ` as the raw script, preserving quotes, spaces, and newlines without shell escaping. No stdin, file, or multiline input flags.
   - **Session tool selection**: Operates against the union of the active session's configured `use_tools` ($U$) and `bash_tools` ($B$), admitting `Resolve(U ∪ B)`. The TUI does not accept `--tools` flags and does not perform static inference. Disabling tool use in the session request or worker configuration means the worker admits no inner tools regardless of `use_tools` or `bash_tools`; pure shell still runs.
   - **Inner tool parameters**: Inner tools are schema-derived and require named `--<param>` options (such as `fs_read --path <file>`). Schema parameters have no single-dash short aliases (`-p`). Inner commands accept `-o json` or `-o text` to control output rendering. Positional tool arguments are not supported.
-  - **Scoped operator consent**: Inner tool calls auto-approve on `PreToolUse` hook `ask` decisions under operator consent. Hook `deny` decisions block the command with status 4 and the reason on stderr (stdout is empty); no JSON result is returned to the script. The `blocked_by_hook` result object applies only to direct tool calls. Excluded control tools (`bash`, `switch_agent`, `ask_user`, `*_session_handoff`) cannot be invoked. Delegated child sessions retain their normal confirmation policies.
+  - **Scoped operator consent**: Inner tool calls run under operator consent; middleware `confirm` prompts inside scripts fail closed because interactive confirmation cannot be answered inside a script. Middleware `deny` decisions block the command with the reason on stderr; no JSON result is returned to the script. Excluded control tools (`bash`, `switch_agent`, `ask_user`, `*_session_handoff`) cannot be invoked. Delegated child sessions retain their normal confirmation and interaction policies.
   - **Output**: Script results and diagnostics append to the chat transcript as system items. If the script fails or exits with a nonzero status, the transcript displays the failure and script exit code.
   - **Worker version**: `.call bash` executes on the active session's worker. A worker built before Bash support rejects the command with a clean error instead of executing it, so upgrade and restart workers together with the frontend when deploying this feature.
 - **Background execution and cancellation**: Tool commands execute as asynchronous background tasks. The input composer remains responsive during execution, and pressing `Ctrl+C` cancels in-flight execution cleanly without modifying the durable session transcript.
 - **Output**: Tool results and diagnostics are appended to the chat transcript as system items. The call does not initiate an LLM model turn or record assistant messages.
-- **Scoped consent**: Direct invocation runs with root operator consent. When a `PreToolUse` hook asks for confirmation (`ask`), the root tool call auto-approves. Hook `deny` decisions, argument transformations, and input validations are strictly enforced. Nested tool calls initiated by delegated child agents do not inherit root consent and present the standard confirmation modal.
+- **Scoped consent**: Direct invocation runs with root operator consent. When tool middleware requests confirmation (`confirm`), the root operator call auto-approves under operator origin. Middleware `deny` decisions, argument transformations, and input validations are strictly enforced. Nested tool calls initiated by delegated child agents do not inherit root consent and present the standard confirmation modal.
 
 ### `.exit` - exit the current scope
 

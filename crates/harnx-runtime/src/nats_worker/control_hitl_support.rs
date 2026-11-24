@@ -6,7 +6,7 @@ use harnx_core::tool::ToolCall;
 use serde_json::json;
 use std::sync::Arc;
 
-pub(super) struct HitlControlFixture {
+pub(in crate::nats_worker::control) struct HitlControlFixture {
     pub handler: SessionControlHandler,
     pub backend: NatsSessionLogBackend,
     pub decisions: tokio::sync::mpsc::UnboundedReceiver<AppliedHitlDecision>,
@@ -46,6 +46,9 @@ impl HitlControlFixture {
             backend: backend.clone(),
             abort_signal: crate::utils::create_abort_signal(),
             hitl_decision_tx: tx,
+            surface_actions: Default::default(),
+            operator_subject: String::new(),
+            surface_action_gates: Default::default(),
         };
         let calls = SessionLogEntry::ToolCalls {
             text: String::new(),
@@ -111,6 +114,7 @@ pub(super) async fn verify_reused_id_next_round(
     fixture
         .backend
         .append_event(&SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![],
             timestamp: None,
         })
@@ -153,6 +157,7 @@ pub(super) async fn verify_terminal_precedence_at_append(
     fixture
         .backend
         .append_event(&SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![],
             timestamp: None,
         })

@@ -1,21 +1,29 @@
 //! Async sub-agent send/wait contracts, durable dispatch and bounded observation.
 //! `session_send.wait` and the top-level `session_wait` options share one
-//! resolver, and both entry points use the
-//! [`super::session_read`] formatter. Discovery is wired separately; synchronous
+//! resolver and one result envelope: the child's final reply once the prompt
+//! settles, or a small activity sample while it runs. Transcript reads belong
+//! to `session_load`. Discovery is wired separately; synchronous
 //! `session_prompt` behavior and schema stay unchanged.
 //!
 //! Handle semantics: `prompt_id` is the original `AppendedPrompt.user_msg_id`
 //! of the dispatched prompt — the durable identity a wait re-attaches to.
 //! `invocation_id` is execution identity and stays diagnostic only.
 
+mod activity;
 pub(super) mod dispatch;
+mod envelope;
 pub(super) mod observation;
 mod progress;
 mod specs;
 
-pub(crate) use specs::{session_send_spec, session_wait_spec};
+pub(crate) use activity::{Activity, LatestStep};
+#[cfg(test)]
+use envelope::result_metadata_bytes;
+pub(crate) use envelope::{
+    ensure_result_metadata_fits, serialized_len, Observation, SessionPromptResult, RESULT_MAX_BYTES,
+};
+pub(crate) use specs::{session_result_template, session_send_spec, session_wait_spec};
 
-use super::session_read::{ReadOptions, ResolvedRead};
 use crate::nats_session_metadata::{CallTimeoutOverride, EffectiveDeadline};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,8 +57,6 @@ pub(crate) struct WaitOptions {
     pub(crate) forever: Option<bool>,
     #[serde(default)]
     pub(crate) include_partial: Option<bool>,
-    #[serde(default)]
-    pub(crate) read: Option<ReadOptions>,
 }
 
 /// A validated wait request.
@@ -58,10 +64,9 @@ pub(crate) struct WaitOptions {
 pub(crate) struct ResolvedWait {
     /// Soft observation limit.
     pub(crate) limit: WaitLimit,
-    /// Whether pending/blocked observations include partial child output.
-    /// Terminal output is delivered under the same bound either way.
+    /// Whether pending/blocked observations carry the activity sample. A
+    /// settled observation returns the final reply either way.
     pub(crate) include_partial: bool,
-    pub(crate) read: ResolvedRead,
 }
 
 impl Default for ResolvedWait {
@@ -69,7 +74,6 @@ impl Default for ResolvedWait {
         Self {
             limit: WaitLimit::Seconds(WAIT_DEFAULT_SECS),
             include_partial: true,
-            read: ResolvedRead::default(),
         }
     }
 }
@@ -116,11 +120,9 @@ impl WaitOptions {
             WaitLimit::Seconds(seconds)
         };
         let include_partial = self.include_partial.unwrap_or(true);
-        let read = self.read.clone().unwrap_or_default().resolve()?;
         Ok(ResolvedWait {
             limit,
             include_partial,
-            read,
         })
     }
 }
@@ -184,67 +186,6 @@ impl WaitStop {
     pub(crate) const WIDEST: Self = Self::CallerDeadline;
 }
 
-/// Shared send/wait result envelope. `output` carries the bounded read (same
-/// formatter for final replies and partial output) and is sized so the entire
-/// serialized envelope fits the resolved `max_output_bytes` budget; the
-/// envelope's own metadata is reserved first so a dispatched handle can never
-/// be lost to the output formatter.
-#[derive(Debug, Serialize)]
-pub(crate) struct SessionPromptResult {
-    pub(crate) session_id: String,
-    pub(crate) prompt_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) invocation_id: Option<String>,
-    pub(crate) dispatch: Option<DispatchConfirmation>,
-    pub(crate) status: SessionPromptStatus,
-    pub(crate) terminal: bool,
-    pub(crate) wait_expired: bool,
-    /// What ended the wait early, when it was not the wait's own limit.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) stopped_by: Option<WaitStop>,
-    pub(crate) elapsed_ms: u64,
-    pub(crate) output: Value,
-}
-
-/// Serialized size of the result envelope with empty output — the bytes that
-/// must be reserved before fitting any output content.
-pub(crate) fn result_metadata_bytes(session_id: &str, prompt_id: &str) -> usize {
-    let envelope = SessionPromptResult {
-        session_id: session_id.to_string(),
-        prompt_id: prompt_id.to_string(),
-        invocation_id: None,
-        dispatch: None,
-        status: SessionPromptStatus::Unknown,
-        terminal: false,
-        wait_expired: false,
-        stopped_by: Some(WaitStop::WIDEST),
-        elapsed_ms: u64::MAX,
-        output: Value::Null,
-    };
-    serde_json::to_string(&envelope)
-        .expect("result envelope serializes")
-        .len()
-}
-
-/// Reject identifiers that cannot fit their own handle metadata before any
-/// dispatch side effect, so a dispatched handle is never lost to the output
-/// budget.
-pub(crate) fn ensure_result_metadata_fits(
-    session_id: &str,
-    prompt_id: &str,
-    max_output_bytes: usize,
-) -> Result<(), String> {
-    let reserved = result_metadata_bytes(session_id, prompt_id);
-    if reserved > max_output_bytes {
-        Err(format!(
-            "result metadata ({reserved} bytes for session_id and prompt_id) exceeds \
-             max_output_bytes budget {max_output_bytes}; the handle could not be returned"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 /// `session_send` arguments. Message/attachments/session_id/timeout_secs keep
 /// `session_prompt` semantics; `timeout_secs` stays the hard child execution
 /// allowance (omitted/null/nonpositive inherits target policy). Omitted or
@@ -284,8 +225,6 @@ pub(crate) struct WaitArgs {
     pub(crate) forever: Option<bool>,
     #[serde(default)]
     pub(crate) include_partial: Option<bool>,
-    #[serde(default)]
-    pub(crate) read: Option<ReadOptions>,
     /// Transport-owned routing arguments, declared because of
     /// `deny_unknown_fields`; the server scrubs model-supplied values before
     /// injecting them (see `add_parent_context_args` in harnx-toolset-server).
@@ -305,17 +244,23 @@ impl WaitArgs {
             seconds: self.seconds,
             forever: self.forever,
             include_partial: self.include_partial,
-            read: self.read.clone(),
         }
     }
 }
+
+/// Waits return the final reply, not a transcript page; say where the page went.
+const READ_REMOVED_HINT: &str = "; waits no longer take read: the result carries the \
+     final reply, and session_load with prompt_id reads the turn's transcript";
 
 /// Parse and fully validate `session_send` arguments before any side effect.
 /// Returns the resolved soft wait when one was requested; `None` means
 /// dispatch-only (omitted or null `wait`).
 pub(crate) fn parse_send_args(args: Value) -> Result<(SendArgs, Option<ResolvedWait>), String> {
-    let parsed: SendArgs = serde_json::from_value(args)
-        .map_err(|error| format!("invalid session_send arguments: {error}"))?;
+    let read = args.get("wait").and_then(|wait| wait.get("read")).is_some();
+    let parsed: SendArgs = serde_json::from_value(args).map_err(|error| {
+        let hint = if read { READ_REMOVED_HINT } else { "" };
+        format!("invalid session_send arguments: {error}{hint}")
+    })?;
     // Same deadline rules as session_prompt: reject impossible overrides
     // before dispatch. The soft wait never grants execution time.
     EffectiveDeadline::resolve(
@@ -328,14 +273,9 @@ pub(crate) fn parse_send_args(args: Value) -> Result<(SendArgs, Option<ResolvedW
     .map_err(|error| format!("invalid session_send arguments: {error}"))?;
     let resolved_wait = parsed.wait.as_ref().map(WaitOptions::resolve).transpose()?;
     // The result envelope always returns the handle, so pre-dispatch the
-    // identifiers must fit their own metadata under the output budget the
-    // caller asked for (default budget when dispatch-only).
-    let budget = resolved_wait
-        .as_ref()
-        .map(|wait| wait.read.max_output_bytes)
-        .unwrap_or(super::session_read::DEFAULT_MAX_OUTPUT_BYTES as usize);
+    // identifiers must fit their own metadata under the result budget.
     if let Some(session_id) = parsed.session_id.as_deref() {
-        ensure_result_metadata_fits(session_id, "", budget)?;
+        ensure_result_metadata_fits(session_id, "", RESULT_MAX_BYTES)?;
     }
     Ok((parsed, resolved_wait))
 }
@@ -344,9 +284,12 @@ pub(crate) fn parse_send_args(args: Value) -> Result<(SendArgs, Option<ResolvedW
 /// Omitted `seconds` defaults to a 240-second soft wait.
 pub(crate) fn parse_wait_args(args: Value) -> Result<(WaitArgs, ResolvedWait), String> {
     let nested_wait = args.get("wait").is_some();
+    let read = args.get("read").is_some();
     let parsed: WaitArgs = serde_json::from_value(args).map_err(|error| {
         let hint = if nested_wait {
             "; session_wait takes seconds/forever at the top level, the nested wait object was removed"
+        } else if read {
+            READ_REMOVED_HINT
         } else {
             ""
         };
@@ -359,11 +302,7 @@ pub(crate) fn parse_wait_args(args: Value) -> Result<(WaitArgs, ResolvedWait), S
         return Err("prompt_id must not be empty".to_string());
     }
     let resolved = parsed.wait_options().resolve_for(WaitCaller::Wait)?;
-    ensure_result_metadata_fits(
-        &parsed.session_id,
-        &parsed.prompt_id,
-        resolved.read.max_output_bytes,
-    )?;
+    ensure_result_metadata_fits(&parsed.session_id, &parsed.prompt_id, RESULT_MAX_BYTES)?;
     Ok((parsed, resolved))
 }
 

@@ -2,12 +2,12 @@
 source: crates/harnx-script/src/description/tests.rs
 expression: description
 ---
-Chain this agent's tool commands and process their results in one script/round trip. This is an in-process shell, not host Bash. Only tool commands can reach host services, through their normal permissions and hooks.
+Chain this agent's tool commands and process their results in one script/round trip. Worth it for loops, many calls, or filtering a large result down to what you need. For a single call, a tool that needs approval, or a result you want to read in full, call the tool directly if you have it. This is an in-process shell, not host Bash. Only tool commands can reach host services, through their normal permissions and hooks.
 
 Dialect: Bash-compatible BashKit. Fresh VFS per run, cwd /tmp; /attachments is read-only at /attachments/<full media CID> (keep existing CID encoding). No direct host filesystem, network or subprocess access. Pipes, redirects, variables, loops and background jobs (& / wait) work. set -e is on by default, with POSIX-style exceptions for conditions, ! and non-final &&/|| commands. Pipelines use the last command's status unless you enable set -o pipefail. Use set +e to handle ordinary failures; fatal errors still stop the script.
 
 Available builtins (tool commands below override same-named builtins):
-., :, [, alias, arch, assert, awk, b2sum, base32, base64, basename, basenc, bash, bc, bg, bind, break, builtin, bunzip2, busybox, bzcat, bzip2, caller, cat, cd, chgrp, chmod, chown, cksum, clear, cmp, column, comm, command, compgen, complete, compopt, continue, cp, csv, cut, date, dd, declare, df, diff, dirname, dirs, disown, dotenv, du, echo, egrep, enable, env, envsubst, eval, exec, exit, expand, export, expr, factor, false, fc, fg, fgrep, file, find, flock, fmt, fold, free, gawk, getconf, getopts, glob, grep, groups, gunzip, gzip, hash, head, help, hexdump, history, hostid, hostname, http, iconv, id, install, jobs, join, jq, json, kill, less, let, link, ln, local, locale, log, logname, ls, make, man, mapfile, mawk, md5sum, mkdir, mkfifo, mktemp, mv, nawk, nice, nl, nohup, nproc, numfmt, od, openssl, parallel, paste, patch, pgrep, pkill, popd, pr, printenv, printf, ps, pushd, pwd, python, python3, read, readarray, readlink, readonly, realpath, retry, return, rev, rg, rm, rmdir, sed, semver, seq, set, sh, sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, shasum, shift, shopt, shuf, sleep, sort, source, split, stat, strings, sudo, sum, sync, tac, tail, tar, tee, template, test, timeout, times, tomlq, touch, tr, trap, tree, true, truncate, tsort, tty, type, typeset, ulimit, umask, unalias, uname, unexpand, uniq, unlink, unset, unzip, uptime, users, uuidgen, verify, wait, watch, wc, which, who, whoami, xargs, xxd, yes, yq, zip
+., :, [, alias, arch, assert, awk, b2sum, base32, base64, basename, basenc, bash, bc, bg, bind, break, builtin, bunzip2, busybox, bzcat, bzip2, caller, cat, cd, chgrp, chmod, chown, cksum, clear, cmp, column, comm, command, compgen, complete, compopt, continue, cp, csv, cut, date, dd, declare, df, diff, dirname, dirs, disown, dotenv, du, echo, egrep, enable, env, envsubst, eval, exec, exit, expand, export, expr, factor, false, fc, fg, fgrep, file, find, flock, fmt, fold, free, gawk, getconf, getopts, glob, grep, groups, gunzip, gzip, hash, head, help, hexdump, history, hostid, hostname, iconv, id, install, jobs, join, jq, json, kill, less, let, link, ln, local, locale, log, logname, ls, make, man, mapfile, mawk, md5sum, mkdir, mkfifo, mktemp, mv, nawk, nice, nl, nohup, nproc, numfmt, od, openssl, parallel, paste, patch, pgrep, pkill, popd, pr, printenv, printf, ps, pushd, pwd, python, python3, read, readarray, readlink, readonly, realpath, retry, return, rev, rg, rm, rmdir, sed, semver, seq, set, sh, sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, shasum, shift, shopt, shuf, sleep, sort, source, split, stat, strings, sudo, sum, sync, tac, tail, tar, tee, template, test, timeout, times, tomlq, touch, tr, trap, tree, true, truncate, tsort, tty, type, typeset, ulimit, umask, unalias, uname, unexpand, uniq, unlink, unset, unzip, uptime, users, uuidgen, verify, wait, watch, wc, which, who, whoami, xargs, xxd, yes, yq, zip
 
 Python: python and python3 are the same embedded Monty subset, not CPython. Use -c, a VFS script file or stdin/heredoc. open()/pathlib use the VFS. Simple classes work; inheritance, metaclasses, re and third-party imports don't. Python cannot call tools or start subprocesses/network requests; call tools in Bash and pass results via /tmp. A shared work budget caps scripts at ~95 Python calls; batch loops into one invocation.
 
@@ -17,11 +17,12 @@ Tool commands:
 - search --query <string> [--filter <json>] [--include-archived|--no-include-archived] [--tags <string>]... [--json <object>]  # Search indexed records.
 
 Tool arguments/discovery:
-- Property names become --kebab-case flags; strings/numbers take values, booleans use --flag / --no-flag, scalar arrays repeat flags, objects/complex values take quoted JSON. No positional arguments.
+- Property names become --kebab-case flags; strings/numbers take plain values (optional ones too: --path src, not JSON), booleans use --flag / --no-flag, scalar arrays repeat flags, objects and multi-type values take quoted JSON. No positional arguments.
 - --json '<object>' supplies original property keys; --json - reads stdin. Flags override base keys regardless of order. Stdin is otherwise ignored by tool commands.
-- Output defaults to structuredContent JSON when present, otherwise text. -o json|text overrides rendering (not sent to the tool).
+- Without a shell form, output defaults to structuredContent JSON when present, otherwise text, which can still carry decoration such as line numbers. -o json|text overrides rendering (not sent to the tool).
+- A tool with a shell form (help <tool> shows its OUTPUT) prints like a command: a file read like cat, a search like grep -n with exit 1 when nothing matches, so under set -e use it in if or ||, or add || true. Notes about cut-off results go to stderr, so check the report before trusting a count. -o json prints the tool's fields.
 - tools [quoted-glob] lists synopses; help <tool> [tool ...] or <tool> --help shows full schema-derived help without dispatch.
-- Tool exits: 0 success, 1 tool error, 2 usage, 3 needs approval (call directly instead), 4 blocked, 5 rejected, 127 unknown command. Run timeout: 124; cancellation: 130.
+- Tool exits: 0 success, 1 tool error, 2 usage error or a tool's own error status, 126 needs approval (call directly instead), blocked or rejected, 127 unknown command. Run timeout: 124; cancellation: 130.
 
 Quoting idioms:
 - Literal multiline argument, with expansion inside the heredoc disabled:
@@ -38,7 +39,7 @@ EOF
 
 Worked pipeline: Use a path this tool can read; filter matching lines and keep three:
 ```bash
-files_fs_read --path src/lib.rs -o text | rg -n 'TODO' | head -3
+files_fs_read --path src/lib.rs -o text | grep -n 'TODO' | head -3
 ```
 
 Defaults/limits: timeout 86400s (timeout_secs: 0 disables it in practice); 10000 shell commands; stdout 1 MiB and stderr 1 MiB captured, with truncation flags/limit_hit. head_lines, tail_lines and max_output_bytes only shape the returned report. VFS: 10 MB per file, 100 MB total. Attachment mount: 10 MB per file, 100 MB cached per run; listings are empty, so use known full CIDs. Inner tools: 8 concurrent, 1000 admitted calls per script. Python: 64 MiB heap and print-buffer ceilings per invocation, bounded by remaining run time; MemoryError is stderr/exit 1, not a typed limit_hit. VM limits aren't process/RSS isolation.

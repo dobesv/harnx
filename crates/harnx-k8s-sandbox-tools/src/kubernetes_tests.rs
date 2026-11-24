@@ -395,6 +395,54 @@ async fn get_maps_a_missing_claim_to_none() {
     assert!(api.get("missing").await.unwrap().is_none());
 }
 
+/// A claim deleted in Kubernetes must surface as the typed not-found error
+/// with Permanent classification, not as an untyped Transport retry (#2840).
+#[tokio::test]
+async fn missing_claim_failures_are_typed_not_found_and_permanent() {
+    let (api, requests) = test_api(|request| {
+        assert_eq!(request.method, Method::GET);
+        failure(StatusCode::NOT_FOUND, "not found")
+    });
+    let now = DateTime::parse_from_rfc3339("2026-09-09T01:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let activity_error = api.bump_activity("missing", now).await.unwrap_err();
+    let replicas_error = api.set_replicas("missing", 1).await.unwrap_err();
+
+    for error in [&activity_error, &replicas_error] {
+        assert!(is_sandbox_not_found(error));
+        assert_eq!(kubernetes_failure(error), (FailureKind::Permanent, None));
+        assert_eq!(error.to_string(), "sandbox not found: missing");
+    }
+    // One GET per call: nothing retried a claim-absent 404.
+    assert_eq!(requests.lock().len(), 2);
+}
+
+#[tokio::test]
+async fn activity_patch_after_a_claim_vanishes_reports_typed_not_found() {
+    let (api, requests) = test_api(|request| match request.method {
+        Method::GET => (
+            StatusCode::OK,
+            claim("claim-vanishing", Some("sandbox-vanishing"), None),
+        ),
+        Method::PATCH => failure(StatusCode::NOT_FOUND, "not found"),
+        _ => panic!("unexpected request: {request:?}"),
+    });
+    let now = DateTime::parse_from_rfc3339("2026-09-09T01:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let error = api.bump_activity("claim-vanishing", now).await.unwrap_err();
+
+    assert!(is_sandbox_not_found(&error));
+    assert_eq!(kubernetes_failure(&error), (FailureKind::Permanent, None));
+    let requests = requests.lock();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, Method::GET);
+    assert_eq!(requests[1].method, Method::PATCH);
+}
+
 #[tokio::test(start_paused = true)]
 async fn hung_kubernetes_request_hits_per_request_timeout() {
     let started = Arc::new(Notify::new());

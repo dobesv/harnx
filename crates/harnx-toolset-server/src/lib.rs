@@ -18,8 +18,11 @@ use invocation::{
     accepts_parent_session_id, add_parent_context_args, metric_tool_name, tool_exec_span,
 };
 mod mcp;
+pub mod mrtr;
+pub mod result_limits;
 #[cfg(test)]
 use mcp::call_tool_result_from_value;
+pub use mcp::McpToolsetAdapter;
 mod lifecycle;
 mod runner;
 pub use runner::{
@@ -28,6 +31,7 @@ pub use runner::{
 };
 mod name;
 mod progress;
+mod registration_handle;
 mod registration_identity;
 pub mod schema;
 mod subscriptions;
@@ -41,6 +45,10 @@ pub use filter::{
 };
 pub use lifecycle::{RegistrationShutdown, ServeLifecycle};
 pub use name::{toolset_name_from_args, validate_toolset_name, NamedToolset, NAME_FLAG};
+pub use registration_handle::{
+    ConditionalDelete, RegistrationAudience as HandleAudience, RegistrationHandle,
+    RegistrationHandleError, StoredRegistration,
+};
 pub use registration_identity::RegistrationIdentity;
 // Re-export globset for callers who need to construct filters
 pub use globset;
@@ -306,6 +314,9 @@ async fn setup_subscriptions(
         tools: toolset.tools(),
         schema_version: TOOL_SCHEMA_VERSION,
         proto_version: TOOL_PROTOCOL_VERSION,
+        user_id: None,
+        ownerless_only: false,
+        connection_id: None,
     };
     let (registry, journal) =
         ensure_control_stores(&settings.connection.client, settings.connection.replicas).await?;
@@ -662,12 +673,14 @@ async fn process_tool_request(
                 call_id: request.call_id.clone(),
                 result: Err(map_invoke_error(error)),
                 final_progress: None,
+                input_required: None,
             }),
     );
     complete_cache_entry(&context.reply_cache, key, reply.clone(), completion).await;
     serve_cached(context, reply_subject, reply).await
 }
 
+// qual:allow(complexity, max_function_lines=70) reason: "Request validation is one ordered gate list (headers, session, tool, args, limits, challenge fields); extracting sub-gates would hide the admission order the journal depends on."
 async fn validate_tool_request(
     context: &ToolRequestContext,
     message: async_nats::Message,
@@ -729,6 +742,7 @@ async fn validate_tool_request(
             call_id: request.call_id,
             result: Err(map_invoke_error(recovery::invoke_error(error))),
             final_progress: None,
+            input_required: None,
         };
         return publish_reply(&context.client, reply_subject, &reply)
             .await
@@ -804,6 +818,7 @@ async fn publish_recoverable_reply(
             call_id,
             result: Err(ToolErrorPayload::Recoverable(message)),
             final_progress: None,
+            input_required: None,
         },
     )
     .await
@@ -814,6 +829,13 @@ fn map_invoke_error(error: ToolInvokeError) -> ToolErrorPayload {
         ToolInvokeError::Recoverable(message) => ToolErrorPayload::Recoverable(message),
         ToolInvokeError::Fatal(message) => ToolErrorPayload::Fatal(message),
         ToolInvokeError::Interrupted(interrupted) => ToolErrorPayload::Interrupted(interrupted),
+        // Challenges are outcomes, not failures; record_outcome lifts them
+        // into `ToolReply::input_required`. Reaching this arm means the
+        // challenge could not be delivered, so degrade to the compatibility
+        // error rather than a silent success.
+        ToolInvokeError::InputRequired(_) => {
+            ToolErrorPayload::Recoverable(harnx_toolset::INPUT_REQUIRED_COMPAT_ERROR.to_string())
+        }
     }
 }
 

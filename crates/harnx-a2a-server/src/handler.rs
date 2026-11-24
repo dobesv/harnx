@@ -4,13 +4,12 @@ use crate::{
     exports::Export,
     identity::{Identity, RequestIdentity},
     input_map::InputLimits,
-    runner::{RunnerError, SessionRequest},
+    runner::SessionRequest,
     store::{TaskAccess, TaskRecord},
 };
 use a2a_lf::*;
-use a2a_server_lf::{handler::RequestHandler, middleware::ServiceParams};
-use async_trait::async_trait;
-use futures::{stream::BoxStream, StreamExt};
+use a2a_server_lf::middleware::ServiceParams;
+use futures::StreamExt;
 use harnx_runtime::NatsSession;
 use std::sync::Arc;
 
@@ -18,6 +17,7 @@ mod admission;
 mod backend;
 mod errors;
 mod listing;
+mod methods;
 pub mod task_view;
 #[cfg(test)]
 mod tests;
@@ -25,7 +25,6 @@ mod wait;
 pub use backend::{Backend, BackendConfig};
 pub use errors::PERMISSION_DENIED_CODE;
 use errors::{map_error, not_found};
-use task_view::{history, validate_history};
 
 struct Admission {
     snapshot: TaskRecord,
@@ -82,8 +81,11 @@ impl HarnxHandler {
             cancel_snapshot_gate: None,
         }
     }
-    fn owner(&self, params: &ServiceParams) -> Result<RequestIdentity, A2AError> {
-        let owner = self.identity.resolve_request_params(params)?;
+    async fn owner(&self, params: &ServiceParams) -> Result<RequestIdentity, A2AError> {
+        let owner = self
+            .identity
+            .resolve_request_params_verified(params)
+            .await?;
         if let Some(rules) = self.backend.store.access_rules() {
             if owner.principal.user_id().is_none() {
                 return Err(crate::identity::missing_identity());
@@ -324,174 +326,4 @@ pub fn return_immediately(configuration: Option<&SendMessageConfiguration>) -> b
     configuration
         .and_then(|configuration| configuration.return_immediately)
         .unwrap_or(false)
-}
-
-#[async_trait]
-impl RequestHandler for HarnxHandler {
-    async fn send_message(
-        &self,
-        params: &ServiceParams,
-        req: SendMessageRequest,
-    ) -> Result<SendMessageResponse, A2AError> {
-        let owner = self.owner(params)?;
-        let immediate = return_immediately(req.configuration.as_ref());
-        let (admission, length) = self.admit_request(owner.clone(), req).await?;
-        let mut task = self.resolve_send_task(&owner, admission, immediate).await?;
-        history(&mut task, length)?;
-        Ok(SendMessageResponse::Task(task))
-    }
-    async fn get_task(
-        &self,
-        params: &ServiceParams,
-        req: GetTaskRequest,
-    ) -> Result<Task, A2AError> {
-        let owner = self.owner(params)?;
-        let mut task = self
-            .reconcile(&owner, self.task(&owner, &req.id).await?)
-            .await?
-            .task;
-        history(&mut task, req.history_length)?;
-        Ok(task)
-    }
-    async fn cancel_task(
-        &self,
-        params: &ServiceParams,
-        req: CancelTaskRequest,
-    ) -> Result<Task, A2AError> {
-        let owner = self.owner(params)?;
-        let initial = self.task(&owner, &req.id).await?;
-        #[cfg(test)]
-        if let Some(gate) = &self.cancel_snapshot_gate {
-            gate.after_snapshot(initial.task.status.state.clone()).await;
-        }
-        if let Some(task) = self
-            .cancel_hitl_if_active(&owner, &req.id, &initial)
-            .await?
-        {
-            return Ok(task);
-        }
-        self.cancel_standard_task(&owner, &req.id, initial).await
-    }
-    async fn list_tasks(
-        &self,
-        params: &ServiceParams,
-        req: ListTasksRequest,
-    ) -> Result<ListTasksResponse, A2AError> {
-        let owner = self.owner(params)?;
-        let context = req
-            .context_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| A2AError::invalid_params("ListTasks requires contextId"))?;
-        validate_history(req.history_length)?;
-        let Some((key, index)) = self
-            .backend
-            .store
-            .list_task_index(&self.export, &owner, context)
-            .await
-            .map_err(map_error)?
-        else {
-            return Err(not_found());
-        };
-
-        let scope = listing::ListingScope {
-            owner: &owner,
-            key: &key,
-            context,
-        };
-        let candidates = self.list_candidates(scope, index.entries, &req).await?;
-        self.list_page(scope, candidates, &req).await
-    }
-    async fn send_streaming_message(
-        &self,
-        params: &ServiceParams,
-        req: SendMessageRequest,
-    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let owner = self.owner(params)?;
-        let (admission, length) = self.admit_request(owner.clone(), req).await?;
-        let (mut snapshot, events) = if admission.direct || admission.events.is_some() {
-            (admission.snapshot, admission.events)
-        } else {
-            self.open_reconciled_stream(&owner, admission.snapshot)
-                .await?
-        };
-        history(&mut snapshot.task, length)?;
-        Ok(crate::sse::task_stream(snapshot, events))
-    }
-    async fn subscribe_to_task(
-        &self,
-        params: &ServiceParams,
-        req: SubscribeToTaskRequest,
-    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let owner = self.owner(params)?;
-        let record = self
-            .reconcile(&owner, self.task(&owner, &req.id).await?)
-            .await?;
-        if record.task.status.state.is_terminal() {
-            return Err(A2AError::unsupported_operation(
-                "terminal tasks cannot be subscribed to",
-            ));
-        }
-        let subscription = self
-            .backend
-            .runner
-            .subscribe(&self.export, &owner, &req.id)
-            .await
-            .map_err(|error| {
-                if matches!(
-                    error.downcast_ref::<RunnerError>(),
-                    Some(RunnerError::Terminal)
-                ) {
-                    A2AError::unsupported_operation("terminal tasks cannot be subscribed to")
-                } else {
-                    map_error(error)
-                }
-            })?;
-        Ok(crate::sse::task_stream(
-            subscription.snapshot,
-            Some(subscription.events),
-        ))
-    }
-    async fn create_push_config(
-        &self,
-        params: &ServiceParams,
-        _req: TaskPushNotificationConfig,
-    ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.owner(params)?;
-        Err(A2AError::push_notification_not_supported())
-    }
-    async fn get_push_config(
-        &self,
-        params: &ServiceParams,
-        _req: GetTaskPushNotificationConfigRequest,
-    ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.owner(params)?;
-        Err(A2AError::push_notification_not_supported())
-    }
-    async fn list_push_configs(
-        &self,
-        params: &ServiceParams,
-        _req: ListTaskPushNotificationConfigsRequest,
-    ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        self.owner(params)?;
-        Err(A2AError::push_notification_not_supported())
-    }
-    async fn delete_push_config(
-        &self,
-        params: &ServiceParams,
-        _req: DeleteTaskPushNotificationConfigRequest,
-    ) -> Result<(), A2AError> {
-        self.owner(params)?;
-        Err(A2AError::push_notification_not_supported())
-    }
-    async fn get_extended_agent_card(
-        &self,
-        params: &ServiceParams,
-        _req: GetExtendedAgentCardRequest,
-    ) -> Result<AgentCard, A2AError> {
-        self.owner(params)?;
-        Err(A2AError::unsupported_operation(
-            "extended agent cards are not supported",
-        ))
-    }
 }

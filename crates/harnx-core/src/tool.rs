@@ -66,6 +66,12 @@ pub struct ToolResult {
     pub markdown: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<MessageContentPart>,
+    /// User-audience A2UI surface envelopes extracted from `output` at
+    /// materialization (non-modal surfaces, plan T5.1). They are removed from
+    /// `output` so the model never sees them, and no request builder reads
+    /// this field; it exists for transcript persistence and frontends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_surfaces: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_agent: Option<SwitchAgentData>,
     /// Private execution observation removed from protocol result metadata
@@ -93,6 +99,7 @@ impl ToolResult {
             output,
             markdown: None,
             content: Vec::new(),
+            user_surfaces: Vec::new(),
             switch_agent: None,
             execution_context: None,
         }
@@ -111,10 +118,69 @@ impl ToolResult {
     }
 }
 
+/// A tool asking the user for input before it can finish — the native
+/// mapping of MCP MRTR `input_required` (SEP-2322).
+///
+/// The provider fills `producer` from its infrastructure identity
+/// (`tool:<server>/<tool>`); everything else is tool-supplied. The runtime
+/// completes the D6 identity (session, round, call, chain version, step
+/// path), validates the requested surface, and stores `request_state` in
+/// the call's checkpoint. Answers reach the tool through the runtime-owned
+/// invocation context, never through `ToolCall::arguments`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolInputRequired {
+    /// `tool:<server>/<tool>`, derived by the provider from its registration.
+    pub producer: String,
+    /// The tool's own request key (the MRTR `inputRequests` key). Distinct
+    /// challenges need distinct keys: an exact repeat of an answered
+    /// (key, kind, payload) gets its previous answer back.
+    pub key: String,
+    /// Interaction kind: [`ToolInputRequired::KIND_CONFIRM`],
+    /// [`ToolInputRequired::KIND_A2UI`] or [`ToolInputRequired::KIND_URL`].
+    pub kind: String,
+    /// The question text for `confirm` and `url` challenges.
+    pub message: Option<String>,
+    /// The A2UI envelope for `a2ui` challenges (validated before suspending).
+    pub surface: Option<serde_json::Value>,
+    /// The link URL for `url` challenges. Only `https:` and loopback `http:`
+    /// are valid; the provider validates before mapping a wire challenge here.
+    pub url: Option<String>,
+    pub summary: String,
+    /// Opaque tool state stored in the call's checkpoint and resent beside
+    /// the responses on the rerun, never inside `arguments`.
+    pub request_state: serde_json::Value,
+}
+
+impl ToolInputRequired {
+    /// Frontends route on this kind with their confirm UI.
+    pub const KIND_CONFIRM: &'static str = "confirm";
+    /// Frontends route on this kind with their A2UI rendering.
+    pub const KIND_A2UI: &'static str = "a2ui";
+    /// Frontends route on this kind with their link UI (decision 6).
+    pub const KIND_URL: &'static str = "url";
+    /// `url` challenge action: proceed after opening the link.
+    pub const URL_ACTION_CONTINUE: &'static str = "continue";
+    /// `url` challenge action: abort the flow.
+    pub const URL_ACTION_CANCEL: &'static str = "cancel";
+
+    /// URL policy for `url` challenges (decision 6): only `https:` and
+    /// loopback `http:` are valid. Everything else makes the challenge
+    /// invalid; callers degrade it to a recoverable error, never to a
+    /// suspended interaction. The rule lives in `harnx-toolset` (the
+    /// wire-side contract this crate builds on); delegate to it so the
+    /// two can never drift.
+    pub fn validate_url(raw: &str) -> Result<(), String> {
+        harnx_toolset::ToolInputRequired::validate_url(raw)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolProviderOutput {
     pub value: Value,
     pub execution_context: Option<ExecutionContextObservation>,
+    /// The tool suspended waiting for user input. When set, `value` carries
+    /// no result and must be ignored.
+    pub input_required: Option<ToolInputRequired>,
 }
 
 impl ToolProviderOutput {
@@ -122,6 +188,7 @@ impl ToolProviderOutput {
         Self {
             value,
             execution_context: None,
+            input_required: None,
         }
     }
 
@@ -176,6 +243,9 @@ pub struct ToolCallOrigin<'a> {
     /// invoked directly. A provider that journals calls keys its row by this,
     /// which is how recovery finds the row again.
     pub tool_round: Option<u64>,
+    /// The caller is a script that can take the tool's data as
+    /// `structuredContent`.
+    pub structured_result: bool,
 }
 
 pub enum ToolError {
@@ -205,6 +275,14 @@ pub trait ToolProvider: Send + Sync {
     /// Returns true if this provider knows how to dispatch `tool_name`.
     /// Used by the routing loop to decide which provider gets the call.
     fn has_tool(&self, tool_name: &str) -> bool;
+
+    /// Whether dispatching `tool_name` may return
+    /// [`ToolProviderOutput::input_required`] (MRTR `input_required`). The
+    /// runtime uses this to open the durable interaction path for rounds
+    /// that contain such a call even when no middleware is configured.
+    fn may_request_input(&self, _tool_name: &str) -> bool {
+        false
+    }
 
     /// Dispatches the tool. Races the call against `abort`. On success
     /// returns the tool's result JSON. On abort, returns a
@@ -712,6 +790,21 @@ pub fn extract_user_display_text(result: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn validate_url_accepts_https_and_loopback_http_only() {
+        // Decision 6: https anywhere, http only on loopback hosts.
+        assert!(ToolInputRequired::validate_url("https://example.com/connect/abc").is_ok());
+        assert!(ToolInputRequired::validate_url("http://localhost:8080/connect").is_ok());
+        assert!(ToolInputRequired::validate_url("http://127.0.0.1:8080/connect").is_ok());
+        assert!(ToolInputRequired::validate_url("http://[::1]:8080/connect").is_ok());
+        // Everything else is an invalid challenge: it must degrade to a
+        // recoverable error, never a suspended interaction.
+        assert!(ToolInputRequired::validate_url("http://example.com/connect").is_err());
+        assert!(ToolInputRequired::validate_url("ftp://example.com/f").is_err());
+        assert!(ToolInputRequired::validate_url("not a url").is_err());
+        assert!(ToolInputRequired::validate_url("").is_err());
+    }
 
     #[test]
     fn test_extract_all_display_text() {

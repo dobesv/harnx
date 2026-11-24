@@ -84,6 +84,23 @@ impl SessionInitializer {
         self
     }
 
+    /// Record the caller principals this session is created for. Only
+    /// trusted server-side creation code calls this; the property is
+    /// read-only for agents and clients, and an inherited snapshot is
+    /// never recomputed.
+    #[must_use]
+    pub fn with_user_principals(
+        mut self,
+        principals: &harnx_core::user_principals::UserPrincipals,
+    ) -> Self {
+        self.properties.put(
+            super::session_properties::USER_PRINCIPALS_PROPERTY,
+            principals.to_property_value(),
+            None,
+        );
+        self
+    }
+
     /// Fill an absent identity after parent inheritance and destination routing are resolved.
     /// Blank strings count as absent. Preserve attributes of any nonblank existing identity.
     #[must_use]
@@ -97,9 +114,12 @@ impl SessionInitializer {
         }
         if self.properties.get("user_id").is_none() {
             if let Some(user_id) = user_id.filter(|value| !value.trim().is_empty()) {
-                return self.with_user_id(user_id);
+                self = self.with_user_id(user_id);
             }
         }
+        // Deliberately no principals fallback here: a session without an
+        // explicit snapshot reads through `SessionProperties::user_principals`,
+        // which derives the same legacy shape from the user_id property.
         self
     }
 
@@ -182,7 +202,78 @@ impl SessionInitializer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_core::user_principals::{from_resolved, legacy_fallback};
     use serde_json::json;
+
+    #[test]
+    fn default_user_id_leaves_principals_absent_and_reads_the_legacy_fallback() {
+        harnx_core::require_nextest();
+        // CLI/TUI/ACP sessions stamp no snapshot; the accessor derives the
+        // legacy shape from the user_id property instead.
+        let initializer = SessionInitializer::named("agent", Default::default())
+            .with_default_user_id(Some("local-owner".into()));
+        assert!(initializer.properties.get("user_principals").is_none());
+        assert_eq!(
+            initializer.properties.user_principals(),
+            legacy_fallback(Some("local-owner"))
+        );
+
+        // An inherited snapshot is never recomputed from a cluster default.
+        let parent = SessionInitializer::named("parent", Default::default())
+            .with_user_id("parent-owner")
+            .with_user_principals(&from_resolved(
+                Some("parent-owner"),
+                Some(&["parent-owner".into(), "alias".into()]),
+                &["developers".into()],
+                &["reviewer".into()],
+            ));
+        let child = SessionInitializer::named("child", Default::default())
+            .with_properties(parent.properties.inherited())
+            .with_default_user_id(Some("cluster-default".into()));
+        assert_eq!(
+            child.properties.user_principals(),
+            parent.properties.user_principals()
+        );
+
+        // Anonymous sessions keep no snapshot and read anonymous.
+        let anonymous = SessionInitializer::named("agent", Default::default())
+            .with_default_user_id(Some("  ".into()));
+        assert!(anonymous.properties.get("user_principals").is_none());
+        assert_eq!(
+            anonymous.properties.user_principals(),
+            harnx_core::user_principals::anonymous()
+        );
+    }
+
+    #[test]
+    fn with_user_principals_stamps_the_snapshot() {
+        harnx_core::require_nextest();
+        let principals = from_resolved(
+            Some("alice"),
+            Some(&["alice".into(), "bob".into()]),
+            &["engineering".into()],
+            &["reviewer".into()],
+        );
+        let initializer = SessionInitializer::named("agent", Default::default())
+            .with_user_principals(&principals);
+        assert_eq!(
+            initializer.properties.get("user_principals").unwrap().value,
+            principals.to_property_value()
+        );
+        assert!(
+            initializer
+                .properties
+                .get("user_principals")
+                .unwrap()
+                .inherit
+        );
+        // Metadata built from the initializer round-trips the snapshot.
+        let metadata = crate::nats_session_metadata::SessionMetadata::new("session-1", initializer);
+        assert_eq!(
+            crate::nats_session_metadata::user_principals(&metadata),
+            principals
+        );
+    }
 
     #[test]
     fn default_user_id_preserves_explicit_and_inherited_properties() {

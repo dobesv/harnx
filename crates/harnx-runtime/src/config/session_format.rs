@@ -5,7 +5,8 @@ use crate::client;
 use crate::nats_session_log::{self, NatsSessionLog};
 use crate::nats_session_metadata::{SessionMetadata, SessionMetadataStore};
 use anyhow::{bail, Context, Result};
-use harnx_core::model::ModelType;
+use harnx_core::agent_config::AgentConfig;
+use harnx_core::model::{Model, ModelType};
 use harnx_core::session::{Session, SessionLogEntry};
 use std::{fmt, str::FromStr};
 
@@ -184,6 +185,8 @@ pub async fn session_metadata_for_agent(
 /// Load a named session with its resolved model and transcript-derived token counts.
 /// Pass the result to [`super::session::render`] for the runtime metadata view.
 /// `None` selects the config's default NATS cluster. Inline agents are unsupported.
+/// Missing local configuration falls back to the recorded override ID, or `unknown`
+/// if no agent definition exists.
 pub async fn load_session_for_render(
     config: &Config,
     cluster: Option<&str>,
@@ -208,10 +211,7 @@ pub async fn load_session_for_render(
         })?
         .metadata;
 
-    let model = match metadata.overrides.model.as_deref() {
-        Some(id) => client::retrieve_model(&config.clients, id, ModelType::Chat)?,
-        None => config.retrieve_agent(expected_agent)?.model().clone(),
-    };
+    let model = resolve_session_model(config, metadata.overrides.model.as_deref(), expected_agent)?;
     let mut base = metadata.base_session();
     base.model_id = model.id();
     base.model = model;
@@ -226,9 +226,48 @@ pub async fn load_session_for_render(
     Ok(session)
 }
 
+/// Resolve the model shown for an inspected session. The session may live on a
+/// remote worker whose agents and clients aren't configured here (GH #2751), so a
+/// missing local definition falls back to the recorded override ID, or to
+/// `unknown` when the session used the agent's default model (which neither the
+/// metadata nor the log records). Failures loading an existing local agent file
+/// or a built-in agent still return an error.
+// qual:allow(iosp) — the fallback rules are a small decision table over lookups; splitting them hides the precedence.
+fn resolve_session_model(
+    config: &Config,
+    override_id: Option<&str>,
+    agent_name: &str,
+) -> Result<Model> {
+    match override_id {
+        Some(id) => Ok(client::retrieve_model(&config.clients, id, ModelType::Chat)
+            .unwrap_or_else(|_| model_from_id(id))),
+        None => {
+            let agent_path = Config::agent_file(agent_name);
+            match config.retrieve_agent(agent_name) {
+                Ok(agent) => Ok(agent.model().clone()),
+                Err(_)
+                    if !agent_path.exists()
+                        && AgentConfig::builtin_markdown(agent_name).is_none() =>
+                {
+                    Ok(Model::new("unknown", ""))
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+fn model_from_id(id: &str) -> Model {
+    match id.split_once(':') {
+        Some((client, name)) => Model::new(client, name),
+        None => Model::new(id, ""),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_support::{env_lock, EnvGuard};
     use crate::config::NatsRouting;
     use crate::nats_session_metadata::SessionInitializer;
     use harnx_core::message::{MessageContent, MessageRole};
@@ -236,6 +275,48 @@ mod tests {
     use harnx_core::tool::ToolCall;
     use serde::Deserialize;
     use serde_json::{json, Value};
+
+    #[test]
+    fn resolve_session_model_rejects_malformed_local_agent() {
+        let _lock = env_lock();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp_dir.path());
+        let agent_path = Config::agent_file("malformed-agent");
+        std::fs::create_dir_all(agent_path.parent().unwrap()).unwrap();
+        std::fs::write(&agent_path, "---\nmodel: [\n---\nInvalid agent config").unwrap();
+
+        let config = Config::default();
+        assert!(agent_path.exists());
+        assert!(resolve_session_model(&config, None, "malformed-agent").is_err());
+    }
+
+    #[test]
+    fn resolve_session_model_uses_unknown_for_missing_agent() {
+        let _lock = env_lock();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp_dir.path());
+        let config = Config::default();
+
+        assert!(!Config::agent_file("remote-only-agent").exists());
+        let model = resolve_session_model(&config, None, "remote-only-agent").unwrap();
+        assert_eq!(model.id(), "unknown");
+    }
+
+    #[test]
+    fn model_from_id_splits_client_and_model() {
+        let model = model_from_id("remote-client:remote-model");
+        assert_eq!(model.client_name(), "remote-client");
+        assert_eq!(model.name(), "remote-model");
+        assert_eq!(model.id(), "remote-client:remote-model");
+    }
+
+    #[test]
+    fn model_from_id_preserves_id_without_colon() {
+        let model = model_from_id("remote-model");
+        assert_eq!(model.client_name(), "remote-model");
+        assert_eq!(model.name(), "");
+        assert_eq!(model.id(), "remote-model");
+    }
 
     #[test]
     fn resolve_session_agent_uses_default_route_and_preserves_explicit_cluster() {
@@ -346,7 +427,9 @@ mod tests {
                 fence_token: Some(7),
             },
             SessionLogEntry::ToolResults {
+                handoff_selection: None,
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("call-id".into()),
                     name: "read".into(),
                     output: json!({"content": [{"type": "text", "text": "line 1\nline 2"}]}),

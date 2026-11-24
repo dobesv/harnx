@@ -35,9 +35,6 @@ harnx-core = { path = "../harnx-core" }
 harnx-engine = { path = "../harnx-engine" }
 harnx-fetch = { path = "../harnx-fetch" }
 harnx-healthz = { workspace = true }
-harnx-hooks = { path = "../harnx-hooks" }
-harnx-hookset = { path = "../harnx-hookset" }
-harnx-hookset-server = { path = "../harnx-hookset-server" }
 harnx-metrics = { path = "../harnx-metrics" }
 harnx-nats-common = { workspace = true }
 harnx-blob-store = { path = "../harnx-blob-store" }
@@ -64,6 +61,7 @@ reqwest-eventsource = { workspace = true }
 rand = "0.10.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
+jsonschema = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 shell-words = { workspace = true }
@@ -92,6 +90,8 @@ arboard = { workspace = true, features = ["wayland-data-control"] }
 arboard = { workspace = true }
 
 [dev-dependencies]
+crc32fast = "1"
+harnx-claude-hook-tools = { path = "../harnx-claude-hook-tools" }
 harnx-attachment-tools = { path = "../harnx-attachment-tools" }
 harnx-test-bins = { path = "../harnx-test-bins" }
 harnx-telemetry = { workspace = true, features = ["testing"] }
@@ -107,3 +107,4 @@ tempfile = "3"
 tokio-test = "0.4"
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
+wiremock = { workspace = true }

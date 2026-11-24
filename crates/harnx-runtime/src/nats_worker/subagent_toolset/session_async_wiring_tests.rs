@@ -51,6 +51,9 @@ impl WiringFixture {
     /// either missing would silently weaken the lost-reply guarantee).
     async fn trusted_context(&self, call_id: &str) -> anyhow::Result<ToolInvocationContext> {
         let request = ToolRequest {
+            user_id: None,
+            input_responses: None,
+            request_state: None,
             operation_id: "operation".into(),
             call_id: call_id.into(),
             tool: SUBAGENT_SESSION_SEND_TOOL.into(),

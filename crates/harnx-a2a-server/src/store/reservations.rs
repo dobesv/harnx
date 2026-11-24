@@ -34,6 +34,15 @@ pub struct FirstMessageReservation {
     pub fingerprint: String,
     pub message: a2a_lf::Message,
     pub allocation: TaskAllocation,
+    /// The winning caller's principal snapshot, recorded with the reservation
+    /// so session initialization and background recovery stamp the original
+    /// caller's principals. Retries and recovery never replace it with the
+    /// retrying request's current memberships; records written before this
+    /// field existed deserialize without it and fall back to the session's
+    /// legacy principals. This is customization data, not the authorization
+    /// identity in `identity`.
+    #[serde(default)]
+    pub principals: Option<harnx_core::user_principals::UserPrincipals>,
 }
 fn key(identity: &DedupeKey) -> Result<String> {
     // Hash one structured identity, not ambiguous concatenated user input.

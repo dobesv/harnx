@@ -341,7 +341,8 @@ fn bash_provider_claims_only_active_bash_name() {
         base_providers: Vec::new(),
         slot: None,
         payload_limit: None,
-        operator_inner_consent: false,
+        script_outputs: Default::default(),
+        full_payload: false,
     });
     assert!(active.has_tool("bash"));
     assert!(!active.has_tool("bash_exec"));
@@ -353,7 +354,8 @@ fn bash_provider_claims_only_active_bash_name() {
         base_providers: Vec::new(),
         slot: None,
         payload_limit: None,
-        operator_inner_consent: false,
+        script_outputs: Default::default(),
+        full_payload: false,
     });
     assert!(!inactive.has_tool("bash"));
 

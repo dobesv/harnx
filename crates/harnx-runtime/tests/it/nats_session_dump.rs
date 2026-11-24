@@ -65,10 +65,10 @@ async fn seed_test_session_metadata(
 
 async fn seed_test_log_entries(
     jetstream: &async_nats::jetstream::Context,
+    agent: &str,
     session_id: &str,
 ) -> Result<NatsSessionLog> {
-    let log =
-        NatsSessionLog::for_agent(jetstream.clone(), "test-agent", session_id).with_replicas(1);
+    let log = NatsSessionLog::for_agent(jetstream.clone(), agent, session_id).with_replicas(1);
     log.append_event_async(&SessionLogEntry::Message {
         id: Some("m1".to_string()),
         role: MessageRole::User,
@@ -315,7 +315,7 @@ async fn dump_session_yaml_includes_all_entries_as_separate_docs() -> Result<()>
     let config = local_nats_config(server.url());
     let jetstream = config.nats_jetstream("local").await?;
     let session_id = new_session_id();
-    let log = seed_test_log_entries(&jetstream, &session_id).await?;
+    let log = seed_test_log_entries(&jetstream, "test-agent", &session_id).await?;
 
     let raw = log.load_events_async().await?;
     let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
@@ -342,7 +342,7 @@ async fn dump_session_jsonl_is_n_lines_parsable_independently() -> Result<()> {
     let config = local_nats_config(server.url());
     let jetstream = config.nats_jetstream("local").await?;
     let session_id = new_session_id();
-    let log = seed_test_log_entries(&jetstream, &session_id).await?;
+    let log = seed_test_log_entries(&jetstream, "test-agent", &session_id).await?;
 
     let raw = log.load_events_async().await?;
     let entries = harnx_core::session_reconstruct::apply_log_mutations_nats(&raw)?;
@@ -399,7 +399,7 @@ async fn load_session_for_render_reconstructs_session_with_model_and_tokens() ->
         SessionInitializer::named("test-agent", Default::default()),
     );
     metadata_store.create(&metadata).await?;
-    let _log = seed_test_log_entries(&jetstream, &session_id).await?;
+    let _log = seed_test_log_entries(&jetstream, "test-agent", &session_id).await?;
 
     let session =
         load_session_for_render(&config, Some("local"), &session_id, "test-agent").await?;
@@ -414,6 +414,67 @@ async fn load_session_for_render_reconstructs_session_with_model_and_tokens() ->
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn load_session_for_render_uses_unknown_model_for_remote_only_agent() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+
+    let config = local_nats_config(server.url());
+    let rendered = render_remote_only_session(&config, None).await?;
+    assert!(rendered.contains("unknown (vision: false)"), "{rendered}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_session_for_render_keeps_unconfigured_override_model_id() -> Result<()> {
+    require_nextest();
+
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+
+    let config = local_nats_config(server.url());
+    let rendered = render_remote_only_session(&config, Some("remote-client:remote-model")).await?;
+    assert!(
+        rendered.contains("remote-client:remote-model (vision: false)"),
+        "{rendered}"
+    );
+    Ok(())
+}
+
+/// Seeds a session for an agent with no local definition and renders it as text.
+async fn render_remote_only_session(
+    config: &Config,
+    model_override: Option<&str>,
+) -> Result<String> {
+    let temp_dir = tempfile::tempdir()?;
+    let _config_dir =
+        super::worker::EnvGuard::set("HARNX_CONFIG_DIR", temp_dir.path().to_str().unwrap());
+
+    let jetstream = config.nats_jetstream("local").await?;
+    let session_id = new_session_id();
+    let metadata_store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let mut metadata = SessionMetadata::new(
+        &session_id,
+        SessionInitializer::named("remote-only-agent", Default::default()),
+    );
+    metadata.overrides.model = model_override.map(str::to_string);
+    metadata_store.create(&metadata).await?;
+    let _log = seed_test_log_entries(&jetstream, "remote-only-agent", &session_id).await?;
+
+    let session =
+        load_session_for_render(config, Some("local"), &session_id, "remote-only-agent").await?;
+    assert_eq!(
+        session.messages.len(),
+        2,
+        "seeded transcript should be reconstructed"
+    );
+    harnx_runtime::config::session::render(&session)
 }
 
 #[tokio::test]

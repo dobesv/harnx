@@ -24,6 +24,7 @@ async fn only_calls_that_did_not_succeed_answer_with_their_partial_result() {
         .complete(
             &failed,
             ToolReply {
+                input_required: None,
                 call_id: failed.call_id.clone(),
                 result: Err(ToolErrorPayload::Recoverable("job failed".into())),
                 final_progress: None,

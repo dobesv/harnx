@@ -1,21 +1,19 @@
 #[path = "hitl_progress_tests.rs"]
 mod hitl_progress;
+#[path = "interaction_continuation_tests.rs"]
+mod interaction_continuation;
 
 use super::{
-    agent_resolved_hooks, derive_hitl_tool_round_continuation, derive_pending_compaction,
-    derive_pending_hitl_approvals, dispatch_session_start, find_orphan_tool_calls, SessionOrigin,
-    SessionStartDispatch,
+    derive_hitl_tool_round_continuation, derive_pending_compaction, derive_pending_hitl_approvals,
+    dispatch_session_start, find_orphan_tool_calls, SessionOrigin, SessionStartDispatch,
 };
 use crate::config::Config;
-use crate::nats_hook_provider::{DiscoveredHook, NatsHookProvider};
+use crate::nats_worker::tests::env_lock;
 use chrono::{TimeZone, Utc};
-use harnx_core::hooks::{HookEvent, HookOutcome, HookPayload, HookResult, HookResultControl};
-use harnx_core::instance::ServerScope;
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::SessionLogEntry;
-use harnx_hookset::{FailPolicy, HookSpec};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn compact_request(id: &str) -> SessionLogEntry {
     SessionLogEntry::compact_request(id, Some("test".into()))
@@ -82,77 +80,102 @@ fn derive_pending_compaction_covers_request_receipt_sequences() {
     }
 }
 
-/// A provider whose only route is a SessionStart hook recording every
-/// payload it receives.
-fn recording_session_start_provider() -> (NatsHookProvider, Arc<Mutex<Vec<HookPayload>>>) {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Arc::clone(&seen);
-    let provider = NatsHookProvider::from_request_handler(
-        ServerScope::from_string("session-start-test"),
-        vec![DiscoveredHook {
-            server: "lifecycle".to_string(),
-            display_label: None,
-            spec: HookSpec {
-                event: "SessionStart".to_string(),
-                matcher: None,
-                priority: 0,
-                timeout_secs: Some(1),
-                fail_policy: FailPolicy::Closed,
-            },
-        }],
-        Arc::new(move |_subject, payload: HookPayload| {
-            recorder.lock().expect("recorder lock").push(payload);
-            HookOutcome {
-                control: HookResultControl::Continue,
-                result: HookResult::default(),
-            }
-        }),
-    );
-    (provider, seen)
+fn session_start_event_config(
+    bash: &str,
+    on_error: harnx_core::hooks::EventHookOnError,
+) -> std::sync::Arc<crate::config::ConfigLock> {
+    let hooks = harnx_core::hooks::HooksConfig {
+        session_start: harnx_core::hooks::EventHooksList {
+            entries: vec![harnx_core::hooks::EventHookEntry::Full(
+                harnx_core::hooks::EventHookDefinition {
+                    name: "greet".to_string(),
+                    source: harnx_core::middleware::MiddlewareSourceConfig::Bash {
+                        bash: bash.to_string(),
+                    },
+                    tools: vec![],
+                    fetch: vec![],
+                    timeout: std::time::Duration::from_secs(30),
+                    on_error,
+                },
+            )],
+        },
+        ..Default::default()
+    };
+    let config = Config {
+        data: harnx_core::config_data::ConfigData {
+            hooks: Some(Box::new(hooks)),
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    std::sync::Arc::new(crate::config::ConfigLock::new(config))
+}
+
+async fn dispatch_test_session_start(
+    origin: SessionOrigin,
+    bash: &str,
+    on_error: harnx_core::hooks::EventHookOnError,
+) -> (anyhow::Result<()>, Arc<tokio::sync::Mutex<Option<String>>>) {
+    let config = session_start_event_config(bash, on_error);
+    let pending = Arc::new(tokio::sync::Mutex::new(None));
+    let result = dispatch_session_start(
+        SessionStartDispatch {
+            origin,
+            session_id: "fresh-session",
+            cwd: PathBuf::from("/tmp/project"),
+            model: "test:test-model".to_string(),
+            pending_async_context: Some(pending.clone()),
+        },
+        &config,
+        &crate::utils::create_abort_signal(),
+        || async { panic!("hooks without tools must not build a tool context") },
+    )
+    .await;
+    (result, pending)
 }
 
 #[tokio::test]
 async fn created_session_dispatches_session_start_to_worker_hooks() {
-    let (provider, seen) = recording_session_start_provider();
-
-    dispatch_session_start(SessionStartDispatch {
-        abort: None,
-        origin: SessionOrigin::Created,
-        provider: Some(&provider),
-        session_id: "fresh-session",
-        cwd: PathBuf::from("/tmp/project"),
-        model: "test:test-model".to_string(),
-        pending_async_context: None,
-    })
+    let _guard = env_lock().await;
+    let (result, pending) = dispatch_test_session_start(
+        SessionOrigin::Created,
+        "add_context \"context from session start\"",
+        harnx_core::hooks::EventHookOnError::Allow,
+    )
     .await;
-
-    let seen = seen.lock().expect("recorder lock");
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].session_id, "fresh-session");
-    assert_eq!(seen[0].cwd, PathBuf::from("/tmp/project"));
-    let HookEvent::SessionStart { source, model } = &seen[0].hook_event else {
-        panic!("expected SessionStart, got {:?}", seen[0].hook_event);
-    };
-    assert_eq!(source, "startup");
-    assert_eq!(model, "test:test-model");
+    result.expect("session start hooks run");
+    assert_eq!(
+        pending.lock().await.as_deref(),
+        Some("context from session start")
+    );
 }
 
 #[tokio::test]
 async fn resumed_session_does_not_redispatch_session_start() {
-    let (provider, seen) = recording_session_start_provider();
-
-    dispatch_session_start(SessionStartDispatch {
-        abort: None,
-        origin: SessionOrigin::Resumed,
-        provider: Some(&provider),
-        session_id: "existing-session",
-        cwd: PathBuf::from("/tmp/project"),
-        model: "test:test-model".to_string(),
-        pending_async_context: None,
-    })
+    let _guard = env_lock().await;
+    let (result, pending) = dispatch_test_session_start(
+        SessionOrigin::Resumed,
+        "add_context \"must not run\"",
+        harnx_core::hooks::EventHookOnError::Allow,
+    )
     .await;
+    result.expect("dispatch succeeds");
+    assert!(pending.lock().await.is_none());
+}
 
-    assert!(seen.lock().expect("recorder lock").is_empty());
+/// A `deny` SessionStart hook failure must fail the activation instead of
+/// being swallowed: setup_agent_loop_context propagates this error.
+#[tokio::test]
+async fn session_start_hook_deny_failure_propagates() {
+    let _guard = env_lock().await;
+    let (result, _pending) = dispatch_test_session_start(
+        SessionOrigin::Created,
+        "exit 3",
+        harnx_core::hooks::EventHookOnError::Deny,
+    )
+    .await;
+    let error = result.expect_err("deny must fail session start");
+    assert!(error.to_string().contains("greet"), "{error:#}");
 }
 
 pub(super) fn user_entry(
@@ -186,7 +209,9 @@ fn tool_calls_entry(call_id: &str) -> SessionLogEntry {
 
 fn tool_results_entry(call_id: &str) -> SessionLogEntry {
     SessionLogEntry::ToolResults {
+        handoff_selection: None,
         results: vec![harnx_core::session::ToolOutput {
+            user_surfaces: Vec::new(),
             id: Some(call_id.to_string()),
             name: "search".to_string(),
             output: serde_json::json!({"ok": true}),
@@ -316,61 +341,66 @@ fn tool_call_without_results_remains_orphaned_after_queued_user() {
 }
 
 #[test]
-fn session_hook_resolution_excludes_instance_hooks() {
-    let config = Config {
-        data: harnx_core::config_data::ConfigData {
-            hooks: Some(harnx_core::hooks::HooksConfig {
-                max_resume: None,
-                entries: vec![harnx_core::hooks::HookConfig {
-                    command: "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 -- echo global".to_string(),
-                    status_message: None,
-                    async_hook: None,
-                    package_dir: None,
-                }],
-            }),
-            ..harnx_core::config_data::ConfigData::default()
-        },
-        ..Config::default()
-    };
-    let config = std::sync::Arc::new(crate::config::ConfigLock::new(config));
-
-    assert!(agent_resolved_hooks(&config).entries.is_empty());
+fn clear_abandons_all_orphan_batches_and_preserves_new_rounds() {
+    let mut entries = vec![
+        (1, tool_calls_entry("older-orphan")),
+        (2, tool_calls_entry("latest-orphan")),
+        (3, SessionLogEntry::Clear),
+    ];
+    assert!(find_orphan_tool_calls(&entries).is_empty());
+    entries.push((4, tool_calls_entry("fresh-call")));
+    let orphans = find_orphan_tool_calls(&entries);
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].seq, 4);
+    assert_eq!(orphans[0].calls[0].id.as_deref(), Some("fresh-call"));
 }
 
 #[test]
-fn session_hook_resolution_keeps_agent_override_of_global_hook() {
-    let global_hook = harnx_core::hooks::HookConfig {
-        command:
-            "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 -- echo global"
-                .to_string(),
-        status_message: None,
-        async_hook: None,
-        package_dir: None,
-    };
-    let agent_config = harnx_core::agent_config::AgentConfig::from_markdown(
-        "override-agent",
-        "---\nhooks:\n  entries:\n    - command: harnx-claude-compatible-hook-server --event SessionStart --timeout 30 -- echo agent\n---\nprompt",
-    )
-    .expect("agent config");
-    let config = Config {
-        data: harnx_core::config_data::ConfigData {
-            hooks: Some(harnx_core::hooks::HooksConfig {
-                max_resume: None,
-                entries: vec![global_hook],
-            }),
-            ..harnx_core::config_data::ConfigData::default()
-        },
-        agent: Some(crate::config::Agent::new(agent_config)),
-        ..Config::default()
-    };
-    let config = std::sync::Arc::new(crate::config::ConfigLock::new(config));
-
-    let hooks = agent_resolved_hooks(&config);
-    assert_eq!(hooks.entries.len(), 1);
-    assert_eq!(
-        hooks.entries[0].command,
-        "harnx-claude-compatible-hook-server --event SessionStart --timeout 30 -- echo agent"
-    );
+fn clear_discards_old_consent_even_when_tool_call_id_is_reused() {
+    let mut entries = vec![
+        (1, tool_calls_entry("reused-call")),
+        (
+            2,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "reused-call".into(),
+                summary: "Old consent".into(),
+                fence_token: 7,
+            },
+        ),
+        (
+            3,
+            SessionLogEntry::HitlApprovalDecision {
+                tool_call_id: "reused-call".into(),
+                approved: true,
+                note: None,
+                fence_token: 7,
+            },
+        ),
+        (4, SessionLogEntry::Clear),
+    ];
+    assert!(derive_pending_hitl_approvals(&entries).unwrap().is_empty());
+    assert!(derive_hitl_tool_round_continuation(&entries)
+        .unwrap()
+        .is_none());
+    entries.extend([
+        (5, tool_calls_entry("reused-call")),
+        (
+            6,
+            SessionLogEntry::HitlApprovalRequested {
+                tool_call_id: "reused-call".into(),
+                summary: "Fresh consent".into(),
+                fence_token: 8,
+            },
+        ),
+    ]);
+    let pending = derive_pending_hitl_approvals(&entries).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].request_seq, 6);
+    let continuation = derive_hitl_tool_round_continuation(&entries)
+        .unwrap()
+        .unwrap();
+    assert_eq!(continuation.round.seq, 5);
+    assert!(continuation.decisions.is_empty());
 }
 
 /// Issue #2493: runtime notes — replay-synthesized context re-logged by
@@ -399,6 +429,15 @@ fn executable_user_message_id_skips_runtime_notes_only() {
         executable_user_message_id(&user_row(
             Some(&note_id),
             &format!("{RUNTIME_NOTE_PREFIX}Started sub-agent 'child'.")
+        )),
+        None
+    );
+    // Hook-added context rows (issue #2198, review F2) are runtime-authored
+    // context, not prompts: the mid-turn fold must never select them.
+    assert_eq!(
+        executable_user_message_id(&user_row(
+            Some(&harnx_core::runtime_note::new_hook_context_message_id()),
+            "context added by an event hook"
         )),
         None
     );

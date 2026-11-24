@@ -1,223 +1,447 @@
 # Tool Confirmation Guide
 
-Tool confirmation pauses a tool call so you can inspect its full arguments, approve it, or return a blocked result to the agent.
+Use middleware `confirm` to pause a tool call for an approve/deny decision. It runs
+inside the worker, including unmanaged/cloud workers; no hook-server process is
+needed. The script decides what approval runs and what denial returns to the model.
+Legacy `PreToolUse` configurations fail configuration loading with migration guidance; only saved pending approvals from existing sessions remain answerable.
 
-## 1. Quick Start
+## Quick start
 
-The fastest way to enable manual confirmation for all tools is to add an
-embedded jaq hook to your `config.yaml`:
-
-```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --jaq
-        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
-```
-
-With this configuration, Harnx will pause and prompt you for every tool call.
-The expression uses jq syntax but is evaluated by Harnx's embedded jaq engine,
-so no `jq` or `jaq` executable is required.
-
-## 2. How It Works
-
-Harnx uses the hooks system for tool confirmation. When a `PreToolUse` hook returns `{"permissionDecision": "ask"}`, this sequence runs:
-
-1. The model requests a tool such as `bash_exec`.
-2. The worker runs matching `PreToolUse` hooks.
-3. With a live confirmation route, the worker sends a request over NATS to the attached frontend. The TUI shows the tool name, full arguments, hook reason, and optional message area.
-4. Without a confirmation route, the worker persists a durable HITL approval request and suspends the invocation. A2A uses this path; the tool isn't automatically denied.
-5. Approving runs the tool. Rejecting returns a synthetic blocked tool result so the agent can continue.
-
-Durable approvals can be decided through the runtime API or web UI. A2A exposes the same pending request as an `INPUT_REQUIRED` task challenge. The old test-only local confirmation bridge has been removed.
-
-## 3. Configuration Methods
-
-You can configure confirmation hooks globally in `config.yaml` or per-agent in front-matter.
-
-### Method A: Selective Confirmation (Matcher)
-
-Use the `--matcher` flag to require confirmation only for specific tools:
+Add middleware globally in `config.yaml`, in agent Markdown front matter, or in
+a tool-server YAML file. This is the confirmation from the shipped demo agent:
 
 ```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --matcher '^(bash_exec|bash_spawn)$'
-        --jaq
-        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Shell command requires approval"}}'
+middleware:
+  - name: confirm-time
+    match: '^time_get_current_time$'
+    bash: |
+      if confirm --id time 'Manual approval required'; then
+        next --id dispatch
+      else
+        deny 'Time lookup denied by the user.'
+      fi
 ```
 
-*The matcher uses a regex against the tool name.*
+`match` is a regex against the tool name. Use anchors for an exact tool, or `.*`
+to match every call. The default `on_error: deny` fails closed on script errors.
+A denial here is an error result with the script's text, not a script failure.
+Use an `if` branch: a bare Bash `confirm` that returns false follows `set -e`.
 
-### Method B: Per-Agent Hooks
-Enable confirmation only for specific agents by adding the hook to their Markdown front-matter:
+The same list works in an agent's front matter alongside `model` and `use_tools`.
+Global, tool-server/package and agent entries compose in that order. See the
+[Middleware Guide](middleware-guide.md) for ordering, overrides, Python, helper
+tool allowlists and timeouts.
+
+### Confirm an Atlas handoff
+
+Handoffs are tool calls too. Pantheon's Daedalus agent ships this exact policy:
 
 ```yaml
----
-model: openai:gpt-4o
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --jaq
-        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
----
-
-You are a helpful assistant with manual tool oversight.
+middleware:
+- name: confirm-atlas-handoff
+  match: '^atlas_session_handoff$'
+  bash: |
+    if confirm --id handoff 'Hand off this plan to Atlas for execution?'; then
+      next --id dispatch
+    else
+      deny 'Atlas handoff denied by the user.'
+    fi
 ```
 
-## 4. Use the TUI Confirmation Modal
+Approval reaches handoff dispatch; denial returns `Atlas handoff denied by the
+user.` as an error result without starting Atlas. Handoff activation waits until
+all calls in the round finish, including siblings still awaiting input.
 
-The modal shows full tool arguments as multiline YAML. If the tool declares a transcript call template, the modal shows that rendered template first; press `Ctrl+F` to switch between the template and raw YAML.
+## What suspends and resumes
 
-The modal grows to the available screen height. Use `PageUp`, `PageDown`, or the mouse wheel to scroll the tool-call body. The header, reason, optional message area, and key help remain visible.
+1. The model requests a tool. Tool preparation and argument validation run
+   before middleware.
+2. With no accepted answer, `confirm` stops the interpreter and requests a modal
+   interaction tagged `harnx.kind: confirm`. Printing JSON cannot forge it.
+3. The worker persists the private checkpoint and request, settles or durably
+   classifies all in-flight siblings, then writes `SuspensionReady`. Frontends
+   don't show requests before that manifest exists.
+4. The frontend submits the interaction ID, exact request sequence and response.
+   The owning worker durably accepts it before resuming. Identical retries are
+   idempotent; conflicting, stale and mismatched replies are rejected.
+5. Only the answered call reruns, from the beginning of its middleware chain.
+   Completed siblings are restored, not dispatched again. Unanswered calls wait.
+   One final `ToolResults` entry combines all results in original order before the
+   model continues.
 
-The message area is focused while the modal is open:
+Suspension survives frontend reconnects and worker moves. Only one request is
+shown at a time, in the latest manifest's order. An unknown interaction kind
+shows **not supported by this client** and permits denial only.
 
-- Type an optional message for the agent.
-- Press `Shift+Enter` or `Alt+Enter` to insert a newline.
-- Press `Enter` to approve after the keyboard has been idle for two seconds. An early `Enter` is ignored and does not restart the idle timer.
-- Press `Ctrl+D` to reject the tool. The agent continues with a blocked tool result.
-- Press `Ctrl+C` to reject and interrupt the session. Text from the message area returns to the main input as a draft and is not queued.
-- Press `Ctrl+F` to switch between template and raw YAML when a template is available.
+The script timeout includes time spent in `next`, but not human response time:
+the interpreter isn't running while suspended. The invocation's execution deadline
+keeps counting. Approval doesn't reset or extend it, and a late response can't
+revive a cancelled or completed round.
 
-On approval or `Ctrl+D`, a non-empty optional message is durably queued to the originating session before the TUI sends the confirmation reply. The agent receives the real or blocked tool result first, then the queued user message. An empty message sends only the approval or rejection.
+### Answers, step keys and saved results
 
-TUI confirmation prompts have no time limit. Cancelling the turn, closing the route, or detaching the TUI ends the wait. If message enqueue fails, the modal stays open with the draft intact so you can retry.
+`confirm --id handoff ...` returns success for approval and failure for denial
+(Python `confirm(..., id='handoff')` returns `True`/`False`). `answer handoff`
+(Python `answer('handoff')`) reads the accepted response as
+`{interaction_id, action, data, note?}`, or exits 1 / returns `None` if absent.
+Answers come only from runtime-accepted user responses, never tool arguments or
+saved values. Notes aren't automatically added as user messages; a script can
+read them through `answer` and decide what to return.
 
-Without a live confirmation route, the worker defers to durable HITL instead of denying the tool. This differs from a live route closing during a TUI wait. A rejected tool call produces a result such as `{"error": "Denied by user", "blocked_by_hook": true}`.
+Use explicit `--id` / Python `id=` keys when reruns can skip or reorder `next`
+calls or confirmations. Unlabelled operations use separate 1-based ordinals in
+each frame; loop iterations need distinct keys. Keys identify logical steps, not
+cached executions: **every `next` is fresh**, including after approval.
 
-## A2A approval replies
+For a post-tool question such as "Keep this result?", use `save`/`saved` to avoid
+running the tool again on resume. Save the result envelope before requesting input
+and restore it on the next attempt; this keeps its host-owned `ref` and media.
+The [tested Bash and Python save/restore example](middleware-guide.md#keep-a-downstream-result-without-running-the-tool-twice)
+shows the complete pattern and a denial that says the command already ran.
+Stash is bounded to 256 KiB per frame and the checkpoint to 8 MiB per call.
 
-A2A parks the existing task at `TASK_STATE_INPUT_REQUIRED` with a plain-text
-challenge. Blocking sends return there, and streams close after the challenge.
-Reply on the same task using `taskId` and `contextId`, or `contextId` alone.
-Clients must preserve the returned `contextId` to continue the conversation.
-Each additional approval pauses that same task again, including multiple tools
-from one model round.
+## Answer in each frontend
 
-Use a text part whose first word is one of:
+### Serve and web
 
-- Approve: `y`, `yes`, `go`, `approve`.
-- Reject: `n`, `no`, `reject`, `deny`.
+The web pending card shows the middleware message, Approve/Deny and an optional
+note. It hydrates after reconnect. It submits JSON-RPC
+`session/interaction_response` to the owning agent/session URL with params
+`{interaction_id, request_seq, response: {action: 'approve' | 'deny', data: {}, note?}}`.
+Use the mandatory ID and positive sequence from the displayed request, not a tool
+call ID alone. The response is `{applied: true, outcome: 'applied' | 'already_applied'}`.
 
-Matching is case-insensitive, and trailing `.`, `!`, or `,` on the first word is
-accepted. `Y!` approves; `no.` rejects; `yes please proceed` approves with an
-audit-only note; `n use a read-only command` rejects with a reason shown to the
-model in the blocked-tool result. Unlike the TUI's queued-message behavior,
-approval notes on the durable A2A path don't become model messages.
+AG-UI CUSTOM `pending_interaction` carries
+`{interaction_id, request_seq, tool_call_id, kind, message, pending_count}`;
+`pending_count` counts further queued requests. A null value clears it. Session
+state uses `awaiting_approval` with interrupt type `interaction`. Rejections are
+visible on the card; RPC error `-32004` has message `interaction response rejected`
+and an outcome such as `stale`, `wrong_sequence` or `conflicting`. Refresh rather
+than retargeting a rejected answer to a newer request. Existing session access
+checks apply. See [serve interaction protocol](../crates/harnx-serve/README.md#middleware-confirm-interactions).
 
-Unrecognized text, data parts, or mixed text/data messages restate the challenge
-without appending agent context or calling the model. There is no rich approval
-UI or structured JSON reply format. Reuse the reply's `messageId` on retries;
-use a new ID for a new answer. Duplicate and conflicting in-flight replies can't
-answer a later challenge.
+### TUI
 
-Parked tasks survive replica/fleet restarts and accept replies on any replica.
-The reconciler discovers decisions made directly through the runtime/web path.
-`CancelTask` stops a parked task. Following Web/TUI precedent, there is no
-approval-specific timeout. The existing frozen invocation execution deadline
-(`run_limits.timeout_secs`, 24 hours by default from admission) keeps counting
-while parked `INPUT_REQUIRED` and is not paused, reset, or extended by approval.
-On expiry, the runtime cancels the invocation (transitioning the task to
-`TASK_STATE_CANCELED`, not a rejection), and late replies cannot revive it.
-The approval window is whatever remains of the original invocation budget.
-Upgrade all A2A replicas together, since old replicas can fail parked tasks.
-Upgrade runtime workers before enabling exact-reference approval decisions so
-request fencing is enforced.
+Middleware requests use the **Middleware confirmation** tray during a local turn
+or when attaching to a NATS session. It opens only after durable suspension is
+ready and shows one request at a time.
 
-See [Interactive tool approval](../crates/harnx-a2a-server/README.md#interactive-tool-approval)
-for the wire message example and deployment details.
+- Type or paste an optional note. `Shift+Enter` or `Alt+Enter` adds a newline.
+- Press `Enter` to approve after two seconds without typing, or `Ctrl+D` to deny.
+- Use `PageUp`/`PageDown` to scroll a long message.
+- Press `Ctrl+C` to interrupt through the normal session cancellation tray.
 
-## 5. Advanced: Conditional Confirmation
+The note is stored in `InteractionResponse.note`, not queued as a separate user
+message. Rejected answers appear in the tray or transcript. A request answered
+elsewhere disappears on durable refresh. Closing the frontend doesn't itself
+approve or deny the durable request; reconnect to answer remaining work.
 
-Embedded jaq hooks receive the full event payload. This hook asks only when a
-shell command contains a potentially destructive command name:
+For direct child sessions awaiting approval, press lowercase `a` on the
+selected root child row, root detail pane, or opened child header displaying
+`⏸ Awaiting input: <message>  a/answer` to answer directly without navigating away.
 
-```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --matcher '^(bash_exec|bash_spawn)$'
-        --jaq
-        'if ((.tool_input.command // "") | test("\\b(rm|mv|cp|chmod|chown|dd|mkfs)\\b"))
-         then {"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Command uses a potentially destructive operation"}}
-         else {} end'
+### A2A
+
+A2A parks the **existing task** at `TASK_STATE_INPUT_REQUIRED` with a text challenge
+showing the middleware message. Blocking sends return there and streams close;
+the task isn't terminal. Reply with `SendMessage` or `SendStreamingMessage`,
+preserving `contextId` and normally `taskId`. Context-only replies answer that
+context's current challenge; task-only replies also work. Mismatched IDs fail.
+
+The first whitespace-delimited word selects the decision, case-insensitively:
+
+| Decision | First words | Example |
+| --- | --- | --- |
+| Approve | `y`, `yes`, `go`, `approve` | `yes audit note` |
+| Deny | `n`, `no`, `reject`, `deny` | `no deny note` |
+
+Trailing `.`, `!` and `,` on the first word are accepted. Remaining text becomes
+the interaction's optional note. For middleware, approval and denial notes stay
+in the response; the script controls whether they're returned to the model.
+(Legacy hook denial notes are included in the synthetic blocked-tool result.)
+Only text parts count as decisions. Unrecognized words, data parts and mixed
+text/data messages restate the challenge without calling the model or answering.
+There is no structured JSON answer format.
+
+Keep the reply's `messageId` on retries. Its receipt is bound to the exact
+challenge, so a duplicate can't answer a later request. Use a new ID for a new
+answer. Replies can reach any replica and resume the same invocation; decisions
+made from web/TUI are also discovered. `CancelTask` works while parked.
+See [A2A interactive approval](../crates/harnx-a2a-server/README.md#interactive-tool-approval)
+for wire examples and server-version deployment constraints.
+
+### ACP
+
+ACP maps confirm to `session/request_permission` with **AllowOnce** and
+**RejectOnce** options. Explicit dialog cancellation denies; a transport
+disconnect leaves the request pending for reconnect/resume. An unsupported kind
+offers only rejection. ACP's permission outcome has **no free-form note field**,
+so ACP responses store no note. Session cancellation prevents a late AllowOnce
+from reviving the turn. See [ACP permissions](../crates/harnx-acp-server/README.md).
+
+### CLI
+
+In non-interactive command-line mode (`harnx prompt`), sub-agent progress displays
+pending interactions for visibility but does not support interactive answering
+([#1865](https://github.com/dobesv/harnx/issues/1865)):
+
+- A nonterminal `SubAgentProgress` carrying `pending_interaction` formats with
+  status `awaiting` and the bounded message (up to 512 UTF-8 bytes):
+  `[sub-agent] awaiting agent=<agent> session=<id> elapsed=... in=... out=... cached=... tools=... message=<msg>`
+- Terminal events (`done`, `failed`, `cancelled`) are never rendered as awaiting,
+  even if a pending interaction was previously displayed.
+- CLI is strictly display-only: it provides no input prompt or command to answer
+  child session approvals. Answer pending requests through the Web UI, TUI, or by
+  submitting an exact decision to the child session's JSON-RPC endpoint.
+
+## URL interactions (`harnx.kind: url`)
+
+Tools that need the user to complete something out of band — starting with
+credential-connect flows such as `jira_connect` — challenge with kind `url`
+instead of `confirm` or `a2ui` (A2UI has no link component). The challenge
+payload is:
+
+```json
+{
+  "url": "https://example.com/connect/abc",
+  "message": "Connect Jira",
+  "summary": "Connect Jira",
+  "request_state": { "challenge_id": "abc" }
+}
 ```
 
-The expression must return an object in the normal hook response shape. Return
-`{}` when no action is needed. Use an external command hook when the policy
-needs I/O or logic that is not practical in jaq.
+Only `https:` and loopback `http:` URLs are valid. Anything else fails
+validation, and the challenge degrades to a recoverable tool error instead of
+suspending the call — a tool can never get a plain-`http` link in front of a
+user. Allowed response actions are `continue` and `cancel`; the stored
+response carries nothing beyond the action (the session stream is cleartext,
+so `data` is rejected for this kind, exactly like the `confirm` shape).
 
-### Confirming an Agent Handoff
+Rendering by frontend:
 
-Agent handoffs are tool calls, so an exact matcher can make a handoff require
-approval without affecting other tools. For example, this requires confirmation
-before Daedalus hands a session to Atlas:
+- **Web** shows the message, a link opening in a new tab
+  (`target="_blank"`, `rel="noopener noreferrer"`), and Continue/Cancel
+  buttons.
+- **TUI** shows the message and the URL as an OSC 8 hyperlink where the
+  terminal supports it, with the plain-text URL as the always-present
+  fallback. `Enter` continues (same two-second idle gate as approvals) and
+  `Ctrl+D` cancels. URL modals have no note field: the response is the
+  action alone.
+- **CLI** (`harnx interact list`) prints the URL and how to answer:
 
-```yaml
-hooks:
-  entries:
-    - command: >-
-        harnx-claude-compatible-hook-server
-        --event PreToolUse
-        --matcher '^atlas_session_handoff$'
-        --jaq
-        '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Hand off this plan to Atlas for execution?"}}'
+  ```
+  Pending interaction <id> (kind url, request sequence 3)
+  Connect Jira
+
+  https://example.com/connect/abc
+
+  Open the link to proceed, then answer `continue`. Answer `cancel` to abort.
+  ```
+
+  Answer with `harnx interact answer <agent> <session> --id <id>
+  --action continue` (or `cancel`).
+
+- **Operator calls** normally reject interactions ("interactions are not
+  supported here"), with one narrow exception: an operator call that
+  challenges with `url` succeeds with `{url, message, request_state}` in its
+  result, so `harnx credentials connect` can print the link and re-call with
+  the returned `request_state`. `confirm` and `a2ui` from operator calls
+  still fail exactly as before.
+
+
+## Direct child sub-agent confirmations
+
+When a sub-agent pauses awaiting human approval (either legacy hook approvals or
+middleware confirmations), direct child pending interactions are surfaced to
+parent frontends.
+
+### Web row and TUI interaction
+
+- **Web UI**: Parent session sub-agent rows display pending interactions for
+  direct child sessions. Users can approve or deny legacy hook approvals and
+  middleware confirmations directly from the parent row without navigating away.
+- **TUI**: Press lowercase `a` (`a/answer`) to answer a pending interaction
+  for a direct child. Active when focused on a selected root child row, viewing
+  passive root detail, or from the first opened child's header. Displays the
+  marker `⏸ Awaiting input: <message>  a/answer`. For legacy `ask` or
+  confirmation, users can approve, deny, or enter notes. An unsupported kind
+  directs the user to open the child session; no answers are accepted from the
+  parent view.
+- **CLI**: Display-only ([#1865](https://github.com/dobesv/harnx/issues/1865)).
+  CLI nonterminal progress reports `awaiting` with the bounded message; no
+  interactive answering is supported from CLI mode.
+
+The TUI uses one confirmation modal at a time. A child confirmation waits behind
+any foreground modal, then rechecks that the displayed request is still pending.
+Parent-row notes are audit notes on the child's decision, not user messages queued
+in the parent's composer. `Ctrl+C` in a child modal interrupts the child, never the
+parent turn. The normal foreground legacy modal keeps its existing queued-message
+behavior.
+
+### Exact-generation semantics and ApprovalRef
+
+Provider tool-call IDs alone are not globally unique across turns or retries.
+To prevent answering a superseded or subsequent request that reuses the same
+tool-call ID, legacy approvals use exact-generation semantics.
+
+The parent row sends the complete `ApprovalRef`:
+- `invocation_id`: Child invocation ID.
+- `tool_round_seq`: Tool round sequence number.
+- `request_seq`: Durable approval request sequence number.
+- `tool_call_id`: Tool call ID.
+
+Post this displayed reference to the **child's** session URL using
+`session/hitl_decision_exact`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "session/hitl_decision_exact",
+  "params": {
+    "request": {
+      "invocation_id": "...",
+      "tool_round_seq": 10,
+      "request_seq": 11,
+      "tool_call_id": "..."
+    },
+    "approved": true,
+    "note": "Reviewed the request"
+  }
+}
 ```
 
-The bundled Pantheon `daedalus` agent includes this hook by default.
+Normal agent and session access checks run against the child before any decision.
+For middleware `confirm` summaries, submit `session/interaction_response` to the
+child URL with the displayed `interaction_id` and `request_seq`.
 
-### Permission Decision Values
-Hooks can return these values in `hookSpecificOutput`:
-*   `"allow"`: Tool proceeds without prompting.
-*   `"deny"`: Tool is blocked immediately (agent gets error).
-*   `"ask"`: User is prompted to approve or deny.
-*   (Empty `{}`): Tool proceeds normally (default).
+### Exact RPC outcome mapping
 
-**Important Notes:**
-*   **Exit Code Shorthand**: A hook script can exit with code `2` to immediately deny a tool call (equivalent to `permissionDecision: "deny"`).
-*   **Timeouts**: The hook execution timeout defaults to 30 seconds.
-*   **Payload**: Jaq expressions receive the payload as input. External hook commands receive the same JSON object on `stdin`.
-*   **Chain of Command**: If multiple hooks are configured for the same event, any hook returning `"ask"` or `"deny"` will take precedence.
+`session/hitl_decision_exact` returns `{applied: bool, outcome: string}` with
+strict outcome semantics:
 
-## 6. Direct Operator Invocation & Scoped Consent
+| Outcome | `applied` | Meaning and UI behavior |
+| --- | --- | --- |
+| `applied` | `true` | Decision was accepted and applied to the exact generation. Clear the row's pending state. |
+| `already_applied` | `true` | Idempotent retry. If recorded `approved` matches the submitted decision, treat as success; if conflicting, show that it was answered differently elsewhere. Includes recorded `note`. |
+| `conflicting` | `false` | A different decision was already accepted for this request; show the recorded answer. Includes recorded `approved`. |
+| `stale` | `false` | The request is no longer pending (e.g. turn completed, timed out, or replaced by a new round). Newer requests that reuse the same tool-call ID remain untouched. |
 
-When an operator executes a tool or BashKit script directly through the CLI (`harnx call tool`, `harnx call bash`) or TUI (`.call tool`, `.call bash`), execution runs under explicit operator consent:
+A missing or unrecognized outcome (such as a bare `{applied: true}` without an
+`outcome` field) is treated as an error.
 
-- **Root Auto-Approval on `ask`**: Because the human operator directly initiated the call, any `PreToolUse` hook returning `"permissionDecision": "ask"` is automatically approved for the root tool call ID. No interactive confirmation modal is displayed for the root call.
-- **Operator Bash Inner Call Auto-Approval**: In `harnx call bash` and `.call bash`, inner tool calls made by the operator's script that return `ask` are also automatically approved.
-- **Contrast with Agent Script Mode**: When an LLM agent runs `bash` in script mode, inner tool calls requiring interactive approval fail closed immediately with exit code 3 (`needs approval: <tool>; call it directly instead of from bash`). Operator scripts run with operator consent and do not fail closed on `ask`.
-- **Hook `deny` Enforced**: A hook returning `"permissionDecision": "deny"` (or exiting with code 2) blocks the tool on all paths. For an inner call in an operator BashKit script, that blocked command exits with status 4 and writes the reason to stderr (with empty stdout), rather than returning a JSON object to the script. (Direct `harnx call tool` denials return a blocked result object `{"error": "<reason>", "blocked_by_hook": true}` and exit 1.) BashKit scripts start with `set -e`, so an unhandled denial makes the outer `harnx call bash` fail (CLI exit status 1). A script that runs `set +e` can handle the status and finish successfully; then the outer CLI exits 0. A direct `harnx call tool` denial exits 1.
-- **Excluded Control Tools**: Control tools (`bash`, `switch_agent`, `ask_user`, and `*_session_handoff`) are excluded from inner script catalogs and cannot be invoked from inside a script.
-- **Argument Mutations and Validation**: Any argument changes returned by hooks via `mutatedToolInput` are applied before execution. Tool parameter schemas are validated normally.
-- **Nested Approval Isolation**: Operator consent applies strictly to the operator's direct invocation and its immediate inner script tool calls:
-  - If an invoked tool spawns a child agent session or triggers nested delegations, those child sessions retain their normal confirmation policies and do not inherit operator auto-approval.
-  - In an interactive TUI session, nested tool calls requiring confirmation present the standard confirmation modal.
-  - In non-interactive CLI executions, nested approval requests safely defer or decline rather than executing unconfirmed.
+### Older servers: NO fallback to legacy method
 
-## 7. Demo
+If `session/hitl_decision_exact` returns JSON-RPC method not found (error `-32601`
+or unknown method) because the server is running an older binary without
+exact-generation support, frontends **MUST NOT** fall back to
+`session/hitl_decision`.
 
+Legacy `session/hitl_decision` resolves by `tool_call_id` against whatever
+request is active on the child session, introducing a race condition where a
+parent answer could approve an unintended newer request. Instead, the UI directs
+the user to open and inspect the child session directly.
 
-To see tool confirmation in action, render the demo recording:
+### No grandchild propagation
 
-<img width="1100" height="600" alt="Image" src="https://github.com/user-attachments/assets/5dff2e3d-f798-485f-a0df-8f17455ddc72" />
+Pending interaction summaries are strictly limited to direct children (`depth = 1`).
+If a child agent delegates to a grandchild agent, that grandchild's pending
+interaction is owned and observed by the child session; it is **never**
+propagated up to the parent or grandparent session. Neither frontends nor
+progress reporters perform recursive descendant traversal.
 
-```sh
-./demos/render.sh tool-confirm
-# → demos/out/tool-confirm.gif
-```
+### Parent stays running
 
-The demo shows two tool calls: the first is approved, the second is denied.
+The child owns the request. When a child suspends waiting for user input, the
+parent session does **not** suspend or pause. The parent stays running, retains
+its own worker lease, and continues its turn or observation loop. Frontends send
+answers directly to the child session; the parent agent doesn't answer for you.
 
-## 8. Related
-*   [Hooks Guide](hooks-guide.md) — Detailed reference for the hook system.
-*   [Configuration Guide](configuration-guide.md) — How to manage global and agent-level settings.
+### Synchronous delegation and summary freshness
+
+Synchronous `{agent}_session_prompt` returns a non-error blocked handle
+(`status: "blocked", terminal: false`, containing `pending_interaction`) when a
+child requires human input, allowing callers to inspect the pending request and
+later resume observation with `{agent}_session_wait` after the user answers.
+
+Child pending summaries are re-derived from the child's durable log on live
+progress updates and during durable catch-up. Reconnects and refreshes hydrate
+authoritative state. Changes publish on the next durable poll without waiting for
+a heartbeat interval. A successful parent-row answer clears only that displayed
+request generation; a newer pending request is left untouched.
+
+## Inner scripts and operator consent
+
+Middleware wraps model calls, inner calls from the model's Bash tool and operator
+calls. An inner-script call reaching `confirm` returns
+`interaction required, can't be answered inside a script`, even under
+`on_error: allow`. It doesn't suspend: replaying the whole model script could
+repeat earlier effects. Ask the model to call the protected tool directly.
+
+Operator **root** calls (`harnx call tool`, TUI `.call tool`) auto-approve confirm
+under explicit operator consent. Denial and argument/result rewriting still apply.
+Other interaction kinds fail without an operator UI. Inner calls from operator
+Bash scripts can't suspend either. Middleware's own `tools:` helpers bypass
+the chain to prevent recursion, while retaining admission and cancellation checks.
+Operator consent doesn't grant approval to child agent sessions. Control tools
+such as `*_session_handoff` aren't available inside model scripts.
+
+## Recovery and deployment safety
+
+An **interrupted** or **outcome unknown** result means effects may already have
+happened. If a worker crashes after a physical dispatch starts but before the
+middleware reaches its next durable boundary, recovery doesn't rerun that
+unfinished attempt. A saved leaf reply isn't a final middleware result; even a
+crash after the reply but before `save` must not redispatch it. Check external
+state before manually retrying. Completed outer results and siblings are reused.
+`save`/`saved` isn't an exactly-once transaction with external tools.
+
+Deploy **readers before writers**: every worker, serve, A2A, ACP and TUI reader
+must contain the T2.1 record readers/guards before enabling a T2.2 durable worker.
+**Rollback below T2.1 is unsupported once any T2.2 worker has run.** A T2.1 worker
+can read but parks T2.2-owned rounds and pending marked handoffs until a newer
+worker resumes them. Keep `harnx_interaction_checkpoints` reachable from every
+resuming worker. Store read errors block whole-round recovery instead of allowing
+redispatch; missing referenced checkpoints produce interrupted/unknown errors.
+
+**Drain in-flight turns when upgrading a middleware-running Phase 1 or T2.1
+worker to T2.2**, before changing its middleware. Those older workers left no
+round-start/attempt evidence, so removing or renaming middleware could hide prior
+effects. Rounds started by T2.2 carry the marker and don't require that drain for
+mixed T2.1/T2.2 ownership. See [rollout and crash details](middleware-guide.md#cluster-rollout-and-rollback)
+for limits, retention and recovery classification.
+
+## Legacy hook approvals
+
+Process-based hooks no longer run, and legacy `hooks:` command entries fail
+configuration loading. Pending approvals already recorded in old sessions still
+use the legacy HITL path. Their readers and decision APIs remain supported;
+approval resumes the saved call and denial produces a blocked result without
+running it. New policies use middleware. Don't rewrite old session records as
+interaction records. The legacy serve method `session/hitl_decision` is unchanged
+and must not receive middleware responses.
+
+The legacy TUI modal shows full arguments as multiline YAML and, when available,
+a rendered transcript template (`Ctrl+F` toggles). `PageUp`, `PageDown` and the
+mouse wheel scroll. `Enter` approves after two seconds idle; `Ctrl+D` rejects;
+`Ctrl+C` rejects and interrupts, restoring text as a draft. Unlike middleware
+notes, a nonempty legacy note is durably queued as a user message before the
+confirmation reply. If enqueue fails, the modal keeps the draft for retry.
+Saved legacy denials remain blocked during recovery.
+See the [Hooks Guide](hooks-guide.md) for compatibility details.
+
+## Demo and verification
+
+The shipped `demos/config/agents/tool-confirm-agent.md` is tested for both
+approval and denial. The tape approves a time lookup with `Enter`, then denies
+another with `Ctrl+D`. Render it with `./demos/render.sh tool-confirm` (output:
+`demos/out/tool-confirm.gif`).
+
+Configuration examples above are read from this guide and compared with the
+shipped agents by integration tests; both approval and denial execute the real
+middleware script. Daedalus's shipped confirmation also runs through the TUI and
+A2A worker harnesses. The middleware guide's examples run verbatim in the runtime
+test suite.
+
+Related: [Agent Guide](agent-guide.md), [Middleware Guide](middleware-guide.md),
+[Configuration Guide](configuration-guide.md).

@@ -21,15 +21,18 @@ struct Cli {
     /// Listen address (default from config.yaml or 127.0.0.1:8000)
     #[clap(short = 'a', long, value_name = "ADDRESS")]
     addr: Option<String>,
-    /// Identity source (header:NAME, cookie:NAME, or NAME); repeat in priority order.
+    /// Identity source (header:NAME, header-csv:NAME, cookie:NAME, or NAME).
+    /// Repeat in priority order. header/NAME is opaque; header-csv selects first item.
     /// Replaces serve_user_id_sources from config when supplied.
     #[clap(long = "user-id-source", value_name = "SOURCE", action = clap::ArgAction::Append)]
     user_id_sources: Vec<String>,
-    /// Trusted raw group header name; repeat to collect values from every header.
+    /// Trusted group header spec: header:NAME (or NAME) is opaque;
+    /// header-csv:NAME parses quoted comma lists. Repeat to collect all items.
     /// Replaces serve_group_headers from config/environment when supplied.
     #[clap(long = "group-header", value_name = "NAME", action = clap::ArgAction::Append)]
     group_headers: Vec<String>,
-    /// Trusted raw role header name; repeat to collect values from every header.
+    /// Trusted role header spec: header:NAME (or NAME) is opaque;
+    /// header-csv:NAME parses quoted comma lists. Repeat to collect all items.
     /// Replaces serve_role_headers from config/environment when supplied.
     #[clap(long = "role-header", value_name = "NAME", action = clap::ArgAction::Append)]
     role_headers: Vec<String>,

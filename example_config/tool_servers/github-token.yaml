@@ -1,0 +1,20 @@
+# GitHub through its remote MCP, connected with each user's own GitHub
+# personal access token. GitHub rejects dynamic client registration, so the
+# connect page offers a token form only; the pasted PAT goes straight to the
+# tool server over HTTPS and is sent upstream as `Authorization: Bearer`.
+# For an OAuth app instead of PATs, use `--auth-methods oauth` with
+# `--oauth-client-id` and `--oauth-client-secret-file`.
+# See docs/tool-credentials.md.
+command: harnx-mcp-remote
+enabled: false
+description: >-
+  GitHub, connected with each user's own personal access token.
+args:
+  - --url
+  - https://api.githubcopilot.com/mcp/
+  - --name
+  - github
+  - --credentials-key-file
+  - /etc/harnx/github-credentials-key.json
+  - --auth-methods
+  - token

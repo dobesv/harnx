@@ -1,6 +1,7 @@
 //! Config loading/initialization extracted from config/mod.rs for code health.
 use super::*;
 use crate::config::patches_split::load_package_patch;
+use crate::config::script_tools::ScriptToolCatalogBuilder;
 use harnx_core::agent_config::AgentConfig;
 
 fn normalize_description(description: Option<String>) -> Option<String> {
@@ -73,6 +74,8 @@ impl Config {
         if !info_flag {
             ret?;
         }
+        config.resolved_middleware()?;
+        config.resolved_event_hooks()?;
         Ok(config)
     }
 
@@ -92,40 +95,96 @@ impl Config {
             data,
             ..Self::default()
         };
+        middleware::bind_middleware(
+            &mut config.middleware,
+            middleware::file_origin(config_path, None)?,
+        )?;
+        if let Some(hooks) = &mut config.data.hooks {
+            event_hooks::bind_event_hooks(hooks, middleware::file_origin(config_path, None)?)?;
+        }
         let config_dir = config_path.parent().unwrap_or(config_path);
         config.clients = Self::load_clients_from_dir(&config_dir.join(paths::CLIENTS_DIR_NAME))?;
         config.nats_servers =
             Self::load_nats_servers_from_dir(&config_dir.join(paths::NATS_SERVERS_DIR_NAME))?;
         config.tool_servers =
             Self::load_tool_servers_from_dir(&config_dir.join(paths::TOOL_SERVERS_DIR_NAME))?;
+        let script_tools = ScriptToolCatalogBuilder::new(&config.data.script_tools, config_path)?;
         let packages_dir = paths::packages_dir();
         if packages_dir.is_dir() {
             Self::load_packages(&mut config, &packages_dir)?;
         }
+        config.script_tool_catalog = Self::finish_script_tool_catalog(script_tools)?;
 
+        config.resolved_middleware()?;
+        config.resolved_event_hooks()?;
         Ok(config)
     }
 
     fn load_packages(config: &mut Config, packages_dir: &Path) -> Result<()> {
-        let Ok(entries) = std::fs::read_dir(packages_dir) else {
-            return Ok(());
-        };
-        let mut packages = entries
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let path = entry.path();
-                package_dir_name(&path).map(|name| (name, path))
-            })
-            .collect::<Vec<_>>();
-        packages.sort_by(|(left, _), (right, _)| left.cmp(right));
-        for (pkg_name, path) in packages {
+        for (pkg_name, path) in Self::sorted_package_dirs(packages_dir)? {
             let patch = load_package_patch(&pkg_name);
-            Self::load_package_servers(config, &path, &pkg_name, patch.as_ref());
+            Self::load_package_servers(config, &path, &pkg_name, patch.as_ref())?;
             config
                 .clients
                 .extend(Self::load_package_clients(&path, &pkg_name, patch.as_ref()));
         }
         Ok(())
+    }
+
+    /// Register every package's script tools from `packages/`, then compile
+    /// the catalog. Shared by both config loaders so the scan and its
+    /// duplicate-name checks live in one place. An absent or unreadable
+    /// `packages/` dir yields no entries (`sorted_package_dirs`).
+    fn finish_script_tool_catalog(
+        mut script_tools: ScriptToolCatalogBuilder,
+    ) -> Result<crate::config::script_tools::ScriptToolCatalog> {
+        for (package, path) in Self::sorted_package_dirs(&paths::packages_dir())? {
+            script_tools.load_package(&path, &package)?;
+        }
+        script_tools.finish()
+    }
+
+    pub(super) fn sorted_package_dirs(packages_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+        // Skip unreadable directories and entries, matching the loader's
+        // pre-script-tools behavior: a permission problem in `packages/`
+        // must not abort startup (C12). Missing dirs are normal; other
+        // read failures are logged so omitted packages stay diagnosable.
+        let mut packages = Self::read_package_dirs(packages_dir);
+        packages.sort_by(|(left, _), (right, _)| left.cmp(right));
+        dedupe_aliased_roots(&mut packages);
+        Ok(packages)
+    }
+
+    fn read_package_dirs(packages_dir: &Path) -> Vec<(String, PathBuf)> {
+        let entries = match read_dir(packages_dir) {
+            Ok(entries) => entries,
+            // No `packages/` directory: nothing to load.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Vec::new();
+            }
+            Err(error) => {
+                log::warn!(
+                    "Skipping packages directory '{}': {error:#}",
+                    packages_dir.display()
+                );
+                return Vec::new();
+            }
+        };
+        entries
+            .filter_map(|entry| match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+                    package_dir_name(&path).map(|name| (name, path))
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Skipping unreadable package entry in '{}': {error:#}",
+                        packages_dir.display()
+                    );
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Load clients from a single package directory, applying any patch expressions.
@@ -250,7 +309,7 @@ impl Config {
         Ok(paths)
     }
 
-    fn load_dynamic(model_id: &str) -> Result<Self> {
+    pub(super) fn load_dynamic(model_id: &str) -> Result<Self> {
         let provider = match model_id.split_once(':') {
             Some((v, _)) => v,
             _ => model_id,
@@ -280,12 +339,36 @@ impl Config {
         client.set_name(provider.to_string());
         config.clients = vec![client];
 
+        let script_tools =
+            ScriptToolCatalogBuilder::new(&config.data.script_tools, &Self::config_file())?;
+        config.script_tool_catalog = Self::finish_script_tool_catalog(script_tools)?;
+
         let config_dir = Self::config_dir();
         config.nats_servers =
             Self::load_nats_servers_from_dir(&config_dir.join(paths::NATS_SERVERS_DIR_NAME))?;
         config.tool_servers =
             Self::load_tool_servers_from_dir(&config_dir.join(paths::TOOL_SERVERS_DIR_NAME))?;
+        Self::load_dynamic_package_servers(&mut config)?;
+        config.resolved_middleware()?;
+        config.resolved_event_hooks()?;
         Ok(config)
+    }
+
+    /// The dynamic path builds its script-tool catalog from `packages/`, so
+    /// those packages' tool servers must load too: a script tool's inner
+    /// server is started from `config.tool_servers`. Package clients stay
+    /// unloaded here — this path constructs the model's client itself
+    /// (pre-existing behavior).
+    fn load_dynamic_package_servers(config: &mut Config) -> Result<()> {
+        for (package, path) in Self::sorted_package_dirs(&paths::packages_dir())? {
+            Self::load_package_servers(
+                config,
+                &path,
+                &package,
+                load_package_patch(&package).as_ref(),
+            )?;
+        }
+        Ok(())
     }
 
     fn setup_model(&mut self) -> Result<()> {
@@ -324,6 +407,35 @@ impl Config {
         }
     }
 }
+
+/// A symlink alias of another package root (e.g. `packages/alias` ->
+/// `packages/pkg`) would load the same definitions twice: for script tools
+/// the duplicate names abort startup. Keep the first entry in sorted-name
+/// order per canonical root and warn on the skipped alias.
+fn dedupe_aliased_roots(packages: &mut Vec<(String, PathBuf)>) {
+    let mut seen = std::collections::HashSet::new();
+    packages.retain(|(name, path)| match std::fs::canonicalize(path) {
+        Ok(canonical) => {
+            if seen.insert(canonical) {
+                true
+            } else {
+                log::warn!(
+                    "Skipping package '{name}' at '{}': alias of an already loaded package",
+                    path.display()
+                );
+                false
+            }
+        }
+        Err(_) => {
+            log::warn!(
+                "Skipping package '{name}' at '{}': cannot resolve the directory",
+                path.display()
+            );
+            false
+        }
+    });
+}
+
 async fn create_config_file(config_path: &Path) -> Result<()> {
     let ans = Confirm::new("No config file, create a new one?")
         .with_default(true)
@@ -408,5 +520,32 @@ mod dynamic_tool_server_tests {
         assert_eq!(config.tool_servers[0].name, "time");
         assert_eq!(config.tool_servers[0].command, "harnx-time-tools");
         assert!(config.tool_servers[0].package.is_none());
+    }
+
+    /// Package script tools load on the dynamic path, so the packages'
+    /// tool servers (their inner servers) must load too.
+    #[test]
+    fn load_dynamic_loads_package_tool_servers() {
+        let _guard = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp_dir.path();
+        let pkg_tool_dir = config_dir
+            .join("packages")
+            .join("pkg")
+            .join(paths::TOOL_SERVERS_DIR_NAME);
+        std::fs::create_dir_all(&pkg_tool_dir).expect("create package tool_servers dir");
+        std::fs::write(
+            pkg_tool_dir.join("time.yaml"),
+            "command: harnx-time-tools\n",
+        )
+        .expect("write time.yaml");
+        let _env_guard = EnvGuard::new("HARNX_CONFIG_DIR", config_dir);
+
+        let config = Config::load_dynamic("openai:gpt-4o").expect("load dynamic config");
+
+        assert_eq!(config.tool_servers.len(), 1);
+        assert_eq!(config.tool_servers[0].name, "time");
+        assert_eq!(config.tool_servers[0].command, "harnx-time-tools");
+        assert_eq!(config.tool_servers[0].package.as_deref(), Some("pkg"));
     }
 }

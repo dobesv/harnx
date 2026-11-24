@@ -1,6 +1,7 @@
 use anyhow::Context;
-use harnx_mcp_bridge::{report_tools_filtered, result_limits::ResultLimits, Args, BridgeToolset};
+use harnx_mcp_bridge::{report_tools_filtered, Args, BridgeToolset};
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
+use harnx_toolset_server::result_limits::ResultLimits;
 use harnx_toolset_server::{
     compile_enable_globs, serve_with_config, FilteredToolset, ServeConfig, ServeLifecycle,
 };

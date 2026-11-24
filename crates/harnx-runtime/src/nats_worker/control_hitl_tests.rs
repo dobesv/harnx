@@ -1,5 +1,5 @@
 #[path = "control_hitl_support.rs"]
-mod control_hitl_support;
+pub(in crate::nats_worker::control) mod control_hitl_support;
 use control_hitl_support::*;
 
 use super::*;

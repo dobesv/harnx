@@ -44,6 +44,9 @@ impl FromStr for AgentSpec {
 pub struct Args {
     #[command(flatten)]
     pub metrics: harnx_metrics::MetricsFlags,
+    #[command(flatten)]
+    pub healthz: harnx_healthz::HealthzFlags,
+
     /// HTTP bind host (set explicitly to expose externally).
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
@@ -79,18 +82,42 @@ pub struct Args {
     #[arg(long, value_name = "URL")]
     pub public_base_url: Option<String>,
 
-    /// Trusted User-ID source: NAME, header:NAME or cookie:NAME (repeatable, first match wins;
-    /// enables user isolation). Cookies must carry a proxy-verified user ID, not a token.
+    /// Trusted User-ID source: NAME, header:NAME, header-csv:NAME, cookie:NAME,
+    /// forge-fit, or bearer-claim:CLAIM (repeatable, first match wins; user isolation).
+    /// header/NAME is one opaque field; header-csv selects its first list item.
+    /// Use header:X-Amzn-Mtls-Clientcert-Subject for a full mTLS certificate DN.
+    /// Bare forge-fit is the Forge token source, not a header name. Without
+    /// verification flags, bearer sources are decode-only and safe only behind a
+    /// verifying proxy with nothing else able to reach the server. Cookies must
+    /// carry a proxy-verified user ID, not a token.
     #[arg(long, value_name = "NAME")]
     pub user_id_header: Vec<String>,
 
-    /// Trusted group membership header name (repeatable, all values contribute).
+    /// Trusted group header spec: header:NAME (or NAME) is one opaque item per
+    /// field; header-csv:NAME parses quoted comma lists. Repeatable; all items count.
+    /// Use header-csv:X-Groups for lists such as "CN=admins,O=Acme", plain-group.
     #[arg(long, value_name = "NAME")]
     pub group_header: Vec<String>,
 
-    /// Trusted role membership header name (repeatable, all values contribute).
+    /// Trusted role header spec: header:NAME (or NAME) is one opaque item per
+    /// field; header-csv:NAME parses quoted comma lists. Repeatable; all items count.
     #[arg(long, value_name = "NAME")]
     pub role_header: Vec<String>,
+
+    /// Verify bearer identity sources against this JWKS URL (https;
+    /// loopback http is allowed for tests). Requires --bearer-issuer and
+    /// --bearer-audience; off by default.
+    #[arg(long, value_name = "URL")]
+    pub bearer_jwks_url: Option<String>,
+
+    /// Expected bearer token issuer (requires --bearer-jwks-url and --bearer-audience).
+    #[arg(long, value_name = "ISSUER")]
+    pub bearer_issuer: Option<String>,
+
+    /// Expected bearer token audience (requires --bearer-jwks-url and --bearer-issuer).
+    /// Pinning audience is essential because all Forge apps share signing keys.
+    #[arg(long, value_name = "AUDIENCE")]
+    pub bearer_audience: Option<String>,
 
     /// Maximum rendered data/inline file part bytes per message.
     #[arg(long, default_value_t = 65536)]
@@ -108,14 +135,19 @@ mod tests {
     impl EnvGuard {
         fn isolated() -> Self {
             harnx_core::require_nextest();
-            let saved = ["HARNX_A2A_AGENTS", "HARNX_CONFIG_DIR", "HARNX_ACCESS_RULES"]
-                .into_iter()
-                .map(|key| {
-                    let value = std::env::var_os(key);
-                    std::env::remove_var(key);
-                    (key, value)
-                })
-                .collect();
+            let saved = [
+                "HARNX_A2A_AGENTS",
+                "HARNX_CONFIG_DIR",
+                "HARNX_ACCESS_RULES",
+                "HARNX_HEALTHZ_ADDR",
+            ]
+            .into_iter()
+            .map(|key| {
+                let value = std::env::var_os(key);
+                std::env::remove_var(key);
+                (key, value)
+            })
+            .collect();
             Self(saved)
         }
     }
@@ -144,6 +176,8 @@ mod tests {
         .unwrap();
         assert_eq!(args.host, "127.0.0.1");
         assert_eq!(args.port, 3020);
+        assert_eq!(args.healthz.healthz_addr, None);
+        assert_eq!(args.metrics.metrics_addr, None);
         assert_eq!(args.max_data_part_bytes, 65536);
         assert_eq!(args.cluster, None);
         assert_eq!(args.config_dir, None);
@@ -281,6 +315,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_observability_flags_and_healthz_env() {
+        let _env = EnvGuard::isolated();
+        std::env::set_var("HARNX_HEALTHZ_ADDR", ":8081");
+        let args = Args::try_parse_from(["harnx-a2a-server", "--agent", "agent"]).unwrap();
+        assert_eq!(args.healthz.healthz_addr.as_deref(), Some(":8081"));
+        let args = Args::try_parse_from([
+            "harnx-a2a-server",
+            "--agent",
+            "agent",
+            "--healthz-addr",
+            "127.0.0.1:8082",
+            "--metrics-addr",
+            ":8456",
+        ])
+        .unwrap();
+        assert_eq!(args.healthz.healthz_addr.as_deref(), Some("127.0.0.1:8082"));
+        assert_eq!(args.metrics.metrics_addr.as_deref(), Some(":8456"));
+        let command = Args::command();
+        let metrics = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "metrics_addr")
+            .unwrap();
+        assert!(metrics.get_env().is_none());
+    }
+
+    #[test]
     fn cli_help_and_definition() {
         let _env = EnvGuard::isolated();
         Args::command().debug_assert();
@@ -288,6 +348,8 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::DisplayHelp);
         let help = error.to_string();
         for flag in [
+            "--healthz-addr",
+            "--metrics-addr",
             "--host",
             "--port",
             "--cluster",
@@ -298,6 +360,9 @@ mod tests {
             "--user-id-header",
             "--group-header",
             "--role-header",
+            "--bearer-jwks-url",
+            "--bearer-issuer",
+            "--bearer-audience",
             "--max-data-part-bytes",
         ] {
             assert!(help.contains(flag), "missing {flag}");
@@ -332,6 +397,48 @@ mod tests {
             assert!(flag.get_env().is_none());
             assert!(flag.get_all_aliases().is_none());
             assert!(flag.get_value_delimiter().is_none());
+        }
+    }
+
+    #[test]
+    fn cli_bearer_verification_flags_take_single_values_without_aliases_or_env() {
+        let _env = EnvGuard::isolated();
+        let args = Args::try_parse_from([
+            "harnx-a2a-server",
+            "--agent",
+            "agent",
+            "--bearer-jwks-url",
+            "https://example.com/.well-known/jwks.json",
+            "--bearer-issuer",
+            "forge/invocation-token",
+            "--bearer-audience",
+            "ari:cloud:ecosystem::app/app-id",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.bearer_jwks_url.as_deref(),
+            Some("https://example.com/.well-known/jwks.json")
+        );
+        assert_eq!(
+            args.bearer_issuer.as_deref(),
+            Some("forge/invocation-token")
+        );
+        assert_eq!(
+            args.bearer_audience.as_deref(),
+            Some("ari:cloud:ecosystem::app/app-id")
+        );
+        let command = Args::command();
+        for id in ["bearer_jwks_url", "bearer_issuer", "bearer_audience"] {
+            let flag = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap();
+            assert!(flag.get_env().is_none(), "{id} must not read an env var");
+            assert!(flag.get_all_aliases().is_none(), "{id} must have no alias");
+            assert!(
+                flag.get_value_delimiter().is_none(),
+                "{id} is single-valued"
+            );
         }
     }
 }

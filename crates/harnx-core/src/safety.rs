@@ -1,7 +1,17 @@
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_MAX_LINES: usize = 2000;
-pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+// Agent-facing truncation defaults: what tool results deliver to the model.
+// Tools inherit these via `TruncateOpts::default()`, and per-tool caps alias
+// DEFAULT_MAX_BYTES directly (MCP bridge result limit, attachment byte_limit,
+// session read max_output_bytes, fetch max_length). Human-facing display uses
+// `TruncateOpts::display_default()` instead and must stay decoupled — see
+// `truncate_opts_agent_and_display_defaults_are_independent`.
+pub const DEFAULT_MAX_BYTES: usize = 131_072;
+pub const DEFAULT_HEAD_LINES: usize = 250;
+pub const DEFAULT_TAIL_LINES: usize = 750;
+pub const DEFAULT_LINE_HEAD_BYTES: usize = 0;
+pub const DEFAULT_LINE_TAIL_BYTES: usize = 0;
 pub const READ_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 pub const WRITE_MAX_BYTES: usize = 100 * 1024 * 1024;
 pub const GREP_MAX_LINE_LENGTH: usize = 500;
@@ -114,6 +124,22 @@ pub struct TruncateOpts {
 
 impl Default for TruncateOpts {
     fn default() -> Self {
+        Self {
+            offset: None,
+            limit: None,
+            head_lines: DEFAULT_HEAD_LINES,
+            tail_lines: DEFAULT_TAIL_LINES,
+            line_head_bytes: DEFAULT_LINE_HEAD_BYTES,
+            line_tail_bytes: DEFAULT_LINE_TAIL_BYTES,
+            max_output_bytes: DEFAULT_MAX_BYTES,
+            marker: None,
+        }
+    }
+}
+
+impl TruncateOpts {
+    /// Compact defaults for human-facing previews, independent of agent output limits.
+    pub fn display_default() -> Self {
         Self {
             offset: None,
             limit: None,
@@ -468,6 +494,63 @@ mod tests {
     fn sanitize_output_text_strips_control_chars_and_replacement() {
         let input = "ok\u{0000}\u{0008}\t\n\rbad\u{FFFD}done";
         assert_eq!(sanitize_output_text(input), "ok\t\n\rbaddone");
+    }
+
+    #[test]
+    fn truncate_opts_agent_and_display_defaults_are_independent() {
+        for (opts, head_lines, tail_lines, line_head_bytes, line_tail_bytes, max_output_bytes) in [
+            (TruncateOpts::default(), 250, 750, 0, 0, 131_072),
+            (TruncateOpts::display_default(), 25, 75, 500, 1500, 16_384),
+        ] {
+            assert_eq!(
+                opts,
+                TruncateOpts {
+                    offset: None,
+                    limit: None,
+                    head_lines,
+                    tail_lines,
+                    line_head_bytes,
+                    line_tail_bytes,
+                    max_output_bytes,
+                    marker: None,
+                }
+            );
+        }
+        assert_eq!(DEFAULT_MAX_BYTES, 131_072);
+    }
+
+    #[test]
+    fn truncate_output_defaults_preserve_long_line_under_byte_budget() {
+        let input = "x".repeat(6_000);
+        let output = truncate_output(&input, &TruncateOpts::default());
+        assert_eq!(output, input);
+        assert!(!output.contains("removed from line"));
+    }
+
+    #[test]
+    fn truncate_output_defaults_cap_oversized_single_line() {
+        let input = format!("HEAD{}TAIL", "x".repeat(400_000 - 8));
+        let output = truncate_output(&input, &TruncateOpts::default());
+        assert!(output.len() <= DEFAULT_MAX_BYTES);
+        assert!(output.starts_with("HEAD") && output.ends_with("TAIL"));
+        let notice = output.lines().nth(1).expect("byte-truncation notice");
+        assert!(notice.contains("bytes removed, showing first"));
+        assert!(notice.contains("Use max_output_bytes to increase limit"));
+        assert!(!notice.contains("removed from line"));
+    }
+
+    #[test]
+    fn truncate_output_defaults_keep_250_head_and_750_tail_lines() {
+        let lines = (1..=5_000)
+            .map(|n| format!("line-{n}\n"))
+            .collect::<Vec<_>>();
+        let output = truncate_output(&lines.concat(), &TruncateOpts::default());
+        let expected = format!(
+            "{}... [truncated: 4000 lines removed. Use head_lines/tail_lines to show more] ...\n{}",
+            lines[..250].concat(),
+            lines[4_250..].concat()
+        );
+        assert_eq!(output, expected);
     }
 
     #[test]

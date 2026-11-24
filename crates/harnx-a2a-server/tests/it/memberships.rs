@@ -58,8 +58,14 @@ async fn start(enabled: bool, user_required: bool) -> Result<Http> {
     };
     let policy = Identity::with_memberships(
         &users,
-        &["X-Groups".into(), "X-Other-Groups".into()],
-        &["X-Roles".into(), "X-Other-Roles".into()],
+        &[
+            "header-csv:X-Groups".into(),
+            "header-csv:X-Other-Groups".into(),
+        ],
+        &[
+            "header-csv:X-Roles".into(),
+            "header-csv:X-Other-Roles".into(),
+        ],
     )?;
     Http::with_identity(h, rules, policy).await
 }
@@ -134,7 +140,15 @@ async fn assert_owner(http: &Http, task: &Value, expected: Option<&str>) -> Resu
         harnx_runtime::nats_session_metadata::session_properties(&record.metadata)?.text("user_id"),
         expected
     );
-    let metadata = serde_json::to_string(&record.metadata)?;
+    // The caller-principals snapshot is the one place memberships persist:
+    // customization data for prompts and tools, never authorization state.
+    // Everything else in the record must stay membership-free.
+    let mut metadata = serde_json::to_value(&record.metadata)?;
+    if let Some(properties) = metadata["extensions"]["dev.harnx.session_properties"].as_object_mut()
+    {
+        properties.remove("user_principals");
+    }
+    let metadata = serde_json::to_string(&metadata)?;
     for membership in ["team", "reviewer", "admins", "supervisor"] {
         assert!(
             !metadata.contains(membership),

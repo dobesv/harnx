@@ -1,5 +1,5 @@
 # ---- llm ----
-model: openai:gpt-4o             # Specify the LLM to use
+model: openai:gpt-6.2-sol        # Specify the LLM to use
 stream: true
 
 # ---- behavior ----
@@ -10,8 +10,9 @@ keybindings: emacs
 # Titles appear in session listings and set the terminal / browser tab title.
 # `title_agent` names an agent (see agents/example-title-agent.md); leave it
 # unset to disable title generation. Point it at a small, fast chat model —
-# NOT a reasoning model (o1/o3/DeepSeek-R1), which exhaust the token budget on
-# internal reasoning and return empty/truncated titles.
+# NOT one that reasons at length (a :high or :max effort alias, DeepSeek-R1),
+# which exhausts the token budget on internal reasoning and returns
+# empty/truncated titles.
 title_agent: example-title-agent
 # Regenerate the title after this many additional tokens of conversation
 # (default 50000). The first title is generated on the first exchange. Set to 0
@@ -48,36 +49,66 @@ toolsets:
     - fs_re_replace
     - fs_rollback_file
 
+# ---- middleware ----
+# In-process tool wrappers; also run in cloud/unmanaged workers.
+# See docs/middleware-guide.md. Timeout includes waiting inside next.
+# Uncomment this block to label bash_exec calls and annotate their JSON result.
+# BEGIN middleware example
+# middleware:
+#   - name: label-bash
+#     match: '^bash_exec$'
+#     bash: |
+#       args=$(tool_input | jq '.arguments | .env = ((.env // {}) + {"MIDDLEWARE_LABEL":"reviewed"})')
+#       result=$(next --id run "$args")
+#       respond "$(echo "$result" | jq '.output.reviewed = true')"
+#     tools: []
+#     timeout: 60s
+#     on_error: deny
+# END middleware example
+
 # ---- hooks ----
-# hooks:
-#   entries:
-#   - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher "bash_exec|bash_spawn" -- dcg
+# hooks:                         # Lifecycle event hooks run in-process scripts.
+#   max_resume: 1                # Stop-hook resume bound per turn.
+#   SessionStart:
+#     - name: session-context
+#       tools: [fs_read]         # Allowlisted tools available to the script.
+#       bash: add_context "$(fs_read --path RUNBOOK.md -o text)"
+#   UserPromptSubmit:
+#     - name: no-secrets
+#       bash: |
+#         payload=$(event_input)
+#         case "$payload" in *password*) block "secrets are not allowed in prompts";; esac
+#       on_error: deny
+#   Stop:
+#     - name: keep-going
+#       bash: resume "finish the checklist first"
 #
-# Example: Mutate tool input via hookSpecificOutput.toolInput
-# This shows how a PreToolUse hook can inject environment variables into Bash calls.
+# Tool-call gating and mutation (the old PreToolUse/PostToolUse hooks) moved to
+# in-process middleware — see the "middleware" section above and docs/hooks-guide.md.
+# Legacy `command:` hook entries fail config load with migration guidance.
 #
-# hooks:
-#   entries:
-#   - command: harnx-claude-compatible-hook-server --event PreToolUse --matcher "bash_exec|bash_spawn" -- /path/to/inject-env-hook.sh
-#
-# The inject-env-hook.sh script would look like:
-#   #!/usr/bin/env python3
-#   import json, sys
-#   data = json.load(sys.stdin)
-#   # Mutate tool_input to add env vars
-#   data["tool_input"]["env"] = {"MY_VAR": "secret-value"}
-#   # Emit mutated input via hookSpecificOutput
-#   json.dump({"hookSpecificOutput": {"toolInput": data["tool_input"]}}, sys.stdout)
-#
-# PreToolUse hooks can return hookSpecificOutput.toolInput to mutate tool arguments.
-# PostToolUse hooks can return hookSpecificOutput.toolResponse to mutate the tool response.
-#
-# ---- harnx-proxy-auth: credential injection via HTTPS MITM proxy ----
+# ---- harnx-proxy-auth: credential injection via HTTPS MITM proxy tool service ----
 #
 # harnx-proxy-auth intercepts outbound HTTPS requests and injects auth headers.
-# It uses a sentinel technique: --env scripts inject fake placeholder tokens into
-# the child bash environment (so the LLM never sees real credentials), then --hook
-# filters match those sentinels in outgoing requests and replace them with real tokens.
+# In modern Harnx configurations, it runs as an ordinary long-lived tool service
+# (--tool-server) exposing the proxy_auth toolset and its `environment` tool
+# (invoked as `proxy_auth_environment`). In-process middleware wraps bash calls
+# (bash_exec / bash_spawn), calls proxy_auth_environment to get proxy defaults
+# and provisioned paths, merges caller environment variables (caller keys win),
+# and forwards the merged environment to bash.
+#
+# The proxy MITM listener binds to loopback (127.0.0.1:<port>) and CA certificates
+# and provisioned configs reside on the local host. Therefore, harnx-proxy-auth
+# MUST share the same filesystem and network namespace as harnx-bash-tools.
+# Under managed supervisor mode, Harnx starts both services together on the bash
+# host. Under unmanaged/distributed deployments, operators deploy proxy-auth
+# alongside bash-tools in the same container/host namespace, connected to a common
+# NATS cluster; the worker executing agent turns and middleware can be remote.
+#
+# NOTE: Connecting multiple bash hosts/proxies to a common NATS URL alone is NOT
+# sufficient: each bash host + proxy pair must use distinct routing scopes
+# (HARNX_SERVER_SCOPE) and package/config identities to avoid mixing local
+# filesystem paths or loopback endpoints across hosts.
 #
 # Available jaq helpers in --hook filters:
 #   bearer(token)         =>  "Bearer <token>"
@@ -89,93 +120,137 @@ toolsets:
 #   $fake_url_base64_key  random URL-safe base64 string
 #   $fake_hex_key         random 32-char hex string
 #   $fake_email           random fake email address
+#   $temp_file_root       per-instance temporary directory (allocated with --fs)
+#   $proxy_port           runtime proxy loopback port (available in --env)
 #
 # `if COND then EXPR end` — omitting `else` passes the input through unchanged when
 # the condition is false (equivalent to `else .` in jaq but cleaner).
 #
-# Example: GitHub PAT auth injection (git over HTTPS + GitHub API + uploads)
+# ---- Tool Server & Middleware Configuration Example ----
 #
-# hooks:
-#   entries:
-#   - command: >-
-#       harnx-proxy-auth
-#       --env 'if env.GITHUB_TOKEN then .GITHUB_TOKEN = "ghp_\($fake_base64_key)" end'
-#       --hook 'if .host == "github.com"
-#               and .headers.authorization == basic("x-access-token"; "ghp_\($fake_base64_key)")
-#           then .headers.authorization = basic("x-access-token"; env.GITHUB_TOKEN)
-#           end'
-#       --hook 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
-#               and (.headers.authorization == bearer("ghp_\($fake_base64_key)")
-#                    or .headers.authorization == "token ghp_\($fake_base64_key)")
-#           then .headers.authorization = bearer(env.GITHUB_TOKEN)
-#           end'
+# 1. Define proxy-auth as a tool server (e.g. in tool_servers/proxy_auth.yaml):
 #
-# The --env script injects a fake ghp_<sentinel> token into the sandbox so tools
-# like `gh` see GITHUB_TOKEN set and consider themselves authenticated. The real
-# token never enters the sandbox — harnx-proxy-auth reads it from the host env
-# and injects it into outbound HTTP auth headers.
+# command: harnx-proxy-auth
+# description: Long-lived auth proxy tool service
+# args:
+#   - --tool-server
+#   # GitHub PAT injection:
+#   - --env
+#   - 'if env.GITHUB_TOKEN then .GITHUB_TOKEN = "ghp_\($fake_base64_key)" end'
+#   - --hook
+#   - 'if .host == "github.com" and .headers.authorization == basic("x-access-token"; "ghp_\($fake_base64_key)") then .headers.authorization = basic("x-access-token"; env.GITHUB_TOKEN) end'
+#   - --hook
+#   - 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (.headers.authorization == bearer("ghp_\($fake_base64_key)") or .headers.authorization == "token ghp_\($fake_base64_key)") then .headers.authorization = bearer(env.GITHUB_TOKEN) end'
+#   # Atlassian (Jira/Confluence) auth injection:
+#   - --fs
+#   - '{"harnx-fs-acli/acli/.keep": ""}'
+#   - --env
+#   - '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+#   - --hook
+#   - ./example_config/jira-auth-hook.py
+#
+# 2. Attach middleware to bash calls (e.g. in tool_servers/bash.yaml or global config):
+#
+# middleware:
+#   - name: proxy-auth
+#     match: '^bash_(exec|spawn)$'
+#     python: |
+#       additions = call_tool("proxy_auth_environment", {})
+#       if additions.get("is_error") or additions.get("isError"):
+#           raise RuntimeError("proxy auth environment lookup failed")
+#       args = tool_input()["arguments"]
+#       caller_env = args.get("env")
+#       if not isinstance(caller_env, dict):
+#           caller_env = {}
+#       env = additions["env"]
+#       env.update(caller_env)  # Caller environment keys always win
+#       args["env"] = env
+#       respond(call_next(args))
+#     tools: [proxy_auth_environment]
+#     timeout: 25h
+#     on_error: deny
 #
 # Example: GitHub App auth injection (resident hook mints + caches installation token)
 # Requires host env: GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, and either
 # GITHUB_APP_INSTALLATION_ID or GITHUB_OWNER/GITHUB_REPO (or GITHUB_ORG).
-# Optional scoping env vars:
-#   GITHUB_APP_REPOSITORIES='["repo-one","repo-two"]'
-#   GITHUB_APP_PERMISSIONS='{"contents":"read","pull_requests":"write"}'
-# Optional test/advanced override: GITHUB_APP_INSTALLATION_TOKEN short-circuits
-# live GitHub exchange and stays proxy-side only.
-#
-# hooks:
-#   entries:
-#   - command: >-
-#       harnx-proxy-auth
-#       --hook ./example_config/github-app-auth-hook.py
-#       # Inline shebang script content also works.
-#
-# Example: Atlassian (Jira/Confluence) auth injection
-# One resident hook handles whole acli workaround once: read host jira_config.yaml,
-# select profile matching current_profile, fetch real token from host keyring, write
-# private synthetic acli config with sentinel token, set ACLI_CONFIG_DIR, and swap in
-# real Authorization header for *.atlassian.com gateway hosts (api./as./...) and the active site host.
-#
-# hooks:
-#   entries:
-#   - command: >-
-#       harnx-proxy-auth
-#       --fs '{"harnx-fs-acli/acli/.keep": ""}'
-#       --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
-#       --hook ./example_config/jira-auth-hook.py
-#
-# NOTE: ACLI_CONFIG_DIR must resolve to the SAME directory jira-auth-hook.py
-# writes into. Both sides key off $temp_file_root — proxy-auth's per-run temp
-# dir, which is unique per instance and auto-deleted on exit. --fs allocates it
-# (and creates the folder); --env hands the path to the sandbox; and proxy-auth
-# sends the same $temp_file_root to the hook in each request's `vars`, so the
-# hook writes its config there. ($temp_file_root is empty UNLESS --fs is passed.)
+# Add to tool_servers/proxy_auth.yaml args:
+#   - --tool-server
+#   - --hook
+#   - ./example_config/github-app-auth-hook.py
 #
 # Example: GCP auth injection for Node ADC / BigQuery-style clients
-# Resident hook injects metadata endpoints into sandbox env, so Google client libs
-# discover ADC without credential files. Sandbox gets only proxy metadata hints;
-# proxy-side hook mints real token on demand and rewrites outbound Authorization
-# on *.googleapis.com requests (for example BigQuery HTTPS) with real scoped token.
-# Result: Node ADC works file-free, real Google credential stays outside sandbox,
-# and sandbox cannot reuse token beyond proxied calls.
+# Resident hook injects metadata endpoints into proxy defaults so Google client libs
+# discover ADC without credential files. Real token is minted on demand by hook and
+# rewritten on *.googleapis.com requests.
+# Add to tool_servers/proxy_auth.yaml args:
+#   - --tool-server
+#   - --env
+#   - '{"GCE_METADATA_HOST":"127.0.0.1:\($proxy_port)","METADATA_SERVER_DETECTION":"assume-present","GOOGLE_CLOUD_PROJECT":"<project-id>"}'
+#   - --hook
+#   - ./example_config/gcp-auth-hook.py
 #
-# Optional host env:
-#   HARNX_GCP_TOKEN_CMD                      token source command
-#     default: gcloud auth print-access-token
-#   HARNX_GCP_SA                             service account for impersonation
-#   HARNX_GCP_TOKEN_CMD='gcloud auth print-access-token --impersonate-service-account=$HARNX_GCP_SA'
-#     use impersonation/scoping without exposing reusable Google credential in sandbox
+# ---- Standalone Sandbox Run Usage ----
 #
-# hooks:
-#   entries:
-#   - command: >-
-#       harnx-proxy-auth
-#       --env '{"GCE_METADATA_HOST":"127.0.0.1:\($proxy_port)","METADATA_SERVER_DETECTION":"assume-present"}'
-#       # Optional: add GOOGLE_CLOUD_PROJECT in same --env object.
-#       # --env '{"GCE_METADATA_HOST":"127.0.0.1:\($proxy_port)","METADATA_SERVER_DETECTION":"assume-present","GOOGLE_CLOUD_PROJECT":"<id>"}'
-#       --hook ./example_config/gcp-auth-hook.py
+# Standalone sandbox-run queries the native environment tool over MCP stdio and
+# keeps the proxy service alive for the command lifetime:
 #
-# Both can be combined into a single harnx-proxy-auth invocation with multiple
-# --env and --hook flags. See docs/sandbox-run.md for full claude-sb / gemini-sb
-# wrapper script examples.
+# harnx-sandbox-run \
+#   --hook environment harnx-proxy-auth \
+#     --fs '{"harnx-fs-acli/acli/.keep": ""}' \
+#     --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}' \
+#     --hook ./example_config/jira-auth-hook.py \
+#   \; \
+#   -- acli jira workitem list
+
+# ---- harnx-aws-creds & harnx-k8s-creds: credential provider tool services ----
+#
+# harnx-aws-creds and harnx-k8s-creds provide scoped credentials to sandboxed
+# tools without mounting host credential directories (~/.aws, ~/.kube).
+# Authorized children can retrieve actual provider credentials over local HTTP;
+# static providers can return long-lived credentials. Protect capabilities/logs.
+#
+# In modern Harnx configurations, each service runs as a long-lived tool service
+# (--tool-server):
+#   - harnx-aws-creds: exposes the `aws_creds` toolset and `aws_creds_environment`
+#     tool (takes `{}`), returning:
+#       env: {AWS_CONTAINER_CREDENTIALS_FULL_URI, AWS_CONTAINER_AUTHORIZATION_TOKEN, AWS_REGION}
+#       filesystem: {}  (AWS provisions no files on disk)
+#   - harnx-k8s-creds: exposes the `k8s_creds` toolset and `k8s_creds_environment`
+#     tool (takes `{}`), returning:
+#       env: {KUBECONFIG}
+#       filesystem: {kubeconfig_path}  (synthetic kubeconfig kept alive on host)
+#
+# In-process middleware attached to bash (bash_exec / bash_spawn) calls the respective
+# environment tool to obtain the additions.
+#
+# PRECEDENCE: Unlike proxy-auth where caller environment keys win, credential
+# provider additions win over caller overrides (env.update(provider_env)), ensuring
+# SDKs in the sandbox reliably target the authorized loopback credential endpoint
+# and synthetic kubeconfig. Unrelated caller environment variables are preserved.
+# If no env field or null is provided, it is treated as {}; non-dict env is denied.
+#
+# CO-LOCATION: Both services need bash's loopback network namespace. K8s also needs
+# its generated OS-temp kubeconfig readable by bash at the same absolute path.
+# The supplied native services start together under the local managed supervisor;
+# remote bash/container deployments must arrange shared namespaces/mounts.
+# Unmanaged services need matching NATS scope/package/config identities (see
+# docs/aws-creds.md and docs/k8s-creds.md); the middleware worker can be remote.
+#
+# MCP TRANSPORTS: Both binaries support:
+#   --name, --mcp-stdio, --mcp-http, --host, --port (default ports: 3010 AWS, 3011 K8s),
+#   and --enable-tool.
+#
+# OPT-IN TEMPLATE: These servers are opt-in and not shipped enabled by default.
+# See `example_config/credential-tools/` for ready-to-copy tool server configs
+# and middleware scripts (copy aws_creds.yaml/aws-creds.py or k8s_creds.yaml/k8s-creds.py
+# into your package; configure --context for K8s before running).
+#
+# Standalone sandbox-run queries native environment tools over MCP stdio:
+#
+# harnx-sandbox-run \
+#   --hook environment harnx-aws-creds --profile my-profile \; \
+#   -- aws s3 ls
+#
+# harnx-sandbox-run \
+#   --hook environment harnx-k8s-creds --context my-cluster \; \
+#   -- kubectl get pods

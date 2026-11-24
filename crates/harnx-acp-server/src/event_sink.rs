@@ -252,6 +252,7 @@ mod tests {
         use harnx_core::api_types::CompletionTokenUsage;
         use harnx_core::event::{SubAgentProgress, SubAgentProgressStatus};
         AgentEvent::Turn(TurnEvent::SubAgentProgress(SubAgentProgress {
+            pending_interaction: None,
             invocation_id: format!("wire-{tool_call_id}"),
             agent: "atlas".into(),
             session_id: "child-session".into(),

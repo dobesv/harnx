@@ -106,11 +106,18 @@ impl Runner {
             .clone()
             .map(Principal::User)
             .unwrap_or(Principal::Anonymous);
+        // First-message recovery stamps the winning caller's stored snapshot;
+        // active recovery only opens a session that already carries its own.
+        let principals = match &target {
+            RecoveryTarget::First(first) => first.principals.as_ref(),
+            RecoveryTarget::Active => None,
+        };
         let session = self
             .stored_session(
                 super::stored_session::StoredSessionRequest {
                     export,
                     owner: &owner,
+                    principals,
                     global_config: &settings.config,
                     activation_route: settings.route.clone(),
                     abort: settings.abort.clone(),

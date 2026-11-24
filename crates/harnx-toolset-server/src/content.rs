@@ -22,6 +22,9 @@ impl WithAudience for ContentBlock {
             ContentBlock::Image(c) => ContentBlock::Image(c.with_annotations(annotations)),
             ContentBlock::Audio(c) => ContentBlock::Audio(c.with_annotations(annotations)),
             ContentBlock::Resource(c) => ContentBlock::Resource(c.with_annotations(annotations)),
+            ContentBlock::ResourceLink(c) => {
+                ContentBlock::ResourceLink(c.with_annotations(annotations))
+            }
             other => other,
         }
     }
@@ -34,6 +37,7 @@ pub fn audience(block: &ContentBlock) -> Option<&Vec<Role>> {
         ContentBlock::Image(c) => c.annotations.as_ref(),
         ContentBlock::Audio(c) => c.annotations.as_ref(),
         ContentBlock::Resource(c) => c.annotations.as_ref(),
+        ContentBlock::ResourceLink(c) => c.annotations.as_ref(),
         _ => None,
     };
     annotations.and_then(|a| a.audience.as_ref())

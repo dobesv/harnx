@@ -1,9 +1,9 @@
 //! Joined-dispatch records and the void-recovery bookkeeping that releases
 //! them (issue #2672). One responsibility: the durable record a joining
 //! caller leaves, and the CAS moves that hand a proven-void join to its
-//! delivering invocation. Moved out of `admission.rs` when this branch's
-//! additions pushed that module over CodeScene's cohesion limit; the public
-//! API paths are unchanged (re-exported through `admission`).
+//! delivering invocation. Moved out of `admission.rs` to keep that module to
+//! one job; the public API paths are unchanged (re-exported through
+//! `admission`).
 use super::{intent_key, prompt_key, InvocationAdmission};
 use crate::nats_session_metadata::SessionMetadataStore;
 use anyhow::{ensure, Context, Result};
@@ -12,9 +12,8 @@ use serde::{Deserialize, Serialize};
 
 /// What one proven-void join releases (issue #2672, review F1): the prompt
 /// whose record and binding still name `dead_invocation`, and the invocation
-/// that must deliver it instead. Grouped so the release entry points stay
-/// within the argument budget (CodeScene policy, like
-/// `RecordedDispatchPrompt`).
+/// that must deliver it instead. Grouped so the release entry points keep
+/// short argument lists, like `RecordedDispatchPrompt`.
 #[derive(Clone, Copy, Debug)]
 pub struct VoidJoinRelease<'a> {
     pub storage: &'a str,

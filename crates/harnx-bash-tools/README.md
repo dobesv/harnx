@@ -54,7 +54,9 @@ a shorter deadline; `0` is rejected. Cancelling the tool call still terminates t
 foreground command and its process group.
 
 `timeout_secs` is reserved execution metadata for command templates. It is injected into every
-template's input schema automatically and must not be declared under the YAML `parameters` map.
+template's input schema automatically alongside output controls (`head_lines`, `tail_lines`,
+`max_output_bytes`) and must not be declared under the YAML `parameters` map. See
+[Reserved template parameters](#reserved-template-parameters) for details.
 
 ## Background process retention
 
@@ -98,6 +100,7 @@ Each command template file contains the following fields:
 | `sandbox` | Map (optional) | Sandbox capabilities for this template. Omitting this field uses the server's default sandbox allowlist. |
 | `template` | Boolean (optional) | Enable Minijinja rendering of `script` before execution. Default is `false`. |
 | `on_user_message` | String (optional) | Action when a new user message arrives: `ignore` (default) or `terminate` (terminate and reap the foreground process group). Unknown values fail template loading. |
+| `protocol` | String (optional) | `jsonl` makes the script's stdout a channel for live status messages and its stderr the tool's result. See [Structured protocol](#structured-protocol-protocol-jsonl). Omit it for plain output. Unknown values fail template loading. |
 | `script` | String (required) | Script body to execute as bash under the sandbox. |
 
 With `on_user_message: terminate`, native NATS calls also stop for a user message
@@ -172,6 +175,91 @@ script: |
   gh issue view "$NUMBER" --repo "$REPO" --json title,body,comments
 ```
 
+### Reserved template parameters
+
+Command templates automatically inject four reserved parameters into their tool schema alongside author-declared parameters. Declaring any of these names under a template's `parameters` map causes loading to fail with an error naming the parameter.
+
+Reserved parameters control process execution and output formatting. They are processed by the server and are never passed to the script environment:
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `timeout_secs` | Integer (1–86400) | 86400 | Command execution deadline in seconds. `0` is rejected. |
+| `head_lines` | Integer (>= 0) | 250 | Return only the first N lines of each stream. |
+| `tail_lines` | Integer (>= 0) | 750 | Return only the last N lines of each stream. |
+| `max_output_bytes` | Integer (>= 0) | 131072 | Truncate output to this many bytes. Long lines are preserved within the byte cap and line window. |
+
+#### Template output defaults
+
+Template authors can set output defaults in an optional top-level `output:` block:
+
+```yaml
+output:
+  head_lines: 25
+  tail_lines: 75
+  max_output_bytes: 65536
+```
+
+Each entry is optional and must be a non-negative integer. Unknown keys, negative numbers, fractional values, strings, and `null` are rejected at load time with the field name. These defaults aren't script parameters or environment bindings. Declared defaults appear in the tool's input schema.
+
+Each field is resolved independently: a non-null caller argument overrides the template default, then the server default in the table above. An omitted or null caller argument inherits the template default. Omitting `output:` (or using `output: {}`) preserves existing server behavior.
+
+The byte cap and head/tail line window apply to stdout and stderr independently; result metadata and formatting are outside those caps. The shipped `gh_issue_view` and `jira_view` templates keep their `max_output_bytes: 65536` defaults.
+
+When calling a template inside the in-process `bash` script tool, the outer `bash` call has its own byte cap and line window. Increase its `max_output_bytes` or line limits separately if needed. Template defaults affect only the inner command.
+
+#### Output truncation and long lines
+
+Bash tools default to 250 head lines, 750 tail lines, and a 131072-byte (128 KiB) cap per stream. Per-line clipping is off by default, so long single-line JSON is returned intact when it fits the byte cap. Output exceeding the byte cap or line window is still truncated.
+
+These defaults apply to:
+- Command templates
+- Foreground execution (`exec`)
+- Background process output (`spawn` wait, `wait`, `status`)
+- Execution log inspection (`read_exec_log`)
+- The in-process `bash` script tool in `harnx-runtime`
+
+Set `max_output_bytes`, `head_lines`, or `tail_lines` explicitly to adjust the byte cap or line window.
+
+When template output is truncated, the hint lists only output controls:
+
+```
+[stdout truncated from X to Y. Use max_output_bytes, head_lines, or tail_lines to see more]
+```
+
+Template hints do not mention `read_exec_log` because template tools accept output controls directly, and callers may not have `read_exec_log`. Re-calling a template with larger limits re-runs its command.
+
+### Structured protocol (`protocol: jsonl`)
+
+A template with `protocol: jsonl` can report live status while its script runs. The TUI shows the status on the tool's row and the Web UI on its card, and links in its markdown can be opened from both. In this mode stdout and stderr do different jobs: stdout carries status messages, and stderr is the tool's result.
+
+The script's environment gets `HARNX_TOOL_PROTOCOL=jsonl`. A script can check it to choose between status messages and plain output, so it still works when run by hand.
+
+Each stdout line is one JSON object. A line with a `progress` object updates the status:
+
+```json
+{"progress": {"title": "PR #123 · 12 passed · 3 pending", "markdown": "[PR #123](https://github.com/o/r/pull/123): 12 passed, 3 pending"}}
+```
+
+`title` and `markdown` are optional strings, and a field left out keeps its current value. Other fields inside `progress` are ignored. A line that isn't UTF-8, isn't a JSON object, has no `progress` object, or is longer than 128 KiB is logged as a warning and skipped. A bad line never fails the call. All of stdout still goes to the execution's stdout log file, but none of it reaches the result.
+
+stderr is the result, on success and on failure. The result keeps the usual metadata header (exit code, log paths and the rest) and contains only the stderr block, which is empty when the script wrote nothing to stderr. `total_lines` and `total_bytes` count stderr only. `head_lines`, `tail_lines`, `max_output_bytes` and the template's `output:` defaults apply to stderr, and the tool's schema describes them that way. Exit codes, timeouts and `stopped_by: new_message` work as they do in plain mode.
+
+Status updates are live events and aren't saved to the session transcript, so write anything the model needs to stderr. The MCP stdio and HTTP routes have no progress channel: status lines are dropped there and the result is the same.
+
+An older harnx that doesn't know `protocol` ignores the field and runs the template in plain mode. The script then sees no `HARNX_TOOL_PROTOCOL` and can print plain output instead.
+
+Without a JSON tool such as `jq`, a bash script has to escape strings itself. This function escapes backslashes, quotes, newlines, carriage returns and tabs, and drops other control characters:
+
+```bash
+json_string() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+  printf '"%s"' "$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')"
+}
+printf '{"progress":{"title":%s}}\n' "$(json_string "$title")"
+```
+
 ### Threat model and security framing
 
 - **Primary security boundary**: The fixed command shape combined with schema parameter validation forms the primary security boundary. The agent cannot alter the script body; it only provides input parameters validated against the declared types and pattern constraints. When `template: false` (the default), inputs are passed solely via environment variables and are never spliced into shell script text.
@@ -210,7 +298,8 @@ script: |
 Parameter names are transformed to `UPPER_SNAKE_CASE` env vars, so avoid names
 that map onto critical shell variables (`PATH`, `IFS`, `HOME`, `PWD`,
 `LD_PRELOAD`, `LD_LIBRARY_PATH`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `PS4`,
-`BASH_XTRACEFD`, `CDPATH`, `GLOBIGNORE`, `BASHOPTS`) or the `BASH_FUNC` prefix.
+`BASH_XTRACEFD`, `CDPATH`, `GLOBIGNORE`, `BASHOPTS`), onto `HARNX_TOOL_PROTOCOL`,
+which harnx sets itself, or the `BASH_FUNC` prefix.
 Two parameters that map to the same env var name, or a parameter that collides
 with a top-level `env:` key, are also rejected. A template that violates any of
 these is rejected at load.

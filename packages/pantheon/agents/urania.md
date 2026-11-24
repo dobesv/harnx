@@ -2,9 +2,9 @@
 role: subagent
 model: bedrock:us.zai.glm-5.3
 model_fallbacks:
-- gemini:gemini-3.8-flash
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
+- gemini:gemini-4-hydrogen
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
 compaction_agent: compact-reviewer
 use_tools:
@@ -40,7 +40,7 @@ description: "Architecture and big picture specialist \u2014 evaluates cross-cut
   \ concerns, dependency direction, design pattern adherence, API contract consistency,\
   \ and system-wide impact. Named after Urania (yoo-RAY-nee-uh), the Muse of astronomy\
   \ \u2014 seeing the codebase from above.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

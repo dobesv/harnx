@@ -20,13 +20,19 @@ pub mod bootstrap;
 pub mod client;
 pub mod commands;
 pub mod config;
+mod event_hook_operations;
+pub mod event_hooks;
+pub mod fault_injection;
 mod file_lock;
+mod handoff_result;
 pub mod identity;
+pub mod interaction_checkpoint;
+pub mod interactions;
 pub mod local_orchestrator;
+pub mod middleware;
 pub mod nats_admin;
 pub mod nats_attachments;
 pub mod nats_event_sink;
-pub mod nats_hook_provider;
 pub mod nats_lease;
 pub mod nats_local_server;
 pub mod nats_metrics;
@@ -38,11 +44,16 @@ pub mod nats_tool_provider;
 pub mod nats_worker;
 pub mod operator_tools;
 pub mod remote_session_cleanup;
+pub mod script_tool_provider;
+mod script_tools;
 pub mod server_identity;
 pub mod session_history;
 pub mod session_meta_tool;
 pub mod session_stream_gc;
 pub mod session_stream_orphans;
+#[cfg(test)]
+mod structured_provider;
+pub mod surfaces;
 pub mod terminated_result;
 #[cfg(test)]
 mod test_environment;
@@ -52,6 +63,7 @@ pub mod tool;
 pub mod tool_context;
 pub mod tool_loop_guard;
 pub mod tool_output;
+pub mod tool_registry_watch;
 pub mod tool_reservation_client;
 mod tool_selector;
 pub mod users;
@@ -83,7 +95,7 @@ pub use agent_loop::{
     ToolApprovalDecision,
 };
 
-pub use tool::{ConfirmToolUseFn, ToolApprovalInterrupt, ToolUseConfirmation};
+pub use tool::{ConfirmToolUseFn, ToolUseConfirmation};
 
 #[cfg(test)]
 #[path = "../tests/it/common/mod.rs"]

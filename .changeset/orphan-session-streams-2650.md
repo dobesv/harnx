@@ -1,5 +1,0 @@
----
-harnx: minor
----
-
-Collect orphaned `SESSION_` JetStream streams that have no session metadata (GH #2650). The hourly session GC previously enumerated only KV metadata, so a stream whose metadata write never landed was never collected. Each pass now inventories `SESSION_` streams, maps them back to a storage key through the stream subject (verified against the stream-name hash), and deletes an orphan once nothing has written to it for the retention window, unless a session or A2A lease or an unresolved A2A task holds it, after re-checking each of those and the stream's age immediately before the delete. Unmappable streams are reported and never touched, and deletions are bounded per pass. `harnx list orphan-streams --cluster <cluster>` reports the inventory as a dry run, and `harnx delete orphan-streams --cluster <cluster>` runs the same guarded cleanup on demand (holding the session-GC leader lease, so it cannot race the periodic pass; `--grace-hours 0` and a zero retention are never treated as a zero-hour grace window). Orphan reconciliation runs automatically wherever `cleanup_remote_sessions_days` is positive, reusing that retention window.

@@ -137,6 +137,7 @@ impl Fixture {
 
     pub async fn assert_original_reply(&self, original: &Value) -> Result<()> {
         let reply = ToolReply {
+            input_required: None,
             call_id: self.request.call_id.clone(),
             result: Ok(original.clone()),
             final_progress: None,
@@ -162,7 +163,10 @@ impl Fixture {
         let normalized = original
             .result
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        assert!(serde_json::to_vec(&normalized)?.len() <= 32_768);
+        assert!(
+            serde_json::to_vec(&normalized)?.len()
+                <= harnx_mcp_bridge::result_limits::DEFAULT_MAX_RESULT_BYTES
+        );
         Ok(normalized)
     }
 

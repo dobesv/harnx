@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::api_types::CompletionTokenUsage;
+pub use crate::pending_interaction::{PendingInteractionRequest, PendingInteractionSummary};
 
 // --- top-level ---------------------------------------------------------------
 
@@ -137,6 +138,9 @@ pub enum ToolEvent {
     },
 }
 
+// Keep the existing event API: pending summaries grow progress without requiring
+// every producer and consumer to box the SubAgentProgress variant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TurnEvent {
     Started,
@@ -340,6 +344,10 @@ pub struct SubAgentProgress {
     /// message that made the call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Input owned by this direct child. Blocked progress stays `Running`;
+    /// older readers can ignore this field without losing the progress event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_interaction: Option<PendingInteractionSummary>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -424,6 +432,7 @@ mod tests {
     #[test]
     fn sub_agent_progress_round_trips_with_stable_status_names() {
         let event = AgentEvent::Turn(TurnEvent::SubAgentProgress(SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "invocation-1".into(),
             agent: "researcher".into(),
             session_id: "session-1".into(),
@@ -459,6 +468,7 @@ mod tests {
     #[test]
     fn sub_agent_progress_names_the_parent_tool_call_when_known() {
         let progress = SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "invocation-1".into(),
             agent: "researcher".into(),
             session_id: "session-1".into(),

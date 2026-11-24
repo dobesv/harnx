@@ -1,5 +1,6 @@
 use crate::lifecycle::{
-    CreateSandboxClaim, SandboxApi, SandboxCondition, SandboxRecord, LAST_ACTIVITY_ANNOTATION,
+    is_sandbox_not_found, CreateSandboxClaim, SandboxApi, SandboxCondition, SandboxNotFoundError,
+    SandboxRecord, LAST_ACTIVITY_ANNOTATION,
 };
 use crate::policy::{operation_metric, FailureKind};
 use anyhow::{Context, Result};
@@ -47,6 +48,13 @@ impl std::error::Error for KubernetesRequestError {
 }
 
 pub(crate) fn kubernetes_failure(error: &anyhow::Error) -> (FailureKind, Option<Duration>) {
+    // A missing claim is a permanent condition, not a transport blip. Errors
+    // without a KubernetesRequestError in their chain used to classify as
+    // Transport, which made the retry policy burn five attempts on a
+    // not-found from `bump_activity` or `sandbox_name`.
+    if is_sandbox_not_found(error) {
+        return (FailureKind::Permanent, None);
+    }
     error
         .chain()
         .find_map(|source| source.downcast_ref::<KubernetesRequestError>())
@@ -221,7 +229,7 @@ impl KubernetesSandboxApi {
     async fn sandbox_name(&self, id: &str) -> Result<String> {
         self.claim(id)
             .await?
-            .with_context(|| format!("sandbox not found: {id}"))?
+            .ok_or_else(|| SandboxNotFoundError::new(id))?
             .data
             .pointer("/status/sandbox/name")
             .and_then(Value::as_str)
@@ -448,7 +456,13 @@ impl SandboxApi for KubernetesSandboxApi {
             }});
             match self.request(operation, self.claims.create(&PostParams::default(), &claim)).await {
                 Ok(created) => Ok(created.name_any()),
-                Err(error) if is_already_exists(&error, &request.name) => Ok(request.name.clone()),
+                Err(error) if is_already_exists(&error, &request.name) => {
+                    // Idempotent create. Also fires while a same-named claim is
+                    // mid-deletion (Kubernetes deletion is asynchronous), so
+                    // this never resurrects a deleted claim; recovery paths
+                    // must claim under a new name instead.
+                    Ok(request.name.clone())
+                }
                 Err(error) => Err(error).with_context(|| format!("create SandboxClaim '{}'", request.name)),
             }
         }.await;
@@ -532,18 +546,34 @@ impl SandboxApi for KubernetesSandboxApi {
     async fn bump_activity(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
         let operation = "bump_activity";
         let result = async {
-            let claim = self.claim(id).await?.with_context(|| format!("sandbox not found: {id}"))?;
+            let claim = self
+                .claim(id)
+                .await?
+                .ok_or_else(|| SandboxNotFoundError::new(id))?;
             if claim.annotations().get(LAST_ACTIVITY_ANNOTATION)
                 .and_then(|time| parse_time(time).ok())
                 .is_some_and(|last| now - last < chrono::Duration::minutes(1)) {
                 return Ok(());
             }
-            self.request(operation, self.claims.patch(
-                id,
-                &PatchParams::default(),
-                &Patch::Merge(json!({"metadata": {"annotations": {LAST_ACTIVITY_ANNOTATION: now.to_rfc3339()}}})),
-            )).await?;
-            Ok(())
+            let patch = self.request(
+                operation,
+                self.claims.patch(
+                    id,
+                    &PatchParams::default(),
+                    &Patch::Merge(json!({"metadata": {"annotations": {LAST_ACTIVITY_ANNOTATION: now.to_rfc3339()}}})),
+                ),
+            )
+            .await;
+            match patch {
+                Ok(_) => Ok(()),
+                // The claim vanished between the GET and this PATCH. Report
+                // the same typed absence the GET path reports so callers
+                // (like sandbox_connect) can recover from it (#2840).
+                Err(error) if is_absent_resource(&error, id) => Err(
+                    anyhow::Error::new(SandboxNotFoundError::new(id)),
+                ),
+                Err(error) => Err(error),
+            }
         }.await;
         Self::record_outcome(operation, &result);
         result

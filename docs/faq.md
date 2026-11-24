@@ -9,8 +9,8 @@ HARNX_LOG_LEVEL=debug harnx
 ```
 
 Then check `~/.local/state/harnx/harnx.log` (or `$XDG_STATE_HOME/harnx/harnx.log`;
-override the whole path with `HARNX_LOG_PATH`). The worker and every tool and
-hook server it starts write there too, so one file covers the whole session.
+override the whole path with `HARNX_LOG_PATH`). The worker and every tool
+server it starts write there too, so one file covers the whole session.
 
 For machine-readable output, set `HARNX_LOG_FORMAT=json` — one JSON object per
 line. See [environment variables](environment-variables.md#logging-envs) for the

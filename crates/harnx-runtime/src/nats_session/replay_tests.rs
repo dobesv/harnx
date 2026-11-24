@@ -1,3 +1,5 @@
+mod interaction;
+
 use crate::{replay_entries_to_sink, replay_entries_to_sink_with_decls};
 use harnx_core::event::{
     AgentEvent, AgentEventSink, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent,
@@ -78,7 +80,9 @@ fn replay_emits_messages_and_tool_events_in_order() {
         (
             43,
             SessionLogEntry::ToolResults {
+                handoff_selection: None,
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("read-call".into()),
                     name: "read".into(),
                     output: json!({"text": "# Harnx\n"}),
@@ -142,7 +146,9 @@ fn replay_with_declarations_renders_tool_call_and_result_templates() {
         (
             2,
             SessionLogEntry::ToolResults {
+                handoff_selection: None,
                 results: vec![ToolOutput {
+                    user_surfaces: Vec::new(),
                     id: Some("read-call".into()),
                     name: "read".into(),
                     output: json!({"text": "# Harnx"}),

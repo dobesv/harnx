@@ -1,9 +1,9 @@
 ---
-model: codex:gpt-6-astra:max
+model: codex:gpt-6.2-astra:max
 model_fallbacks:
-- openai:gpt-6-astra:max
-- claude:claude-fable-5-1:max
-- gemini:gemini-4-argon
+- openai:gpt-6.2-astra:max
+- claude:claude-fable-5-2:max
+- gemini:gemini-4-carbon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-researcher
 use_tools:
@@ -14,7 +14,7 @@ use_tools:
 description: "Architecture and strategy consultant \u2014 provides deep analysis of\
   \ technology trade-offs, scalability concerns, and long-term architectural implications.\
   \ Like consulting the Oracle (OR-uh-kul) at Delphi for complex technical decisions.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: oracle_core
   description: Core identity and instructions for Oracle

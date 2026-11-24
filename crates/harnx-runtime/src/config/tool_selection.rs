@@ -3,7 +3,7 @@ use super::{
     bash_declaration::{synthesize_bash_declaration, BASH_TOOL_NAME},
     tool_name_selector, AgentConfig, Config, ToolDeclaration,
 };
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 impl Config {
     pub fn select_tools(&self, agent: &AgentConfig) -> Option<Vec<ToolDeclaration>> {
@@ -68,10 +68,32 @@ impl Config {
     /// by the `BashProvider` to build the script-mode `ToolSpec`s the
     /// harnx-script backend exposes as shell commands. Empty when script
     /// mode is inactive; same resolution and ordering as `bash_tool_names`.
+    // qual:api — pub convenience for embedders; runtime rounds call
+    // `bash_inner_tool_declarations_with` to thread one captured set.
     pub fn bash_inner_tool_declarations(&self) -> Vec<ToolDeclaration> {
+        self.bash_inner_tool_declarations_with(
+            &self.nats_tool_declarations_snapshot(),
+            &self.accepted_script_tools(),
+        )
+    }
+
+    /// Same resolution against one round capture (decision 12): the NATS
+    /// declarations and the accepted script-tool view are the same sets the
+    /// round's advertisements were built from, so the bash inner catalog
+    /// cannot name a tool the round does not serve.
+    pub(crate) fn bash_inner_tool_declarations_with(
+        &self,
+        nats_declarations: &[ToolDeclaration],
+        script_tools: &[Arc<super::script_tools::ResolvedScriptTool>],
+    ) -> Vec<ToolDeclaration> {
         let agent = self.tool_selection_agent();
         let package = harnx_core::package_namespace::pkg_from_qualified(agent.name());
-        self.select_bash_inner_tools(agent.bash_tools().as_deref().unwrap_or(&[]), package)
+        self.select_bash_inner_tools_with(
+            agent.bash_tools().as_deref().unwrap_or(&[]),
+            package,
+            nats_declarations,
+            script_tools,
+        )
     }
 
     /// The inner tool set script mode exposes as shell commands, resolved from
@@ -96,11 +118,34 @@ impl Config {
         bash_tools: &[String],
         package: Option<&str>,
     ) -> Vec<ToolDeclaration> {
+        self.select_bash_inner_tools_with(
+            bash_tools,
+            package,
+            &self.nats_tool_declarations_snapshot(),
+            &self.accepted_script_tools(),
+        )
+    }
+
+    /// Same resolution against one round capture: the declaration pool and
+    /// the accepted script-tool view come from the caller, which built the
+    /// round's advertisements from the same sets.
+    fn select_bash_inner_tools_with(
+        &self,
+        bash_tools: &[String],
+        package: Option<&str>,
+        nats_declarations: &[ToolDeclaration],
+        script_tools: &[Arc<super::script_tools::ResolvedScriptTool>],
+    ) -> Vec<ToolDeclaration> {
         if !self.tool_use || bash_tools.is_empty() {
             return Vec::new();
         }
         let selectors_str = bash_tools.join(",");
-        let (declarations, _) = self.tool_declarations_for_use_tools(Some(&selectors_str), package);
+        let (declarations, _) = self.tool_declarations_for_use_tools_with_script_tools(
+            Some(&selectors_str),
+            package,
+            nats_declarations,
+            script_tools,
+        );
         let tool_names = self.collect_selected_tool_names(bash_tools, &declarations);
         let mut inner: Vec<ToolDeclaration> = declarations
             .into_iter()
@@ -124,11 +169,30 @@ impl Config {
         use_tools: &[String],
         package: Option<&str>,
     ) -> Vec<ToolDeclaration> {
+        let script_tools = self.accepted_script_tools();
+        self.select_tools_for_package_with_script_tools(use_tools, package, &script_tools)
+    }
+
+    /// Same selection with a precomputed accepted script-tool view (decision
+    /// 12). An empty view resolves base tools only, which serves the
+    /// script-tool inner-selector resolution.
+    pub(crate) fn select_tools_for_package_with_script_tools(
+        &self,
+        use_tools: &[String],
+        package: Option<&str>,
+        script_tools: &[Arc<super::script_tools::ResolvedScriptTool>],
+    ) -> Vec<ToolDeclaration> {
         if !self.tool_use {
             return Vec::new();
         }
         let use_tools_str = use_tools.join(",");
-        let (declarations, _) = self.tool_declarations_for_use_tools(Some(&use_tools_str), package);
+        let nats_declarations = self.nats_tool_declarations_snapshot();
+        let (declarations, _) = self.tool_declarations_for_use_tools_with_script_tools(
+            Some(&use_tools_str),
+            package,
+            &nats_declarations,
+            script_tools,
+        );
         let tool_names = self.collect_selected_tool_names(use_tools, &declarations);
 
         let mut functions: Vec<ToolDeclaration> = declarations
@@ -139,6 +203,21 @@ impl Config {
         self.merge_agent_owned_tools(&mut functions, &tool_names);
 
         functions
+    }
+
+    /// Resolve helper tools for middleware and lifecycle scripts, excluding
+    /// tools that must stay at the model boundary. Cached declarations must
+    /// already use the names visible from `package`, as in
+    /// [`Config::select_tools_for_package`].
+    pub(crate) fn select_script_tools_for_package(
+        &self,
+        selectors: &[String],
+        package: Option<&str>,
+    ) -> Vec<ToolDeclaration> {
+        self.select_tools_for_package(selectors, package)
+            .into_iter()
+            .filter(|tool| is_bash_inner_tool_allowed(&tool.name))
+            .collect()
     }
 
     /// Resolve the concrete set of tool names selected by `use_tools`,

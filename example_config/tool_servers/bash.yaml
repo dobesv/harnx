@@ -20,8 +20,6 @@ args:
   - ~/.config/git
   - --allow-read
   - ~/.config/rtk
-  - --allow-write
-  - ~/.codescene
   # Disable interactive editor
   - --env
   - EDITOR=true

@@ -520,7 +520,53 @@ describe('toAgUiMessages', () => {
       expect((agent as any).forwardsCustomEvent('message_attachments')).toBe(false);
       expect((agent as any).forwardsCustomEvent('session_attach_boundary')).toBe(false);
       expect((agent as any).forwardsCustomEvent('session_handoff')).toBe(false);
+      expect((agent as any).forwardsCustomEvent('pending_interaction')).toBe(false);
       expect((agent as any).forwardsCustomEvent('other_event')).toBe(true);
+    });
+
+    it('passes pending_interaction to onPendingInteraction via handleAgentEvent', async () => {
+      const onPendingInteraction = vi.fn();
+      const { HarnxHttpAgent } = await import('../ChatProvider');
+      const agent = new HarnxHttpAgent({
+        url: '/url',
+        onStatus: vi.fn(),
+        onRunFailed: vi.fn(),
+        onUsage: vi.fn(),
+        onToolSummary: vi.fn(),
+        onSubAgentEvent: vi.fn(),
+        onPendingInteraction,
+      });
+
+      (agent as any).handleAgentEvent({
+        type: 'CUSTOM',
+        name: 'pending_interaction',
+        value: {
+          interaction_id: 'int-789',
+          request_seq: 1,
+          tool_call_id: 'tc-1',
+          kind: 'confirm',
+          message: 'Confirm execution',
+          pending_count: 0,
+        },
+      });
+
+      expect(onPendingInteraction).toHaveBeenCalledWith({
+        interactionId: 'int-789',
+        requestSeq: 1,
+        toolCallId: 'tc-1',
+        kind: 'confirm',
+        message: 'Confirm execution',
+        pendingCount: 0,
+      });
+
+      // Test clearing via null
+      (agent as any).handleAgentEvent({
+        type: 'CUSTOM',
+        name: 'pending_interaction',
+        value: null,
+      });
+
+      expect(onPendingInteraction).toHaveBeenCalledWith(null);
     });
 
     it('passes message_attachments to onMessageAttachments via handleAgentEvent', async () => {

@@ -8,11 +8,17 @@ use tokio::time::Instant;
 use super::{BashKitBackend, RunControl};
 use crate::{CancellationToken, ScriptBackend, ScriptLimits, ScriptRun, ScriptStatus};
 
-// Cap running interpreters and retained closures in Tokio's blocking queue.
-// The permit lives in the closure, including after a queued caller returns.
+// A parent holds its permit while awaiting host calls, so descendants must use
+// a different pool. Fair pools at increasing depths make the wait graph acyclic.
+// Permits live in closures, including after an unstarted queued caller returns.
 pub(super) const MAX_SCRIPT_WORKERS: usize = 8;
-pub(super) static ADMISSION: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_SCRIPT_WORKERS)));
+pub(super) static ADMISSION: LazyLock<[Arc<Semaphore>; crate::MAX_SCRIPT_NESTING]> =
+    LazyLock::new(|| std::array::from_fn(|_| Arc::new(Semaphore::new(MAX_SCRIPT_WORKERS))));
+
+tokio::task_local! {
+    // Depth for the next run, explicitly restored inside the blocking worker.
+    pub(crate) static NESTING_DEPTH: usize;
+}
 
 struct CancelOnDrop {
     control: Arc<RunControl>,
@@ -63,7 +69,8 @@ impl ScriptBackend for BashKitBackend {
         let deadline = Instant::now() + timeout;
         let limits = request.limits.clone();
         let cancel = request.cancel.clone();
-        let permit = match admit(&cancel, deadline, timeout).await {
+        let depth = NESTING_DEPTH.try_with(|depth| *depth).unwrap_or(0);
+        let permit = match admit(&cancel, deadline, timeout, depth).await {
             Ok(permit) => permit,
             Err(result) => return finish(result, &limits),
         };
@@ -71,6 +78,8 @@ impl ScriptBackend for BashKitBackend {
             stop: cancel.child_token(),
             fatal: Mutex::new(None),
             flag: OnceLock::new(),
+            host_stopped: std::sync::atomic::AtomicBool::new(false),
+            child_depth: depth + 1,
         });
         let mut worker = spawn(request, control.clone(), permit);
         let _cleanup = CancelOnDrop {
@@ -89,7 +98,13 @@ impl ScriptBackend for BashKitBackend {
         });
         let deadline_hit = completed.deadline_hit(deadline, stopped_by_deadline);
         let mut result = completed.result;
-        if !cancel.is_cancelled() && deadline_hit {
+        if control
+            .host_stopped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            result.status = ScriptStatus::Stopped;
+            result.exit_code = super::INTERRUPTED_EXIT_CODE;
+        } else if !cancel.is_cancelled() && deadline_hit {
             normalize_timeout(&mut result, timeout);
         }
         finish(result, &limits)
@@ -100,7 +115,17 @@ async fn admit(
     cancel: &CancellationToken,
     deadline: Instant,
     timeout: Duration,
+    depth: usize,
 ) -> Result<OwnedSemaphorePermit, ScriptRun> {
+    let Some(pool) = ADMISSION.get(depth) else {
+        return Err(worker_failure(
+            false,
+            format!(
+                "script nesting depth limit exceeded (maximum {} runs)\n",
+                crate::MAX_SCRIPT_NESTING
+            ),
+        ));
+    };
     tokio::select! {
         biased;
         () = cancel.cancelled() => Err(worker_failure(true, "cancelled\n".to_owned())),
@@ -109,7 +134,7 @@ async fn admit(
             normalize_timeout(&mut result, timeout);
             Err(result)
         }
-        permit = ADMISSION.clone().acquire_owned() => Ok(permit.expect("script admission never closes")),
+        permit = pool.clone().acquire_owned() => Ok(permit.expect("script admission never closes")),
     }
 }
 
@@ -122,6 +147,7 @@ fn spawn(
         script,
         limits,
         commands,
+        python_functions,
         fs_mounts,
         cancel: _,
     } = request;
@@ -129,15 +155,19 @@ fn spawn(
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let result = runtime.block_on(BashKitBackend.execute(
-            crate::ScriptRequest {
-                script: &script,
-                limits,
-                commands,
-                fs_mounts,
-                cancel: control.stop.clone(),
-            },
-            control,
+        let result = runtime.block_on(NESTING_DEPTH.scope(
+            control.child_depth,
+            BashKitBackend.execute(
+                crate::ScriptRequest {
+                    script: &script,
+                    limits,
+                    commands,
+                    python_functions,
+                    fs_mounts,
+                    cancel: control.stop.clone(),
+                },
+                control,
+            ),
         ));
         Completed {
             result,

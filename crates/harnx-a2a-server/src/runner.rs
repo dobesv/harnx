@@ -51,6 +51,7 @@ mod reconciler;
 mod recovery;
 mod remote;
 mod reply;
+mod reply_delivery;
 mod reply_note;
 mod resume;
 mod segment;
@@ -114,6 +115,43 @@ pub enum RunnerError {
     Busy,
     Terminal,
 }
+
+impl Runner {
+    /// Bounded hold for a task's outstanding steered drain (issue #2774):
+    /// recovery waits for a live worker to finish answering the steered rows
+    /// before settling, but after [`HEAD_DRAIN_TIMEOUT`] the sweep falls
+    /// through to the ordinary owner-loss interrupt+settle path instead of
+    /// wedging the task and its context.
+    pub(super) fn hold_steered_drain(&self, task_id: &str) -> bool {
+        let mut holds = self.steered_drain_holds.lock();
+        // An expired hold is the owning task's fall-through proof: purging
+        // it here (an earlier purge removed any expired entry on every
+        // call) would let another task's sweep reset the owner's window —
+        // its next call would insert a fresh timestamp and defer its
+        // recovery again. Keep other tasks' expired holds until their own
+        // expiry check removes them, and bound the map by count instead;
+        // the cap only trims state for tasks whose recovery never came
+        // back, which have no live hold to lose.
+        if holds.len() >= STEERED_DRAIN_HOLDS_CAP {
+            holds.retain(|id, seen| id == task_id || seen.elapsed() < HEAD_DRAIN_TIMEOUT);
+        }
+        match holds.get(task_id) {
+            Some(seen) if seen.elapsed() < HEAD_DRAIN_TIMEOUT => true,
+            Some(_) => {
+                holds.remove(task_id);
+                false
+            }
+            None => {
+                holds.insert(task_id.to_owned(), std::time::Instant::now());
+                true
+            }
+        }
+    }
+
+    pub(super) fn clear_steered_drain_hold(&self, task_id: &str) {
+        self.steered_drain_holds.lock().remove(task_id);
+    }
+}
 impl std::fmt::Display for RunnerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -138,12 +176,29 @@ struct ContextSlot {
     active: Arc<Mutex<Option<Arc<RunnerHandle>>>>,
 }
 
+/// How long a fresh admission waits for the previous invocation's runtime
+/// admission head to drain steered continuation rounds (issue #2774) before
+/// capturing the fixed predecessor, and how long recovery holds an outstanding
+/// steered drain for a live worker before falling through to the ordinary
+/// owner-loss interrupt+settle. The candidate lease is held for the whole
+/// wait, so no other admission can interleave; the bound keeps a wedged
+/// predecessor or a dead worker from pinning the context forever.
+pub(super) const HEAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on the steered-drain hold map. Expired holds are removed only by
+/// their owning task's own expiry check (see [`Runner::hold_steered_drain`]),
+/// so the map is bounded by count, not by time-based purging.
+const STEERED_DRAIN_HOLDS_CAP: usize = 1024;
+
 /// One runner per cluster/store. Do not share a store between different brokers.
 pub struct Runner {
     store: Arc<A2aStore>,
     contexts: parking_lot::Mutex<HashMap<ContextKey, Arc<ContextSlot>>>,
     shutting_down: AtomicBool,
     boot_id: String,
+    /// First observation of each task's outstanding steered drain
+    /// (issue #2774); bounds recovery's hold, see [`HEAD_DRAIN_TIMEOUT`].
+    steered_drain_holds: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
     #[cfg(feature = "fault-injection")]
     lease_config_override: parking_lot::Mutex<Option<harnx_runtime::nats_lease::NatsLeaseConfig>>,
     #[cfg(feature = "fault-injection")]
@@ -169,6 +224,7 @@ impl Runner {
         Arc::new(Self {
             store,
             contexts: Default::default(),
+            steered_drain_holds: Default::default(),
             shutting_down: AtomicBool::new(false),
             boot_id: uuid::Uuid::new_v4().to_string(),
             #[cfg(feature = "fault-injection")]
@@ -235,7 +291,12 @@ impl Runner {
         } = request;
         self.verify_existing_context(export, owner, local_id)
             .await?;
-        let initializer = session_initializer(export, &owner.principal, local_id)?;
+        let initializer = session_initializer(
+            export,
+            &owner.principal,
+            owner.stampable_principals().as_ref(),
+            local_id,
+        )?;
         let session = Box::pin(NatsSession::from_global_config(
             NatsSessionConfig {
                 cluster: export.cluster.clone().unwrap_or_else(|| "__local__".into()),
@@ -428,18 +489,22 @@ impl Runner {
 fn session_initializer(
     export: &Export,
     owner: &Principal,
+    principals: Option<&harnx_core::user_principals::UserPrincipals>,
     local_id: Option<&str>,
 ) -> Result<SessionInitializer> {
     let initializer = SessionInitializer::named(export.agent.clone(), Default::default());
     if local_id.is_some() {
+        // Existing sessions keep the identity stamped at their creation.
         return Ok(initializer);
     }
-    let Some(user_id) = owner.user_id() else {
-        return Ok(initializer);
+    let mut initializer = match owner.user_id() {
+        Some(user_id) => initializer.with_user_id(user_id),
+        None => initializer,
     };
-    Ok(initializer.with_properties(serde_json::from_value(
-        serde_json::json!({"user_id": {"value": user_id, "inherit": true}}),
-    )?))
+    if let Some(principals) = principals {
+        initializer = initializer.with_user_principals(principals);
+    }
+    Ok(initializer)
 }
 
 async fn shutdown_turn(handle: &RunnerHandle) {
@@ -568,4 +633,83 @@ fn turn_outcome(
 struct AdmissionOwnership {
     guard: OwnedMutexGuard<Option<Arc<RunnerHandle>>>,
     authority: OwnedTask,
+}
+
+#[cfg(test)]
+mod session_initializer_tests {
+    use super::*;
+    use crate::{
+        exports::AgentCardMeta,
+        identity::Identity,
+        store::{DedupeKey, FirstMessageReservation, TaskAllocation},
+    };
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    #[test]
+    fn group_only_a2a_reservation_recovery_stamps_principals_without_user_id() -> Result<()> {
+        let identity = Identity::with_memberships(&[], &["x-groups".into()], &["x-roles".into()])?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-groups"),
+            HeaderValue::from_static("engineering"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-roles"),
+            HeaderValue::from_static("reviewer"),
+        );
+        let owner = identity.resolve_request(&headers)?;
+        assert_eq!(owner.principal, Principal::Anonymous);
+
+        let reservation = FirstMessageReservation {
+            identity: DedupeKey {
+                cluster: "__local__".into(),
+                export: "agent".into(),
+                owner: None,
+                message_id: "first-message".into(),
+            },
+            fingerprint: "fingerprint".into(),
+            message: serde_json::from_value(serde_json::json!({
+                "messageId": "first-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "Hello"}]
+            }))?,
+            allocation: TaskAllocation::new("agent", "session".into()),
+            principals: owner.stampable_principals(),
+        };
+        let recovered: FirstMessageReservation =
+            serde_json::from_slice(&serde_json::to_vec(&reservation)?)?;
+        let export = Export {
+            agent: "agent".into(),
+            public_name: "agent".into(),
+            cluster: None,
+            card_meta: AgentCardMeta {
+                name: "agent".into(),
+                description: String::new(),
+                version: "1".into(),
+                conversation_starters: Vec::new(),
+            },
+            lookup_keys: Vec::new(),
+        };
+        let initializer = session_initializer(
+            &export,
+            &owner.principal,
+            recovered.principals.as_ref(),
+            None,
+        )?;
+
+        let metadata =
+            harnx_runtime::nats_session_metadata::SessionMetadata::new("session", initializer);
+        let properties = harnx_runtime::nats_session_metadata::session_properties(&metadata)?;
+        assert!(properties.get("user_id").is_none());
+        assert_eq!(
+            properties.get("user_principals").unwrap().value,
+            serde_json::json!({
+                "user_id": null,
+                "users": [],
+                "groups": ["engineering"],
+                "roles": ["reviewer"]
+            })
+        );
+        Ok(())
+    }
 }

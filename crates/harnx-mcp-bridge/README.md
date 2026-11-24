@@ -71,6 +71,17 @@ The repeatable `--enable-tool <GLOB>` option applies across all modes:
 - **Session Identity**: Tools requiring caller session identity (such as attachment creation tools) fail clearly when called via stdio bridge, because standalone stdio invocations carry no session identity context.
 - **Process Lifecycle**: The bridge uses `ChildProcessManager` to manage child processes. On completion or error, the bridge explicitly stops and reaps the child process. `kill_on_drop` provides fallback protection against process leaks.
 
+## MRTR Input-Required Support
+
+When connecting to external MCP servers, the bridge probes `server/discover` and negotiates the MCP 2026-07-28 protocol revision (Model-Resolved Tool Responses / MRTR, SEP-2322) when the server offers it. Older servers that only support the legacy `initialize` handshake continue to work unchanged without elicitation capabilities.
+
+MRTR is a server-level capability. When a wrapped server negotiates the 2026-07-28 revision:
+- Every tool listed by that server is stamped with `harnx:input_required` in its `ToolSpec`.
+- During execution, an `input_required` result from `tools/call` suspends the call as a native harnx challenge (`confirm` or an A2UI form) rather than completing.
+- When the user answers the challenge, the bridge re-invokes the tool, passing the accepted responses (`inputResponses`) and opaque state (`requestState`) beside the unchanged tool arguments.
+- Repeated challenges are supported up to a cap of 10 rounds (`MAX_TOOL_INPUT_ROUNDS`).
+- Unsupported elicitation kinds (sampling, roots, URL elicitation) fail clearly with a recoverable error instead of failing silently.
+
 ## Request Timeout Policy
 
 MCP tool listings have no timeout field, so a wrapped server can advertise its
@@ -93,7 +104,7 @@ value into `ToolSpec.timeout_secs` for its NATS registration.
 
 ## Result Limits and Original Attachments
 
-Every result is limited to **32,768 bytes** of compact serialized `CallToolResult`
+Every result is limited to **131,072 bytes (128 KiB)** of compact serialized `CallToolResult`
 JSON by default. This is a per-result limit, not a limit shared across calls in a
 round. JSON escaping, all content parts, annotations, `structuredContent`, `_meta`
 and envelope fields count. Direct CLI stdout adds a trailing newline outside the

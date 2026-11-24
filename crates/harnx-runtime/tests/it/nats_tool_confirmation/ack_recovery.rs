@@ -177,6 +177,7 @@ impl Fixture {
     async fn complete_round(&self) -> Result<()> {
         self.backend
             .append_event(&SessionLogEntry::ToolResults {
+                handoff_selection: None,
                 results: vec![],
                 timestamp: None,
             })
@@ -479,6 +480,9 @@ async fn assert_post_advance_ref_stale(
     fixture.commit_decision(true).await?;
     fixture.complete_round().await?;
     fixture.append_pending_round().await?;
+    let newer = fixture.reference().await?;
+    assert_eq!(newer.tool_call_id, reference.tool_call_id);
+    assert_ne!(newer.request_seq, reference.request_seq);
     let before = fixture.backend.load_events_latest_async().await?;
     assert_eq!(
         fixture
@@ -494,7 +498,22 @@ async fn assert_post_advance_ref_stale(
             .await?,
         HitlDecisionOutcome::Stale
     );
-    assert_eq!(fixture.backend.load_events_latest_async().await?, before);
+    let after = fixture.backend.load_events_latest_async().await?;
+    assert_eq!(after, before);
+    let pending = harnx_runtime::interactions::derive_pending_interaction_summary(
+        &after,
+        "",
+        "local",
+        fixture.source.session_id(),
+        &newer.invocation_id,
+    )?
+    .context("newer approval remains pending")?;
+    assert_eq!(
+        pending.request,
+        harnx_core::pending_interaction::PendingInteractionRequest::LegacyApproval {
+            request: newer
+        }
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(50), commands.next())
             .await

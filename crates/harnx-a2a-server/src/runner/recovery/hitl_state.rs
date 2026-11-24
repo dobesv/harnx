@@ -17,7 +17,7 @@ pub(super) async fn check_unchanged_parked(runner: &Runner, session: &NatsSessio
         return Ok(false);
     };
     let authority = OwnedTask::ticket_from_context(&context, session.storage_key())?;
-    let progress = session.fixed_prompt_progress(&authority).await?;
+    let progress = crate::hitl::interaction::fixed_progress(session, &authority).await?;
     let matches_request = matches!(
         progress,
         PromptProgress::InputRequired(p) if p.approval_ref(authority.invocation_id()) == checkpoint.request
@@ -67,12 +67,10 @@ pub(super) async fn park_recovered_hitl(
     if is_already_parked_waiting(active, &request) {
         return Ok(());
     }
+    let challenge = crate::hitl::interaction::challenge_status(session, pending).await?;
     authority
         .update(&runner.store, session.storage_key(), |active| {
-            active.snapshot.task.status = status(
-                TaskState::InputRequired,
-                Some(&crate::hitl::render_challenge(pending)),
-            );
+            active.snapshot.task.status = challenge.clone();
             active.hitl_checkpoint = Some(HitlCheckpoint {
                 request: request.clone(),
                 phase: HitlPhase::Waiting,

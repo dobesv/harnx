@@ -6,18 +6,19 @@ use crate::{commands::ToolSpec, help::synopsis, BashKitBackend, FsLimits, Script
 
 mod examples;
 
-const PURPOSE: &str = "Chain this agent's tool commands and process their results in one script/round trip. This is an in-process shell, not host Bash. Only tool commands can reach host services, through their normal permissions and hooks.\n\n";
+const PURPOSE: &str = "Chain this agent's tool commands and process their results in one script/round trip. Worth it for loops, many calls, or filtering a large result down to what you need. For a single call, a tool that needs approval, or a result you want to read in full, call the tool directly if you have it. This is an in-process shell, not host Bash. Only tool commands can reach host services, through their normal permissions and hooks.\n\n";
 
 const DIALECT: &str = "Dialect: Bash-compatible BashKit. Fresh VFS per run, cwd /tmp; /attachments is read-only at /attachments/<full media CID> (keep existing CID encoding). No direct host filesystem, network or subprocess access. Pipes, redirects, variables, loops and background jobs (& / wait) work. set -e is on by default, with POSIX-style exceptions for conditions, ! and non-final &&/|| commands. Pipelines use the last command's status unless you enable set -o pipefail. Use set +e to handle ordinary failures; fatal errors still stop the script.\n\n";
 
 const PYTHON: &str = "Python: python and python3 are the same embedded Monty subset, not CPython. Use -c, a VFS script file or stdin/heredoc. open()/pathlib use the VFS. Simple classes work; inheritance, metaclasses, re and third-party imports don't. Python cannot call tools or start subprocesses/network requests; call tools in Bash and pass results via /tmp. A shared work budget caps scripts at ~95 Python calls; batch loops into one invocation.\n\n";
 
 const ARGUMENTS: &str = "Tool arguments/discovery:\n\
-- Property names become --kebab-case flags; strings/numbers take values, booleans use --flag / --no-flag, scalar arrays repeat flags, objects/complex values take quoted JSON. No positional arguments.\n\
+- Property names become --kebab-case flags; strings/numbers take plain values (optional ones too: --path src, not JSON), booleans use --flag / --no-flag, scalar arrays repeat flags, objects and multi-type values take quoted JSON. No positional arguments.\n\
 - --json '<object>' supplies original property keys; --json - reads stdin. Flags override base keys regardless of order. Stdin is otherwise ignored by tool commands.\n\
-- Output defaults to structuredContent JSON when present, otherwise text. -o json|text overrides rendering (not sent to the tool).\n\
+- Without a shell form, output defaults to structuredContent JSON when present, otherwise text, which can still carry decoration such as line numbers. -o json|text overrides rendering (not sent to the tool).\n\
+- A tool with a shell form (help <tool> shows its OUTPUT) prints like a command: a file read like cat, a search like grep -n with exit 1 when nothing matches, so under set -e use it in if or ||, or add || true. Notes about cut-off results go to stderr, so check the report before trusting a count. -o json prints the tool's fields.\n\
 - tools [quoted-glob] lists synopses; help <tool> [tool ...] or <tool> --help shows full schema-derived help without dispatch.\n\
-- Tool exits: 0 success, 1 tool error, 2 usage, 3 needs approval (call directly instead), 4 blocked, 5 rejected, 127 unknown command. Run timeout: 124; cancellation: 130.\n\n";
+- Tool exits: 0 success, 1 tool error, 2 usage error or a tool's own error status, 126 needs approval (call directly instead), blocked or rejected, 127 unknown command. Run timeout: 124; cancellation: 130.\n\n";
 
 const QUOTING: &str = "Quoting idioms:\n\
 - Literal multiline argument, with expansion inside the heredoc disabled:\n\

@@ -5,10 +5,9 @@ use crate::nats_session_metadata::SessionOverrideUpdate;
 use anyhow::{anyhow, bail, Context, Result};
 
 /// A tool-selector setting's `.set` behavior, bundled so
-/// [`Config::update_tool_selectors`] stays within CodeScene's argument
-/// threshold: how a raw value parses (with the setting's own meaning for
-/// `null`), which session override to persist, and how the parsed value
-/// lands in memory.
+/// [`Config::update_tool_selectors`] keeps a short argument list: how a raw
+/// value parses (with the setting's own meaning for `null`), which session
+/// override to persist, and how the parsed value lands in memory.
 struct ToolSelectorSetting {
     parse: fn(&str) -> Option<Vec<String>>,
     persist: fn(Option<Vec<String>>) -> SessionOverrideUpdate,
@@ -199,8 +198,8 @@ impl Config {
     /// Shared `.set` handling for tool-selector settings: parse the value
     /// with the setting's `null` mapping, persist the session override, then
     /// apply it in memory. The per-setting behavior lives in
-    /// [`ToolSelectorSetting`], which keeps this within CodeScene's
-    /// argument threshold.
+    /// [`ToolSelectorSetting`], which keeps this function's argument list
+    /// short.
     fn update_tool_selectors(
         config: &GlobalConfig,
         value: &str,

@@ -3,7 +3,7 @@ role: subagent
 model: codex:gpt-6-luna
 model_fallbacks:
 - openai:gpt-6-luna
-- gemini:gemini-3.8-flash
+- gemini:gemini-4-hydrogen
 - claude:claude-haiku-5-5
 - bedrock:minimax.minimax-m2.5
 compaction_agent: compact-dev
@@ -44,7 +44,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Quick tasks and minor bugs specialist — handles the small, fast, 'blink-and-you-miss-it' fixes with rapid turnaround. Named after Hermes (HER-meez), the Winged Messenger.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

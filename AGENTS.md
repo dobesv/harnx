@@ -61,7 +61,8 @@ hashes for semantically-identical payloads with different key ordering.
 ├── docs/                       # User-facing documentation
 ├── scripts/                    # Shell completions and shell-integration scripts
 ├── Argcfile.sh                 # Developer helper commands (argc-based; install moved to xtask)
-├── xtask/                      # Rust task runner (`cargo xtask install`) for local automation
+├── xtask/                      # Rust task runner (`cargo xtask install`, `affected`, `quality`) for local automation
+├── rustqual.toml               # Settings for the code quality gate (`cargo xtask quality`)
 ├── .changeset/                 # Changeset files for release notes
 ├── knope.toml                  # Release automation config
 ├── renovate.json               # Dependency update bot config
@@ -78,7 +79,7 @@ cargo fmt --all                                               # Auto-format code
 cargo clippy --workspace --all-targets -- -D warnings         # Lint — treat warnings as errors
 cargo nextest run $(cargo xtask affected)                    # Run the tests of every package the change can affect, once
 cargo nextest run --workspace -E 'test(=<name>) | ...' --stress-count=20  # Stress only the tests you added or changed
-cs delta origin/HEAD --error-on-warnings                      # Run CodeScene analysis and fail on quality warnings
+cargo xtask quality                                           # Fail on rustqual findings the change adds or makes worse
 python3 scripts/check_changesets.py                           # Check that every changeset will reach a changelog
 ```
 
@@ -91,12 +92,6 @@ If the workspace build fails with `Permission denied (os error 13)` from
 `a2a-pb`'s vendored protoc binary can't run. Prefix cargo commands with
 `PROTOC=/usr/bin/protoc` to use the system protoc instead.
 
-If `cs delta` fails its license or API request with an SSL handshake error
-behind a TLS-intercepting proxy, set `CS_CERTS` to the proxy CA file path.
-Use `CS_CERTS="$SSL_CERT_FILE"` only when `SSL_CERT_FILE` is set and points to
-that CA. `cs` is a GraalVM native image and doesn't honor `SSL_CERT_FILE` on
-its own.
-
 **Scope the test run to the affected packages.** `cargo xtask affected` diffs
 the working tree, uncommitted and untracked files included, against its merge
 base with `origin/HEAD` (or `--base <rev>`) and prints `-p` arguments for every
@@ -104,7 +99,9 @@ package whose tests the change can break, or `--workspace` when that is all of
 them. It uses guppy's determinator, so a `Cargo.lock` bump selects only the
 packages that build the bumped crate. If it prints nothing, no Rust test is
 affected; don't run the bare `cargo nextest run` it would expand to, which
-tests everything.
+tests everything. It checks the merge base out with `git worktree add`, which
+fails inside Claude Code's Bash sandbox because the sandbox makes the
+repository's `.git/worktrees` read-only; run that one command outside it.
 
 Cargo's graph cannot see tests that launch another workspace binary by path,
 or read files outside their crate (`packages/`, `example_config/`, an
@@ -120,12 +117,26 @@ tmux/interrupt e2e and other timing-sensitive tests; a pure unit test needs no
 stress run. Some flakes only appear under full-suite load, so when a new test
 is timing-sensitive, also run it once alongside the rest of its crate.
 
-CI uses the same selection on pull requests and runs the whole suite in the
-merge queue and on `main`, so a missing edge is caught before merge rather than
-after. CI skips the build and tests entirely when every changed file is on the
-exclusion list in `.github/workflows/ci.yaml` (web, docs, changesets, READMEs,
+CI uses the same selection on pull requests and runs the whole suite on
+`main`. Mergify's merge queue tests its batches as ordinary pull requests, so
+it uses the selection too: a missing edge, or a test only the whole suite
+runs, first fails on `main`. CI skips the build and tests entirely when every changed file is on the
+exclusion list in `.github/workflows/ci.yaml` (web, changesets, READMEs,
 release workflows), which the first path rule in `.config/affected.toml`
 mirrors. A test that starts reading one of those paths must take it off both.
+
+CI compiles each OS once, with `cargo nextest archive --workspace`, and
+splits the selected tests between several jobs that run them from the archive
+without a compiler (`.github/workflows/ci-rust.yaml`; a failure shows under
+`<OS> / Test (k/N)`). The test jobs unpack the test binaries and the
+workspace bins into the checkout's own `target/debug`, so the usual ways of
+finding a sibling binary still work: next to the test's own executable,
+through `env!("CARGO_BIN_EXE_...")`, or in `target/debug` under the workspace
+root, and `CARGO_TARGET_TMPDIR` (`target/tmp`) exists, empty. Nothing else
+from the build directory is there, so a test that reads another file under
+`target/` or runs cargo to build something passes locally and fails in CI. Only xtask's tests may run cargo, and the test jobs
+fetch crates for them alone; a new test that runs `cargo metadata` needs its
+package added to that step's condition.
 
 **Use `cargo nextest`, never `cargo test`.** Tests rely on nextest's per-test
 process isolation; `cargo test` shares one process and produces spurious
@@ -139,17 +150,67 @@ test failures.
 
 **Do not skip any of these steps or you WILL miss problems**
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
-**CodeScene Health scores MUST NOT decrease as part of the change, only increase**
+**Don't add rustqual findings or make existing ones worse** (see "Code quality gate").
 
-A clean `cs delta` doesn't guarantee CodeScene's PR check passes. The check
-(`CodeScene Code Health Review (main)`) runs the server's analysis, which
-scores some files differently and can report findings `cs` doesn't: it once
-flagged Low Cohesion in a file where three helper functions had been added,
-while `cs check` scored the same file as improved, and moving the helpers to
-their own module cleared it. Read the PR check's result after pushing, and
-when it fails on something `cs` can't reproduce, satisfy the PR check. A
-check stuck in `queued` restarts with
-`gh api -X POST repos/dobesv/harnx/check-runs/<id>/rerequest`.
+### Code quality gate
+
+`cargo xtask quality` runs [rustqual](https://github.com/SaschaOnTour/rustqual)
+on the working tree, uncommitted and untracked files included, and on its merge
+base with `origin/HEAD` (or `--base <rev>`), and fails on every finding the
+change added or made worse. The workspace's thousands of existing findings are
+not a to-do list, and the gate ignores them. Findings are matched by file,
+category and function rather than by line, and follow a renamed file. "Worse"
+means a bigger number on a finding both sides have: a longer function, higher
+complexity, deeper nesting, more parameters or more `unwrap`s. A file already
+over the length limit may grow; only crossing the limit counts.
+
+On a multi-commit branch, a per-task run with `--base HEAD` measures only the
+last commit's delta and misses findings earlier commits added — a branch
+whose tasks each ran the gate that way reached pre-submit with 120 unmeasured
+findings. Measure the whole branch the way CI will, against the merge base
+(`cargo xtask quality --base origin/main`).
+
+rustqual is pinned in `xtask/rustqual/Cargo.toml` and its lockfile, so nothing
+needs installing; the first run builds it, which takes about a minute. Its
+settings live in `rustqual.toml`, and both sides of the comparison use the
+working tree's copy, so changing a setting never fails the gate by itself.
+`cargo xtask rustqual <path> --verbose` runs the same binary with the same
+settings to show what is behind a finding, and `--suggestions` adds refactoring
+hints for logic-plus-calls (`iosp`) violations.
+
+Fix what the gate reports. When a finding is deliberate, suppress it with a
+comment on the line above the item: `// qual:allow(iosp) — <reason>` for a
+logic-plus-calls violation, and `// qual:allow(<dimension>, <target>) reason:
+"<reason>"` for anything else, where the target names the kind of finding and a
+metric target pins its ceiling (`max_function_lines=80`).
+`cargo xtask rustqual --explain allow` lists the targets. `// qual:api` and
+`// qual:test_helper` mark a function used only from outside its crate or only
+from tests, which rustqual otherwise reports as dead code.
+
+rustqual treats only an exact `#[cfg(test)]` as test code. A module gated with
+`#[cfg(all(test, unix))]` is analysed as production code, so its helpers'
+`unwrap`s and test-only calls are reported. Write that gate as two attributes,
+`#[cfg(test)]` and `#[cfg(unix)]`, which compile the same.
+
+A finding in a file the change never touched can still come from the change.
+The repeated-match check (DRY-005, `repeated_match`) groups `match` expressions
+by the shape of their arms, whatever the enum and the values, and reports every
+member once a group reaches three. A new `A => 0, B => 2, _ => 1` match on one
+enum joined two such matches on unrelated enums in test files, and all three
+were reported.
+
+The duplicate-fragment check (`dry, fragment`) clusters similar code across
+files the same way. A third e2e file repeating the standard
+broker/binary/env-guard preamble grew clusters whose other members sat in
+`bash_script_mode.rs` and `tool_supervisor.rs`, and the gate reported those
+pre-existing pairs as made worse. Suppressing your new copy changes nothing —
+the findings live at the other locations. Deduplicate the shared shape into a
+helper (the `start_time_server` helper in
+`crates/harnx-runtime/tests/it/bash_script_mode.rs` now serves three e2es), or
+`qual:allow(dry, fragment)` the pre-existing fragment with a written reason.
+
+The `Code quality` CI job runs the gate on pull requests and annotates the diff
+with what it finds. It is advisory: `.mergify.yml` doesn't require it.
 
 ### Test sandbox
 
@@ -169,7 +230,11 @@ top-level `/tmp` entry that holds the checkout, the target directory or
 `HOME` is shared with the host. No DNS server is reachable inside, so a name
 resolves only through `/etc/hosts` and NSS modules: RFC 6761 `*.localhost`
 names need `myhostname` in `/etc/nsswitch.conf` (`libnss-myhostname` on
-Debian and Ubuntu, which CI installs). On macOS the test
+Debian and Ubuntu, which CI installs). Cargo runs offline there
+(`CARGO_NET_OFFLINE`), so a test that runs `cargo metadata`, as xtask's
+`affected` tests do, needs every target platform's crates in the registry,
+not just the host's that a build downloads; run `cargo fetch` first, as CI
+does for them. On macOS the test
 runs in its own process group, which is killed when the test ends, along with
 any process whose command line names the test's private home, such as its
 broker. A process that moved to its own group without naming the home, such
@@ -270,14 +335,14 @@ Use `--no-sandbox` when the test scope is bash behavior, not sandbox isolation. 
 
 ### MCP bridge result limits
 
-Bridged MCP tool results are capped at 32 KiB serialized JSON by default
+Bridged MCP tool results are capped at 128 KiB serialized JSON by default
 (`--max-result-bytes` / `HARNX_MCP_MAX_RESULT_BYTES`, minimum 1024). Oversized parts
 offload to NATS attachments with original MIME and bytes; oversized aggregates fall back
 to `application/json`, preserving success status for collective fitting parts if representable,
 or returning an explicit error for unrepresentable schemas/metadata. Calls without trusted
 session identity or NATS storage (e.g. direct CLI) return bounded recoverable errors
-without retaining originals. Native tool results above 32 KiB pass unchanged when within
-server storage/wire limits (broker `max_payload` and journal KV row budget); the 32 KiB
+without retaining originals. Native tool results above 128 KiB pass unchanged when within
+server storage/wire limits (broker `max_payload` and journal KV row budget); the 128 KiB
 presentation cap applies only to bridged results. See
 `crates/harnx-mcp-bridge/README.md#result-limits-and-original-attachments` and
 `docs/nats-ha.md#oversized-terminal-tool-replies` for per-result caps, attachment paging,
@@ -300,27 +365,13 @@ default) must return its first execution_id-bearing response instead of expiring
 60 s backstop. Direct stdio clients that ignore unknown `_meta` keys are unaffected.
 See `crates/harnx-mcp-bridge/README.md#request-timeout-policy`.
 
-### Session transcript and PreToolUse hook mutation
-
-### Hook command strings must use `shell_words::join`
-
-Hook command strings that embed binary paths or JSON expressions MUST use
-`shell_words::join` on all platforms, including Windows. Unquoted Windows paths
-(`C:\Program Files\...\hook-server.exe`) split on backslashes and spaces when
-passed through `shell_words::split` in the hook server, breaking execution.
-
-Precedent: `crates/harnx-runtime/src/nats_worker/operator_tools/tests.rs:761` and
-`crates/harnx-runtime/tests/it/nats_worker/tool_cli.rs:619`. Existing fixtures
-use `shell_words::join([binary, "--event", "PreToolUse", "--jaq", expression])`
-to preserve Windows paths with backslashes and JSON containing apostrophes.
-
-### Session transcript and PreToolUse hook mutation
+### Session transcript and middleware argument mutation
 
 Persisted `ToolCalls` entries hold the arguments as received from the LLM, before
-`PreToolUse` hooks run, except that `null`s for omitted optional parameters are
+tool middleware runs, except that `null`s for omitted optional parameters are
 already gone (see "Tool parameter schemas"). `execute_tool_round_with_persistence`
-(`crates/harnx-runtime/src/tool.rs`) appends calls before hooks apply
-`mutated_tool_input`. To assert hook-injected env or args, read `ToolResults`
+(`crates/harnx-runtime/src/tool.rs`) appends calls before middleware modifies
+arguments before `next`. To assert middleware-injected env or args, read `ToolResults`
 or process output instead.
 
 ### Test skips must probe capability, not timeout
@@ -330,6 +381,13 @@ A test that skips on timeout hides real failures. Guard skips with an explicit c
 A probe must not skip on its own mistakes either. `harnx-sandbox-run`'s integration tests skipped from the day they were written, because their probe passed flags the binary never accepted. When the probe's own invocation is rejected, such as by a usage error, fail the test; skip only when the capability is missing.
 
 ### Broker-backed tests and wall-clock margins
+
+Group membership is by test name, not by what the test does: the `broker-e2e` override in
+`.config/nextest.toml` filters names (a broad `test(/nats/)` plus explicit filters such as
+`^tests::upload_attachments_` and `^access_prompt_attachments::`), in both the default and
+`ci` profiles. A test that spawns a `nats-server` but matches no filter runs in the
+default group and can destabilize the rest of the run — give it a matching name or add
+the filter to both profiles. Verify with `cargo nextest show-config test-groups`.
 
 Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
 (`.config/nextest.toml`; local runs use `-local` copies with higher caps). On
@@ -371,7 +429,7 @@ tests verify the same bootstrap path that Windows executes unchanged.
 ### Error classification through typed causes, not strings
 
 When classifying broker/JetStream errors (such as size limits), use typed downcasts
-against async-nats 0.50 error causes rather than string matching. String matching on
+against async-nats 0.51 error causes rather than string matching. String matching on
 error messages creates false positives: permission-denied or connection errors may
 contain words like "size" or "exceeded" without actually being size limits.
 
@@ -406,6 +464,24 @@ source error: `config/session_persistence/append_status.rs` keeps the first appe
 across a batch, and `require_authoritative_appends` adds operation context with
 `.with_context`, never `bail!`. Regression coverage:
 `tests/it/nats_worker/activation_size_failure.rs`.
+
+async-nats 0.51's own wrappers sometimes destroy the typed cause before it reaches you.
+`ObjectStore::put` stringifies its chunk and metadata publish errors (`PutError` carries
+the message as its source, no inner `jetstream::Error` to downcast), so for a publish
+failure the surviving fallback signal is the client's `connection_state() != Connected`.
+`PutErrorKind::PurgeOldChunks` is the exception: it keeps a typed `PurgeError` source, and
+it only fires after the new version's metadata has been acknowledged — treat it as a
+committed version with a failed old-chunk cleanup, not as a publish failure (see
+`committed_after_failed_cleanup` in `crates/harnx-blob-store/src/media.rs`).
+Bucket-ensure round trips after connect surface the
+inner error wrapped in an outer typed kind instead (`context::RequestError` with
+`TimedOut`/`NoResponders`, or `GetStreamError`/`CreateStreamError`/`LastRawMessageError`
+kinds such as JetStream `CLUSTER_NOT_AVAILABLE`/`STREAM_OFFLINE`). Classify on those
+outer kinds, never on the message text: `is_nats_unavailable` in
+`crates/harnx-serve/src/nats_access.rs` is the reference implementation, and
+`nats_access_tests.rs` builds its fixtures from real error values (deserialized API
+payloads wrapped in async-nats's own constructors, live no-responders chains) rather than
+hand-built strings.
 
 ### Telling a flake from a regression
 
@@ -534,22 +610,48 @@ token action exposes.
 the LiteLLM registry every Monday. Know what it does not maintain before
 trusting a price or adding a model.
 
-A model the registry does not list is kept verbatim, never refreshed, and
-reported in the run summary as `provider <name>: preserving models not present
-in LiteLLM: ...`. That line is the only signal that an entry's price is frozen,
-so read it rather than skimming the diff. Fields in `HARNX_ONLY_FIELDS`, such
-as `patches` and `require_max_tokens`, describe harnx's own request handling,
-are never supplied upstream, and must stay in that list or a refresh resets
-them. Any new field of that kind belongs there too.
+For each kind of model (chat, embedding, reranker) the registry lists for a
+provider, the registry is the whole list. A model it stops listing, or marks
+past its deprecation date, is dropped with its aliases and appears under
+`removed:` in the run summary, which becomes the auto-merge pull request's
+body. Hand-maintained entries survive only for providers the script doesn't
+map (qianwen, zhipuai, ernie, openrouter and github; the comment above
+`LITELLM_TO_HARNX_PROVIDER` says why) and for kinds the registry doesn't list
+for a covered provider, such as Jina's embedding models. A kind counts as
+listed even when its only entries are deprecated or are models harnx's client
+can't call (`registry_kinds`). Fields in `HARNX_ONLY_FIELDS`, such as `patches`
+and `require_max_tokens`, describe harnx's own request handling, are never
+supplied upstream, and must stay in that list or a refresh resets them. Any new
+field of that kind belongs there too.
 
-A provider whose LiteLLM prefix is missing from `LITELLM_TO_HARNX_PROVIDER`
+The refresh lists only models the provider's client can call
+(`client_can_call`). Vertex's client dispatches chat by model family and sends
+embeddings in the text-embedding schema, so Vertex's partner models (Llama,
+gpt-oss, Grok and other `-maas` entries) and multimodal embeddings stay out,
+and no client without a rerank operation (Bedrock, Vertex, Gemini, Claude,
+OpenAI) gets rerankers. Supporting one of those in the client means widening
+`client_can_call` and the guards that mirror it,
+`clients_without_rerank_list_no_rerankers` and
+`vertex_lists_only_model_families_its_client_can_call`.
+
+A provider whose LiteLLM name is missing from `LITELLM_TO_HARNX_PROVIDER`
 never reaches the merge path at all: `regenerate_provider_models` copies the
-existing block verbatim and prints nothing, so the whole provider's prices
-freeze with no warning line. That is how Gemini went stale — LiteLLM renamed
-its `google_ai` prefix to `gemini`, every Gemini entry was dropped before any
-other check ran, and cached-token calls then recorded no cost (#2638). If an
-entire provider's prices look frozen, check the mapping table in
-`scripts/update_models.py` before blaming the registry.
+existing block verbatim, so the whole provider's prices freeze. That is how
+Gemini went stale when LiteLLM renamed `google_ai` to `gemini`, after which
+cached-token calls recorded no cost (#2638), and how xAI went stale after
+`x_ai` became `xai`. The run summary reports a mapped name that matches no
+registry entry (`mapped LiteLLM providers with no registry entries: ...`), so
+a rename shows up as that line; the fix is the new name in the table. A
+provider that was never mapped still freezes silently.
+
+A missing name for part of a provider deletes rather than freezes. LiteLLM
+lists Cohere's chat models under `cohere_chat`, and Vertex's Gemini and
+embedding models under bare keys tagged `vertex_ai-language-models` and
+`vertex_ai-embedding-models`; without those table entries the refresh drops
+them as unlisted. Its modes are the registry's too: rerankers are `rerank`,
+which the catalog stores as type `reranker`. Before accepting a removal, check
+that the registry stopped listing the model rather than listing it under a
+name or mode the script doesn't read.
 
 A model the registry adds starts with no `patches`, because only an existing
 entry has any to carry over. The refresh gives new models the patches harnx
@@ -565,6 +667,30 @@ adds the next such model. An OpenAI failure means a Responses model has no
 reasoning patch, usually because the registry doesn't mark it
 `supports_reasoning`: give it a curated patch if it reasons, or add it to the
 guard's `openai_model_without_reasoning` if it doesn't.
+
+Those two patches are all a new model gets. Effort aliases, the removal of
+sampling parameters and Gemini 4's per-request output limit are lists of model
+names in `scripts/model_variants.py` (`OPENAI_EFFORT_VARIANTS`,
+`apply_openai_base_patches`, `GEMINI_4_REQUEST_PATCHES`), and no guard fails
+for a model missing from them. GPT-6.2 arrived without `:high` and `:max`
+aliases, and Gemini 4 Carbon with its whole 1,048,576-token window as its
+output limit. Read a new model's catalog entry before an agent selects it.
+
+Claude thinking aliases come from the registry's flags rather than model
+names. `ThinkingSupport.from_registry` (`scripts/model_variants.py`) reads
+`supports_adaptive_thinking`, `supports_legacy_thinking` (a fixed
+`budget_tokens` is still accepted), `supports_reasoning` and the
+`supports_{xhigh,max}_reasoning_effort` flags. A model that accepts a budget
+keeps a fixed-budget `:thinking`. One that accepts only adaptive thinking gets
+it on the base model and on `:thinking` (Bedrock: `:thinking` only), at the
+model's own default effort, plus `:xhigh` and `:max` on the Claude API and
+Vertex where flagged. The one per-model rule left is
+`uses_thinking_binding_controls`, because the registry doesn't say which
+models check replayed thinking. The guard names the adaptive-only families
+itself (`claude_is_adaptive_only`), so an entry that loses its adaptive flag
+fails the job with `sends a fixed thinking budget, which it rejects` instead of
+shipping an alias that always returns 400. Check the model card, then correct
+the guard or wait for the registry rather than patching the catalog.
 
 LiteLLM records a capability only where it holds, so an omission is silence
 rather than a denial. `CURATED_CAPABILITY_FLAGS` lets a curated `true` survive
@@ -590,6 +716,15 @@ refresh one provider also imports every other provider's current upstream
 drift, which does not belong in a scoped changeset. After a scoped refresh,
 take `HEAD:crates/harnx/models.yaml`, splice in only the `provider:` block
 you meant to change, and confirm `git diff` touches that block alone.
+
+To apply a new rule in `scripts/model_variants.py` without the registry, load
+the catalog with `load_existing_data`, pass a provider's own models (minus
+those `is_generated_variant_name` matches) to `regenerate_provider_models` as
+the fetched set, and write the result with `render_models_yaml`. Rendering
+every provider unchanged reproduces the file byte for byte, so the diff shows
+only what the rule changed. This works for OpenAI and Gemini. Claude's thinking
+aliases need the registry's flags, which the catalog doesn't store, so a Claude
+provider regenerated this way loses them.
 
 ## Key Patterns
 
@@ -642,6 +777,17 @@ Consequences:
   used by `harnx info agent` / `.info agent`) must keep `use_tools` selectors
   verbatim — filtering them against local declarations silently drops every
   tool-server tool.
+
+### Observability wiring for new long-running server binaries
+
+Long-running binaries that don't go through `harnx_toolset_server::run_toolset_main` (e.g. `harnx-serve`, `harnx-worker`, `harnx-a2a-server`, `harnx-mcp-bridge`) wire runtime observability by hand. `harnx-a2a-server` landed without healthz or HTTP route metrics (issue #2701). Toolset servers get runtime wiring steps 1–3 from `harnx_toolset_server::run_toolset_main`; documentation updates and packaging steps remain manual. For packaging, follow the [native toolset server checklist](#adding-a-new-native-toolset-server), including workspace membership, `.github/workflows/release.yaml` and `docker/harnx.Dockerfile`.
+
+Wire runtime observability:
+
+1. **CLI + init** — flatten `harnx_metrics::MetricsFlags` and `harnx_healthz::HealthzFlags` into the arg struct, then call `harnx_metrics::init` and `harnx_healthz::init` before anything slow (NATS connect, bootstrap). `MetricsFlags` has no env fallback; `HealthzFlags` honors `HARNX_HEALTHZ_ADDR`. Both `init`s are no-ops when the address is unset.
+2. **Readiness lifecycle** — the healthz listener starts `503`. Call `readiness.ready()` only after bootstrap completes and the main listener binds; call `readiness.not_ready()` on SIGTERM/Ctrl-C *before* draining runners and in-flight connections, so load balancers stop sending traffic during drain.
+3. **HTTP metrics** — for Axum servers, layer `harnx_metrics::http_metrics_middleware` on the outer router (as in `crates/harnx-a2a-server/src/routes.rs`), never inside per-request handlers, so route labels stay bounded templates rather than raw paths.
+4. **Docs** — add the binary to the coverage lists in `docs/healthz.md` and `docs/metrics.md`.
 
 ### Adding a new native toolset server
 
@@ -936,6 +1082,62 @@ does). A new native toolset with a map-typed parameter loses strict mode for
 that whole tool, so prefer a list of name/value objects when strictness
 matters.
 
+### What script mode reads from a tool
+
+Inside a `bash` script every tool is a command (`crates/harnx-script`), and
+three things a tool declares decide how well it works there.
+
+- **Parameter types.** A scalar, or an array of scalars, becomes a plain
+  flag, and so does its nullable form (`Option<T>`: `type: [T, "null"]`,
+  `nullable: true`, or `anyOf` of one type and null). Anything else, including
+  a union of two non-null types, a `$ref` that survived inlining or a map,
+  takes one quoted JSON argument, which models get wrong more often.
+- **Audience annotations.** A command's text output is the result's text
+  blocks minus those whose `annotations.audience` doesn't include
+  `assistant`. Put the data a script should pipe in an assistant-audience or
+  unannotated block, and the one-line summary for the person watching in a
+  user-audience block. A tool that annotates its data `user` prints nothing
+  in a script.
+- **Structured results.** The `bash` tool's inner calls send the request
+  capability `harnx:structured_result`
+  (`InnerCallExecutorConfig::structured_results`), and so does a custom
+  script tool's Bash body; direct model calls, a script tool's Python body
+  and a middleware's or hook's own `call_tool` don't. A native tool that
+  wants a shell form returns script-style fields when
+  `ToolInvocationContext::wants_structured_result()`
+  (`text` for a file, `paths` or `matches` for a search), declares with
+  `ToolSpec::with_script_output` which field is stdout, stderr and the exit
+  status, and leaves its direct-call output byte-identical. It bounds the
+  result itself, and puts a note about cut-off data in the field the mapping
+  names as `stderr`, never in the data. Paths it prints have to be usable as
+  arguments to the next command. Scripts run with `set -e`, so a non-zero
+  status for "nothing found" (`fs_grep` exits 1) ends a script that doesn't
+  guard the call. `harnx-fs-tools` is the reference (`script_result.rs`,
+  `script_search.rs`).
+
+  The request rides on the call context (`ToolCallOrigin::structured_result`,
+  set only by the fork the `bash` tool's inner calls use), not on a
+  task-local: a
+  script middleware runs on harnx-script's worker thread, and its `call_next`
+  dispatch would lose one. A middleware or hook that wraps a script's inner
+  call sees the script-shaped result, so one that scans `content` text misses
+  the data. MCP doesn't carry the request, so the mapping is stripped from
+  MCP listings (`harnx-toolset-server/src/mcp.rs`) and from the sandbox
+  gateway's proxied specs: a tool reached that way answers in model style
+  and advertises no shell form.
+
+The `bash` tool's own result has two shapes, chosen by
+`BashProviderConfig::full_payload`. A model round gets `status`, `exit_code`,
+the truncation flags and the rendered report in `content`. An operator
+command (`harnx call bash`, `.call bash`) also gets `stdout`, `stderr` and
+`trace` as fields. Code that renders or inspects a model round's `bash` result
+has to read `content`.
+
+A script that runs to a non-zero `exit` comes back as status `error` with no
+`error` text; status `ok` always means exit code 0. Only a failure of the run
+itself (a resource limit, a timeout, a cancel, a fatal inner call) carries
+`error` text (`crates/harnx-script/src/bashkit_backend/outcome.rs`).
+
 ### Loop protection
 
 Models, Gemini in particular, fall into loops. Two guards in
@@ -1158,6 +1360,25 @@ changes but should be audited for correctness. `message_role_for_assignment`
 `renumber_remote_messages_for_window` wipe every reloaded tool message's `log_seq`,
 silently disabling TUI transcript actions on tool rows (#2557).
 
+Tool rounds are "open" only through `interactions::pending::open_rounds`
+(`harnx-runtime/src/interactions/pending.rs`); any new derivation of open or
+suspended rounds must share it rather than copy the round-boundary logic. A
+private copy in `interaction_checkpoint/guard.rs` that skipped `Clear` let a
+pre-Clear suspended round be redispatched after `.empty session` (#2744 review),
+which also required `find_orphan_tool_calls` and
+`nats_worker/agent_loop/handoff_recovery.rs` to honor `Clear` separately. The durable interaction and surface variants (`ToolCallCompleted`, `InteractionRequested`,
+`SuspensionReady`, `InteractionResponse`, and `SurfaceAction`) follow the readers-before-writers
+rule above. For `SessionLogEntry::SurfaceAction`, the writers are `harnx surface act`, the TUI surface
+action modal, the `harnx-serve` `session/surface_action` RPC, and the worker control path.
+Readers across the cluster must be upgraded before producers write any `SurfaceAction` entries.
+Control clients must also upgrade before workers: older clients cannot parse the worker's
+early `Pending` acknowledgement and fall back to idle execution after 40 seconds, risking a
+duplicate tool run while the worker is still executing. Rollback below this release is one-way
+once any `SurfaceAction` exists in a transcript, because older readers hard-reject unknown log
+entry variants. Reader arms live in `config/session/replay.rs`, `session_history.rs`, and
+`interaction_checkpoint/guard.rs`, and rollout order plus the `harnx_interaction_checkpoints`
+store are documented in `docs/middleware-guide.md`.
+
 Mid-tool entries (arriving between `ToolCalls` and `ToolResults`) must be queued in
 `messages_queued_during_tool` during reconstruction so tool_use→tool_result adjacency is
 preserved. See `SubAgentStarted` handling in `config/session.rs` for the pattern.
@@ -1250,11 +1471,15 @@ Don't add a typed field to `SessionMetadata`. It denies unknown fields, so
 every older reader fails on the records that carry the field, and during a
 rolling deploy older workers stop running those sessions. Use an extension
 namespace, which older readers keep as opaque JSON. Descriptive values that
-agents or frontends set, such as a user identity, belong in session
+agents or frontends set, such as a branch or issue link, belong in session
 properties (`dev.harnx.session_properties`): a row in `PROPERTY_DEFINITIONS`
 (`nats_session_metadata/session_properties.rs`) brings its validation, its
 line in `harnx_write_session_meta`'s description and whether sub-agent
-sessions inherit it. See "Session properties" in `docs/nats-ha.md`.
+sessions inherit it. Identity-bearing properties (`user_id`,
+`user_principals`) are the opposite: `read_only: true` and written only by
+trusted creation code through `SessionInitializer`, because access rules and
+agent tailoring trust what they hold. See "Session properties" in
+`docs/nats-ha.md`.
 
 ### HTTP Test Clients and Proxy Environments
 
@@ -1286,10 +1511,37 @@ access checks requiring ownership match (admin scope can bypass ownership). See
 `user_id` is defined with `read_only: true`, and tests in
 `session_properties_tests.rs` guarding this invariance.
 
+The caller's resolved principals (user id, expanded aliases, groups, roles)
+are snapshotted at the same creation moment into a second read-only session
+property, `user_principals` (`USER_PRINCIPALS_PROPERTY` in
+`nats_session_metadata/session_properties.rs`, inherit-by-default). Only
+trusted creation code writes it: `RequestIdentity::stampable_principals`
+(harnx-serve, harnx-a2a-server) through
+`SessionInitializer::with_user_principals`. A2A stores it with the
+first-message reservation, so retries and background recovery stamp the
+original caller, never the retrying caller's current memberships. No client
+request field, session override, session variable, or tool can set it.
+Sub-agent and handoff sessions copy it verbatim (`inherited()` /
+`inherited_identity()`) and never recompute it — group or role revocations
+reach only new sessions. Reads go through
+`nats_session_metadata::user_principals` / `SessionProperties::user_principals`,
+which never fail: a missing snapshot reads as a legacy fallback derived from
+`user_id` (pre-snapshot sessions, CLI/TUI/ACP), so does a property value that
+can't be parsed, and an extension that fails to decode entirely reads as
+anonymous (warn-logged). The snapshot drives agent `patches` and the
+`__user__` template variable. It is customization, never authorization —
+access checks keep using live request memberships. See "Agent Patches" in
+`docs/agent-guide.md` for the user-facing semantics.
+
 Shared request identity resolution lives in `harnx_runtime::identity`
 (`identity.rs`), used by `harnx-a2a-server` and `harnx-serve`. It extracts from
-configured HTTP headers or cookies and is fail-closed: an empty or malformed
-matching source returns an error rather than falling back. User aliases
+configured headers, cookies, or `Authorization: Bearer` tokens (`forge-fit`,
+`bearer-claim:CLAIM` — decoded without any signature check) and is fail-closed:
+an empty, malformed or unusable matching source returns an error rather than
+falling back. Bearer verification is async (JWKS fetch and cache), so it lives
+only in `harnx-a2a-server` (`bearer_verify.rs`, the `--bearer-*` flags, off by
+default); while a verifier is configured, that crate's sync decode-only
+resolution paths fail closed rather than decode tokens. User aliases
 (`users.yaml`) may also assign configured `groups` and `roles` to matched callers;
 these are merged with header memberships but never grant ownership. See
 `docs/configuration-guide.md` under "User Aliases" for the merge semantics.
@@ -1303,8 +1555,9 @@ Precedence at metadata creation:
 4. Global `user_id` in `config.yaml` / `HARNX_USER_ID`.
 
 Blank explicit or inherited strings count as absent, so defaults apply. Handoffs
-use `SessionProperties::inherited_user_id` to copy only the user identity, not
-execution-context properties like `git_branch`.
+use `SessionProperties::inherited_identity` to copy only the identity —
+`user_id` plus the `user_principals` snapshot — not execution-context
+properties like `git_branch`.
 
 Control commands in `harnx-serve` (cancel, compact) must not create metadata.
 They check for an existing canonical record via `control_session()` before
@@ -1337,7 +1590,14 @@ Parked `INPUT_REQUIRED` tasks release A2A ownership but keep their fixed admissi
 
 Session-prefix keys are purged by `delete_remote_session_by_key` through
 `purge_session_prefix`. Coordinated session deletion also removes global first-message reservations, recovery registrations, task event subjects and the scoped A2A lease. It refuses unsettled work and revision-purges authority before the log; purge tombstones fence stale writers. Those A2A tombstones (under `sessions/<key>/a2a/`, `a2a/first-messages/` and `a2a.registry.`) are permanent on purpose: A2A records are created with strict creates (`update(key, value, 0)`), which a marker blocks but an expired one doesn't, so a deleted record could come back. Delete other KV keys through `harnx_nats_common::markers::purge` (in a bucket created with `limit_markers` or reconciled with `allow_expiring_markers`) rather than a plain `delete` or `purge`, whose marker stays forever, and only when nothing guards the key with a strict create. Remove an object-store object by purging its chunk and metadata subjects, reading its metadata from the stream leader (`harnx_blob_store::media`), since the object store's `delete` leaves a metadata entry behind. Checkpoint cleanup retains subject predecessors and never purges an active pending envelope. Stream policy, measured payload limits, permissions and drain rollout live in `docs/a2a-operations.md`. New per-session storage
-should use the session prefix to reuse existing GC.
+should use the session prefix to reuse existing GC, and each new per-session
+bucket must be added to the `delete_session_leftovers` cascade
+(`harnx-runtime/src/nats_admin.rs`), opened without creating it since an absent
+bucket has nothing to purge. When the bucket has no TTL, purge its subjects
+physically with a stream purge plus subject filter (like
+`CheckpointStore::purge_session` for `harnx_interaction_checkpoints`) instead
+of per-key KV purge: a per-key PURGE marker leaves the subject listed forever,
+which "keys gone" checks and listings then misreport.
 
 ### Crate layering for NATS tool servers
 
@@ -1371,6 +1631,17 @@ A departing replica holding the latest revision will delete the key, leaving sur
 undiscoverable until their next refresh (up to 30s). Only use `DeleteIfCurrent` for
 singletons that are guaranteed never to share their registration identity.
 
+User-scoped (`…{identity}.u.{user}`) and ownerless-only (`…{identity}.anon`)
+registrations — the per-principal additions credentialed tool servers publish
+(`harnx_toolset_server::RegistrationHandle`) — follow a stricter rule than either
+policy: no blind puts and no unconditional deletes. Every refresh is a CAS on the
+KV revision the writer last read, and every delete additionally checks the stored
+`connection_id` (`ConditionalDelete::ConnectionMismatch` leaves a newer connection's
+registration alone), so a stale instance can keep a removed principal's registration
+alive for at most one refresh interval and can never clobber or recreate a newer
+connection's. See `crates/harnx-toolset-server/src/registration_handle.rs` and
+`docs/tool-credentials.md`.
+
 
 ### Canonical `cid:` URL scheme
 
@@ -1394,13 +1665,26 @@ Operational properties:
 
 ### Run-deadline cancellation is invocation-fenced
 
-Worker deadline timeouts use `interrupt_invocation` (in `nats_session/interrupt.rs`),
-binding the cancellation to the specific admission's prompt sequence. Unlike
+Worker deadline timeouts use `interrupt_invocation_stop_steered` (in
+`nats_session/interrupt.rs`), binding the cancellation to the specific
+admission's prompt sequence. Unlike
 session-level `interrupt_session`, which targets the current turn, invocation-fenced
 cancellation checks the terminal boundary before appending a `Cancel`. If the
 invocation already completed or an earlier cancellation won, the fenced call
 returns without appending. Late timer callbacks cannot cancel a subsequent
 independent run in the same session.
+
+A first `TurnEnd` is not proof the invocation settled: steering (issue #2774) can
+extend an invocation past its first terminator while steered rows are still
+outstanding. Only a stop naming the invocation that currently holds the session's
+admission head may end that extended drain — deadline callbacks pass the expired
+invocation, `interrupt_prompt` and `interrupt_admitted_invocation` pass their own
+binding — while a headless stop (`interrupt_invocation`, `owning_head: None`) stays
+scoped to the prompt's own turn and reports `Idle` at its terminator. Ownership is
+re-derived from the head on every CAS attempt — once a successor's prompt row is
+appended, the log's `steered_rows_outstanding` view cannot attribute rows to an
+invocation, so the head is the only authority that keeps a stale owner's `Cancel`
+off a successor's work.
 
 This fencing is distinct from lease loss or worker failover, which set a
 nonterminal abort flag without publishing a cancellation.
@@ -1415,7 +1699,7 @@ reused; its abort flag is now set, and a replacement turn must create a fresh ha
 
 `session_send` and `session_wait` (issue #1550) add durable dispatch and
 prompt-specific observation on top of the unchanged synchronous
-`session_prompt`; `session_load` gained the same bounded `read` contract.
+`session_prompt`; `session_load` gained a bounded `read` contract.
 Implementation: `nats_worker/subagent_toolset/async_session/`,
 `nats_session/dispatch.rs`, `nats_session_log/window.rs`,
 `nats_worker/subagent_toolset/session_read.rs`.
@@ -1456,8 +1740,21 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    cannot claim the read-only hint. `session_load` is a pure read — it never
    resumes, activates or repairs.
 
-5. **Bounded read contract** — the entire serialized result, metadata
-   included, fits `max_output_bytes` (default 16384, range 1024..65536);
+5. **Waits return the final reply, never a transcript** — a settled wait
+   carries the child's last assistant reply as `response` (found in the 32
+   rows before the terminal, `observation/output.rs`), the way
+   `session_prompt` returns it; a running one carries a ~2 KiB `activity`
+   sample built from the tool round the snapshot already holds, so a poll
+   costs no extra read (`async_session/activity.rs`). Waits take no `read`
+   option. The first version paged the turn forward from its prompt, so
+   every repeated wait on a long child returned the same oldest 128 KiB and
+   a finished child's reply was cut off; `session_load` is the only
+   transcript reader.
+
+6. **Bounded read contract (`session_load`)** — the entire serialized result,
+   metadata included, fits `max_output_bytes` (default 131072, range
+   1024..307200).
+   Per-event previews default to 250 head lines and 750 tail lines;
    physical scans cap at 1000 records / 8 MiB per page
    (`nats_session_log/window.rs`); holes are explicit `omitted_ranges`
    recoverable through the `entry_index` + `byte_offset` continuation, with
@@ -1467,7 +1764,22 @@ Implementation: `nats_worker/subagent_toolset/async_session/`,
    not synthetic conversion tests — strict-mode clients send `null` for
    omitted nested objects (see "Tool parameter schemas").
 
-6. **Dispatched prompts report progress from a parent-side watcher, not from
+7. **Async admissions are detached from parent interruption** (issue #2779) —
+   `session_send` sets `InvocationAdmission.detached` before durable append for
+   new invocations. Joined messages keep the existing invocation's admission.
+   Parent `Cancel`/`Error`, including restart recovery's prompt-scoped stop,
+   cannot refuse the child's next turn or worker resume. An inline soft wait
+   doesn't change this. Cancelling `session_send` or `session_wait` stops only
+   observation; `SubagentToolset::cancel` interrupts children only for
+   `session_new`/`session_prompt`. Ancestor checks
+   (`TurnWorker::refuse_resume_under_interrupted_parent`,
+   `nats_worker/daemon_turn_input.rs`) stop at a detached admission,
+   after checking that invocation's own terminal state for synchronous
+   descendants. Explicit `session_cancel` and inherited deadlines still stop
+   detached work. The default-false field preserves old admission JSON without
+   adding an `InvocationEdgeKind` variant that older readers would reject.
+
+8. **Dispatched prompts report progress from a parent-side watcher, not from
    the child's turn** (issue #2664) — successful dispatch and an authorized
    `session_wait` start (`async_session/progress.rs`) a
    `SubagentProgressReporter` watcher, deduplicated per prompt in-process.
@@ -1497,6 +1809,19 @@ deliveries. A message that reaches `max_deliver` is never delivered again, even
 after the limit is raised, and lowering the limit below a message's delivery
 count drops it without the max-deliveries advisory. See "Delivery limits" in
 `docs/nats-ha.md`.
+
+### `kv::Store::status()` serves cached stream info
+
+`kv::Store::status()` clones the stream's cached info, so a `max_message_size`
+or other limit changed after the handle was opened stays invisible to it.
+When a size-rejection retry must plan against the limit that actually rejected
+the write, read the config fresh with `jetstream.get_stream(...).info()`.
+`InvocationJournal::complete_bounded` hit this: its typed-size retry re-planned
+an image offload against a stale ~1 MiB budget, and the real 8192-byte row cap
+turned the single retry into a fatal completion
+(`crates/harnx-toolset-server/src/invocation_journal/completion.rs`).
+Reading a config just to modify and update it in one step is fine with
+`status()`, which is why several test helpers still use it.
 
 ### Interrupt acceptance
 
@@ -1548,9 +1873,43 @@ the wrong branch (#1743). When adding arms or modifying this loop, keep them
 pure signal checks — no `.await` calls, no shared-state mutations inside select
 arms.
 
-Build the workspace before cross-process tests after changing tool or hook wire
+Build the workspace before cross-process tests after changing tool wire
 types. Those tests launch workspace sidecars as well as linked test code; a stale
-hook or tool binary can fail decoding even when a per-crate build succeeds.
+tool binary can fail decoding even when a per-crate build succeeds.
+
+### Future size and type erasure in harnx-runtime
+
+harnx-runtime's async chains are deep enough that large futures fail in three
+distinct ways, and the three need different fixes:
+
+- **Test stack overflows.** Nextest's test processes use the default 8 MiB
+  stack, and a large inline future (tool discovery, tool-context construction)
+  counts toward the *caller's* stack frame while it is awaited. Growth anywhere
+  in the chain can tip razor-edge tests into SIGSEGV before any of the new code
+  runs (`nats_worker::operator_tools::admission_tests::real_subagent_operator_roots_and_inherited_deadlines`
+  failed this way; commit `361687041` fixed it). Fix: `Box::pin` the big future
+  at its builder entry point so its state lives on the heap while the caller
+  waits on network I/O — `execute_tool_round`,
+  `build_tool_eval_context`/`build_tool_eval_context_with_provider` and
+  `run_reserved_tool_command`'s `reserved_eval_context` all do this.
+- **E0275 in dependent crates.** rustc's auto-trait evaluation recurses through
+  the concrete future *type*, and `Pin<Box<impl Future>>` doesn't shorten that
+  chain: the compiler still walks every nested future inside the box. A concrete
+  future reaching the async-nats/rustls connect chain overflows the trait-solver
+  recursion budget in crates that merely call harnx-runtime (harnx-serve).
+  Fix: type-erase to `Pin<Box<dyn Future<Output = …> + Send>>`, as
+  `Config::nats_client` (`config/nats_split.rs`),
+  `NatsToolProvider::open_discovery_transport` and `round_nats_provider`
+  (`tool.rs`) do. A plain `Box::pin` there is not enough.
+- **Query-depth overflow on layout (harnx-tui).** rustc lays out one `async fn`'s
+  future as a single cumulative walk through every nested future across its
+  `.await` chains, so one wide event loop can overflow even when auto-trait
+  evaluation is fine — harnx-tui's `run_loop_inner` failed Windows CI with
+  `queries overflow the depth limit` (PR #2835) while Linux still built.
+  Fix: `Pin<Box<dyn Future>>` seams between the loop and its deep subchains
+  (`*_erased` wrappers; no `Send` — the futures borrow `!Sync` `Tui` state),
+  documented on `run_loop_inner` (`harnx-tui/src/lifecycle.rs`). Not a
+  `recursion_limit` bump.
 
 ### TUI transcript items are TUI-local
 
@@ -1701,7 +2060,7 @@ Qualify non-`__local__` agent names with their cluster. Never call
 
 CI runs integration tests against an isolated `nats-server` per test via
 `spawn_nats_server` in `crates/harnx-runtime/tests/it/common/mod.rs`. The CI
-workflow installs `nats-server` on all platforms (`.github/workflows/ci.yaml`);
+workflow installs `nats-server` on all platforms (`.github/workflows/ci-rust.yaml`);
 tests that skip when the binary is absent still pass, but real coverage requires
 the installed binary.
 
@@ -1914,10 +2273,11 @@ messages produce non-empty output. Render sites: `nats_session.rs:render_message
 ### Metadata rendering requires session reconstruction
 
 Text-format session metadata (`.info session` or `harnx info session`) uses `session::render()`
-(`config/session.rs:500`) which requires a reconstructed `Session` with model resolution and
-token counts. The helper `load_session_for_render()` (`session_format.rs:88`) loads KV metadata,
-resolves the model via `overrides.model` or the named agent's config, reconstructs transcript-
-derived fields (`turns`, `tokens`), and calls `update_tokens()`. Do NOT pass the raw
+(`config/session.rs:80`) which requires a reconstructed `Session` with model resolution and
+token counts. The helper `load_session_for_render()` (`session_format.rs:190`) loads KV metadata,
+resolves the model via `overrides.model` or the named agent's config (falling back to the
+recorded override ID or an unknown model when local configuration is unavailable), reconstructs
+transcript-derived fields (`turns`, `tokens`), and calls `update_tokens()`. Do NOT pass the raw
 `SessionMetadata` KV record to `session::render()` — it lacks resolved model and transcript state.
 
 ## Usage Accounting Semantics
@@ -1985,6 +2345,12 @@ passed to `Toolset::invoke_with_context`. Defaults to a no-op sink when the requ
 is call-bound and safe to clone into spawned tasks. Implementations that forward only `Toolset::invoke`
 will not receive the handle.
 
+Bash command templates reach the handle through the script's stdout instead: a template that
+declares `protocol: jsonl` writes `{"progress": {"title", "markdown"}}` lines there, and its stderr
+becomes the tool result (`crates/harnx-bash-tools/README.md`, "Structured protocol"). The bash
+toolset keeps the invocation context in a task-local, so code that needs the handle reads it
+(`invocation_progress()`) before any `tokio::spawn`.
+
 The server-side `ProgressPublisher` (`harnx-toolset-server/src/progress.rs`) coalesces on a 250ms
 interval, mirroring the engine's `RuntimeToolProgress`. First update publishes promptly; subsequent
 updates merge pending state; `finish()` yields the final bounded snapshot.
@@ -2047,6 +2413,15 @@ the legacy poll-based reporter with the shared tool-call rendering path. Key inv
    soon as it starts, then one per metric change and one per 10-second heartbeat
    (`SUBAGENT_PROGRESS_HEARTBEAT` in `subagent_toolset.rs`). The projection layer
    does not add throttling.
+
+7. **Fields, not status variants** — `SubAgentProgressStatus` has no
+   `#[serde(other)]`, so a new variant breaks every older reader decoding the
+   live progress event or the persisted `sub_agent_progress`, and web drops the
+   whole event. Extend `SubAgentProgress` with optional
+   `#[serde(default, skip_serializing_if)]` fields instead
+   (`pending_interaction`, #2744), and add the field to web's `subAgentNotes.ts`
+   parser and `SubAgentNote` type too: that parser copies only known fields and
+   silently drops the rest.
 
 Implementation: `subagent_progress_to_update` in `event_map.rs:320-360` (ACP), and
 `emit_subagent_progress_update` in `ag_ui.rs:578-610` (Web). Tests enforce status mapping
@@ -2134,14 +2509,14 @@ The `ToolCallCard` component uses live fields when present: `title` overrides `t
 
 ### Tool confirmation modal ordering and delivery
 
-When a `PreToolUse` hook returns `permissionDecision: "ask"`, the TUI modal queues an optional user message via durable JetStream append before sending the approval reply. Worker reloads the session log at the tool seam, ensuring the agent sees `tool call → tool result (real or blocked) → queued message`.
+Worker-side tool-use confirmation — a middleware `confirm` interaction after durable suspension, or a saved legacy approval from a pre-middleware session — opens the TUI modal. A message-bearing decision queues the optional user message via a durable JetStream append, and the decision reply is sent only after that append commits.
 
-Key invariants (verified by `denied_zero_execution_round_injects_queued_messages_once_after_blocked_result` in `crates/harnx-runtime/tests/it/nats_tool_confirmation.rs`):
+Key invariants (verified by `tool_confirmation_waits_for_commit_and_uses_captured_origin`, `whitespace_confirmation_message_resolves_without_enqueue`, `tool_confirmation_enqueue_failure_keeps_reply_and_draft_for_retry`, and `stale_tool_confirmation_enqueue_completion_cannot_resolve_reply` in `crates/harnx-tui/src/tests.rs`):
 
-1. **Order-barrier** — frontend awaits JetStream PubAck before replying. Worker receives decision only after message is durable.
+1. **Order-barrier** — `submit_tool_confirm` (`harnx-tui/src/tool_confirmation.rs`) resolves the reply only on `ConfirmationEnqueueResult::Committed`; the worker receives the decision only after the message is durable. A stale enqueue completion for another modal cannot resolve the current reply.
 2. **Origin capture** — modal state captures `(session_id, cluster)` at open; enqueue targets that origin, not the currently-active session.
-3. **Idempotent dedup** — stable `submission_id` (UUID generated at modal open) reused on retry; duplicate JetStream appends are safe.
-4. **Fail-closed paths** — append failure keeps modal open with draft; route closure, dismissal, and Ctrl+C all resolve false without enqueue.
+3. **Idempotent dedup** — stable `submission_id` (UUID generated at modal open) becomes the appended row's message id and is reused on retry; duplicate appends under the same id are safe.
+4. **Fail-closed paths** — append failure keeps modal open with draft; route closure, dismissal, and Ctrl+C all resolve false without enqueue. Ctrl+C and dismissal restore the modal draft to the main composer.
 
 The 2-second keyboard-idle gate on approval (`TOOL_CONFIRM_IDLE_GATE` in `harnx-tui/src/tool_confirmation.rs`) resets on every keypress and paste into the message textarea. Ctrl+J is a newline fallback when Shift+Enter is unavailable.
 

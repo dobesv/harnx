@@ -1,6 +1,98 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.4.22 (2026-11-23)
+
+### Features
+
+- stream live progress from JSONL tool templates (#2714)
+- make script-mode tool commands pipeable (#2838)
+- move shipped agents to GPT-6.2, Fable 5.2 and Gemini 4 (#2839)
+- return image blocks and offload large tool images (#2844)
+- Migrate coding bash tool execution from legacy hooks to in-process proxy-auth middleware, backed by the dedicated `proxy_auth` tool server.
+
+#### Return MCP image blocks from `harnx-fetch-tools` (`fetch_html`, `fetch_markdown`, `fetch_txt`, `fetch_json`, `fetch_readable`) for PNG, JPEG, GIF, and WebP responses up to 5 MiB. Unsupported image formats (such as SVG and AVIF) and images over 5 MiB return clear errors, while existing SSRF protections and `fetch_youtube_transcript` behavior remain unchanged.
+
+When a successful native NATS tool reply exceeds the completion budget because of inline images, the toolset server now stores those images as session-owned `cid:media:` attachments and replaces them with `resource_link` blocks so the model still receives them. This covers `fs_read`, `fetch_*`, `attachment_read`, and the Kubernetes sandbox gateway.
+
+Also allow `erato` in `pantheon` to call `fetch_fetch_markdown` for public image URLs without a sandbox, and update the `pantheon` and `coding` fetch tool configs and READMEs for image support.
+
+#### Move the shipped agents to GPT-6.2 Astra and Sol, Claude Fable 5.2 and the Gemini 4 Carbon, Neon and Hydrogen models.
+
+Oracle and Plato use GPT-6.2 Astra at maximum effort, then Fable 5.2 and Gemini 4 Carbon. Every Sol 6.1 slot becomes Sol 6.2 at the same price. Gemini 3.8 Flash slots become Gemini 4 Hydrogen, which costs twice 3.8 Flash's introductory price until December 31, 2026 and the same afterwards. The other Gemini 4 Argon slots, including Minos, become Gemini 4 Neon.
+
+The model catalog adds `:high` and `:max` aliases for `gpt-6.2-astra` and `gpt-6.2-sol` and drops their sampling parameters. Gemini 4 Carbon, Neon and Hydrogen now reserve one request's 65,536 output tokens inside their shared 1,048,576-token window instead of listing the whole window as the output limit.
+
+### Fixes
+
+- update rust crate a2a_server_lf to v0.5.3 (#2579)
+- have Clio rebase before it squashes (#2731)
+- update assistant-ui (#2745)
+- update dependency @assistant-ui/react-markdown to v0.14.26 (#2749)
+- update dependency @ag-ui/client to v1.0.4 (#2748)
+- return the final reply from sub-agent waits, not a transcript page (#2806)
+- update assistant-ui (#2822)
+- update dependency @ag-ui/client to v1.0.5 (#2824)
+- Update package README tool servers table to document in-process proxy-auth middleware and the bundled `proxy_auth` tool server.
+- Compaction summaries no longer report an agent's instructions to its delegates as the user's own requests. The summarizer now receives the transcript as speaker-tagged elements (`<user>`, `<assistant>`, `<tool_call>`, `<tool_result>`, `<runtime_note>`) instead of headings, our own tag names inside message text are escaped, and a `<kept_after_summary>` block shows which messages, including the user's latest prompt, are replayed verbatim after the summary. The packaged compaction prompts and the built-in summarizer prompt explain the tags.
+
+## 0.4.21 (2026-11-16)
+
+### Fixes
+
+- prefer bounded waits to preserve prompt caches (#2710)
+- derive Claude thinking aliases and models from LiteLLM (#2709)
+- drop models when all of a provider's entries are dead (#2711)
+- Prefer repeated four-minute waits for work expected to finish within roughly two hours to help keep the model's prompt cache warm, even when there is no other work to do. Reserve indefinite waits for longer idle periods.
+
+## 0.4.20 (2026-11-15)
+
+### Features
+
+- have Pantheon reviewers read before executing (#2656)
+- route reviews by file kind and audit dependencies (#2660)
+- compress the tool invocation journal bucket with S2 (#2666)
+- expire deleted-session tombstones and standalone rows (#2668)
+- collect read-only sessions and orphan streams that hold messages (#2671)
+- cap agent waits at 240 seconds and end them early on new messages (#2677)
+- let agent callers join a busy child session's active turn (#2694)
+
+#### Waits on sub-agents and background commands now default to and cap at 240 seconds, accept `forever: true`, and return early when a new message arrives.
+
+Breaking argument changes:
+
+- Every wait takes `seconds` (1 to 240, default 240) or `forever: true`, not both. `0` and values above 240 are rejected.
+- `bash_spawn`'s nested `wait.timeout_secs` is now `wait.seconds`, and `bash_wait`'s `timeout_secs` is now `seconds`. The old names are rejected.
+- `session_wait` takes `seconds`, `forever`, `include_partial` and `read` at the top level; the nested `wait` object is removed.
+- `bash_spawn`, `bash_exec` and command templates take `timeout_secs` from 1 to 86400, and 86400 (24 hours) is the default for all three. `0` no longer means no deadline. A spawn killed at its deadline reports `status: timed_out`.
+- `bash_spawn`, `bash_wait` and `bash_status` now reject any argument they do not declare instead of ignoring it, which matters for third-party MCP clients of `harnx-bash-tools`.
+- `status` is now a built-in bash tool, so a command template cannot use that name or any other built-in name. A template passed with `--tool` or `--tools-dir` fails startup, and an auto-discovered one is skipped with a warning. The `--enable-tool` example in `docs/bash-mcp-server.md` now names a template `service_status`; a config that used `--enable-tool status` for its own template must rename it.
+
+New tools and results:
+
+- `bash_status` reports a spawned command's state without waiting. For a sub-agent, call `session_load` with `prompt_id`.
+- A wait can end early with `stopped_by: "new_message"` (a new message arrived for the waiting agent) or `stopped_by: "caller_deadline"` (60 seconds before the agent's own run deadline). Neither is an error. Waits over the k8s-sandbox proxy and MCP stdio routes run to their limit.
+- `session_wait` no longer reports `unknown` after a child compacts mid-turn.
+
+### Fixes
+
+- ground interviews in research and clarify plan handoffs (#2659)
+- delete a session's rows without leaving purge markers (#2663)
+- keep leases expiring, and leave expiring markers on release (#2675)
+- compact sub-agent session wait transcripts (#2684)
+- stop deletions leaving permanent markers in sessions, plans and attachments (#2686)
+- anchor sub-agent status rows to tool calls (#2699)
+- include tool discoveries in session title context (#2696)
+- Make Pantheon's code review cheaper and faster. Muses and Judges now review by reading the code and quoting CI results, and report a missing test or a manual check rather than running tests, linters or builds themselves, unless reading can't settle a finding. Aristarchus keeps the previous verdict when a rebase leaves a PR's own diff unchanged, and reviews only the files that changed since the last round. Before review, Sisyphus and Atlas run the repository's pre-submit checks rather than the whole suite. They skip the review for rebases that leave the PR's commits unchanged, docs-only edits and comment replies. Minos now runs on Gemini 4 Argon. The shared shell guidance in both packages now asks for a `bash_exec` timeout well past a command's usual run time, and for terminating a spawned command that runs well past its usual time without new output.
+- Allow bash command templates to opt in to new-message interruption with `on_user_message: terminate`. Interrupted templates terminate their process group and return partial output with `stopped_by: new_message`. Enable this for Pantheon's PR stability waiter so agents can read new messages before restarting the wait.
+
+#### Add optional nested `wait` configuration to `bash_spawn` with duration and output-filtering controls, preserving process lifecycle on wait expiry and updating eligible agent guidance.
+
+- `bash_spawn` accepts an optional nested `wait` object with `head_lines`, `tail_lines`, `max_output_bytes`, and `grep`.
+- Omitting `wait` preserves immediate spawn behavior. Wait expiry returns partial output without terminating the running process. The wait's duration fields are described in the bounded soft waits release note.
+- Shipped `coding` and `pantheon` agents with the full shell execution trio (`bash_spawn`, `bash_wait`, `bash_terminate`) now prefer `bash_spawn` with nested `wait` for tests, linters, and builds, with `bash_wait` or `bash_terminate` for post-expiry management. `bash_exec` remains available for quick synchronous commands.
+- MCP tool listings now carry each tool's request-timeout policy in `_meta` (`timeout_secs`): `harnx-mcp-bridge` copies it into `ToolSpec.timeout_secs` for its NATS registration, and `harnx_toolset_server`'s MCP adapter writes it from native specs. Bash `spawn`/`wait`/`exec` advertise `0` (no elapsed deadline) on this route, matching the native NATS toolset, so a bridged nested spawn wait returns its first execution_id-bearing response instead of expiring at the caller's 60-second request backstop. Third-party MCP servers that advertise nothing keep the caller's default backstop; malformed values are ignored rather than disabling a deadline. Direct stdio clients are unaffected.
+
 ## 0.4.19 (2026-11-04)
 
 ### Features

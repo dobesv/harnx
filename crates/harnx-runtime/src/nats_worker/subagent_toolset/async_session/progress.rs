@@ -235,6 +235,7 @@ pub(super) fn ensure_watcher(toolset: &SubagentToolset, watched: WatchedPrompt) 
     registry.insert(key.clone(), std::sync::Arc::clone(&shared));
     drop(registry);
     let config = WatcherConfig {
+        cluster: toolset.route.cluster().to_owned(),
         client: toolset.client.clone(),
         jetstream: toolset.jetstream.clone(),
         session_metadata: toolset.session_metadata.clone(),
@@ -277,6 +278,7 @@ pub(super) fn watcher_registered(
 }
 
 struct WatcherConfig {
+    cluster: String,
     client: async_nats::Client,
     jetstream: async_nats::jetstream::Context,
     session_metadata: crate::nats_session_metadata::SessionMetadataStore,
@@ -317,6 +319,11 @@ async fn run_watcher(config: WatcherConfig, shared: SharedSnapshots) {
         return;
     }
     let reporter = announce_watcher(&config, &parent_sink, &shared).await;
+    reporter.set_pending_interaction(scan.pending_interaction(
+        &config.watched.agent,
+        &config.cluster,
+        &config.watched.session_id,
+    ));
     let subscriber = subscribe_child_events(&config).await;
     watch_until_settled(Watching {
         config,
@@ -604,7 +611,7 @@ async fn watch_until_settled(mut watcher: Watching) {
                     );
                     return;
                 }
-                Ok(WatchState::Pending) => watcher.refresh_failures = 0,
+                Ok(WatchState::Pending) => watcher.note_refresh_success(),
                 Err(stop @ (Stop::Expired | Stop::Unavailable)) => {
                     watcher.note_refresh_failure(stop);
                 }
@@ -625,6 +632,16 @@ async fn watch_until_settled(mut watcher: Watching) {
 }
 
 impl Watching {
+    fn note_refresh_success(&mut self) {
+        self.refresh_failures = 0;
+        self.reporter
+            .set_pending_interaction(self.scan.pending_interaction(
+                &self.config.watched.agent,
+                &self.config.cluster,
+                &self.config.watched.session_id,
+            ));
+    }
+
     /// Durable settlement: the reporter's own terminal publish, one retry if
     /// its actor stopped first, and the finished-snapshot retention that
     /// keeps the measured view for later same-process waits.
@@ -632,6 +649,7 @@ impl Watching {
         let watched = &self.config.watched;
         // Replace the lossy advisory estimate with the durable turn total
         // before the terminal snapshot.
+        self.reporter.set_pending_interaction(None);
         if let Some(usage) = usage {
             self.reporter.set_usage(usage);
         }
@@ -837,6 +855,7 @@ pub(super) fn terminal_progress_value(
     live: Option<SubAgentProgress>,
 ) -> SubAgentProgress {
     let live = live.unwrap_or_else(|| SubAgentProgress {
+        pending_interaction: None,
         invocation_id: child.prompt_id.clone(),
         agent: child.agent.clone(),
         session_id: child.session_id.clone(),
@@ -848,6 +867,7 @@ pub(super) fn terminal_progress_value(
         tool_call_id: None,
     });
     SubAgentProgress {
+        pending_interaction: None,
         invocation_id: child.prompt_id.clone(),
         agent: child.agent.clone(),
         session_id: child.session_id.clone(),
@@ -1060,6 +1080,7 @@ mod tests {
         title: Option<&str>,
     ) -> SubAgentProgress {
         SubAgentProgress {
+            pending_interaction: None,
             invocation_id: "prompt-1".into(),
             agent: "metis".into(),
             session_id: "child-1".into(),

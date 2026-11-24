@@ -64,11 +64,17 @@ pub(super) struct ControlListenerCtx<'a> {
     pub(super) lease: &'a Arc<NatsSessionLease>,
     pub(super) backend: &'a NatsSessionLogBackend,
     pub(super) abort_signal: &'a crate::utils::AbortSignal,
+    /// Live handles the control handler shares with this activation's agent
+    /// loop: `note`-visibility surface actions queue into the running turn.
+    pub(super) surface_actions: crate::surfaces::SurfaceActionQueue,
+    /// Operator tool subject for direct surface-action tool targets.
+    pub(super) operator_subject: String,
 }
 
 struct PreparedControl {
     task: JoinHandle<()>,
     hitl_decision_rx: tokio::sync::mpsc::UnboundedReceiver<super::control::AppliedHitlDecision>,
+    surface_actions: crate::surfaces::SurfaceActionQueue,
 }
 
 /// Borrowed parameters for [`WorkerRuntime::prepare_activation_control`].
@@ -243,7 +249,6 @@ pub(super) struct WorkerRuntime {
     pub(super) activation_route: SessionActivationRoute,
     pub(super) activation_mode: WorkerActivationMode,
     pub(super) activation_heartbeat_interval: Duration,
-    pub(super) manage_servers: bool,
     pub(super) worker_id: String,
     pub(super) identity: crate::worker_identity::WorkerReadiness,
     pub(super) lease: NatsLeaseConfig,
@@ -737,6 +742,9 @@ impl WorkerRuntime {
             &activation.session_id,
             self.lease.replicas,
         );
+        let surface_actions = crate::surfaces::SurfaceActionQueue::new();
+        let operator_subject =
+            crate::operator_tools::subject(&self.cluster, &self.activation_route)?;
         match Self::spawn_control_listener(ControlListenerCtx {
             client: &self.client,
             jetstream: &self.jetstream,
@@ -744,6 +752,8 @@ impl WorkerRuntime {
             lease,
             backend: &backend,
             abort_signal,
+            surface_actions: surface_actions.clone(),
+            operator_subject,
         })
         .await
         {
@@ -943,25 +953,14 @@ impl WorkerRuntime {
         Self::active_session_started(&activation, &lease);
         async move {
             let result = if shutdown.is_cancelled() {
-                control.task.abort();
-                let _ = control.task.await;
-                let backend = NatsSessionLogBackend::new(
-                    worker.jetstream.clone(),
-                    &activation.session_id,
-                    worker.lease.replicas,
-                );
-                let turn_config = Arc::new(ConfigLock::new(worker.config.read().clone()));
-                execution
-                    .finish(
-                        &backend,
-                        &lease,
-                        super::execution_control::FinishedTurn::for_failover(
-                            None,
-                            turn_config,
-                            super::execution_control::FailoverCause::Shutdown,
-                        ),
-                    )
-                    .await
+                Self::settle_shutdown_before_start(
+                    &worker,
+                    &activation,
+                    &lease,
+                    control.task,
+                    execution,
+                )
+                .await
             } else {
                 worker
                     .execute_session(super::daemon_session_exec::SessionExecutionInputs {
@@ -971,6 +970,7 @@ impl WorkerRuntime {
                         abort_signal,
                         control_task: control.task,
                         hitl_decision_rx: control.hitl_decision_rx,
+                        surface_actions: control.surface_actions,
                         execution,
                         shutdown,
                     })
@@ -988,6 +988,37 @@ impl WorkerRuntime {
         }
         .instrument(span)
         .await;
+    }
+
+    /// Settle an activation whose shutdown was already cancelled before the
+    /// turn could start: stop the control listener and close the execution as
+    /// a shutdown failover, as the pre-existing finish path would.
+    async fn settle_shutdown_before_start(
+        worker: &Arc<Self>,
+        activation: &SessionActivate,
+        lease: &Arc<NatsSessionLease>,
+        control_task: JoinHandle<()>,
+        execution: WorkerExecution,
+    ) -> Result<FinishCause> {
+        control_task.abort();
+        let _ = control_task.await;
+        let backend = NatsSessionLogBackend::new(
+            worker.jetstream.clone(),
+            &activation.session_id,
+            worker.lease.replicas,
+        );
+        let turn_config = Arc::new(ConfigLock::new(worker.config.read().clone()));
+        execution
+            .finish(
+                &backend,
+                lease,
+                super::execution_control::FinishedTurn::for_failover(
+                    None,
+                    turn_config,
+                    super::execution_control::FailoverCause::Shutdown,
+                ),
+            )
+            .await
     }
 
     async fn claim_activation(
@@ -1311,6 +1342,7 @@ impl WorkerRuntime {
         Ok(PreparedControl {
             task: tokio::spawn(handler.listen(subscriber)),
             hitl_decision_rx,
+            surface_actions: ctx.surface_actions,
         })
     }
 }
@@ -1372,7 +1404,7 @@ mod tests {
             let headers = {
                 let _entered = publisher_span.enter();
                 super::super::activation_transport::activation_headers(
-                    async_nats::header::HeaderValue::from("message-id"),
+                    async_nats::header::HeaderValue::from_lossy("message-id"),
                 )
             };
             assert_eq!(

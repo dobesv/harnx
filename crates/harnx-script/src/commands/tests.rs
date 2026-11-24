@@ -21,6 +21,19 @@ impl InnerExecutor for FakeExecutor {
             "text_tool" => CallOutcome::Ok(
                 json!({"content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}),
             ),
+            "mapped" => CallOutcome::Ok(
+                json!({"content":[{"type":"text","text":"fallback"}],"structuredContent":{"text":"body","notes":["careful"],"code":3}}),
+            ),
+            "mapped_plain" => {
+                CallOutcome::Ok(json!({"content":[{"type":"text","text":"plain text"}]}))
+            }
+            "mapped_broken" => CallOutcome::ToolError {
+                message: "mapped failure".into(),
+                partial_result: None,
+            },
+            "mapped_domain_error" => CallOutcome::Ok(
+                json!({"content":[{"type":"text","text":"domain failure"}],"isError":true}),
+            ),
             "approval" => CallOutcome::ApprovalRequired,
             "broken" => CallOutcome::ToolError {
                 message: "tool failed".into(),
@@ -50,6 +63,7 @@ impl InnerExecutor for FakeExecutor {
 
 fn spec(name: &str) -> ToolSpec {
     ToolSpec {
+        output: None,
         name: name.into(),
         description: format!("Run {name}. More detail."),
         schema: json!({"type":"object","properties":{}}),
@@ -70,7 +84,24 @@ fn specs() -> Vec<ToolSpec> {
     .into_iter()
     .map(spec)
     .collect();
+    for name in [
+        "mapped",
+        "mapped_plain",
+        "mapped_broken",
+        "mapped_domain_error",
+    ] {
+        let mut tool = spec(name);
+        tool.output = Some(OutputMapping {
+            stdout: Some("text".into()),
+            stderr: Some("notes".into()),
+            exit_code: Some("code".into()),
+            error_exit_code: Some(2),
+            ..Default::default()
+        });
+        specs.push(tool);
+    }
     specs.push(ToolSpec {
+        output: None,
         name: "fs_read".into(),
         description: "Read a file. Return contents.".into(),
         schema: json!({"properties":{"path":{"type":"string"}},"required":["path"]}),
@@ -83,6 +114,7 @@ async fn run(script: &str, executor: Arc<FakeExecutor>) -> ScriptRun {
     BashKitBackend
         .run(crate::ScriptRequest {
             script,
+            python_functions: None,
             limits: ScriptLimits {
                 timeout_secs: 5,
                 ..Default::default()
@@ -132,13 +164,13 @@ async fn ordinary_outcomes_have_distinct_exit_codes_and_errexit() {
     for (script, code, error) in [
         (
             "approval",
-            3,
+            126,
             "needs approval: approval; call it directly instead of from bash",
         ),
         ("broken", 1, "tool failed"),
         ("domain_error", 1, "domain failure"),
-        ("blocked", 4, "policy block"),
-        ("rejected", 5, "call budget exceeded"),
+        ("blocked", 126, "policy block"),
+        ("rejected", 126, "call budget exceeded"),
         ("unknown", 127, "tool disappeared"),
         ("fs_read --no-such-flag", 2, "unknown flag"),
         ("fs_read", 2, "missing required flags"),
@@ -157,6 +189,18 @@ async fn ordinary_outcomes_have_distinct_exit_codes_and_errexit() {
     let result = run("set +e; approval; echo recovered", Arc::default()).await;
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.stdout, "recovered\n");
+}
+
+#[tokio::test]
+async fn stderr_names_why_a_command_may_not_run() {
+    for (script, prefix) in [
+        ("approval", "needs approval: "),
+        ("blocked", "blocked: "),
+        ("rejected", "rejected: "),
+    ] {
+        let result = run(script, Arc::default()).await;
+        assert!(result.stderr.starts_with(prefix), "{script}: {result:?}");
+    }
 }
 
 #[tokio::test]
@@ -252,4 +296,33 @@ fn duplicate_and_reserved_catalog_names_fail_before_execution() {
             "{name:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn mapped_tool_success_uses_its_mapping() {
+    let result = run("mapped", Arc::new(FakeExecutor::default())).await;
+    assert_eq!(result.stdout, "body");
+    assert_eq!(result.stderr, "mapped: careful\n");
+    assert_eq!(result.exit_code, 3);
+}
+
+#[tokio::test]
+async fn mapped_tool_errors_exit_with_the_error_exit_code() {
+    for script in ["mapped_broken", "mapped_domain_error"] {
+        let result = run(script, Arc::new(FakeExecutor::default())).await;
+        assert_eq!(result.exit_code, 2, "{script}: {result:?}");
+    }
+}
+
+#[tokio::test]
+async fn unmapped_tool_errors_still_exit_one() {
+    let result = run("broken", Arc::new(FakeExecutor::default())).await;
+    assert_eq!(result.exit_code, 1);
+}
+
+#[tokio::test]
+async fn mapped_tool_with_a_plain_content_result_renders_its_text() {
+    let result = run("mapped_plain", Arc::new(FakeExecutor::default())).await;
+    assert_eq!(result.stdout, "plain text\n");
+    assert_eq!(result.exit_code, 0);
 }

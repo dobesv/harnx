@@ -25,6 +25,7 @@ mod hitl_state;
 mod operations;
 mod streaming;
 mod supervision;
+mod user_principals;
 
 struct Replica {
     backend: Arc<Backend>,

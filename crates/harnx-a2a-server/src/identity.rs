@@ -16,10 +16,13 @@ use axum::{
 };
 use harnx_core::user_aliases::UserAliases;
 use harnx_runtime::identity::{
-    merge_memberships, IdentitySource, IdentitySources, MembershipHeaders,
+    merge_memberships, BearerIdentity, IdentitySelection, IdentitySource, IdentitySources,
+    MembershipHeaders,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+use crate::bearer_verify::BearerVerifier;
 
 /// Implementation-defined JSON-RPC server error, outside A2A's -32001..-32009.
 pub const MISSING_IDENTITY_CODE: i32 = -32000;
@@ -90,6 +93,23 @@ impl RequestIdentity {
             roles: self.roles.iter().map(String::as_str).collect(),
         }
     }
+
+    /// The caller-principals snapshot for this request, as resolved at entry.
+    pub fn user_principals(&self) -> harnx_core::user_principals::UserPrincipals {
+        harnx_core::user_principals::from_resolved(
+            self.principal.user_id(),
+            self.expanded_users.as_deref(),
+            &self.groups,
+            &self.roles,
+        )
+    }
+
+    /// The snapshot to record when this request creates a session: none for
+    /// an anonymous caller, so the session resolves the legacy fallback.
+    pub fn stampable_principals(&self) -> Option<harnx_core::user_principals::UserPrincipals> {
+        let principals = self.user_principals();
+        (!principals.is_anonymous()).then_some(principals)
+    }
 }
 
 /// Ordered identity policy. Empty configuration enables shared anonymous mode.
@@ -98,8 +118,10 @@ pub struct Identity {
     sources: IdentitySources,
     groups: MembershipHeaders,
     roles: MembershipHeaders,
-    membership_names: Vec<HeaderName>,
     aliases: Option<Arc<UserAliases>>,
+    // Present only when bearer verification is configured; the sync resolve
+    // paths fail closed when it is set, see `with_bearer_verification`.
+    verifier: Option<Arc<BearerVerifier>>,
 }
 
 impl Identity {
@@ -121,12 +143,38 @@ impl Identity {
             sources: IdentitySources::new(sources).context("invalid user-id-header sources")?,
             groups: group_headers,
             roles: role_headers,
-            membership_names: groups
-                .iter()
-                .chain(roles)
-                .map(|name| name.parse())
-                .collect::<Result<_, _>>()?,
+            verifier: None,
         })
+    }
+
+    /// Require verified bearer tokens for bearer identity sources. When set,
+    /// bearer sources resolve only from tokens that verify against the JWKS
+    /// (`iss`, `aud`, RS256 signature, time claims); a token that fails
+    /// verification fails closed as 401 / -32000 and later sources are never
+    /// tried. Header and cookie sources are unaffected.
+    ///
+    /// Invariant for every identity-resolution entry point: either verify the
+    /// selected bearer token, or fail closed while a verifier is configured.
+    /// The sync decode-only paths (`resolve`, `resolve_request`,
+    /// `resolve_service_params`, `resolve_request_params`) return
+    /// `missing_identity()` because they can't await a fetch. A new entry
+    /// point must add the guard or verify, and
+    /// `sync_decode_only_paths_fail_closed_when_verification_is_enabled`
+    /// must cover it.
+    pub fn with_bearer_verification(mut self, verifier: Arc<BearerVerifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
+    }
+
+    pub(crate) fn validate_bearer_verification(&self) -> anyhow::Result<()> {
+        if self.verifier.is_some() {
+            anyhow::ensure!(
+                self.sources.has_bearer_source(),
+                "bearer verification flags require a bearer identity source; \
+                 configure --user-id-header forge-fit or bearer-claim:CLAIM"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_access_rules(&self, enabled: bool) -> anyhow::Result<()> {
@@ -142,11 +190,51 @@ impl Identity {
         if self.sources.sources().is_empty() {
             return Ok(Principal::Anonymous);
         }
+        // Bearer verification is async, so it lives in `resolve_verified`.
+        // Decoding a token here would bypass it; fail closed instead.
+        if self.verifier.is_some() {
+            return Err(missing_identity());
+        }
         self.sources
             .resolve(headers)
             .map_err(|_| missing_identity())?
             .map(Principal::User)
             .ok_or_else(missing_identity)
+    }
+
+    /// Verification-aware principal resolution for both request paths. With no
+    /// verifier configured this is exactly the decode-only `resolve`.
+    async fn resolve_verified(&self, headers: &HeaderMap) -> Result<Principal, A2AError> {
+        if self.sources.sources().is_empty() {
+            return Ok(Principal::Anonymous);
+        }
+        match self
+            .sources
+            .select(headers)
+            .map_err(|_| missing_identity())?
+        {
+            Some(IdentitySelection::Resolved(user)) => Ok(Principal::User(user)),
+            Some(IdentitySelection::Bearer(bearer)) => {
+                Ok(Principal::User(self.resolve_bearer(&bearer).await?))
+            }
+            None => Err(missing_identity()),
+        }
+    }
+
+    /// Resolve a selected bearer source: verify when a verifier is configured,
+    /// decode only when none is. Never retries later sources.
+    async fn resolve_bearer(&self, bearer: &BearerIdentity<'_>) -> Result<String, A2AError> {
+        let user = match &self.verifier {
+            Some(verifier) => {
+                let claims = verifier
+                    .verify(bearer.token())
+                    .await
+                    .map_err(bearer_rejected)?;
+                bearer.resolve_claims(&claims)
+            }
+            None => bearer.resolve_decode_only(),
+        };
+        user.map_err(|_| missing_identity())
     }
 
     /// Share startup-only aliases without changing the principal used for ownership.
@@ -178,6 +266,16 @@ impl Identity {
         self.resolve_with_memberships(principal, headers)
     }
 
+    /// HTTP middleware path: verify bearer sources when verification is
+    /// configured, then validate membership headers. See `resolve_verified`.
+    pub async fn resolve_request_verified(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<RequestIdentity, A2AError> {
+        let principal = self.resolve_verified(headers).await?;
+        self.resolve_with_memberships(principal, headers)
+    }
+
     /// HTTP middleware validates raw values before the SDK drops non-text fields.
     /// Direct handler calls still resolve every configured membership occurrence.
     ///
@@ -191,10 +289,25 @@ impl Identity {
         params: &ServiceParams,
     ) -> Result<RequestIdentity, A2AError> {
         let mut headers = HeaderMap::new();
-        for name in &self.membership_names {
+        for name in self.groups.names().chain(self.roles.names()) {
             Self::add_membership_params(name, params, &mut headers)?;
         }
         let principal = self.resolve_service_params(params)?;
+        self.resolve_with_memberships(principal, &headers)
+    }
+
+    /// Handler path: verify bearer sources when verification is configured.
+    /// Same semantics as `resolve_request_verified`, so both ownership
+    /// resolution paths agree for valid and invalid tokens.
+    pub async fn resolve_request_params_verified(
+        &self,
+        params: &ServiceParams,
+    ) -> Result<RequestIdentity, A2AError> {
+        let mut headers = HeaderMap::new();
+        for name in self.groups.names().chain(self.roles.names()) {
+            Self::add_membership_params(name, params, &mut headers)?;
+        }
+        let principal = self.resolve_service_params_verified(params).await?;
         self.resolve_with_memberships(principal, &headers)
     }
 
@@ -240,15 +353,44 @@ impl Identity {
     /// RequestHandler receives headers through ServiceParams, not axum extensions.
     /// Keep this policy on the handler and resolve before accessing session state.
     pub fn resolve_service_params(&self, params: &ServiceParams) -> Result<Principal, A2AError> {
+        // Same fail-closed guard as `resolve`: the sync loop decodes bearer
+        // tokens directly and must never bypass verification.
+        if self.verifier.is_some() {
+            return Err(missing_identity());
+        }
         let mut headers = HeaderMap::new();
         for source in self.sources.sources() {
             Self::add_params_to_headers(source, params, &mut headers)?;
             // Cookie sources share fields, but each source must be resolved in order.
             if let Some(user) = source.resolve(&headers).map_err(|_| missing_identity())? {
-                return Ok(Principal::User(user.to_owned()));
+                return Ok(Principal::User(user));
             }
         }
         self.resolve(&headers)
+    }
+
+    /// Handler-side bearer verification, lazily per source to preserve the
+    /// malformed-later-param ordering of `resolve_service_params`.
+    async fn resolve_service_params_verified(
+        &self,
+        params: &ServiceParams,
+    ) -> Result<Principal, A2AError> {
+        let mut headers = HeaderMap::new();
+        for source in self.sources.sources() {
+            Self::add_params_to_headers(source, params, &mut headers)?;
+            // Cookie sources share fields, but each source must be selected in order.
+            match source.select(&headers).map_err(|_| missing_identity())? {
+                Some(IdentitySelection::Resolved(user)) => return Ok(Principal::User(user)),
+                Some(IdentitySelection::Bearer(bearer)) => {
+                    return Ok(Principal::User(self.resolve_bearer(&bearer).await?));
+                }
+                None => continue,
+            }
+        }
+        if self.sources.sources().is_empty() {
+            return Ok(Principal::Anonymous);
+        }
+        Err(missing_identity())
     }
 
     /// Add values from params to headers for the given source, if not already present.
@@ -259,8 +401,11 @@ impl Identity {
         headers: &mut HeaderMap,
     ) -> Result<(), A2AError> {
         let (name, limit) = match source {
-            IdentitySource::Header(name) => (name.clone(), 1),
+            IdentitySource::Header(source) => (source.name().clone(), 1),
             IdentitySource::Cookie(_) => (HeaderName::from_static("cookie"), usize::MAX),
+            IdentitySource::ForgeFit | IdentitySource::BearerClaim(_) => {
+                (HeaderName::from_static("authorization"), 1)
+            }
         };
         // Several cookie sources share the same header fields. Don't append them twice.
         if headers.contains_key(&name) {
@@ -286,14 +431,32 @@ pub(crate) fn missing_identity() -> A2AError {
     )
 }
 
+/// Bearer verification failures fail closed with a reason category only; the
+/// token, its claims and the JWKS body never appear in errors or logs.
+fn bearer_rejected(failure: crate::bearer_verify::VerifyFailure) -> A2AError {
+    // Fetch-path JWKS faults are bounded by the refetch throttle; warn so an
+    // outage is visible at default log levels. Per-token rejections stay at
+    // debug. Reason categories only, never token content.
+    if failure.is_jwks_fault() {
+        tracing::warn!(reason = failure.category(), "bearer token rejected");
+    } else {
+        tracing::debug!(reason = failure.category(), "bearer token rejected");
+    }
+    A2AError::new(MISSING_IDENTITY_CODE, failure.category())
+}
+
 /// Resolve identity before protocol dispatch; protected cards use this layer too.
 pub(crate) async fn require_identity(
     State(identity): State<Identity>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    match identity.resolve_request(request.headers()) {
+    // Bind before matching: the verification future borrows the headers, and a
+    // match scrutinee temporary would keep that borrow across the arms.
+    let resolved = identity.resolve_request_verified(request.headers()).await;
+    match resolved {
         Ok(caller) => {
+            crate::request_log::http::caller(&request, &caller);
             request.extensions_mut().insert(caller.principal.clone());
             request.extensions_mut().insert(caller);
             next.run(request).await
@@ -303,29 +466,33 @@ pub(crate) async fn require_identity(
 }
 
 pub(crate) async fn rpc_error_response(
-    request: Request,
+    mut request: Request,
     status: StatusCode,
     error: A2AError,
 ) -> Response {
     // Bound rejected input too. An unreadable body has no recoverable id.
-    let id = to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
+    let body = to_bytes(std::mem::take(request.body_mut()), MAX_REQUEST_BODY_BYTES)
         .await
         .ok()
-        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
+    let id = body
+        .as_ref()
         .and_then(|body| body.get("id").cloned())
         .filter(|id| id.is_string() || id.is_number() || id.is_null())
         .unwrap_or(Value::Null);
-    let error = if status == StatusCode::UNAUTHORIZED {
+    let wire_error = if status == StatusCode::UNAUTHORIZED {
         // Preserve the existing identity error envelope when rules are off.
         json!({"code": error.code, "message": error.message})
     } else {
         json!(error.to_jsonrpc_error())
     };
-    (
+    let mut response = (
         status,
-        Json(json!({"jsonrpc": "2.0", "id": id, "error": error})),
+        Json(json!({"jsonrpc": "2.0", "id": id, "error": wire_error})),
     )
-        .into_response()
+        .into_response();
+    crate::request_log::http::rejected(&request, body.as_ref(), &mut response, Some(&error));
+    response
 }
 
 #[cfg(test)]
@@ -354,7 +521,7 @@ mod tests {
                 ),
             )
             .route_layer(axum::middleware::from_fn_with_state(
-                identity(&["x-user"]),
+                identity(&["header:X-Amzn-Mtls-Clientcert-Subject"]),
                 require_identity,
             ));
         let response = app
@@ -362,7 +529,10 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/")
-                    .header("x-user", " user , ignored")
+                    .header(
+                        "X-Amzn-Mtls-Clientcert-Subject",
+                        " CN=alice,OU=eng,O=Acme Corp ",
+                    )
                     .body(Body::from("unchanged request body"))
                     .unwrap(),
             )
@@ -371,7 +541,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
-            "user"
+            "CN=alice,OU=eng,O=Acme Corp"
         );
     }
 
@@ -432,21 +602,27 @@ mod tests {
     }
 
     #[test]
-    fn identity_comma_lists_and_repeated_headers_use_first_value() {
+    fn identity_preserves_commas_and_uses_first_repeated_header() {
         let identity = identity(&["x-user"]);
         let mut headers = HeaderMap::new();
-        headers.append("x-user", "  first-user  , second-user".parse().unwrap());
+        headers.append("x-user", "  first-user  , second-user  ".parse().unwrap());
         headers.append("x-user", "third-user".parse().unwrap());
-        assert_eq!(
-            identity.resolve(&headers).unwrap().user_id(),
-            Some("first-user")
-        );
+        let params = ServiceParams::from([(
+            "x-user".into(),
+            vec!["  first-user  , second-user  ".into(), "third-user".into()],
+        )]);
+        for principal in [
+            identity.resolve(&headers).unwrap(),
+            identity.resolve_service_params(&params).unwrap(),
+        ] {
+            assert_eq!(principal.user_id(), Some("first-user  , second-user"));
+        }
     }
 
     #[test]
     fn identity_empty_or_whitespace_first_value_is_rejected() {
         let identity = identity(&["x-user", "x-fallback"]);
-        for value in ["", "  \t ", " , second-user", ",second-user"] {
+        for value in ["", "  \t "] {
             let mut headers = HeaderMap::new();
             headers.insert("x-user", value.parse().unwrap());
             headers.insert("x-fallback", "fallback".parse().unwrap());
@@ -579,6 +755,264 @@ mod tests {
                 .resolve_service_params(&params)
                 .map_err(|error| error.code);
             assert_eq!(http, handler);
+        }
+    }
+
+    #[test]
+    fn identity_bearer_service_params_match_http_and_preserve_order() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let payload = br#"{"principal":"account-id","context":{"cloudId":"site-id"}}"#;
+        let valid = format!("bearer e30.{}.signature", URL_SAFE_NO_PAD.encode(payload));
+        for (source, expected) in [
+            ("forge-fit", "CN=account-id,OU=site-id,O=atlassian.com"),
+            ("bearer-claim:principal", "account-id"),
+        ] {
+            let identity = identity(&[source, "x-fallback"]);
+            for (authorization, expected) in [
+                (None, Ok("fallback")),
+                (Some("Basic credentials"), Ok("fallback")),
+                (Some(valid.as_str()), Ok(expected)),
+                (Some("Bearer invalid-token"), Err(MISSING_IDENTITY_CODE)),
+                (Some("Bearer"), Err(MISSING_IDENTITY_CODE)),
+            ] {
+                let mut headers = HeaderMap::new();
+                let mut params = ServiceParams::new();
+                headers.insert("x-fallback", "fallback".parse().unwrap());
+                params.insert("x-fallback".into(), vec!["fallback".into()]);
+                if let Some(authorization) = authorization {
+                    headers.append("authorization", authorization.parse().unwrap());
+                    headers.append("authorization", "Bearer ignored-token".parse().unwrap());
+                    params.insert(
+                        "authorization".into(),
+                        vec![authorization.into(), "Bearer ignored-token".into()],
+                    );
+                }
+                let http = identity
+                    .resolve_request(&headers)
+                    .map(|caller| caller.principal)
+                    .map_err(|error| error.code);
+                let handler = identity
+                    .resolve_request_params(&params)
+                    .map(|caller| caller.principal)
+                    .map_err(|error| error.code);
+                assert_eq!(http, expected.map(|user| Principal::User(user.into())));
+                assert_eq!(handler, http);
+            }
+        }
+        let identity = identity(&["x-primary", "forge-fit"]);
+        let mut params = ServiceParams::new();
+        params.insert("x-primary".into(), vec!["primary".into()]);
+        params.insert("authorization".into(), vec!["invalid\n".into()]);
+        assert_eq!(
+            identity
+                .resolve_request_params(&params)
+                .unwrap()
+                .principal
+                .user_id(),
+            Some("primary")
+        );
+    }
+
+    mod bearer_verification {
+        use super::*;
+        use crate::bearer_verify::test_util::{
+            forge_claims, sign, verifier, JwksServer, TestKey, JWKS_PRIMARY, PRIMARY_KEY,
+            SECONDARY_PEM,
+        };
+
+        const DN: &str =
+            "CN=557058:account-id,OU=d0d52620-3203-4cfa-8db5-f2587155f0dd,O=atlassian.com";
+
+        async fn verified_identity(sources: &[&str]) -> (Identity, JwksServer) {
+            let server = JwksServer::start(JWKS_PRIMARY).await;
+            let identity = identity(sources)
+                .with_bearer_verification(std::sync::Arc::new(verifier(&server.url)));
+            (identity, server)
+        }
+
+        fn valid_token() -> String {
+            sign(&forge_claims("557058:account-id"), &PRIMARY_KEY)
+        }
+
+        // Signed with a key that isn't in the served JWKS.
+        fn forged_token() -> String {
+            sign(
+                &forge_claims("557058:account-id"),
+                &TestKey {
+                    kid: "primary-2026-01",
+                    pem: SECONDARY_PEM,
+                },
+            )
+        }
+
+        fn bearer_headers(token: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+            headers
+        }
+
+        fn bearer_params(token: &str) -> ServiceParams {
+            let mut params = ServiceParams::new();
+            params.insert("authorization".into(), vec![format!("Bearer {token}")]);
+            params
+        }
+
+        #[tokio::test]
+        async fn verified_paths_agree_and_reject_invalid_tokens() {
+            let (identity, _server) = verified_identity(&["forge-fit"]).await;
+            let http = identity
+                .resolve_request_verified(&bearer_headers(&valid_token()))
+                .await
+                .unwrap();
+            let handler = identity
+                .resolve_request_params_verified(&bearer_params(&valid_token()))
+                .await
+                .unwrap();
+            assert_eq!(http.principal, Principal::User(DN.into()));
+            assert_eq!(handler.principal, http.principal);
+
+            let error = identity
+                .resolve_request_verified(&bearer_headers(&forged_token()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, MISSING_IDENTITY_CODE);
+            assert_eq!(error.message, "bad bearer token signature");
+            assert!(!error.message.contains("Bearer"));
+            assert_eq!(
+                identity
+                    .resolve_request_params_verified(&bearer_params(&forged_token()))
+                    .await
+                    .unwrap_err()
+                    .code,
+                MISSING_IDENTITY_CODE
+            );
+        }
+
+        #[tokio::test]
+        async fn verified_missing_authorization_falls_through() {
+            let (identity, _server) = verified_identity(&["forge-fit", "x-fallback"]).await;
+            let mut headers = HeaderMap::new();
+            headers.insert("x-fallback", "fallback-user".parse().unwrap());
+            assert_eq!(
+                identity
+                    .resolve_request_verified(&headers)
+                    .await
+                    .unwrap()
+                    .principal
+                    .user_id(),
+                Some("fallback-user")
+            );
+            let mut params = ServiceParams::new();
+            params.insert("x-fallback".into(), vec!["fallback-user".into()]);
+            assert_eq!(
+                identity
+                    .resolve_request_params_verified(&params)
+                    .await
+                    .unwrap()
+                    .principal
+                    .user_id(),
+                Some("fallback-user")
+            );
+        }
+
+        #[tokio::test]
+        async fn verified_precedence_follows_configured_order() {
+            // Both resolution paths (HTTP headers and handler ServiceParams)
+            // must follow the same precedence; check them in lockstep.
+            fn service_params(entries: &[(&str, &str)]) -> ServiceParams {
+                let mut params = ServiceParams::new();
+                for (name, value) in entries {
+                    params.insert((*name).into(), vec![(*value).into()]);
+                }
+                params
+            }
+
+            // A present earlier header wins, even with an invalid token present.
+            let (identity, _server) = verified_identity(&["x-user", "forge-fit"]).await;
+            let mut headers = bearer_headers(&forged_token());
+            headers.insert("x-user", "header-user".parse().unwrap());
+            let params = service_params(&[
+                ("x-user", "header-user"),
+                ("authorization", &format!("Bearer {}", forged_token())),
+            ]);
+            for resolved in [
+                identity.resolve_request_verified(&headers).await.unwrap(),
+                identity
+                    .resolve_request_params_verified(&params)
+                    .await
+                    .unwrap(),
+            ] {
+                assert_eq!(resolved.principal.user_id(), Some("header-user"));
+            }
+
+            // An invalid token at the bearer source fails closed; later
+            // sources are never tried.
+            let (identity, _server) = verified_identity(&["forge-fit", "x-user"]).await;
+            let mut headers = bearer_headers(&forged_token());
+            headers.insert("x-user", "header-user".parse().unwrap());
+            let params = service_params(&[
+                ("authorization", &format!("Bearer {}", forged_token())),
+                ("x-user", "header-user"),
+            ]);
+            for error in [
+                identity
+                    .resolve_request_verified(&headers)
+                    .await
+                    .unwrap_err(),
+                identity
+                    .resolve_request_params_verified(&params)
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert_eq!(error.code, MISSING_IDENTITY_CODE);
+            }
+
+            // No Authorization header at the bearer source falls through.
+            let (identity, _server) = verified_identity(&["forge-fit", "x-user"]).await;
+            let mut headers = HeaderMap::new();
+            headers.insert("x-user", "header-user".parse().unwrap());
+            let params = service_params(&[("x-user", "header-user")]);
+            for resolved in [
+                identity.resolve_request_verified(&headers).await.unwrap(),
+                identity
+                    .resolve_request_params_verified(&params)
+                    .await
+                    .unwrap(),
+            ] {
+                assert_eq!(resolved.principal.user_id(), Some("header-user"));
+            }
+        }
+
+        #[tokio::test]
+        async fn sync_decode_only_paths_fail_closed_when_verification_is_enabled() {
+            let (identity, _server) = verified_identity(&["forge-fit"]).await;
+            let headers = bearer_headers(&valid_token());
+            for error in [
+                identity.resolve(&headers).unwrap_err(),
+                identity.resolve_request(&headers).unwrap_err(),
+            ] {
+                assert_eq!(error.code, MISSING_IDENTITY_CODE);
+            }
+            let params = bearer_params(&valid_token());
+            for error in [
+                identity.resolve_service_params(&params).unwrap_err(),
+                identity.resolve_request_params(&params).unwrap_err(),
+            ] {
+                assert_eq!(error.code, MISSING_IDENTITY_CODE);
+            }
+        }
+
+        #[tokio::test]
+        async fn unverified_identity_decodes_bearer_without_any_jwks_fetch() {
+            // No verification flags: decode-only behavior, zero fetches.
+            let server = JwksServer::start(JWKS_PRIMARY).await;
+            let identity = identity(&["forge-fit"]);
+            let resolved = identity
+                .resolve_request_verified(&bearer_headers(&valid_token()))
+                .await
+                .unwrap();
+            assert_eq!(resolved.principal, Principal::User(DN.into()));
+            assert_eq!(server.fetches(), 0);
         }
     }
 }

@@ -1,0 +1,20 @@
+command: harnx-aws-creds
+description: Long-lived AWS container-credentials provider tool service
+
+# Deploy alongside bash in the same filesystem/network namespace.
+# Exposes the aws_creds toolset and aws_creds_environment tool.
+# To use a specific AWS profile from ~/.aws/config, pass --profile <name> in args.
+
+middleware:
+  - name: aws-creds
+    match: '^bash_(exec|spawn)$'
+    script: middleware/aws-creds.py
+    tools: [aws_creds_environment]
+    timeout: 25h
+    on_error: deny
+
+args:
+  - --tool-server
+  # Optional: specify a host AWS profile (default uses standard AWS credential chain)
+  # - --profile
+  # - my-profile

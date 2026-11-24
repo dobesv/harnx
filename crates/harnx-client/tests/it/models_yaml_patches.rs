@@ -180,6 +180,12 @@ fn package_openai_models_use_responses_without_sampling_parameters() {
         "gpt-6.1-sol:high",
         "gpt-6.1-sol:max",
         "gpt-6.1-terra",
+        "gpt-6.2-astra",
+        "gpt-6.2-astra:high",
+        "gpt-6.2-astra:max",
+        "gpt-6.2-sol",
+        "gpt-6.2-sol:high",
+        "gpt-6.2-sol:max",
     ] {
         let model = Model::from_config("openai", &openai.models)
             .into_iter()
@@ -248,16 +254,24 @@ fn prefix_bound_claude_models_use_adaptive_thinking_and_an_output_limit() {
         .iter()
         .find(|provider| provider.provider == "claude")
         .expect("Claude catalog");
+    // Without an effort alias the model runs at its own default effort.
     for (name, real_name, effort, limit) in [
-        ("claude-fable-5-1", "claude-fable-5-1", "high", 128000),
-        ("claude-fable-5-1:max", "claude-fable-5-1", "max", 128000),
-        ("claude-haiku-5-5", "claude-haiku-5-5", "medium", 128000),
+        ("claude-fable-5-1", "claude-fable-5-1", None, 128000),
         (
-            "claude-haiku-5-5:thinking",
-            "claude-haiku-5-5",
-            "medium",
-            24000,
+            "claude-fable-5-1:max",
+            "claude-fable-5-1",
+            Some("max"),
+            128000,
         ),
+        ("claude-fable-5-2", "claude-fable-5-2", None, 128000),
+        (
+            "claude-fable-5-2:max",
+            "claude-fable-5-2",
+            Some("max"),
+            128000,
+        ),
+        ("claude-haiku-5-5", "claude-haiku-5-5", None, 128000),
+        ("claude-haiku-5-5:thinking", "claude-haiku-5-5", None, 24000),
     ] {
         let model = Model::from_config("claude", &claude.models)
             .into_iter()
@@ -283,7 +297,7 @@ fn prefix_bound_claude_models_use_adaptive_thinking_and_an_output_limit() {
             patched["headers"]["anthropic-beta"],
             "files-api-2025-04-14,thinking-binding-controls-2026-08-01"
         );
-        assert_eq!(patched["body"]["output_config"]["effort"], effort);
+        assert_eq!(patched["body"]["output_config"]["effort"], json!(effort));
         assert!(patched["body"].get("temperature").is_none());
         assert!(patched["body"].get("top_p").is_none());
     }
@@ -300,6 +314,8 @@ fn vertex_thinking_binding_controls_reach_the_http_request() {
         "claude-haiku-5-5@default:thinking",
         "claude-fable-5-1",
         "claude-fable-5-1@default:max",
+        "claude-fable-5-2",
+        "claude-fable-5-2@default:max",
     ] {
         let model = provider_models("vertexai")
             .into_iter()
@@ -371,8 +387,12 @@ fn opus_5_5_uses_adaptive_thinking_and_required_output_limit() {
                 json!({"type": "adaptive", "display": "summarized"}),
                 "{provider_name}:{name}"
             );
-            let expected_effort = name.rsplit_once(':').map_or("medium", |(_, effort)| effort);
-            assert_eq!(patched["body"]["output_config"]["effort"], expected_effort);
+            // The base model keeps Opus 5.5's own default effort.
+            let expected_effort = name.rsplit_once(':').map(|(_, effort)| effort);
+            assert_eq!(
+                patched["body"]["output_config"]["effort"],
+                json!(expected_effort)
+            );
             assert!(patched["body"].get("temperature").is_none());
             assert!(patched["body"].get("top_p").is_none());
         }
@@ -408,20 +428,22 @@ fn gemini_3_8_drops_sampling_settings_without_losing_thinking_or_output_limit() 
     );
 }
 
-#[test]
-fn argon_limits_fit_one_rest_request_and_preserve_smaller_output_limits() {
+/// Checks one Gemini 4 model's limits against the most a single request may
+/// return for each REST method.
+fn assert_gemini_4_limits(name: &str, rest_ceiling: u64, stream_ceiling: u64) {
     let model = provider_models("gemini")
         .into_iter()
-        .find(|model| model.name() == "gemini-4-argon")
-        .expect("Argon catalog entry");
-    assert_eq!(model.max_input_tokens(), Some(983040));
-    assert_eq!(model.max_tokens_param(), Some(65536));
-    for (method, ceiling) in [("generateContent", 32768), ("streamGenerateContent", 65536)] {
+        .find(|model| model.name() == name)
+        .unwrap_or_else(|| panic!("missing Gemini catalog entry {name}"));
+    assert_eq!(model.max_input_tokens(), Some(983040), "{name}");
+    assert_eq!(model.max_tokens_param(), Some(65536), "{name}");
+    for (method, ceiling) in [
+        ("generateContent", rest_ceiling),
+        ("streamGenerateContent", stream_ceiling),
+    ] {
         for requested in [None, Some(8192), Some(1048576)] {
             let mut envelope = request_envelope(&model);
-            envelope["url"] = json!(format!(
-                "https://example.invalid/models/gemini-4-argon:{method}"
-            ));
+            envelope["url"] = json!(format!("https://example.invalid/models/{name}:{method}"));
             envelope["body"]["generationConfig"] = json!({"temperature": 0.7, "topP": 0.9});
             if let Some(limit) = requested {
                 envelope["body"]["generationConfig"]["maxOutputTokens"] = json!(limit);
@@ -430,13 +452,27 @@ fn argon_limits_fit_one_rest_request_and_preserve_smaller_output_limits() {
             let generation = &patched["body"]["generationConfig"];
             assert_eq!(
                 generation["maxOutputTokens"],
-                requested.unwrap_or(ceiling).min(ceiling)
+                requested.unwrap_or(ceiling).min(ceiling),
+                "{name} {method}"
             );
             assert_eq!(generation["thinkingConfig"]["includeThoughts"], true);
-            assert!(generation.get("temperature").is_none());
-            assert!(generation.get("topP").is_none());
+            assert!(generation.get("temperature").is_none(), "{name}");
+            assert!(generation.get("topP").is_none(), "{name}");
         }
     }
+}
+
+#[test]
+fn argon_limits_fit_one_rest_request_and_preserve_smaller_output_limits() {
+    assert_gemini_4_limits("gemini-4-argon", 32768, 65536);
+}
+
+#[test]
+fn gemini_4_limits_fit_one_request_and_preserve_smaller_output_limits() {
+    // Carbon halves a non-streaming REST request's output as Argon does.
+    assert_gemini_4_limits("gemini-4-carbon", 32768, 65536);
+    assert_gemini_4_limits("gemini-4-hydrogen", 65536, 65536);
+    assert_gemini_4_limits("gemini-4-neon", 65536, 65536);
 }
 
 #[test]
@@ -616,6 +652,82 @@ fn claude_thinking_entries_request_summarized_display() {
     }
 }
 
+#[test]
+fn adaptive_only_claude_models_never_send_a_thinking_budget() {
+    let mut checked = 0;
+    for provider_name in ["claude", "vertexai", "bedrock"] {
+        for model in provider_models(provider_name)
+            .iter()
+            .filter(|model| claude_is_adaptive_only(model.real_name()))
+        {
+            let patched = patched_request(model, request_envelope(model));
+            assert!(
+                !patched.to_string().contains("budget_tokens"),
+                "{provider_name}:{} sends a fixed thinking budget, which it rejects: {patched}",
+                model.name()
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 50,
+        "expected at least 50 adaptive-only Claude entries, checked {checked}"
+    );
+}
+
+// A catalog entry its client can't call is selectable but fails every
+// request. The refresh filters with `client_can_call` in
+// scripts/update_models.py; keep these guards in step with it.
+
+/// Bedrock, Vertex, Gemini, Claude and OpenAI clients have no rerank operation.
+#[test]
+fn clients_without_rerank_list_no_rerankers() {
+    for provider_name in ["bedrock", "vertexai", "gemini", "claude", "openai"] {
+        let rerankers: Vec<_> = provider_models(provider_name)
+            .into_iter()
+            .filter(|model| model.model_type() == ModelType::Reranker)
+            .map(|model| model.name().to_string())
+            .collect();
+        assert!(
+            rerankers.is_empty(),
+            "{provider_name} lists rerankers its client can't call: {rerankers:?}"
+        );
+    }
+}
+
+/// The model families Vertex's client can call: chat dispatches by family
+/// (`ModelCategory::from_str`), and embeddings use the text-embedding schema.
+fn vertex_client_families(model_type: ModelType) -> &'static [&'static str] {
+    match model_type {
+        ModelType::Chat => &["gemini", "claude", "mistral", "codestral"],
+        ModelType::Embedding => &[
+            "text-embedding",
+            "text-multilingual-embedding",
+            "gemini-embedding",
+        ],
+        ModelType::Reranker => &[],
+    }
+}
+
+#[test]
+fn vertex_lists_only_model_families_its_client_can_call() {
+    let models = provider_models("vertexai");
+    let uncallable: Vec<_> = models
+        .iter()
+        .filter(|model| {
+            !vertex_client_families(model.model_type())
+                .iter()
+                .any(|family| model.real_name().starts_with(family))
+        })
+        .map(|model| model.name())
+        .collect();
+    assert!(!models.is_empty(), "no Vertex entries checked");
+    assert!(
+        uncallable.is_empty(),
+        "Vertex lists models its client can't call: {uncallable:?}"
+    );
+}
+
 /// Returns the container key (`output_config` or `reasoning`) when the patch
 /// sets an effort level under it.
 fn effort_path(patch: &str) -> Option<&'static str> {
@@ -635,14 +747,22 @@ fn opus_4_omits_thinking_by_default(family: &str) -> bool {
     })
 }
 
-fn bedrock_claude_omits_thinking_by_default(model: &Model) -> bool {
-    let Some((_, family)) = model.real_name().split_once("anthropic.claude-") else {
+/// Claude models that reject a fixed `budget_tokens` and, unless asked,
+/// return thinking blocks with no text. The generator reads this from the
+/// registry; the guard states it independently so a registry that drops the
+/// flag fails the refresh instead of shipping aliases that always 400.
+fn claude_is_adaptive_only(real_name: &str) -> bool {
+    let Some((_, family)) = real_name.split_once("claude-") else {
         return false;
     };
-    ["opus-5", "sonnet-5", "fable-5", "haiku-5"]
+    ["opus-5", "sonnet-5", "fable-5", "mythos-5", "haiku-5"]
         .iter()
         .any(|prefix| family.starts_with(prefix))
         || opus_4_omits_thinking_by_default(family)
+}
+
+fn bedrock_claude_omits_thinking_by_default(model: &Model) -> bool {
+    model.real_name().contains("anthropic.claude-") && claude_is_adaptive_only(model.real_name())
 }
 
 fn assert_bedrock_summarized_thinking(model: &Model) -> bool {
@@ -685,9 +805,9 @@ fn bedrock_adaptive_thinking_preserves_output_limits() {
         .find(|provider| provider.provider == "bedrock")
         .expect("Bedrock Converse catalog");
     let models = Model::from_config("bedrock", &bedrock.models);
-    for (name, effort) in [
-        ("us.anthropic.claude-sonnet-5-5", "high"),
-        ("us.anthropic.claude-haiku-5-5", "medium"),
+    for name in [
+        "us.anthropic.claude-sonnet-5-5",
+        "us.anthropic.claude-haiku-5-5",
     ] {
         let model = models
             .iter()
@@ -710,10 +830,7 @@ fn bedrock_adaptive_thinking_preserves_output_limits() {
             .expect("valid adaptive thinking patch");
             assert_eq!(
                 patched["body"]["additionalModelRequestFields"],
-                json!({
-                    "thinking": {"type": "adaptive", "display": "summarized"},
-                    "output_config": {"effort": effort}
-                })
+                json!({"thinking": {"type": "adaptive", "display": "summarized"}})
             );
             let inference = &patched["body"]["inferenceConfig"];
             assert_eq!(inference["maxTokens"], json!(output_limit));

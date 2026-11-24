@@ -13,6 +13,40 @@ use chrono::Utc;
 use harnx_core::execution_context::ExecutionContextObservation;
 use harnx_core::session::{Session, SessionLogEntry, ToolOutput};
 
+/// One accepted outer result can project observations before its siblings finish.
+/// The caller commits ToolCallCompleted first; this function never closes a round.
+pub(crate) fn prepare_completed_observation(
+    session: &Session,
+    result: &ToolResult,
+) -> Result<PendingExecutionContextPersistence> {
+    let pending = session
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match &message.content {
+            MessageContent::ToolCalls(pending) => Some(pending),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("completed tool call has no pending round"))?;
+    anyhow::ensure!(
+        pending
+            .tool_results
+            .iter()
+            .any(|slot| slot.call == result.call),
+        "completed tool call does not match pending round"
+    );
+    Ok(PendingExecutionContextPersistence::for_session(
+        session,
+        result.execution_context.iter().cloned().collect(),
+        true,
+    ))
+}
+
+pub(crate) fn completion_media_location(
+    session: &Session,
+) -> Result<(harnx_core::cid_url::SessionRef, Option<std::path::PathBuf>)> {
+    Ok((session_ref(session)?, attachments_dir(session)))
+}
 /// Finalize the tool round opened by [`super::session::add_tool_calls`] by filling in
 /// the in-memory outputs and writing a `ToolResults` log entry.
 /// Matches each result to its call by id (or by position when the id
@@ -55,12 +89,21 @@ pub(crate) fn prepare_tool_results_in_place(
         anyhow::bail!("add_tool_results called but the last session message is not role=Tool");
     }
 
+    for result in results.iter_mut() {
+        result.switch_agent = crate::handoff_result::effective_switch(result);
+    }
     let accepted_observations = accept_tool_result_replacements(&mut pending.tool_results, results);
+    for result in &mut pending.tool_results {
+        result.switch_agent = crate::handoff_result::effective_switch(result);
+    }
+    let handoff_selection =
+        crate::handoff_result::select(&pending.tool_results).and_then(|switch| switch.tool_call_id);
     let log_results = tool_outputs(&pending.tool_results);
 
     let appended = append_event_status(
         session,
         &SessionLogEntry::ToolResults {
+            handoff_selection,
             results: log_results,
             timestamp: Some(Utc::now()),
         },
@@ -111,6 +154,7 @@ fn tool_outputs(results: &[ToolResult]) -> Vec<ToolOutput> {
             output: result.output.clone(),
             markdown: result.markdown.clone(),
             content: result.content.clone(),
+            user_surfaces: result.user_surfaces.clone(),
             switch_agent: result.switch_agent.clone(),
         })
         .collect()
@@ -143,6 +187,10 @@ fn accept_tool_result_replacements(
             }
             slot.output = replacement.output;
             slot.content = replacement.content;
+            // User-audience surfaces must survive the replacement: the
+            // durable ToolResults rows are built from the pending slots,
+            // and frontends read the surface envelopes from them (T5.1).
+            slot.user_surfaces = replacement.user_surfaces;
             slot.switch_agent = replacement.switch_agent;
         }
     }

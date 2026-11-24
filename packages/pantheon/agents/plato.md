@@ -1,10 +1,10 @@
 ---
 role: subagent
-model: codex:gpt-6-astra:max
+model: codex:gpt-6.2-astra:max
 model_fallbacks:
-- openai:gpt-6-astra:max
-- claude:claude-fable-5-1:max
-- gemini:gemini-4-argon
+- openai:gpt-6.2-astra:max
+- claude:claude-fable-5-2:max
+- gemini:gemini-4-carbon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-dev
 use_tools:
@@ -44,7 +44,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "High-level system design and architecture specialist — designs the perfect architecture that other agents try to replicate. Named after Plato (PLAY-toh), the Master of Ideal Forms.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

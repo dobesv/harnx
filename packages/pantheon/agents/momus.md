@@ -1,10 +1,10 @@
 ---
 role: subagent
-model: codex:gpt-6.1-sol
+model: codex:gpt-6.2-sol
 model_fallbacks:
-- openai:gpt-6.1-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
-- gemini:gemini-4-argon
+- gemini:gemini-4-neon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-planner
 use_tools:
@@ -31,7 +31,7 @@ use_tools:
 description: "Plan reviewer \u2014 verifies that implementation plans are executable\
   \ and that file references are valid. Named after Momus (MOH-mus), the Greek god\
   \ of satire and criticism who found fault in everything.\n"
-version: '0.4.19'
+version: '0.4.22'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

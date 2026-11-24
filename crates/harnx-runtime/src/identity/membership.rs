@@ -1,18 +1,10 @@
 //! Request-local memberships from explicitly trusted HTTP headers.
 
-use super::IdentityError;
-use anyhow::Context;
+use super::{HeaderSpec, IdentityError, IdentitySource};
+use anyhow::{bail, Context};
 use http::{HeaderMap, HeaderName};
 
-/// Normalize string values by splitting on comma, trimming whitespace, and filtering empty entries.
-///
-/// This function accepts owned strings; merge normalizes configured values via `normalize_membership_iter`.
-/// Preserves duplicates and order from the input.
-pub(crate) fn normalize_membership_values(values: Vec<String>) -> Vec<String> {
-    normalize_membership_iter(values.iter().map(|s| s.as_str()))
-}
-
-/// Shared normalization logic that works over an iterator of string slices.
+/// Configured alias memberships retain their existing comma-list normalization.
 fn normalize_membership_iter<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     values
         .into_iter()
@@ -60,52 +52,53 @@ pub fn merge_memberships(header: Vec<String>, configured: &[String]) -> Vec<Stri
 /// strip or overwrite these headers before supplying authenticated memberships.
 #[derive(Clone, Debug, Default)]
 pub struct MembershipHeaders {
-    names: Vec<HeaderName>,
+    sources: Vec<HeaderSpec>,
 }
 
 impl MembershipHeaders {
-    /// Validate raw HTTP header names at startup. No source prefixes or cookies.
-    pub fn new(names: &[String]) -> anyhow::Result<Self> {
-        let names = names
+    /// Validate `header:NAME`, `header-csv:NAME`, or bare header names at startup.
+    /// Cookies and bearer identity sources cannot supply memberships.
+    pub fn new(sources: &[String]) -> anyhow::Result<Self> {
+        let sources = sources
             .iter()
-            .map(|name| {
-                HeaderName::from_bytes(name.as_bytes())
-                    .with_context(|| format!("invalid membership header name '{name}'"))
+            .map(|raw| {
+                match raw.parse::<IdentitySource>()
+                    .with_context(|| format!("invalid membership header source '{raw}'"))? {
+                    IdentitySource::Header(source) => Ok(source),
+                    _ => bail!("unsupported membership source '{raw}': expected header:NAME or header-csv:NAME"),
+                }
             })
             .collect::<anyhow::Result<_>>()?;
-        Ok(Self { names })
+        Ok(Self { sources })
     }
 
-    /// Collect all repeated fields and comma-separated entries from every name.
+    /// Raw header names for adapters that receive headers through SDK parameters.
+    pub fn names(&self) -> impl Iterator<Item = &HeaderName> {
+        self.sources.iter().map(HeaderSpec::name)
+    }
+
+    /// Collect memberships from every configured source and repeated field.
     ///
-    /// Trim whitespace and ignore empty entries. Missing headers yield an empty
-    /// collection. Duplicates are retained and have no effect on access grants.
-    /// Commas always delimit entries; quoted lists and escaping aren't supported.
-    /// Any non-text field rejects the whole extraction, even after valid fields.
+    /// `header:` and bare names keep one opaque, trimmed value per field.
+    /// `header-csv:` joins repeated fields with commas before parsing; commas
+    /// outside quotes delimit items, except escaped commas (`\,`). Quoted items
+    /// decode `\"` and `\\`; other escapes stay literal. Invalid lists or non-text
+    /// fields reject the whole extraction, even after valid fields.
+    /// Empty items are ignored; missing headers yield an empty collection.
+    /// Order and duplicates are retained and have no effect on access grants.
     /// Errors never contain header values. Returned memberships are request-local,
     /// not session metadata.
     pub fn resolve(&self, headers: &HeaderMap) -> Result<Vec<String>, IdentityError> {
-        // Collect raw header values, fail closed if any invalid UTF-8
-        let mut raw_values = Vec::new();
-        let mut has_invalid = false;
-
-        for name in &self.names {
-            for field in headers.get_all(name) {
-                match field.to_str() {
-                    Ok(value) => raw_values.push(value),
-                    Err(_) => has_invalid = true,
-                }
-            }
+        let mut values = Vec::new();
+        for source in &self.sources {
+            values.extend(
+                source
+                    .values(headers, super::header::HeaderFields::All)?
+                    .into_iter()
+                    .filter(|value| !value.is_empty()),
+            );
         }
-
-        // Fail closed: any invalid UTF-8 rejects the whole extraction
-        if has_invalid {
-            return Err(IdentityError::InvalidValue);
-        }
-
-        Ok(normalize_membership_values(
-            raw_values.into_iter().map(String::from).collect(),
-        ))
+        Ok(values)
     }
 }
 
@@ -114,32 +107,63 @@ mod tests {
     use super::*;
     use http::{header::COOKIE, HeaderValue};
 
-    fn policy(names: &[&str]) -> MembershipHeaders {
+    fn csv_policy(names: &[&str]) -> MembershipHeaders {
         harnx_core::require_nextest();
-        MembershipHeaders::new(&names.iter().map(|name| (*name).into()).collect::<Vec<_>>())
-            .unwrap()
+        MembershipHeaders::new(
+            &names
+                .iter()
+                .map(|name| format!("header-csv:{name}"))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
     }
 
     #[test]
-    fn membership_names_are_validated_without_source_prefixes() {
+    fn membership_specs_reject_invalid_names_and_unsupported_sources() {
         harnx_core::require_nextest();
         for name in [
             "",
             "x groups",
             "x:groups",
             "x\ngroups",
-            "header:x-groups",
+            "header:",
+            "header-csv:",
+            "header-csv:bad name",
             "cookie:groups",
+            "forge-fit",
+            "bearer-claim:groups",
         ] {
             let error = MembershipHeaders::new(&[name.into()]).unwrap_err();
-            assert!(error.to_string().contains("invalid membership header name"));
+            assert!(error.to_string().contains("membership"));
         }
         assert!(MembershipHeaders::new(&["x-groups".into(), "invalid name".into()]).is_err());
     }
 
     #[test]
+    fn membership_header_specs_make_comma_handling_explicit() {
+        harnx_core::require_nextest();
+        let dn = "CN=admins,OU=eng,O=Acme";
+        let mut headers = HeaderMap::new();
+        headers.append("x-groups", format!(" {dn} ").parse().unwrap());
+        headers.append("x-groups", " CN=ops,O=Acme ".parse().unwrap());
+        for raw in ["X-Groups", "header:X-Groups", "HeAdEr:X-Groups"] {
+            let policy = MembershipHeaders::new(&[raw.into()]).unwrap();
+            assert_eq!(policy.resolve(&headers).unwrap(), [dn, "CN=ops,O=Acme"]);
+        }
+        let quoted = r#""CN=admins,OU=eng,O=Acme", "CN=ops,O=Acme""#;
+        headers.insert("x-groups", quoted.parse().unwrap());
+        let opaque = MembershipHeaders::new(&["header:x-groups".into()]).unwrap();
+        assert_eq!(opaque.resolve(&headers).unwrap(), [quoted]);
+        let csv = MembershipHeaders::new(&["HeAdEr-CsV:X-Groups".into()]).unwrap();
+        assert_eq!(csv.resolve(&headers).unwrap(), [dn, "CN=ops,O=Acme"]);
+        headers.insert("x-groups", "\"unterminated".parse().unwrap());
+        assert_eq!(opaque.resolve(&headers).unwrap(), ["\"unterminated"]);
+        assert_eq!(csv.resolve(&headers), Err(IdentityError::InvalidValue));
+    }
+
+    #[test]
     fn membership_names_are_case_insensitive() {
-        let policy = policy(&["X-Groups"]);
+        let policy = csv_policy(&["X-Groups"]);
         let mut headers = HeaderMap::new();
         headers.insert("x-groups", HeaderValue::from_static("engineering"));
         assert_eq!(policy.resolve(&headers).unwrap(), ["engineering"]);
@@ -147,7 +171,7 @@ mod tests {
 
     #[test]
     fn membership_collects_repeated_comma_and_multiple_header_values() {
-        let policy = policy(&["x-groups", "x-missing", "x-other-groups"]);
+        let policy = csv_policy(&["x-groups", "x-missing", "x-other-groups"]);
         let mut headers = HeaderMap::new();
         headers.append(
             "x-groups",
@@ -171,7 +195,7 @@ mod tests {
 
     #[test]
     fn membership_missing_and_empty_values_yield_no_memberships() {
-        let policy = policy(&["x-groups", "x-roles"]);
+        let policy = csv_policy(&["x-groups", "x-roles"]);
         let mut headers = HeaderMap::new();
         assert!(policy.resolve(&headers).unwrap().is_empty());
         for value in ["", " \t ", ",,", " , \t , "] {
@@ -182,7 +206,7 @@ mod tests {
 
     #[test]
     fn membership_default_trusts_nothing_and_ignores_unconfigured_values() {
-        let policy = policy(&["x-groups"]);
+        let policy = csv_policy(&["x-groups"]);
         let mut headers = HeaderMap::new();
         headers.insert("x-roles", HeaderValue::from_bytes(b"\xff").unwrap());
         headers.insert(COOKIE, HeaderValue::from_static("groups=admin"));
@@ -197,7 +221,7 @@ mod tests {
 
     #[test]
     fn membership_duplicate_header_names_and_values_are_retained() {
-        let policy = policy(&["x-groups", "X-GROUPS"]);
+        let policy = csv_policy(&["x-groups", "X-GROUPS"]);
         let mut headers = HeaderMap::new();
         headers.insert("x-groups", HeaderValue::from_static("ops,ops"));
         assert_eq!(
@@ -207,8 +231,50 @@ mod tests {
     }
 
     #[test]
+    fn membership_quoted_lists_are_identical_across_repeated_fields() {
+        let policy = csv_policy(&["x-groups"]);
+        let raw = r#""CN=admins,OU=eng,O=Acme", "CN=Smith\, Alice,O=Acme", plain-group"#;
+        let expected = [
+            "CN=admins,OU=eng,O=Acme",
+            r"CN=Smith\, Alice,O=Acme",
+            "plain-group",
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-groups", raw.parse().unwrap());
+        assert_eq!(policy.resolve(&headers).unwrap(), expected);
+        for (index, _) in raw.match_indices(',') {
+            headers.remove("x-groups");
+            headers.append("x-groups", raw[..index].parse().unwrap());
+            headers.append("x-groups", raw[index + 1..].parse().unwrap());
+            assert_eq!(
+                policy.resolve(&headers).unwrap(),
+                expected,
+                "split at {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_invalid_quotes_reject_all_names_without_leaking_values() {
+        let policy = csv_policy(&["x-groups", "x-other-groups"]);
+        for raw in [r#""secret"#, r#""secret"junk, admin"#] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-groups", "valid".parse().unwrap());
+            headers.append("x-other-groups", raw.parse().unwrap());
+            headers.append("x-other-groups", "later".parse().unwrap());
+            let error = policy.resolve(&headers).unwrap_err();
+            assert_eq!(error, IdentityError::InvalidValue);
+            assert!(!error.to_string().contains("secret"));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-groups", "\"unfinished".parse().unwrap());
+        headers.insert("x-other-groups", "other\"".parse().unwrap());
+        assert_eq!(policy.resolve(&headers), Err(IdentityError::InvalidValue));
+    }
+
+    #[test]
     fn membership_malformed_repeated_field_rejects_whole_extraction() {
-        let policy = policy(&["x-groups"]);
+        let policy = csv_policy(&["x-groups"]);
         let mut headers = HeaderMap::new();
         headers.append("x-groups", HeaderValue::from_static("sensitive-membership"));
         headers.append("x-groups", HeaderValue::from_bytes(b"secret-\xff").unwrap());
@@ -221,7 +287,7 @@ mod tests {
 
     #[test]
     fn membership_malformed_later_header_name_rejects_whole_extraction() {
-        let policy = policy(&["x-groups", "x-other-groups"]);
+        let policy = csv_policy(&["x-groups", "x-other-groups"]);
         let mut headers = HeaderMap::new();
         headers.insert("x-groups", HeaderValue::from_static("engineering"));
         headers.insert("x-other-groups", HeaderValue::from_bytes(b"\xff").unwrap());
@@ -230,8 +296,8 @@ mod tests {
 
     #[test]
     fn membership_groups_and_roles_use_independent_policies() {
-        let groups = policy(&["x-groups"]);
-        let roles = policy(&["x-roles"]);
+        let groups = csv_policy(&["x-groups"]);
+        let roles = csv_policy(&["x-roles"]);
         let mut headers = HeaderMap::new();
         headers.insert("x-groups", HeaderValue::from_static("engineering"));
         headers.insert("x-roles", HeaderValue::from_static("reviewer"));
@@ -239,33 +305,24 @@ mod tests {
         assert_eq!(roles.resolve(&headers).unwrap(), ["reviewer"]);
     }
 
-    // Tests for normalize_membership_values and merge_memberships
-
     #[test]
-    fn normalize_membership_values_basic() {
+    fn configured_membership_values_basic() {
         harnx_core::require_nextest();
-        let values = vec![
-            "engineering".into(),
-            "ops , support ".into(),
-            ",,admin,".into(),
-        ];
-        let result = normalize_membership_values(values);
+        let result = normalize_membership_iter(["engineering", "ops , support ", ",,admin,"]);
         assert_eq!(result, ["engineering", "ops", "support", "admin"]);
     }
 
     #[test]
-    fn normalize_membership_values_preserves_duplicates() {
+    fn configured_membership_values_preserve_duplicates() {
         harnx_core::require_nextest();
-        let values = vec!["ops,ops".into(), "ops".into()];
-        let result = normalize_membership_values(values);
+        let result = normalize_membership_iter(["ops,ops", "ops"]);
         assert_eq!(result, ["ops", "ops", "ops"]);
     }
 
     #[test]
-    fn normalize_membership_values_filters_empty() {
+    fn configured_membership_values_filter_empty() {
         harnx_core::require_nextest();
-        let values = vec!["".into(), "   ".into(), ",,".into()];
-        let result = normalize_membership_values(values);
+        let result = normalize_membership_iter(["", "   ", ",,"]);
         assert!(result.is_empty());
     }
 

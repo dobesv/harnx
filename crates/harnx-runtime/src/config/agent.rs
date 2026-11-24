@@ -69,9 +69,29 @@ fn load_with_qualified_name_from_contents(
     contents: &str,
 ) -> Result<Agent> {
     let mut config = AgentConfig::from_markdown(qualified_name, contents)?;
-    let _ = path;
-    if let Some((pkg, stem)) = qualified_name.split_once('/') {
+    let package_dir = if let Some((pkg, stem)) = qualified_name.split_once('/') {
         apply_package_agent_transforms(&mut config, pkg, stem)?;
+        // A package patch can rewrite or add `patches`; compile what the
+        // package left behind so a broken filter surfaces at load, not at the
+        // first session activation.
+        harnx_core::jaq::validate_filters_with_globals(
+            config.patches(),
+            harnx_core::agent_config::PATCH_GLOBAL_NAMES,
+        )
+        .with_context(|| format!("validate `patches` of agent '{qualified_name}'"))?;
+        Some(harnx_core::config_paths::package_dir(pkg))
+    } else {
+        None
+    };
+    middleware::bind_middleware(
+        &mut config.middleware,
+        middleware::file_origin(path, package_dir.as_deref())?,
+    )?;
+    if let Some(hooks) = config.hooks_mut() {
+        event_hooks::bind_event_hooks(
+            hooks,
+            middleware::file_origin(path, package_dir.as_deref())?,
+        )?;
     }
     Ok(Agent::new(config))
 }
@@ -94,42 +114,32 @@ pub fn apply_package_agent_transforms(
     // Format is "client:model" or just "client". The leading-slash escape "/foo"
     // resolves to top-level "foo"; "other/foo" passes through unchanged.
     if let Some(model_id) = config.model_id().map(ToOwned::to_owned) {
-        let resolved = match model_id.split_once(':') {
-            Some((client_part, model_part)) => {
-                let resolved_client = harnx_core::package_namespace::resolve_package_relative_name(
-                    client_part,
-                    Some(pkg_name),
-                );
-                format!("{resolved_client}:{model_part}")
-            }
-            None => harnx_core::package_namespace::resolve_package_relative_name(
-                &model_id,
-                Some(pkg_name),
-            ),
-        };
+        let resolved = resolve_package_model_id(&model_id, Some(pkg_name));
         config.set_model_id(Some(resolved));
     }
     // Rewrite model_fallbacks too
     let resolved_fallbacks: Vec<String> = config
         .model_fallbacks()
         .iter()
-        .map(|fb| match fb.split_once(':') {
-            Some((client_part, model_part)) => {
-                let resolved_client = harnx_core::package_namespace::resolve_package_relative_name(
-                    client_part,
-                    Some(pkg_name),
-                );
-                format!("{resolved_client}:{model_part}")
-            }
-            None => {
-                harnx_core::package_namespace::resolve_package_relative_name(fb, Some(pkg_name))
-            }
-        })
+        .map(|fb| resolve_package_model_id(fb, Some(pkg_name)))
         .collect();
     if !resolved_fallbacks.is_empty() {
         config.set_model_fallbacks(resolved_fallbacks);
     }
     Ok(())
+}
+
+/// Resolve only the client part; model names may contain `/` themselves.
+/// Shared by package loading and session patches so both use the same namespace.
+pub(super) fn resolve_package_model_id(model_id: &str, package: Option<&str>) -> String {
+    match model_id.split_once(':') {
+        Some((client, model)) => {
+            let client =
+                harnx_core::package_namespace::resolve_package_relative_name(client, package);
+            format!("{client}:{model}")
+        }
+        None => harnx_core::package_namespace::resolve_package_relative_name(model_id, package),
+    }
 }
 
 fn load_package_patch_for(pkg_name: &str) -> Result<Option<harnx_core::package::PackagePatch>> {
@@ -217,6 +227,21 @@ pub fn resolve_file_defaults(agent: &mut Agent) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(Config::agents_config_dir);
     resolve_file_backed_variables(agent.config.variables_mut(), &agent_dir)
+}
+
+/// Resolve available variables from declarations and original session inputs.
+/// Missing required values are allowed here because patches can supply defaults;
+/// activation validates the effective declarations after applying all patches.
+/// Previously resolved defaults must not become explicit overrides after patches.
+pub fn resolve_session_variables(agent: &mut Agent, variables: &AgentVariables) -> Result<()> {
+    resolve_file_defaults(agent)?;
+    let resolved = if agent.defined_variables().is_empty() {
+        variables.clone()
+    } else {
+        init_agent_variables(agent.defined_variables(), variables, true)?
+    };
+    agent.set_shared_variables(resolved);
+    Ok(())
 }
 
 /// Resolve file-backed variable defaults and populate `shared_variables`.

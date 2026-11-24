@@ -29,7 +29,7 @@ async fn normal_prompt_observes_for_unrelated_caller_with_correct_content_and_st
     .await?;
     assert_eq!(pending["status"], "pending");
     assert_eq!(pending["terminal"], false);
-    assert!(serde_json::to_string(&pending["output"])?.contains("original"));
+    assert!(pending.get("response").is_none(), "{pending}");
     f.append(message("reply", MessageRole::Assistant, "original answer"))
         .await?;
     f.append(end(dispatched.prompt.user_msg_seq())).await?;
@@ -42,9 +42,7 @@ async fn normal_prompt_observes_for_unrelated_caller_with_correct_content_and_st
     .await?;
     assert_eq!(completed["status"], "completed");
     assert_eq!(completed["terminal"], true);
-    let output = serde_json::to_string(&completed["output"])?;
-    assert!(output.contains("original"), "{output}");
-    assert!(output.contains("original answer"), "{output}");
+    assert_eq!(completed["response"], "original answer");
     Ok(())
 }
 
@@ -56,10 +54,10 @@ async fn live_polls_have_changing_observation_metadata() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(2)).await;
     let second = f.poll(json!({"seconds": 1})).await?;
     assert_pending(&first, true);
-    assert_eq!(first["output"]["observation"]["error"], "soft_wait_expired");
+    assert_eq!(first["observation"]["error"], "soft_wait_expired");
     assert_ne!(
-        first["output"]["observation"]["observed_at_ms"],
-        second["output"]["observation"]["observed_at_ms"]
+        first["observation"]["observed_at_ms"],
+        second["observation"]["observed_at_ms"]
     );
     Ok(())
 }
@@ -81,7 +79,7 @@ async fn initial_send_wait_and_later_wait_share_formatter_and_soft_expiry_never_
         .iter()
         .any(|(_, e)| matches!(e, SessionLogEntry::Cancel { .. })));
     let later = f.poll(json!({"seconds": 1})).await?;
-    assert_eq!(first["output"]["events"], later["output"]["events"]);
+    assert_pending(&later, true);
     f.append(message(
         "done",
         MessageRole::Assistant,
@@ -100,10 +98,8 @@ async fn initial_send_wait_and_later_wait_share_formatter_and_soft_expiry_never_
     )
     .await?;
     assert_eq!(initial_replay["status"], "completed");
-    assert_eq!(
-        initial_replay["output"]["events"],
-        completed["output"]["events"]
-    );
+    assert_eq!(completed["response"], "child finishes later");
+    assert_eq!(initial_replay["response"], completed["response"]);
     Ok(())
 }
 
@@ -131,10 +127,7 @@ async fn observer_cancel_returns_handle_without_child_cancel_or_false_cancelled_
     assert_eq!(result["prompt_id"], "original-prompt");
     assert_eq!(result["terminal"], false);
     assert_ne!(result["status"], "cancelled");
-    assert_eq!(
-        result["output"]["observation"]["error"],
-        "observer_cancelled"
-    );
+    assert_eq!(result["observation"]["error"], "observer_cancelled");
     assert_eq!(f.log.load_events_latest_async().await?.len(), 1);
     f.append(end(1)).await?;
     assert_eq!(f.status().await?["status"], "completed");
@@ -205,52 +198,6 @@ async fn missing_or_inconsistent_context_wrong_agent_session_token_and_missing_b
 }
 
 #[tokio::test]
-async fn bounded_terminal_partial_continuation_and_empty_range_keep_whole_result_under_budget(
-) -> Result<()> {
-    let f = Fixture::new().await?;
-    f.dispatch().await?;
-    let index = f
-        .append(message(
-            "huge",
-            MessageRole::Assistant,
-            &"🔥\\\"\n".repeat(30_000),
-        ))
-        .await?;
-    f.append(end(1)).await?;
-    let result = f.poll(json!({"seconds": 1, "read": {"max_output_bytes": 1024, "head_lines": 1, "tail_lines": 1}})).await?;
-    assert_eq!(result["status"], "completed");
-    assert!(serialized(&result) <= 1024);
-    assert_eq!(result["output"]["truncated"], true);
-    let continuation = f.poll(json!({"seconds": 1, "read": {"max_output_bytes": 1024, "entry_index": index, "byte_offset": 0}})).await?;
-    assert!(serialized(&continuation) <= 1024);
-    assert!(continuation["output"]["continuation"].is_object());
-    let empty = f
-        .poll(json!({"seconds": 1, "read": {"index_min": 1000}}))
-        .await?;
-    for key in [
-        "events",
-        "effective_index_max",
-        "scanned_through",
-        "continuation",
-        "omitted_ranges",
-    ] {
-        assert!(
-            empty["output"].get(key).is_some(),
-            "missing canonical field {key}"
-        );
-    }
-    let outside = f
-        .poll(json!({"seconds": 1, "read": {"entry_index": 1000, "byte_offset": 0}}))
-        .await?;
-    assert_eq!(
-        outside["output"]["observation"]["error"],
-        "entry_outside_prompt_scope"
-    );
-    assert_eq!(f.activation_count().await?, 1);
-    Ok(())
-}
-
-#[tokio::test]
 async fn broker_unavailability_keeps_handle_budget_and_unknown_without_terminal_claim() -> Result<()>
 {
     let mut f = Fixture::new().await?;
@@ -304,7 +251,8 @@ async fn send_without_wait_returns_dispatch_receipt_without_starting_observation
     assert_eq!(result["session_id"], "child");
     assert_eq!(result["prompt_id"], "original-prompt");
     assert_pending(&result, false);
-    assert!(result["output"].get("events").is_none());
+    assert!(result.get("activity").is_none(), "{result}");
+    assert!(result.get("response").is_none(), "{result}");
     assert_initial_dispatch_unchanged(&f).await?;
     Ok(())
 }
@@ -378,7 +326,7 @@ async fn settled_marker_survives_one_budget_drop_but_not_two() -> Result<()> {
         "status": "completed",
         "session_id": "child",
         "prompt_id": "original-prompt",
-        "output": "child's final answer",
+        "response": "child's final answer",
     });
     let mut full = base.clone();
     attach_terminal_progress(&mut full, &f.toolset, evidence(usize::MAX));

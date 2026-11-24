@@ -80,9 +80,7 @@ async fn real_worker_completes_after_initial_soft_expiry_and_after_observer_canc
         daemon.abort();
         let _ = daemon.await;
         assert_eq!(completed["status"], "completed");
-        assert!(completed["output"]
-            .to_string()
-            .contains("child continued after observation"));
+        assert_eq!(completed["response"], "child continued after observation");
         let after = f
             .toolset
             .session_metadata

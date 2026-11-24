@@ -166,7 +166,9 @@ async fn a_parent_holding_the_calls_result_forbids_resuming_its_child() -> Resul
         &fixture.js,
         &fixture.parent_key,
         &SessionLogEntry::ToolResults {
+            handoff_selection: None,
             results: vec![ToolOutput {
+                user_surfaces: Vec::new(),
                 id: Some(CALL.into()),
                 name: "subagent_session_prompt".into(),
                 output: serde_json::json!({"text": "already answered"}),
