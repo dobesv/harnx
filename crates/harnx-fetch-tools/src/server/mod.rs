@@ -2,11 +2,13 @@ mod handler;
 mod image;
 pub mod model;
 mod params;
+mod script_result;
 
 use std::sync::Arc;
 
 pub(crate) use handler::tool_schema;
 pub use params::{FetchParams, YoutubeTranscriptParams};
+pub use script_result::ResultStyle;
 
 use crate::client::FetchClient;
 use crate::net::Lookup;

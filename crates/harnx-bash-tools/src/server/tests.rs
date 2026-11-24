@@ -600,6 +600,7 @@ fn read_exec_log_params(execution_id: impl Into<String>, stream: &str) -> ReadEx
         head_lines: None,
         tail_lines: None,
         max_output_bytes: None,
+        line_numbers: None,
     }
 }
 
@@ -1369,6 +1370,7 @@ async fn test_exec_truncation_mentions_log_paths_and_read_exec_log_works() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
+            line_numbers: None,
         })
         .await
         .unwrap();
@@ -1388,6 +1390,7 @@ async fn test_exec_truncation_mentions_log_paths_and_read_exec_log_works() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
+            line_numbers: None,
         })
         .await
         .unwrap();
@@ -1412,6 +1415,7 @@ async fn test_read_exec_log_rejects_invalid_stream() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
+            line_numbers: None,
         })
         .await;
 
@@ -1455,6 +1459,7 @@ async fn test_read_exec_log_offset_and_tail_combined() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
+            line_numbers: None,
         })
         .await
         .unwrap();
@@ -2374,6 +2379,7 @@ async fn test_concurrent_execution_log_isolation() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
+            line_numbers: None,
         })
     };
 

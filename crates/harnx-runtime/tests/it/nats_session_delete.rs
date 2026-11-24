@@ -1,7 +1,8 @@
 use crate::common;
 
 use anyhow::{Context, Result};
-use common::spawn_nats_server;
+use async_nats::jetstream::{kv, Context as JetStream};
+use common::{spawn_nats_server, NatsServerHandle};
 use harnx_core::{
     message::{ImageUrl, MessageContent, MessageContentPart, MessageRole},
     require_nextest,
@@ -231,4 +232,141 @@ async fn append_user_message(log: &NatsSessionLog) -> Result<()> {
     })
     .await?;
     Ok(())
+}
+
+struct PlanCleanupFailure {
+    _server: NatsServerHandle,
+    config: Config,
+    js: JetStream,
+    store: SessionMetadataStore,
+    metadata: SessionMetadata,
+    revision: u64,
+    plans: kv::Store,
+    plan_key: String,
+}
+
+impl PlanCleanupFailure {
+    // qual:test_helper
+    async fn seed() -> Result<Option<Self>> {
+        let Some(server) = spawn_nats_server().await? else {
+            return Ok(None);
+        };
+        let config = local_nats_config(server.url());
+        let js = config.nats_jetstream("local").await?;
+        let store = SessionMetadataStore::ensure(&js, 1).await?;
+        let mut metadata = SessionMetadata::new(
+            "partial-deletion",
+            SessionInitializer::named("oracle", Default::default()).with_user_id("alice"),
+        );
+        metadata.created_at = chrono::DateTime::UNIX_EPOCH;
+        let key = metadata.storage_key();
+        let revision = store.create(&metadata).await?.unwrap();
+        let activity = harnx_runtime::nats_session_metadata::SessionActivity {
+            first_activation_at: None,
+            last_activity_at: metadata.created_at,
+        };
+        store
+            .kv_store()
+            .put(
+                harnx_runtime::nats_session_metadata::activity_key(&key),
+                serde_json::to_vec(&activity)?.into(),
+            )
+            .await?;
+        append_user_message(&NatsSessionLog::new_with_replicas(js.clone(), &key, 1)).await?;
+
+        let plans = harnx_blob_store::plans::ensure_plans_bucket(&js, 1).await?;
+        let plan_key = format!("plan/{key}/test/index.md");
+        // The real plans cleanup rejects a document it can't decode as UTF-8.
+        plans.put(&plan_key, vec![0xff].into()).await?;
+        Ok(Some(Self {
+            _server: server,
+            config,
+            js,
+            store,
+            metadata,
+            revision,
+            plans,
+            plan_key,
+        }))
+    }
+
+    // qual:test_helper
+    async fn assert_partial_deletion(&self) -> Result<()> {
+        let key = self.metadata.storage_key();
+        assert!(self
+            .js
+            .get_stream(stream_name_for_session(&key))
+            .await
+            .is_err());
+        assert!(self.store.get_activity(&key).await?.is_none());
+        let record = self
+            .store
+            .get(&key)
+            .await?
+            .context("owner record was removed")?;
+        assert_eq!(record.revision, self.revision);
+        assert_eq!(record.metadata, self.metadata, "including the owner stamp");
+        Ok(())
+    }
+
+    // qual:test_helper
+    async fn repair_plan(&self) -> Result<()> {
+        self.plans
+            .put(&self.plan_key, "# Valid document".into())
+            .await?;
+        Ok(())
+    }
+
+    // qual:test_helper
+    async fn assert_cleanup_finished(&self) -> Result<()> {
+        assert!(self.plans.get(&self.plan_key).await?.is_none());
+        assert!(self
+            .store
+            .get(&self.metadata.storage_key())
+            .await?
+            .is_none());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn session_delete_keeps_owner_on_plan_cleanup_failure_and_can_retry() -> Result<()> {
+    require_nextest();
+    let Some(fixture) = PlanCleanupFailure::seed().await? else {
+        return Ok(());
+    };
+    let id = &fixture.metadata.session_id;
+    let error = delete_remote_session(&fixture.config, "local", "oracle", id)
+        .await
+        .expect_err("plan cleanup must fail the deletion");
+    assert!(error.downcast_ref::<std::string::FromUtf8Error>().is_some());
+    fixture.assert_partial_deletion().await?;
+    fixture.repair_plan().await?;
+    let retried = delete_remote_session(&fixture.config, "local", "oracle", id).await?;
+    assert!(!retried.stream_deleted);
+    assert_eq!(retried.attachments_deleted, 1);
+    assert_eq!(retried.metadata_keys_deleted, 1);
+    fixture.assert_cleanup_finished().await
+}
+
+#[tokio::test]
+async fn retention_gc_reselects_partially_deleted_session_without_activity_or_transcript(
+) -> Result<()> {
+    use harnx_runtime::remote_session_cleanup::run_remote_cleanup;
+
+    require_nextest();
+    let Some(fixture) = PlanCleanupFailure::seed().await? else {
+        return Ok(());
+    };
+    let failed = run_remote_cleanup(&fixture.config, 1, "local").await;
+    assert_eq!((failed.scanned, failed.deleted, failed.errors), (1, 0, 1));
+    fixture.assert_partial_deletion().await?;
+
+    fixture.repair_plan().await?;
+    let retried = run_remote_cleanup(&fixture.config, 1, "local").await;
+    assert_eq!(
+        (retried.scanned, retried.deleted, retried.errors),
+        (1, 1, 0)
+    );
+    fixture.assert_cleanup_finished().await
 }

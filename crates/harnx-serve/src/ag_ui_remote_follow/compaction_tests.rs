@@ -12,7 +12,7 @@ fn remote_completion_hydrates_summary_and_metadata_from_shared_fixture() {
         let events = pending::completion_events(&history, "fixture", Some(&base)).unwrap();
         assert_eq!(
             normalize_tool_row_ids(&events[..2]),
-            normalize_tool_row_ids(&snapshot.events())
+            normalize_tool_row_ids(&snapshot.live_events())
         );
     }
 }
@@ -37,7 +37,7 @@ fn remote_compaction_advisory_emits_completed_metadata_then_snapshot() {
 fn assert_remote_snapshot(forwarder: &mut AdvisoryForwarder, history: &[(u64, SessionLogEntry)]) {
     let snapshot = HistorySnapshot::from_entries(history, &Session::default(), true).unwrap();
     let events: Vec<_> = std::iter::from_fn(|| forwarder.event_rx.try_recv().ok()).collect();
-    assert_eq!(events, snapshot.events());
+    assert_eq!(events, snapshot.live_events());
 }
 
 // Legacy tool rows have random message IDs; call identity and content stay exact.
@@ -78,7 +78,7 @@ fn remote_compaction_projection_respects_session_instructions() {
     let expected = HistorySnapshot::from_entries(&history, &base, true).unwrap();
     let events: Vec<_> = std::iter::from_fn(|| forwarder.event_rx.try_recv().ok()).collect();
     assert_eq!(expected.messages.len(), 1);
-    assert_eq!(events, expected.events());
+    assert_eq!(events, expected.live_events());
 }
 
 fn compacted_event() -> AgentEvent {
@@ -143,7 +143,7 @@ fn assert_refreshed_remote_events(rx: &mut tokio::sync::mpsc::Receiver<QueuedEve
     let completed = serde_json::to_value(rx.try_recv().unwrap().event).unwrap();
     assert_eq!(completed["value"]["compaction_seq"], 5);
     let expected = HistorySnapshot::from_entries(&fixture(6), &Session::default(), true).unwrap();
-    for expected in expected.events() {
+    for expected in expected.live_events() {
         assert_eq!(rx.try_recv().unwrap().event, expected);
     }
 }

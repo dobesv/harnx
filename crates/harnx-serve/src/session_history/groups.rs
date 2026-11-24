@@ -1,4 +1,4 @@
-use crate::{ag_ui::history_messages_for_snapshot, ag_ui_sync::wire_message_id};
+use crate::{ag_ui_sync::wire_message_id, history_projection::project_message};
 use ag_ui_core::types::message::Message as AgUiMessage;
 use anyhow::Result;
 use harnx_core::{
@@ -12,6 +12,7 @@ pub(super) struct Group {
     pub from: u64,
     pub to: u64,
     pub messages: Vec<AgUiMessage>,
+    pub reasoning: Option<(String, Vec<String>)>,
     pub marker: bool,
 }
 
@@ -29,21 +30,21 @@ pub(super) fn message_groups(view: &TranscriptView, base: &Session) -> Result<Ve
         stabilize_history_id(message, *ordinal);
         *ordinal += 1;
     }
-    let messages = history_messages_for_snapshot(&session.messages);
-    let mut messages = messages.into_iter();
     let mut rounds = round_bounds(&view.entries);
     Ok(session
         .messages
         .iter()
-        .map(|message| {
+        .enumerate()
+        .map(|(ordinal, message)| {
             let seq = message.log_seq.unwrap_or(0) as u64;
             let end = round_end(&mut rounds, message, seq);
-            let mut rows: Vec<_> = messages.by_ref().take(row_count(message)).collect();
-            stabilize_tool_ids(&mut rows);
+            let mut projected = project_message(message, ordinal);
+            stabilize_tool_ids(&mut projected.rows);
             Group {
                 from: seq.min(end),
                 to: seq.max(end),
-                messages: rows,
+                messages: projected.rows,
+                reasoning: projected.reasoning,
                 marker: false,
             }
         })
@@ -57,19 +58,6 @@ fn stabilize_tool_ids(rows: &mut [AgUiMessage]) {
         if let AgUiMessage::Tool { id, .. } = row {
             *id = wire_message_id(&format!("history-result:{base}:{index}"));
         }
-    }
-}
-
-fn row_count(message: &Message) -> usize {
-    match &message.content {
-        MessageContent::ToolCalls(calls) => {
-            1 + calls
-                .tool_results
-                .iter()
-                .filter(|result| !harnx_runtime::config::session::is_pending_tool_result(result))
-                .count()
-        }
-        _ => 1,
     }
 }
 

@@ -1,5 +1,6 @@
 import { http, HttpResponse } from 'msw';
 import {
+  additionalReasoning,
   additionalSnapshot,
   createSessionEventsStream,
   isPromptlessRun,
@@ -16,6 +17,7 @@ import {
   emitThinkingRun,
   emitStandardReply,
   getSpecialSnapshot,
+  getSpecialSnapshotReasoning,
 } from './thinkingFixtures';
 
 const SUB_AGENT_SESSION_ID = 'child-session-0001';
@@ -120,6 +122,19 @@ function buildSnapshot(session: string) {
   return [...SESSION_ONE_SNAPSHOT, ...additionalSnapshot(session)];
 }
 
+function buildSnapshotReasoning(session: string): Record<string, string[]> {
+  return {
+    ...(getSpecialSnapshotReasoning(session) ?? {}),
+    ...additionalReasoning(session),
+  };
+}
+
+function hasSnapshotFeature(request: Request, feature: string): boolean {
+  const header = request.headers.get('x-harnx-snapshot-features');
+  if (!header) return false;
+  return header.split(',').some((token) => token.trim() === feature);
+}
+
 const MOCK_ATTACH_BOUNDARY_SEQ = 100;
 // Live handoff seq (101) > attach boundary (100) ⇒ navigates;
 // persisted/replayed handoff seq (≤100) ⇒ hydrated as history, no re-navigation (models #1803 reload-safety).
@@ -155,7 +170,8 @@ function emitSnapshot(
   controller: ReadableStreamDefaultController<Uint8Array>,
   session: string,
   threadId: string,
-  runId: string
+  runId: string,
+  includeHistoryReasoning: boolean,
 ) {
   controller.enqueue(encodeSseEvent({
     type: 'CUSTOM',
@@ -168,6 +184,15 @@ function emitSnapshot(
     type: 'MESSAGES_SNAPSHOT',
     messages: buildSnapshot(session),
   }));
+  if (includeHistoryReasoning && session !== 'session-thinking-legacy') {
+    controller.enqueue(encodeSseEvent({
+      type: 'CUSTOM',
+      threadId,
+      runId,
+      name: 'history_reasoning',
+      value: buildSnapshotReasoning(session),
+    }));
+  }
   const states = controlStates.get(session) || [];
   const isLiveHandoff = pendingLiveHandoffSessions.delete(session);
   for (const state of states) {
@@ -403,7 +428,15 @@ async function emitSubAgentRun({
   controller.close();
 }
 
-function createAgUiStream({ session, body }: { session: string; body: any }) {
+function createAgUiStream({
+  session,
+  body,
+  includeHistoryReasoning,
+}: {
+  session: string;
+  body: any;
+  includeHistoryReasoning: boolean;
+}) {
   const threadId = body?.threadId ?? `thread-${session}`;
   const runId = body?.runId ?? 'r-1';
   const messages = Array.isArray(body?.messages) ? body.messages : [];
@@ -482,7 +515,7 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
         // RUN_STARTED -> MESSAGES_SNAPSHOT -> RUN_FINISHED). A prompted run below
         // is a pure delta and must NOT emit MESSAGES_SNAPSHOT — applying an empty/
         // stale snapshot mid-run would wipe the optimistic user message + reply.
-        emitSnapshot(controller, session, threadId, runId);
+        emitSnapshot(controller, session, threadId, runId, includeHistoryReasoning);
         return;
       }
 
@@ -748,7 +781,12 @@ export const happyPathHandlers = [
     }
 
     const body = await request.clone().json() as any;
-    const stream = createAgUiStream({ session: String(params.session), body });
+    const includeHistoryReasoning = hasSnapshotFeature(request, 'history-reasoning');
+    const stream = createAgUiStream({
+      session: String(params.session),
+      body,
+      includeHistoryReasoning,
+    });
 
     return new HttpResponse(stream, {
       headers: {
@@ -796,7 +834,11 @@ export const sendFailHandlers = [
       return new HttpResponse(null, { status: 500, statusText: 'Internal Server Error' });
     }
 
-    return new HttpResponse(createAgUiStream({ session: String(params.session), body }), {
+    return new HttpResponse(createAgUiStream({
+      session: String(params.session),
+      body,
+      includeHistoryReasoning: hasSnapshotFeature(request, 'history-reasoning'),
+    }), {
       headers: {
         'Content-Type': 'text/event-stream'
       }

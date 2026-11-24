@@ -253,6 +253,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             exit_code: Some("exit_code".to_string()),
             error_exit_code: Some(2),
             summary: Some("path:line:text per line, path usable as --path, like grep -n; exit 1 when nothing matched".to_string()),
+            ..Default::default()
         }),
         spec::<FindFilesParams>("find", "Find files by glob pattern. Prefer this tool over running bash find.", true, tool_templates::FIND_CALL)
         .with_script_output(ScriptOutput {

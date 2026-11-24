@@ -84,16 +84,16 @@ fn proxied_bash_waits_do_not_advertise_stop_on_new_message() {
         .all(|spec| !spec.stops_on_new_message()));
 }
 
-/// The file tools declare a script output mapping natively; the proxy reaches
-/// them over MCP, which cannot carry the request that makes them honour it.
+/// The file tools declare a script output mapping natively; the proxy passes
+/// the request for a script-shaped result on, so it advertises the same one.
 #[test]
-fn proxied_file_tools_do_not_advertise_a_script_output_mapping() {
+fn proxied_file_tools_advertise_the_native_script_output_mapping() {
     let native = harnx_fs_tools::builtin_tool_specs();
     assert!(native.iter().any(|spec| spec.script_output().is_some()));
-    assert!(native
-        .into_iter()
-        .map(proxy_spec)
-        .all(|spec| spec.script_output().is_none()));
+    for spec in native {
+        let expected = spec.script_output();
+        assert_eq!(proxy_spec(spec).script_output(), expected);
+    }
 }
 
 #[test]

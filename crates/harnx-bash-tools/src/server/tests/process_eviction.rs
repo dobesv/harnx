@@ -42,6 +42,7 @@ async fn insert_process(
 fn exited(at: Instant) -> ProcessExit {
     ProcessExit {
         code: Some(7),
+        signal: None,
         exited_at: Some(at),
         timed_out: false,
         wait_error: None,
@@ -132,6 +133,7 @@ async fn running_and_unknown_fate_processes_are_never_evicted() {
     let failed = insert_process(&server, directory.path(), "exec-failed-wait").await;
     failed.send_replace(Some(ProcessExit {
         code: None,
+        signal: None,
         exited_at: None,
         timed_out: false,
         wait_error: Some("injected wait failure".to_owned()),

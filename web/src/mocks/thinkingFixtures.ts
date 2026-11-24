@@ -18,7 +18,9 @@ export function finishThinkingExchange(
   persistExchange(
     session,
     userText,
-    '<think>\nThinking through the approach in real time...\n</think>\n\nHere is the final answer after live reasoning.',
+    'Here is the final answer after live reasoning.',
+    undefined,
+    ['Thinking through the approach in real time...'],
   );
   controller.close();
 }
@@ -31,6 +33,26 @@ export const THINKING_HYDRATED_SNAPSHOT = [
   },
   {
     id: 'think-assistant-1',
+    role: 'assistant',
+    content: 'Here is the complete solution to your problem.',
+  },
+];
+
+export const THINKING_HYDRATED_REASONING: Record<string, string[]> = {
+  'think-assistant-1': [
+    'First analyze the constraints.\nThen construct the proof.',
+  ],
+};
+
+// Legacy inline-tagged fixture retained to verify fallback parsing for older servers.
+export const LEGACY_THINKING_HYDRATED_SNAPSHOT = [
+  {
+    id: 'legacy-think-user-1',
+    role: 'user',
+    content: 'Solve this problem step by step',
+  },
+  {
+    id: 'legacy-think-assistant-1',
     role: 'assistant',
     content: '<think>\nFirst analyze the constraints.\nThen construct the proof.\n</think>\n\nHere is the complete solution to your problem.',
   },
@@ -85,7 +107,13 @@ export const RESTORED_SESSION_SNAPSHOT = [
 
 export function getSpecialSnapshot(session: string): any[] | null {
   if (session === 'session-thinking-hydrated') return THINKING_HYDRATED_SNAPSHOT;
+  if (session === 'session-thinking-legacy') return LEGACY_THINKING_HYDRATED_SNAPSHOT;
   if (session === 'session-restored') return RESTORED_SESSION_SNAPSHOT;
+  return null;
+}
+
+export function getSpecialSnapshotReasoning(session: string): Record<string, string[]> | null {
+  if (session === 'session-thinking-hydrated') return THINKING_HYDRATED_REASONING;
   return null;
 }
 

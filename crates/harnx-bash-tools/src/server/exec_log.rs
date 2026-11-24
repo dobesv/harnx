@@ -1,4 +1,6 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
+use super::log_read::{offset_error, LoadedLog};
+use super::script_log::log_line;
 use super::*;
 use harnx_toolset_server::content::WithAudience;
 
@@ -70,29 +72,21 @@ impl BashServer {
         &self,
         params: ReadExecLogParams,
     ) -> Result<CallToolResult, ErrorData> {
-        Self::validate_read_exec_log_params(&params)?;
-        let path = self.resolve_log_path(&params.execution_id, &params.stream)?;
-        self.ensure_regular_log_file(&path).await?;
+        let path = self.open_log(&params).await?;
         let content = self.read_sanitized_log_content(&path).await?;
-        let grep_regex = Self::build_grep_regex(params.grep.as_deref())?;
-        let (numbered_lines, regex_error) =
-            Self::collect_matching_log_lines(&content, grep_regex.as_ref());
-        let mut notices = Self::build_regex_notices(regex_error);
+        let LoadedLog {
+            path,
+            lines: numbered_lines,
+            mut notices,
+        } = Self::filter_log_lines(path, &content, &params)?;
 
         let total_matching_lines = numbered_lines.len();
         if total_matching_lines == 0 {
             return Ok(Self::build_empty_log_result(&params, &path));
         }
 
-        if let Some(offset) = params.offset {
-            if offset > total_matching_lines {
-                return tool_error(format!(
-                    "offset {} is beyond the {} matching lines in {}",
-                    offset,
-                    total_matching_lines,
-                    path.display()
-                ));
-            }
+        if let Some(message) = offset_error(&path, params.offset, total_matching_lines) {
+            return tool_error(message);
         }
 
         let selection =
@@ -102,7 +96,7 @@ impl BashServer {
         let raw_output = selection
             .lines
             .into_iter()
-            .map(|(line_number, line)| format!("{line_number}: {line}"))
+            .map(|(number, line)| log_line(number, &line, params.line_numbers.unwrap_or(true)))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -207,15 +201,7 @@ impl BashServer {
         params: &ReadExecLogParams,
         total_matching_lines: usize,
     ) -> Result<ReadExecLogSelection, ErrorData> {
-        if let Some(offset) = params.offset {
-            if offset == 0 {
-                return Err(ErrorData::invalid_params("offset must be >= 1", None));
-            }
-        }
-
-        let limit = params.limit.unwrap_or(200).max(1);
-        let (lines, mut notices) =
-            Self::select_log_lines(numbered_lines, params.offset, limit, params.tail);
+        let (lines, mut notices) = Self::select_checked_log_lines(numbered_lines, params)?;
         // The offset-based "more lines" pagination notice only applies to
         // forward reads. When `tail` is set the selection is anchored to the
         // end of the window, so there are never more lines after it.
