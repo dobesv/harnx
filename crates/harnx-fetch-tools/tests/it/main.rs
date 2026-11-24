@@ -4,4 +4,5 @@
 
 mod fetch_integration;
 mod mcp_http_client;
+mod script_fetch;
 mod ssrf;

@@ -333,6 +333,8 @@ args:
 
 Use `--no-sandbox` when the test scope is bash behavior, not sandbox isolation. Hosts that block unprivileged user namespaces (some containers) fail `harnx-sandbox-exec` with exit 127 before the command runs. Precedent: `proxy_auth_hook_injects_env_vars_into_bash_exec` in `crates/harnx/tests/it/tmux_e2e.rs`; `write_with_wait_tool` in `crates/harnx/src/test_utils/interrupt.rs` bridges the time server the same way.
 
+Such a test says nothing about what `harnx-sandbox-exec` does to a result, and the shipped bash servers run every command through it. The tool sees the wrapper's exit code, not the command's status: the wrapper reported a command killed by a signal as exit 1 while every `--no-sandbox` test saw the signal. A change to how the bash tools read a command's status needs a check of the wrapper too (`exit_code` in `crates/harnx-sandbox-common/src/bin/sandbox_exec.rs` has unit tests that need no namespaces).
+
 ### MCP bridge result limits
 
 Bridged MCP tool results are capped at 128 KiB serialized JSON by default
@@ -1109,11 +1111,18 @@ three things a tool declares decide how well it works there.
   `ToolSpec::with_script_output` which field is stdout, stderr and the exit
   status, and leaves its direct-call output byte-identical. It bounds the
   result itself, and puts a note about cut-off data in the field the mapping
-  names as `stderr`, never in the data. Paths it prints have to be usable as
-  arguments to the next command. Scripts run with `set -e`, so a non-zero
+  names as `stderr`, never in the data. A note that says where to continue
+  (`--offset K`, `start_index=K`) is computed from what was printed after
+  every cap, not from the window the tool selected before the byte cap cut
+  it: a script that follows K otherwise skips the dropped part. Paths it
+  prints have to be usable as arguments to the next command. Scripts run with `set -e`, so a non-zero
   status for "nothing found" (`fs_grep` exits 1) ends a script that doesn't
   guard the call. `harnx-fs-tools` is the reference (`script_result.rs`,
-  `script_search.rs`).
+  `script_search.rs`); `harnx-bash-tools` is the reference for a tool that
+  behaves like a command (`server/script_result.rs`): its mapping sets
+  `stderr_text` for the command's own stderr, printed as stored before the
+  notes, and `exit_code` for its status (a value outside 0 to 255 is reported
+  as 255).
 
   The request rides on the call context (`ToolCallOrigin::structured_result`,
   set only by the fork the `bash` tool's inner calls use), not on a
@@ -1121,10 +1130,11 @@ three things a tool declares decide how well it works there.
   script middleware runs on harnx-script's worker thread, and its `call_next`
   dispatch would lose one. A middleware or hook that wraps a script's inner
   call sees the script-shaped result, so one that scans `content` text misses
-  the data. MCP doesn't carry the request, so the mapping is stripped from
-  MCP listings (`harnx-toolset-server/src/mcp.rs`) and from the sandbox
-  gateway's proxied specs: a tool reached that way answers in model style
-  and advertises no shell form.
+  the data. Over MCP the capability travels in the request `_meta`
+  (`"harnx:structured_result": true`), so a tool behind `harnx-mcp-bridge` or
+  in the k8s sandbox gets its shell form; a server older than this answers in
+  model style and the command prints that text. A bridged script-style result
+  over the bridge's result limit is an error that says how to page.
 
 The `bash` tool's own result has two shapes, chosen by
 `BashProviderConfig::full_payload`. A model round gets `status`, `exit_code`,

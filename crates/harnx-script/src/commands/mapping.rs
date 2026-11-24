@@ -18,6 +18,9 @@ pub struct OutputMapping {
     /// Format for an object item of the stdout field: `{name}` is replaced
     /// by that item's field.
     pub row: Option<String>,
+    /// structuredContent string field printed on stderr exactly as stored,
+    /// before the notes. For a command's own stderr.
+    pub stderr_text: Option<String>,
     /// structuredContent field (string or array of strings) printed on stderr.
     pub stderr: Option<String>,
     /// structuredContent integer field used as the exit status.
@@ -49,7 +52,7 @@ pub(super) fn apply(
     };
     Some(Mapped {
         stdout,
-        stderr: notes(tool, mapping, structured),
+        stderr: stderr(tool, mapping, structured),
         exit_code: exit_code(mapping, structured),
     })
 }
@@ -123,6 +126,24 @@ fn scalar_text(value: Option<&Value>) -> String {
     }
 }
 
+/// The stderr text as stored, then the notes. The text gets a newline before
+/// the first note only when it lacks one, so text without notes stays exact.
+fn stderr(tool: &str, mapping: &OutputMapping, structured: &Value) -> String {
+    let text = mapping
+        .stderr_text
+        .as_deref()
+        .and_then(|name| structured.get(name))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let notes = notes(tool, mapping, structured);
+    let separator = if !text.is_empty() && !text.ends_with('\n') && !notes.is_empty() {
+        "\n"
+    } else {
+        ""
+    };
+    format!("{text}{separator}{notes}")
+}
+
 fn notes(tool: &str, mapping: &OutputMapping, structured: &Value) -> String {
     let field = mapping
         .stderr
@@ -153,13 +174,21 @@ fn clamp_exit(code: i64) -> i32 {
     code.clamp(EXIT_CODE_MIN, EXIT_CODE_MAX) as i32
 }
 
+/// A status outside what a shell reports means the command failed, so it is
+/// 255 rather than a value that could read as success.
 fn exit_code(mapping: &OutputMapping, structured: &Value) -> i32 {
     mapping
         .exit_code
         .as_deref()
         .and_then(|name| structured.get(name))
         .and_then(Value::as_i64)
-        .map_or(0, clamp_exit)
+        .map_or(0, |code| {
+            if (EXIT_CODE_MIN..=EXIT_CODE_MAX).contains(&code) {
+                code as i32
+            } else {
+                EXIT_CODE_MAX as i32
+            }
+        })
 }
 
 #[cfg(test)]

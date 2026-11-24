@@ -408,3 +408,20 @@ async fn interleaved_calls_to_two_endpoints_preserve_both_sessions() -> Result<(
     server2.await?;
     Ok(())
 }
+
+#[test]
+fn call_request_marks_each_requested_capability_in_meta() {
+    let capabilities = BTreeSet::from([harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_string()]);
+    let request = call_request("exec", Map::new(), &capabilities);
+    let meta = request.meta.expect("request _meta");
+    assert_eq!(
+        meta.get(harnx_toolset::CAPABILITY_STRUCTURED_RESULT),
+        Some(&Value::Bool(true))
+    );
+    assert!(meta
+        .get(harnx_core::execution_context::EXECUTION_CONTEXT_NAMESPACE)
+        .is_none());
+
+    let request = call_request("exec", Map::new(), &BTreeSet::new());
+    assert!(request.meta.is_none());
+}

@@ -52,10 +52,6 @@ impl ServerHandler for McpToolsetAdapter {
                 // on, so a tool reached this way cannot stop on one, and a
                 // bridge must not advertise that it does.
                 meta.remove(harnx_toolset::STOP_ON_NEW_MESSAGE_META_KEY);
-                // The request for a script-shaped result does not travel over
-                // MCP either, so the tool would answer in model style and the
-                // mapping would describe output it never produces.
-                meta.remove(harnx_toolset::SCRIPT_OUTPUT_META_KEY);
                 if let Some(timeout_secs) = spec.timeout_secs {
                     meta.insert(
                         harnx_toolset::TOOL_TIMEOUT_META_KEY.to_owned(),
@@ -193,12 +189,22 @@ fn mcp_invocation_context(
     request: &CallToolRequestParams,
     context: &RequestContext<RoleServer>,
 ) -> Result<ToolInvocationContext, ErrorData> {
-    let capabilities = context
+    let structured_result = context
         .meta
-        .contains_key(EXECUTION_CONTEXT_NAMESPACE)
-        .then(|| EXECUTION_CONTEXT_NAMESPACE.to_string())
-        .into_iter()
-        .collect();
+        .get(harnx_toolset::CAPABILITY_STRUCTURED_RESULT)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let capabilities = [
+        context
+            .meta
+            .contains_key(EXECUTION_CONTEXT_NAMESPACE)
+            .then_some(EXECUTION_CONTEXT_NAMESPACE),
+        structured_result.then_some(harnx_toolset::CAPABILITY_STRUCTURED_RESULT),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_owned)
+    .collect();
     let input_responses = match &request.input_responses {
         Some(responses) => crate::mrtr::responses_from_mrtr(responses).map_err(|error| {
             ErrorData::invalid_params(format!("cannot use inputResponses: {error}"), None)

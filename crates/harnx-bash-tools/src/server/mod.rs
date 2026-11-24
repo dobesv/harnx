@@ -52,11 +52,15 @@ mod foreground_run;
 mod handler;
 mod handlers;
 mod lifecycle;
+mod log_read;
 mod params;
 mod process;
 mod protocol_reader;
 mod render;
 mod retention;
+mod script_log;
+mod script_pending;
+mod script_result;
 mod supervisor;
 #[cfg(all(test, not(target_os = "windows")))]
 mod tests;
@@ -65,6 +69,8 @@ pub(crate) use handlers::*;
 pub(crate) use params::*;
 pub(crate) use render::*;
 use retention::SpawnedProcesses;
+pub(crate) use script_log::read_log_script_output;
+pub(crate) use script_result::{exec_script_output, pending_script_output};
 use supervisor::{spawn_supervisor, ProcessControl, ProcessExit};
 
 use crate::tool_template::{OnUserMessage, ToolProtocol, ToolTemplate};

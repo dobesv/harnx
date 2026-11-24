@@ -70,6 +70,23 @@ The most recent 1,024 evicted execution IDs report that the process finished and
 longer tracked. Older evicted IDs return the same error as unknown IDs. Eviction does
 not delete log files; `read_exec_log` can still read them.
 
+## Output in `bash` scripts
+
+Inside a `bash` tool script, `bash_exec` and the command templates behave like `bash -c`. The command's stdout goes to the script's stdout, its stderr to the script's stderr, and the script sees the command's exit status. A direct call is unchanged: it returns the model-facing report.
+
+- A signal that ends the command gives 128 plus the signal number. The command's own `timeout_secs` gives 124, and it is not a tool error in a script, so output produced before the deadline still reaches a pipe. A new message that stops the command gives 130. Any error from `bash_exec`, a template, `bash_spawn`, `bash_wait` or `bash_status` gives 125 with the reason on stderr: a command that could not start (an empty command, an unusable `working_dir`, a rejected `env` key), an unknown execution id, or a bridged result over the bridge's limit. `bash_read_exec_log` errors exit 1.
+- Scripts run with `set -e`, so a failing command ends the script unless it is used in `if`, followed by `||`, or followed by `|| true`: `bash_exec --command 'grep -q x f' || echo missing`.
+- A stream longer than `max_output_bytes` (default 131072) keeps whole lines from its start. A note on stderr, `bash_exec: stdout cut at N of M bytes; full log: bash_read_exec_log --execution-id ID --stream stdout --offset K`, says so, names the log to read and the line to continue from; `--offset` is left off when a single over-long first line was cut mid-line, and from a wait or status that used `grep`. `head_lines` and `tail_lines` are ignored in a script, with a note saying so (`bash_exec: tail_lines is ignored in a script; pipe to tail`); `grep` on `bash_wait` and `bash_status` still applies.
+- `-o json` prints `execution_id`, `status` (`exited`, `timeout` or `interrupted`), `exit_code`, `stdout`, `stderr`, `notes`, `stdout_log_path` and `stderr_log_path`, plus `diffs` when the call recorded history diffs.
+
+`bash_spawn`, `bash_wait` and `bash_status` report a command that has finished the same way. A command that has not finished prints one line of JSON (`execution_id`, `status`, `notes`, `running_for_secs`, `stopped_by` when a new message or your run deadline ended the wait, and the two log paths) and exits 0, with a note on stderr when it is still running. `bash_spawn` with no `wait` prints that line with status `spawned`.
+
+`bash_read_exec_log` prints the selected log lines as plain text, with no line-number prefix. Pass `--line-numbers` to get `N: line` rows. A direct call numbers lines unless you pass `line_numbers: false`. Notes about paging and truncation go to stderr. A forward read that stops before the last matching line, at the 200-line default or at `max_output_bytes`, ends with `N more lines. Use --offset K to continue`, where K is the line after the last one printed; a `tail` read has no such note. `-o json` adds `start_line`, `end_line` and `total_lines`.
+
+`bash_terminate` and `bash_rollback_file` keep their usual output. Command templates with `protocol: jsonl` keep their usual output too, because their stderr is the result.
+
+The shell form applies when the tool server is native, behind `harnx-mcp-bridge` with `--mcp-stdio`, or in the k8s sandbox. A bridged result over the bridge's 128 KiB limit is an error that says how to page.
+
 ## Shell command templates
 
 Command templates allow defining custom fixed shell command shapes in YAML files. Each template registers as a distinct MCP tool with a strongly typed input schema. Instead of giving an agent arbitrary shell execution privileges, templates restrict execution to a fixed script where agent-provided parameters are validated against a schema and passed to the script as environment variables.
