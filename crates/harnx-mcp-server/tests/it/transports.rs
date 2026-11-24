@@ -9,7 +9,7 @@ use rmcp::{
     },
     ClientHandler,
 };
-use std::process::Stdio;
+use std::{future::Future, process::Stdio};
 
 struct Client;
 impl ClientHandler for Client {
@@ -262,6 +262,39 @@ async fn http_two_sessions_isolated_delete_cancels_only_owner() -> Result<()> {
     Ok(())
 }
 
+/// Bounds one step of a test and names it, so a stuck step fails with the
+/// step's name instead of running into nextest's SIGKILL.
+async fn step<T, E>(name: &str, future: impl Future<Output = Result<T, E>>) -> Result<T>
+where
+    anyhow::Error: From<E>,
+{
+    Ok(tokio::time::timeout(DEADLINE, future)
+        .await
+        .with_context(|| format!("timed out waiting for {name}"))??)
+}
+
+/// Pings the session until dropped. rmcp's idle timer counts only messages
+/// the session receives, not requests it is still working on, so a `list_tools`
+/// that outlasts the idle period loses its session mid-request, and the rmcp
+/// client then waits forever for the response. Opening the reservation and
+/// discovering tools takes about 0.4 s on an idle machine, which a slow CI
+/// runner stretches past a short idle period.
+fn keep_session_active(client: &RunningService<RoleClient, Client>) -> AbortOnDropHandle<()> {
+    let peer = client.peer().clone();
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        let interval = Duration::from_millis(100);
+        loop {
+            let ping = ClientRequest::PingRequest(PingRequest {
+                method: Default::default(),
+                extensions: Default::default(),
+            });
+            // A ping that waits on a lost session must not stop the next one.
+            let _ = tokio::time::timeout(interval, peer.send_request(ping)).await;
+            tokio::time::sleep(interval).await;
+        }
+    }))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_idle_expiry_releases_and_process_bootstrap_survives() -> Result<()> {
     let fixture = Fixture::new()?;
@@ -273,8 +306,9 @@ async fn http_idle_expiry_releases_and_process_bootstrap_survives() -> Result<()
     )
     .await?;
     let first = http_client(&url).await?;
-    first.list_tools(None).await?;
-    let one = recv(&mut peer.reserves).await?;
+    let first_active = keep_session_active(&first);
+    step("first list_tools", first.list_tools(None)).await?;
+    let one = step("first reservation", recv(&mut peer.reserves)).await?;
     let pending = tokio::spawn({
         let client = first.peer().clone();
         async move {
@@ -283,32 +317,51 @@ async fn http_idle_expiry_releases_and_process_bootstrap_survives() -> Result<()
                 .await
         }
     });
-    let (_, request, _) = recv(&mut peer.calls).await?;
+    let (_, request, _) = step("first call to reach the tool", recv(&mut peer.calls)).await?;
     // Leave the client alive without DELETE. LocalSessionManager inactivity
     // ends its worker, which must release despite handler/request Arc ownership.
+    drop(first_active);
     assert_eq!(
-        recv(&mut peer.releases).await?.reservation_id,
+        step("idle expiry to release", recv(&mut peer.releases))
+            .await?
+            .reservation_id,
         "reservation-0"
     );
     assert_eq!(
-        serde_json::to_value(recv(&mut peer.cancels).await?)?["call_id"],
+        serde_json::to_value(
+            step("idle expiry to cancel the call", recv(&mut peer.cancels)).await?
+        )?["call_id"],
         request.call_id
     );
-    no_renew_after_release(&mut peer, "reservation-0").await?;
-    first.cancel().await?;
-    assert!(pending.await?.is_err());
+    step(
+        "release control without renewal",
+        no_renew_after_release(&mut peer, "reservation-0"),
+    )
+    .await?;
+    step("first client cancel", first.cancel()).await?;
+    assert!(step("expired call to fail", pending).await?.is_err());
     let second = http_client(&url).await?;
-    assert_eq!(second.list_tools(None).await?.tools.len(), 2);
-    let two = recv(&mut peer.reserves).await?;
+    let second_active = keep_session_active(&second);
+    assert_eq!(
+        step("second list_tools", second.list_tools(None))
+            .await?
+            .tools
+            .len(),
+        2
+    );
+    let two = step("second reservation", recv(&mut peer.reserves)).await?;
     assert_ne!(one.session_storage_key, two.session_storage_key);
     // Server shutdown also owns cleanup for sessions clients haven't deleted.
+    drop(second_active);
     shutdown.cancel();
-    tokio::time::timeout(DEADLINE, server).await???;
+    step("server shutdown", server).await??;
     assert_eq!(
-        recv(&mut peer.releases).await?.reservation_id,
+        step("shutdown to release", recv(&mut peer.releases))
+            .await?
+            .reservation_id,
         "reservation-1"
     );
-    second.cancel().await?;
+    step("second client cancel", second.cancel()).await?;
     Ok(())
 }
 

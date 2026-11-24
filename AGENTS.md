@@ -409,6 +409,14 @@ than a SIGKILL would.
 When one of these tests fails, check a passing run's timings for the same block
 before blaming the test. If the whole block is slow, the margin is the bug.
 
+rmcp's Streamable HTTP session idle timer (`SessionConfig::keep_alive`)
+restarts only when the session receives a message, not while it is still
+handling a request. A test that shortens it to watch a session expire has to
+keep the session busy until the moment it wants the timer to run, as
+`keep_session_active` in `crates/harnx-mcp-server/tests/it/transports.rs`
+does. Otherwise a slow `list_tools` loses its session mid-request, and the
+rmcp client waits forever for the reply.
+
 ### CLI binaries need an 8 MiB stack on Windows
 
 Windows executables start with a 1 MiB stack. Deep debug-build async dispatch frames
