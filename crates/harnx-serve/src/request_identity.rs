@@ -9,23 +9,23 @@ use std::time::Instant;
 
 /// Owned request-local identity. Only `user_id` can become session metadata.
 #[derive(Clone, Default)]
-pub(super) struct RequestIdentity {
-    pub(super) user_id: Option<String>,
-    pub(super) groups: Vec<String>,
-    pub(super) roles: Vec<String>,
+pub(crate) struct RequestIdentity {
+    pub(crate) user_id: Option<String>,
+    pub(crate) groups: Vec<String>,
+    pub(crate) roles: Vec<String>,
     // Authorization-only snapshot; session creation keeps the raw user_id.
-    pub(super) expanded_users: Option<Vec<String>>,
+    pub(crate) expanded_users: Option<Vec<String>>,
 }
 
 /// Storage for the slices borrowed by the core caller view.
-pub(super) struct RequestCaller<'a> {
+pub(crate) struct RequestCaller<'a> {
     users: Vec<&'a str>,
     groups: Vec<&'a str>,
     roles: Vec<&'a str>,
 }
 
 impl RequestCaller<'_> {
-    pub(super) fn view(&self) -> CallerView<'_> {
+    pub(crate) fn view(&self) -> CallerView<'_> {
         CallerView {
             users: &self.users,
             groups: &self.groups,
@@ -35,18 +35,24 @@ impl RequestCaller<'_> {
 }
 
 impl RequestIdentity {
-    pub(super) fn of<B>(req: &hyper::Request<B>) -> Self {
+    pub(crate) fn of<B>(req: &hyper::Request<B>) -> Self {
         req.extensions().get::<Self>().cloned().unwrap_or_default()
     }
 
-    pub(super) fn user_id<B>(req: &hyper::Request<B>) -> Option<String> {
+    pub(crate) fn user_id<B>(req: &hyper::Request<B>) -> Option<String> {
         req.extensions()
             .get::<Self>()
             .and_then(|id| id.user_id.clone())
     }
 
+    /// The resolved user id of this request's identity, the value session
+    /// creation stamps as owner.
+    pub(crate) fn resolved_user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
     /// The principals snapshot for this request, as resolved at entry.
-    pub(super) fn principals(&self) -> harnx_core::user_principals::UserPrincipals {
+    pub(crate) fn principals(&self) -> harnx_core::user_principals::UserPrincipals {
         harnx_core::user_principals::from_resolved(
             self.user_id.as_deref(),
             self.expanded_users.as_deref(),
@@ -56,7 +62,7 @@ impl RequestIdentity {
     }
 
     /// The principals to stamp: none when the request is anonymous.
-    pub(super) fn stampable_principals(
+    pub(crate) fn stampable_principals(
         &self,
     ) -> Option<harnx_core::user_principals::UserPrincipals> {
         let principals = self.principals();
@@ -64,7 +70,7 @@ impl RequestIdentity {
     }
 
     /// Borrow authorization users and memberships from the request snapshot.
-    pub(super) fn caller(&self) -> RequestCaller<'_> {
+    pub(crate) fn caller(&self) -> RequestCaller<'_> {
         RequestCaller {
             users: match &self.expanded_users {
                 Some(users) => users.iter().map(String::as_str).collect(),
@@ -119,7 +125,7 @@ impl Server {
         self.access_rules.is_some() && protected
     }
 
-    pub(super) fn prepare_request(
+    pub(crate) fn prepare_request(
         &self,
         req: &mut hyper::Request<Incoming>,
         started: Instant,

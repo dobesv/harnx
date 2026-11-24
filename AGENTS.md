@@ -117,6 +117,12 @@ tmux/interrupt e2e and other timing-sensitive tests; a pure unit test needs no
 stress run. Some flakes only appear under full-suite load, so when a new test
 is timing-sensitive, also run it once alongside the rest of its crate.
 
+An exact filter (`-E 'test(=name)'`) needs the test's full module path, e.g.
+`nats_session_claim_tests::claim_race_...`, not the bare function name. A bare
+name matches zero tests, and a `--stress-count` run over that empty selection
+still reports `20/20 iterations passed` — a false green. Check the
+`Starting N tests across M binaries` line before trusting a filtered run.
+
 CI uses the same selection on pull requests and runs the whole suite on
 `main`. Mergify's merge queue tests its batches as ordinary pull requests, so
 it uses the selection too: a missing edge, or a test only the whole suite
@@ -389,6 +395,17 @@ Group membership is by test name, not by what the test does: the `broker-e2e` ov
 default group and can destabilize the rest of the run — give it a matching name or add
 the filter to both profiles. Verify with `cargo nextest show-config test-groups`.
 
+When a test hands `nats-server` a config file, note 2.11 rejects the
+block-style `mappings` list shown in its docs (`"src": ["dst"]` fails with
+"Expected an entry for the mapping destination"); use a plain string
+destination (`mappings: { "src": "dst" }`). Subject mappings are also the
+deterministic way to simulate a post-connect write outage: reroute exactly one
+subject so no stream listens on it (see
+`claim_row_i_kv_write_failure_after_connect_is_503` in
+`crates/harnx-serve/src/nats_session_claim_tests.rs`). The same `mappings`
+trick simulates lagging followers and leaderless streams; see "NATS/GC tests:
+CI coverage and isolation" for those setups.
+
 Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
 (`.config/nextest.toml`; local runs use `-local` copies with higher caps). On
 a contended GitHub runner that whole block has been measured running 6 to 40
@@ -489,7 +506,18 @@ outer kinds, never on the message text: `is_nats_unavailable` in
 `crates/harnx-serve/src/nats_access.rs` is the reference implementation, and
 `nats_access_tests.rs` builds its fixtures from real error values (deserialized API
 payloads wrapped in async-nats's own constructors, live no-responders chains) rather than
-hand-built strings.
+hand-built strings. Post-connect KV writes surface the same way: `kv::Store::create`
+and `update` wrap a stalled or dying broker in typed `CreateError`/`UpdateError`/
+`PublishError` kinds (plus the direct-get `NO_RESPONDERS` fallback, whose conversion drops
+its source), so callers of `is_nats_unavailable` answer 503 for them while store answers
+(`AlreadyExists`, `InvalidKey`, `WrongLastRevision`, `MaxPayloadExceeded`) stay non-outage.
+A missing kind made a post-connect reservation outage answer HTTP 400 instead of the
+retriable 503 (#2855). Besides `guard_error_status` and the claim path's `claim_read_error`,
+the 503 mappers include `crates/harnx-serve/src/attachments/upload_store.rs` and the
+`ag_ui_rpc.rs` attachment preflight (through `SourceCheck`'s `read_failure` in
+`session_access.rs`). CID authorization deliberately does not map outages to 503: an
+unavailable source reads as absent and gets the blob route's own 404
+(`cid.rs::can_access_cid`).
 
 ### Telling a flake from a regression
 
@@ -1573,6 +1601,47 @@ opening a control handle; without metadata they return idle/not-found rather
 than creating one. Creating it there would stamp only the defaults, and the
 next prompt's request identity could never replace them.
 
+Under access rules, the session guard
+(`crates/harnx-serve/src/session_access.rs::guard_session_request`) renders
+the same 404 for a missing and a foreign ID once the owner lookup succeeds
+and decodes. A lookup or decode error never becomes that 404 and never
+defers: it propagates through `guard_error_status` — 503 for a recognized
+broker outage, 400 otherwise. Only a confirmed absence (`Ok(None)`) can
+defer, and only for a claim-candidate item POST. The `/v1/cid/*` blob route
+returns its own 404 for missing, foreign, undecodable and broker-unavailable
+source records (`crates/harnx-serve/src/cid.rs::can_access_cid`). The
+deferral is a `POST` to exactly `/v1/agents/{agent}/sessions/{session}` with
+a claimable ID, which the guard hands to the claim path: classification rows
+a–g are inline comments in
+`crates/harnx-serve/src/session_claim.rs`, and rows h–i — a live registered
+actor forces a leader reread of the canonical record, otherwise the ID is
+reserved via `create_or_read_session_metadata` — live in
+`crates/harnx-serve/src/session_claim_reservation.rs`. Pinned by
+`crates/harnx-serve/tests/it/access_sessions/claim_matrix.rs` and
+`crates/harnx-serve/src/nats_session_claim_tests.rs`:
+
+- A request that doesn't qualify as a creating prompt never reaches actor or
+  stream code on an unseen ID.
+- Refused outcomes are identical for missing and foreign IDs: same 404
+  status, body and application headers, and — for claim-candidate item
+  POSTs after a successful owner lookup — the same bounded body read (with
+  its cap and deadline) before any owner-dependent answer. That is
+  final-response parity, not a no-oracle guarantee — processing time can
+  still differ for prompt-scope callers, and the 403 for an admin-only
+  creating prompt and the 503 for a broker outage are intentional
+  exceptions.
+- An owner denial on the claim path is the guard's 404, never the actor's 409
+  `Rejected`.
+- Owner decoding is strict on the claim path
+  (`session_claim_reservation.rs::claim_record_owner`): undecodable
+  properties and a present non-string `user_id` fail closed, admins
+  included. The guard's own owner read (`read_session_owner`) is more
+  lenient — it treats a present non-string `user_id` as a legacy owner.
+- Owners are matched only through `rules.can_access_session`, never raw
+  `user_id` equality: prompt scope requires the stored owner to be among the
+  caller's `CallerView::users` (aliases included), admin scope reaches any
+  existing session, and groups/roles grant scope — never ownership.
+
 A `SESSION_` JetStream stream must never exist before canonical metadata does
 (`sessions/<storage_key>/meta` in `harnx_sessions`). The stream name is
 `SESSION_<sha256(storage_key)>` and cannot be reversed, and the remote GC
@@ -1606,6 +1675,20 @@ physically with a stream purge plus subject filter (like
 `CheckpointStore::purge_session` for `harnx_interaction_checkpoints`) instead
 of per-key KV purge: a per-key PURGE marker leaves the subject listed forever,
 which "keys gone" checks and listings then misreport.
+
+`delete_session_leftovers` never touches the canonical record: the final
+revision-conditional purge of `sessions/<key>/meta` runs in `delete_session_state`
+(`harnx-runtime/src/nats_admin.rs`), after the leftovers cascade and the A2A
+cleanup, conditioned on the KV revision captured when deletion started (#2855).
+While the canonical record remains — any earlier failure leaves it in place,
+with the session still owned by its old owner — other prompt-scope callers
+cannot claim a partially deleted ID, and re-running `harnx delete session` or
+retention GC can finish the job. A deletion that saw no canonical record at
+start skips the final purge, so it never removes a record a later creator
+wrote. The reorder protects the canonical key only while the owner record
+remains; it does not fence later incarnations of a reused ID — media, plans,
+live actors and streams from the previous session are not
+incarnation-checked.
 
 ### Crate layering for NATS tool servers
 

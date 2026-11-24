@@ -372,6 +372,10 @@ Lists available sessions as tab-separated agent names and session IDs, one sessi
 
 Deletes the specified agent’s NATS session from the specified cluster. If the agent selector includes `@cluster`, it must match `--cluster`. (Replaces the old `harnx session delete` command.)
 
+Exit status:
+- Exits **0** on a completed deletion (`Deleted remote session ...`) or when the session is absent (`Remote session ... not found; nothing to delete.`).
+- Exits **1** if deletion fails partway or if the final canonical metadata purge was skipped because the record's revision changed during deletion. The incomplete-deletion error (`Incomplete deletion of remote session '<session>' on cluster '<cluster>' (canonical metadata purge skipped because its revision changed; stream_deleted=..., lease_deleted=..., metadata_keys_deleted=..., attachments_deleted=...)`) is printed to stderr.
+
 ### `harnx compact session <agent-name> <session-id> [--timeout <seconds>]`
 
 Submits a manual compaction request for a session and blocks until it completes, streaming progress advisories.

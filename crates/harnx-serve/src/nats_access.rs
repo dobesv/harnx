@@ -108,6 +108,15 @@ pub(crate) fn sanitize_nats_session_error(cluster: &str, error: anyhow::Error) -
 ///   `get_object_store` and `create_object_store`) and raw-message reads
 ///   (`LastRawMessageError`), matched by their `JetStream(error)` kinds'
 ///   codes plus the bare no-responder/timeout kinds async-nats maps to;
+/// - the KV write and direct-get kinds (review D1): a `kv::Store::create`
+///   whose broker dies or stalls *after* connect surfaces as
+///   `CreateErrorKind::Publish`/`Ack` (the ack timeout and the publish
+///   failure, whose `UpdateErrorKind::TimedOut` and
+///   `PublishErrorKind::TimedOut | BrokenPipe | StreamNotFound` sources
+///   stay in or fall out of the chain), and a direct get with no
+///   responders arrives as a bare `DirectGetErrorKind::ErrorResponse`
+///   because that conversion drops its source — the kind is the only
+///   carrier, so the kind is matched, never the message text;
 /// - the recovery deadline marker, when a leader read exhausted its retry
 ///   window without confirming completion.
 // qual:allow(coupling, deh) reason: "the anyhow error chain is a dynamic-typing boundary: async-nats publishes its failure modes as concrete error types and codes, and the upload error contract requires classifying by those types instead of message text (is_nats_connect_error already downcasts the same way). An enum over the variants would have to re-wrap every async-nats error in harnx-blob-store and harnx-runtime."
@@ -119,6 +128,64 @@ pub(crate) fn is_nats_unavailable(error: &anyhow::Error) -> bool {
                 // qual:allow(coupling, deh) reason: "same as the function-level marker: the recovery marker is only distinguishable by downcasting the anyhow chain."
                 .downcast_ref::<harnx_nats_common::recovery::RecoveryDeadlineExceeded>()
                 .is_some()
+            // The KV write path (review D1): the ack timeout of a
+            // `kv::Store::create` whose broker stalled after connect. The
+            // `From` conversions drop the ack's `PublishError` source here,
+            // so the kind itself carries the failure mode.
+            || cause
+                // qual:allow(coupling, deh) reason: "same as the function-level marker: the KV error kinds are only distinguishable by downcasting the anyhow chain."
+                .downcast_ref::<async_nats::jetstream::kv::CreateError>()
+                .is_some_and(|create| {
+                    matches!(
+                        create.kind(),
+                        async_nats::jetstream::kv::CreateErrorKind::Publish
+                            | async_nats::jetstream::kv::CreateErrorKind::Ack
+                    )
+                })
+            // The same timeout one level down, where `CreateError` keeps
+            // the `UpdateError` as its source; the other update kinds
+            // (invalid key, wrong revision) are store answers, not outages.
+            || cause
+                // qual:allow(coupling, deh) reason: "same as the function-level marker: the KV error kinds are only distinguishable by downcasting the anyhow chain."
+                .downcast_ref::<async_nats::jetstream::kv::UpdateError>()
+                .is_some_and(|update| {
+                    matches!(
+                        update.kind(),
+                        async_nats::jetstream::kv::UpdateErrorKind::TimedOut
+                    )
+                })
+            // The publish round trip under the KV wrappers: timed-out ack,
+            // dropped connection (broken pipe), and a lost stream
+            // (no responders). Payload limits, backpressure and
+            // last-sequence conflicts are deliberately not here: those are
+            // store answers, never retriable outages.
+            || cause
+                // qual:allow(coupling, deh) reason: "same as the function-level marker: the publish kinds are only distinguishable by downcasting the anyhow chain."
+                .downcast_ref::<async_nats::jetstream::context::PublishError>()
+                .is_some_and(|publish| {
+                    matches!(
+                        publish.kind(),
+                        async_nats::jetstream::context::PublishErrorKind::TimedOut
+                            | async_nats::jetstream::context::PublishErrorKind::BrokenPipe
+                            | async_nats::jetstream::context::PublishErrorKind::StreamNotFound
+                    )
+                })
+            // A direct get with no responders: that conversion drops its
+            // source, so the error-response status is the only carrier.
+            // Other error responses mean the broker answered — not an
+            // outage.
+            || cause
+                // qual:allow(coupling, deh) reason: "same as the function-level marker: the direct-get kinds are only distinguishable by downcasting the anyhow chain."
+                .downcast_ref::<async_nats::jetstream::stream::DirectGetError>()
+                .is_some_and(|get| {
+                    matches!(
+                        get.kind(),
+                        async_nats::jetstream::stream::DirectGetErrorKind::ErrorResponse(
+                            async_nats::StatusCode::NO_RESPONDERS,
+                            _,
+                        )
+                    )
+                })
             || cause
                 // qual:allow(coupling, deh) reason: "same as the function-level marker: the request kinds are only distinguishable by downcasting the anyhow chain."
                 .downcast_ref::<async_nats::RequestError>()

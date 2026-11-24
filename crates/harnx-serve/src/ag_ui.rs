@@ -1051,6 +1051,32 @@ pub fn parse_run_input(body: &[u8]) -> Result<RunAgentInput<JsonValue, JsonValue
     })
 }
 
+/// Classify an AG-UI run body as a creating prompt for a deferred session
+/// claim (plan design step 3, rows b, d, e): the body must parse as run
+/// input with valid resume params, carry no resume decisions (nothing can
+/// be pending on a missing session, decision D6), and end in a genuinely
+/// new nonblank user message, classified against the empty snapshot a
+/// missing session would have. Anything else stays hidden behind the
+/// guard's 404.
+pub(crate) fn run_input_qualifies_as_creating_prompt(body: &[u8]) -> bool {
+    let relaxed: RelaxedRunAgentInput<JsonValue> = match serde_json::from_slice(body) {
+        Ok(relaxed) => relaxed,
+        Err(_) => return false,
+    };
+    let resume = match parse_resume_params(&relaxed.resume) {
+        Ok(resume) => resume,
+        Err(_) => return false,
+    };
+    if !resume.is_empty() {
+        return false;
+    }
+    let run_input = match parse_run_input(body) {
+        Ok(run_input) => run_input,
+        Err(_) => return false,
+    };
+    pending_user_prompt(&run_input, &[]).is_some()
+}
+
 async fn subscribe(handle: &SessionHandle) -> SubscribeResult {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     handle
