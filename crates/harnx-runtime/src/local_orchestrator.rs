@@ -88,16 +88,7 @@ pub fn resolve_worker_binary() -> Result<PathBuf> {
     }
 
     let current = std::env::current_exe().context("resolve current frontend executable")?;
-    let directory = current
-        .parent()
-        .context("current frontend executable has no parent directory")?;
-    let directory = if directory.file_name().is_some_and(|name| name == "deps") {
-        directory
-            .parent()
-            .context("test executable deps directory has no parent")?
-    } else {
-        directory
-    };
+    let directory = harnx_core::bin_dir_of_exe(&current);
     let sibling = directory.join(WORKER_BINARY);
     if sibling.is_file() {
         return Ok(sibling);

@@ -23,11 +23,7 @@ fn view(selectors: &[&str]) -> ToolReservationView {
 }
 
 fn server_config(name: &str, bin: &str) -> Result<ToolServerConfig> {
-    let binary = std::env::current_exe()?
-        .parent()
-        .context("test binary dir")?
-        .parent()
-        .context("target debug dir")?
+    let binary = harnx_core::bin_dir_of_exe(&std::env::current_exe()?)
         .join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
     ensure!(
         binary.is_file(),

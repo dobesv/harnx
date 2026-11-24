@@ -80,10 +80,7 @@ pub(crate) fn time_server_binary() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     let mut path = std::env::current_exe().context("resolve test executable")?;
-    path.pop();
-    if path.file_name().is_some_and(|name| name == "deps") {
-        path.pop();
-    }
+    path = harnx_core::bin_dir_of_exe(&path);
     path.push(if cfg!(windows) {
         "harnx-time-tools.exe"
     } else {

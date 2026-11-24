@@ -12,11 +12,7 @@ const HELPER_OUTPUT: &str = "context read from a cold-started helper server";
 const NO_HELPER_CONTEXT: &str = "hook has no helper tools";
 
 fn fs_tools_binary() -> Result<PathBuf> {
-    let binary = std::env::current_exe()?
-        .parent()
-        .context("test executable directory")?
-        .parent()
-        .context("workspace binary directory")?
+    let binary = harnx_core::bin_dir_of_exe(&std::env::current_exe()?)
         .join(format!("harnx-fs-tools{}", std::env::consts::EXE_SUFFIX));
     ensure!(
         binary.is_file(),
