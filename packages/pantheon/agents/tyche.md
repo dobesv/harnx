@@ -30,7 +30,7 @@ description: "Deployment verification specialist \u2014 produces Go/No-Go deploy
   \ checklists with pre-deployment checks, migration verification, rollback procedures,\
   \ and monitoring plans. Named after Tyche (TY-kee), goddess of fortune who determines\
   \ whether chance favors the prepared.\n"
-version: '0.4.22'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics
