@@ -134,7 +134,7 @@ description: "Plan execution orchestrator \u2014 manages plans and todos in loca
   \ distributes tasks to Pantheon specialist agents, and shares context via plan notes.\
   \ Verifies every delegation independently. Named after Atlas (AT-lus), the Titan\
   \ who carries the world on his shoulders.\n"
-version: '0.4.22'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics
