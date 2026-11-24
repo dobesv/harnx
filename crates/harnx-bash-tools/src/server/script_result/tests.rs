@@ -14,7 +14,6 @@ fn report<'a>(stdout: &'a str, stderr: &'a str, cap: usize) -> CommandReport<'a>
         log_command: Some("bash_read_exec_log".to_string()),
         log_unfiltered: true,
         notes: Vec::new(),
-        diffs: Vec::new(),
     }
 }
 
@@ -115,16 +114,6 @@ fn empty_streams_are_empty_strings_not_missing() {
     assert_eq!(fields["stdout"], "");
     assert_eq!(fields["stderr"], "");
     assert_eq!(fields["notes"], serde_json::json!([]));
-    assert!(fields.get("diffs").is_none());
-}
-
-#[test]
-fn diffs_are_a_field_not_stdout() {
-    let mut input = report("out\n", "", 100);
-    input.diffs = vec!["commit abc\n".to_string()];
-    let fields = fields(input);
-    assert_eq!(fields["stdout"], "out\n");
-    assert_eq!(fields["diffs"], serde_json::json!(["commit abc\n"]));
 }
 
 #[test]

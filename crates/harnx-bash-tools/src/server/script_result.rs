@@ -35,8 +35,6 @@ pub(crate) struct CommandReport<'a> {
     /// the lines.
     pub log_unfiltered: bool,
     pub notes: Vec<String>,
-    /// History diffs the model-facing result appends as extra text blocks.
-    pub diffs: Vec<String>,
 }
 
 /// Exit statuses a shell uses for a command a signal or a deadline ended.
@@ -169,13 +167,15 @@ pub(crate) fn read_log_command() -> String {
     format!("{}_read_exec_log", crate::toolset::TOOLSET_NAME)
 }
 
+/// The history diff a direct call appends is left out: a script reads the
+/// command's own output, and the diff has no cap shared with the streams.
 pub(crate) fn command_result(report: CommandReport<'_>, summary: String) -> CallToolResult {
     let stdout = cut_stream(report.stdout, report.max_output_bytes);
     let stderr = cut_stream(report.stderr, report.max_output_bytes);
     let mut notes = report.notes.clone();
     notes.extend(cut_note("stdout", &stdout, &report));
     notes.extend(cut_note("stderr", &stderr, &report));
-    let mut fields = json!({
+    let fields = json!({
         "execution_id": report.execution_id,
         "status": report.status,
         "exit_code": report.exit_code,
@@ -185,9 +185,6 @@ pub(crate) fn command_result(report: CommandReport<'_>, summary: String) -> Call
         "stdout_log_path": report.stdout_log_path,
         "stderr_log_path": report.stderr_log_path,
     });
-    if !report.diffs.is_empty() {
-        fields["diffs"] = json!(report.diffs);
-    }
     let mut result = CallToolResult::success(vec![
         ContentBlock::text(summary).with_audience(vec![Role::User])
     ]);

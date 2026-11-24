@@ -175,20 +175,19 @@ fn clamp_exit(code: i64) -> i32 {
 }
 
 /// A status outside what a shell reports means the command failed, so it is
-/// 255 rather than a value that could read as success.
+/// 255 rather than a value that could read as success. An integer too large
+/// for `i64` is still an integer, not a missing status.
 fn exit_code(mapping: &OutputMapping, structured: &Value) -> i32 {
-    mapping
+    let status = mapping
         .exit_code
         .as_deref()
-        .and_then(|name| structured.get(name))
-        .and_then(Value::as_i64)
-        .map_or(0, |code| {
-            if (EXIT_CODE_MIN..=EXIT_CODE_MAX).contains(&code) {
-                code as i32
-            } else {
-                EXIT_CODE_MAX as i32
-            }
-        })
+        .and_then(|name| structured.get(name));
+    match status.and_then(Value::as_i64) {
+        Some(code) if (EXIT_CODE_MIN..=EXIT_CODE_MAX).contains(&code) => code as i32,
+        Some(_) => EXIT_CODE_MAX as i32,
+        None if status.is_some_and(Value::is_u64) => EXIT_CODE_MAX as i32,
+        None => 0,
+    }
 }
 
 #[cfg(test)]

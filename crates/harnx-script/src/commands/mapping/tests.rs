@@ -101,6 +101,12 @@ fn exit_status_outside_the_shell_range_is_255() {
     }
 }
 
+#[test]
+fn exit_status_too_large_for_i64_is_255() {
+    let status = json!({"exit_code": 9_223_372_036_854_775_808_u64});
+    assert_eq!(apply_text(status).exit_code, 255);
+}
+
 fn stderr_text_mapping() -> OutputMapping {
     OutputMapping {
         stderr_text: Some("err".into()),

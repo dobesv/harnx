@@ -605,6 +605,33 @@ async fn spawned_command_past_its_own_deadline_reports_a_timeout() {
     assert!(has_note(fields, "timed out after 1s and was terminated"));
 }
 
+/// A direct call appends a diff of what the command changed. A script gets
+/// none: no shell form prints it, and it would add to a result whose size
+/// only the streams' cap bounds.
+#[tokio::test]
+async fn exec_in_a_script_carries_no_history_diff() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    gix::init(directory.path()).expect("git init");
+    std::fs::write(directory.path().join("note.txt"), "before\n").expect("write note");
+    let toolset = toolset_in(directory.path()).await;
+    let write_note = |text: &str| {
+        json!({
+            "command": format!("printf '{text}\\n' > note.txt"),
+            "working_dir": directory.path(),
+        })
+    };
+    let script = call(&toolset, "exec", write_note("after"), true).await;
+    assert_eq!(
+        script["structuredContent"]["exit_code"],
+        json!(0),
+        "{script}"
+    );
+    assert!(script["structuredContent"].get("diffs").is_none());
+    assert!(!script.to_string().contains("```diff"), "{script}");
+    let direct = call(&toolset, "exec", write_note("again"), false).await;
+    assert!(direct.to_string().contains("```diff"), "{direct}");
+}
+
 #[tokio::test]
 async fn wait_ended_by_a_new_message_reports_stopped_by() {
     let spawner = Spawner::new().await;

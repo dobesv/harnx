@@ -102,7 +102,9 @@ impl BashServer {
         ended.notes.extend(ctx.line_cap_notes.iter().cloned());
         let stdout = matching_lines(read_lossy(&entry.stdout_log_path).await, ctx.grep);
         let stderr = matching_lines(read_lossy(&entry.stderr_log_path).await, ctx.grep);
-        let diffs = entry
+        // The result carries no diff, but the first report of an exit takes
+        // the after-exit snapshot, and a later direct wait reports this diff.
+        entry
             .exit_diff
             .get_or_init(|| {
                 self.diff_snapshots(
@@ -112,8 +114,7 @@ impl BashServer {
                     "after wait",
                 )
             })
-            .await
-            .clone();
+            .await;
         let summary = summary(kind, ended.exit_code);
         command_result(
             CommandReport {
@@ -130,7 +131,6 @@ impl BashServer {
                 log_command: Some(read_log_command()),
                 log_unfiltered: ctx.grep.is_none(),
                 notes: ended.notes,
-                diffs,
             },
             summary,
         )

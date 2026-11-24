@@ -164,16 +164,12 @@ impl BashServer {
         outcome: RunOutcome,
         finish: ExecFinish<'_>,
     ) -> CallToolResult {
-        // The diff is taken even after a timeout: the command may have
-        // changed files before it was stopped.
-        let diffs = self
-            .diff_snapshots(
-                finish.before_snaps,
-                finish.snapshot_decision,
-                finish.working_dir,
-                "after exec",
-            )
-            .await;
+        // The snapshot is taken even after a timeout: the command may have
+        // changed files before it was stopped. A script gets no diff of it.
+        if !finish.before_snaps.is_empty() {
+            self.take_snapshots(finish.snapshot_decision, finish.working_dir, "after exec")
+                .await;
+        }
         let mut ended = script_result::ended(outcome.kind, outcome.status);
         ended.notes.extend(params.line_cap_notes.iter().cloned());
         let lines = outcome.stdout_str.lines().count() + outcome.stderr_str.lines().count();
@@ -199,7 +195,6 @@ impl BashServer {
                     .then(script_result::read_log_command),
                 log_unfiltered: true,
                 notes: ended.notes,
-                diffs,
             },
             format!("{prefix}, {lines} lines, {}", format_size(bytes)),
         )

@@ -2,10 +2,11 @@
 //! and truncation notes beside it rather than inside it.
 
 use super::log_read::{offset_error, LoadedLog};
-use super::script_pending::{read_lossy, structured};
+use super::script_pending::structured;
 use super::script_result::{cut_stream, StreamText};
 use super::{
-    format_size, tool_error, BashServer, CallToolResult, ErrorData, ReadExecLogParams, TruncateOpts,
+    format_size, internal_error, tool_error, BashServer, CallToolResult, ErrorData, Path,
+    ReadExecLogParams, TruncateOpts,
 };
 use harnx_toolset::ScriptOutput;
 use serde_json::json;
@@ -29,6 +30,15 @@ pub(crate) fn log_line(number: usize, line: &str, numbered: bool) -> String {
     }
 }
 
+/// The log as text. Bytes that are not UTF-8 become U+FFFD. A read that
+/// fails is an error: an empty result would say the command printed nothing.
+async fn read_log(path: &Path) -> Result<String, ErrorData> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|err| internal_error(format!("failed to read '{}': {err}", path.display())))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 impl BashServer {
     // qual:allow(iosp) — checks the offset against the matching lines, then selects and reports, as the model-style read does.
     pub(super) async fn script_read_exec_log(
@@ -36,7 +46,7 @@ impl BashServer {
         params: ReadExecLogParams,
     ) -> Result<CallToolResult, ErrorData> {
         let path = self.open_log(&params).await?;
-        let content = read_lossy(&path).await;
+        let content = read_log(&path).await?;
         let LoadedLog {
             path,
             lines,
@@ -141,4 +151,30 @@ fn log_result(report: LogReport<'_>) -> CallToolResult {
         }),
         summary,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_log;
+
+    #[tokio::test]
+    async fn a_log_that_cannot_be_read_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = read_log(&dir.path().join("gone.log")).await.unwrap_err();
+        assert!(
+            error.message.contains("failed to read"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_log_and_bytes_that_are_not_utf8_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.log");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(read_log(&path).await.unwrap(), "");
+        std::fs::write(&path, b"a\xffb\n").unwrap();
+        assert_eq!(read_log(&path).await.unwrap(), "a\u{fffd}b\n");
+    }
 }
