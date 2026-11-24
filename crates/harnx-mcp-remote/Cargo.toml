@@ -37,7 +37,7 @@ url = "2"
 oauth2 = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
-sse-stream = "0.2.4"
+sse-stream = "0.3.0"
 ipnet = { workspace = true }
 thiserror = { workspace = true }
 
