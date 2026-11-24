@@ -191,7 +191,10 @@ pub fn apply_filter_with_vars(
         &runner,
         &filter.0,
         vars.runtime_vars()?,
-        std::iter::once(Ok::<_, String>(input)),
+        (
+            &jaq_all::json::Val::Null,
+            std::iter::once(Ok::<_, String>(input)),
+        ),
         |value| Ok::<_, String>(Some(value)),
         |result| {
             // `Exn` borrows from the filter execution, so it cannot escape this
@@ -246,7 +249,10 @@ fn run_env_script(script: &str, vars: &JaqVars) -> Result<serde_json::Map<String
         &runner,
         &filter,
         vars.runtime_vars()?,
-        std::iter::once(Ok::<_, String>(input)),
+        (
+            &jaq_all::json::Val::Null,
+            std::iter::once(Ok::<_, String>(input)),
+        ),
         |value| Ok::<_, String>(Some(value)),
         |result| {
             // `Exn` borrows from the filter execution; convert to an owned
