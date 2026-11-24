@@ -64,7 +64,10 @@ fn run_fs_script(script: &str, vars: &crate::filter::JaqVars, input: Value) -> R
         &runner,
         &filter,
         vars.runtime_vars()?,
-        std::iter::once(Ok::<_, String>(jaq_input)),
+        (
+            &jaq_all::json::Val::Null,
+            std::iter::once(Ok::<_, String>(jaq_input)),
+        ),
         |value| Ok::<_, String>(Some(value)),
         |result| {
             // `Exn` borrows from the filter execution; convert to an owned
