@@ -28,7 +28,7 @@ harnx-core = { path = "../harnx-core" }
 harnx-healthz = { workspace = true }
 harnx-runtime = { path = "../harnx-runtime" }
 jsonwebtoken = { workspace = true }
-lru = "0.18"
+lru = "0.19"
 metrics = { workspace = true }
 harnx-metrics = { workspace = true }
 parking_lot = { workspace = true }
