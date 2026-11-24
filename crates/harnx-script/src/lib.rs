@@ -20,7 +20,7 @@ use std::{collections::HashMap, path::Path, path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-pub use bashkit::{ExcType, ExtFunctionResult, MontyException, MontyObject};
+pub use bashkit::{ExcType, ExtFunctionResult, MontyException, MontyObject, ObjectRef};
 pub use bashkit::{FileSystem, FsLimits, InMemoryFs, ReadOnlyFs};
 pub use bashkit_backend::BashKitBackend;
 pub use host::{ScriptControl, ScriptHostContext, ScriptPythonFunctions, ScriptPythonHandler};
