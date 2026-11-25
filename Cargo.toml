@@ -87,7 +87,7 @@ opt-level = "z"
 
 [workspace.dependencies]
 thiserror = "2"
-bashkit = { version = "=0.20.2", default-features = false, features = ["jq"] }
+bashkit = { version = "=0.21.1", default-features = false, features = ["jq"] }
 anyhow = "1.0.69"
 bytes = "1.4.0"
 axum = "0.8"

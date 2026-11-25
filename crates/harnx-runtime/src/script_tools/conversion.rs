@@ -1,7 +1,7 @@
 //! Monty's serde format is tagged Rust data, not JSON-shaped Python values.
 
 use anyhow::{anyhow, bail, ensure, Result};
-use harnx_script::MontyObject;
+use harnx_script::{MontyObject, ObjectRef};
 use serde_json::{Number, Value};
 
 const MAX_JSON_DEPTH: usize = 64;
@@ -16,18 +16,18 @@ fn json_to_python(value: Value, depth: usize) -> Result<MontyObject> {
         "middleware JSON nesting exceeds {MAX_JSON_DEPTH} levels"
     );
     match value {
-        Value::Null => Ok(MontyObject::None),
-        Value::Bool(value) => Ok(MontyObject::Bool(value)),
-        Value::String(value) => Ok(MontyObject::String(value)),
+        Value::Null => Ok(MontyObject::none()),
+        Value::Bool(value) => Ok(MontyObject::bool(value)),
+        Value::String(value) => Ok(MontyObject::string(value)),
         Value::Number(value) => number_to_python(value),
         Value::Array(values) => values
             .into_iter()
             .map(|value| json_to_python(value, depth + 1))
-            .collect::<Result<_>>()
-            .map(MontyObject::List),
+            .collect::<Result<Vec<_>>>()
+            .map(MontyObject::list),
         Value::Object(values) => values
             .into_iter()
-            .map(|(key, value)| Ok((MontyObject::String(key), json_to_python(value, depth + 1)?)))
+            .map(|(key, value)| Ok((MontyObject::string(key), json_to_python(value, depth + 1)?)))
             .collect::<Result<Vec<_>>>()
             .map(MontyObject::dict),
     }
@@ -35,41 +35,55 @@ fn json_to_python(value: Value, depth: usize) -> Result<MontyObject> {
 
 fn number_to_python(number: Number) -> Result<MontyObject> {
     if let Some(value) = number.as_i64() {
-        Ok(MontyObject::Int(value))
+        Ok(MontyObject::int(value))
     } else if let Some(value) = number.as_u64() {
-        Ok(MontyObject::BigInt(value.into()))
+        Ok(MontyObject::bigint(value.into()))
     } else {
         number
             .as_f64()
-            .map(MontyObject::Float)
+            .map(MontyObject::float)
             .ok_or_else(|| anyhow!("JSON number cannot be represented in Python"))
     }
 }
 
 pub(crate) fn from_python(value: MontyObject) -> Result<Value> {
-    convert(value, 0)
+    convert(value.as_ref(), 0)
 }
 
-fn convert(value: MontyObject, depth: usize) -> Result<Value> {
+fn convert(value: ObjectRef<'_>, depth: usize) -> Result<Value> {
     ensure!(
         depth < MAX_JSON_DEPTH,
         "Python middleware JSON nesting exceeds {MAX_JSON_DEPTH} levels"
     );
-    match value {
-        MontyObject::None => Ok(Value::Null),
-        MontyObject::Bool(value) => Ok(Value::Bool(value)),
-        MontyObject::Int(value) => Ok(Value::Number(value.into())),
-        MontyObject::BigInt(value) => integer_to_json(&value.to_string()),
-        MontyObject::Float(value) => Number::from_f64(value)
+    // `type_name` is exact for the JSON-shaped types: a set, namedtuple or
+    // class instance reports its own name and falls through to the error.
+    match value.type_name() {
+        "NoneType" => Ok(Value::Null),
+        "bool" => value
+            .as_bool()
+            .map(Value::Bool)
+            .ok_or_else(|| anyhow!("Python bool has no boolean value")),
+        // The decimal form covers every size, including past `i64`.
+        "int" => integer_to_json(&value.py_repr()),
+        "float" => value
+            .as_float()
+            .and_then(Number::from_f64)
             .map(Value::Number)
             .ok_or_else(|| anyhow!("non-finite Python number is not JSON")),
-        MontyObject::String(value) => Ok(Value::String(value)),
-        MontyObject::List(values) | MontyObject::Tuple(values) => values
+        "str" => value
+            .as_str()
+            .map(|text| Value::String(text.to_owned()))
+            .ok_or_else(|| anyhow!("Python str has no text value")),
+        "list" | "tuple" => value
+            .items()
+            .ok_or_else(|| anyhow!("Python sequence has no items"))?
             .into_iter()
-            .map(|value| convert(value, depth + 1))
+            .map(|item| convert(item, depth + 1))
             .collect::<Result<_>>()
             .map(Value::Array),
-        MontyObject::Dict(values) => values
+        "dict" => value
+            .pairs()
+            .ok_or_else(|| anyhow!("Python dict has no entries"))?
             .into_iter()
             .map(|pair| dict_entry(pair, depth))
             .collect::<Result<_>>()
@@ -78,11 +92,14 @@ fn convert(value: MontyObject, depth: usize) -> Result<Value> {
     }
 }
 
-fn dict_entry((key, value): (MontyObject, MontyObject), depth: usize) -> Result<(String, Value)> {
-    let MontyObject::String(key) = key else {
+fn dict_entry(
+    (key, value): (ObjectRef<'_>, ObjectRef<'_>),
+    depth: usize,
+) -> Result<(String, Value)> {
+    let Some(key) = key.as_str() else {
         bail!("Python JSON object keys must be strings");
     };
-    Ok((key, convert(value, depth + 1)?))
+    Ok((key.to_owned(), convert(value, depth + 1)?))
 }
 
 // serde_json parses larger integers as f64; reject them rather than round tool arguments.
@@ -111,10 +128,10 @@ mod tests {
     #[test]
     fn middleware_python_rejects_unrepresentable_numbers_and_object_keys() {
         for value in [
-            MontyObject::Float(f64::INFINITY),
-            MontyObject::Float(f64::NAN),
-            MontyObject::BigInt(u128::MAX.into()),
-            MontyObject::dict(vec![(MontyObject::Int(1), MontyObject::None)]),
+            MontyObject::float(f64::INFINITY),
+            MontyObject::float(f64::NAN),
+            MontyObject::bigint(u128::MAX.into()),
+            MontyObject::dict(vec![(MontyObject::int(1), MontyObject::none())]),
         ] {
             assert!(from_python(value).is_err());
         }
@@ -123,10 +140,10 @@ mod tests {
     #[test]
     fn middleware_python_json_conversion_bounds_nesting_in_both_directions() {
         let mut json = Value::Null;
-        let mut python = MontyObject::None;
+        let mut python = MontyObject::none();
         for _ in 0..MAX_JSON_DEPTH {
             json = Value::Array(vec![json]);
-            python = MontyObject::List(vec![python]);
+            python = MontyObject::list(vec![python]);
         }
         assert!(to_python(json).is_err());
         assert!(from_python(python).is_err());

@@ -51,7 +51,7 @@ fn returned_parse_error_survives_full_stderr_capture() {
 #[tokio::test]
 async fn late_parse_error_is_capped_by_bashkit_before_classification() {
     // This is a dependency boundary, not an Err(Parse) classification path:
-    // Once stderr has overflowed, BashKit 0.20.2 returns Ok(exit 2) and caps
+    // Once stderr has overflowed, BashKit 0.21.1 returns Ok(exit 2) and caps
     // even its streaming callback. PR3 never receives the syntax diagnostic.
     for cap in [0, 3] {
         let limits = ScriptLimits {
