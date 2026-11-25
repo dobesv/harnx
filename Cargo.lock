@@ -4945,7 +4945,6 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_json",
- "sse-stream",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
