@@ -776,7 +776,7 @@ impl NatsToolProvider {
             return response;
         }
         if response.is_err() && !abort.aborted_failover() {
-            self.schedule_cancel(&durable, &server);
+            self.send_cancel(&durable, &server).await;
         }
         response
     }

@@ -12,7 +12,7 @@ use super::control::{control_subject, SessionControlHandler};
 use super::daemon::{SessionActivate, SessionActivationRoute, WorkerActivationMode};
 use super::daemon_background::BackgroundServices;
 use super::execution_control::{FinishCause, WorkerExecution};
-use super::server_reconciler::{tool_servers_for_activation, ServerReconciler};
+use super::server_reconciler::{tool_servers_for_activation, Claimed, ServerReconciler};
 use crate::config::{ConfigLock, GlobalConfig};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
@@ -417,26 +417,22 @@ impl WorkerRuntime {
         if servers.is_empty() {
             return;
         }
-        let to_start = reconciler
+        let claimed = reconciler
             .claim_users(&activation.session_id, servers)
             .await;
-        Self::wait_for_tool_server_start(reconciler, to_start, &activation.session_id).await;
+        Self::wait_for_tool_server_start(reconciler, claimed, &activation.session_id).await;
     }
 
     pub(super) async fn wait_for_tool_server_start(
         reconciler: Arc<ServerReconciler>,
-        to_start: Vec<crate::config::ToolServerConfig>,
+        claimed: Claimed,
         user_id: &str,
     ) {
-        if to_start.is_empty() {
+        if claimed.is_empty() {
             return;
         }
-        let server_names = to_start
-            .iter()
-            .map(|server| server.name.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let task = tokio::spawn(async move { reconciler.start_claimed(to_start).await });
+        let server_names = claimed.names().join(", ");
+        let task = tokio::spawn(async move { reconciler.start_claimed(claimed).await });
         match tokio::time::timeout(SESSION_TOOL_SERVER_START_TIMEOUT, task).await {
             Ok(Ok(())) => {}
             Ok(Err(join_error)) => {

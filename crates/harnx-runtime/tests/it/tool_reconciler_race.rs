@@ -213,10 +213,7 @@ async fn claim_users_registers_before_the_matching_start_completes() {
         .claim_users("s1", vec![tool_server("time")])
         .await;
     assert_eq!(
-        to_start
-            .iter()
-            .map(|server| server.name.as_str())
-            .collect::<Vec<_>>(),
+        to_start.names(),
         ["time"],
         "the first user of a fresh name must be told to start it"
     );
@@ -302,4 +299,89 @@ async fn session_started_starts_multiple_servers_concurrently_not_sequentially()
          sequentially (~600ms); the activation ack window can't afford the sum once \
          more than a couple of servers are configured. took {elapsed:?}"
     );
+}
+
+/// A session that wants a server another session is still starting has to
+/// wait for that start. Its reservation discovers tools as soon as
+/// `start_claimed` returns, and before the server registers there are none.
+#[tokio::test]
+async fn a_session_that_joins_a_server_mid_start_waits_for_it() {
+    harnx_core::require_nextest();
+    let (launcher, entered_start, release_start) = GatedLauncher::new(GatedCall::Start);
+    let reconciler = Arc::new(ServerReconciler::new(launcher.clone(), Duration::ZERO));
+    let first = tokio::spawn({
+        let reconciler = reconciler.clone();
+        async move {
+            reconciler
+                .session_started("s1", vec![tool_server("time")])
+                .await
+        }
+    });
+    entered_start
+        .await
+        .expect("s1 should have called start on 'time'");
+
+    let joined = reconciler
+        .claim_users("s2", vec![tool_server("time")])
+        .await;
+    assert_eq!(joined.names(), ["time"], "s2 must wait for s1's start");
+    let mut joining = tokio::spawn({
+        let reconciler = reconciler.clone();
+        async move { reconciler.start_claimed(joined).await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut joining)
+            .await
+            .is_err(),
+        "s2 went on before 'time' had started"
+    );
+
+    release_start
+        .send(())
+        .expect("start is still parked on this gate waiting to be released");
+    first.await.expect("s1's session_started panicked");
+    tokio::time::timeout(Duration::from_secs(60), joining)
+        .await
+        .expect("s2 still waiting after 'time' started")
+        .expect("s2's start_claimed panicked");
+    assert_eq!(launcher.started.lock().unwrap().as_slice(), ["time"]);
+
+    // Once started, a later session has nothing to wait for.
+    let later = reconciler
+        .claim_users("s3", vec![tool_server("time")])
+        .await;
+    assert!(later.is_empty(), "{:?}", later.names());
+}
+
+/// A failed start must not leave a joining session waiting out its timeout.
+#[tokio::test]
+async fn a_session_that_joins_a_failing_start_stops_waiting_when_it_fails() {
+    harnx_core::require_nextest();
+    let reconciler = Arc::new(ServerReconciler::new(
+        Arc::new(FailingLauncher),
+        Duration::ZERO,
+    ));
+    let first = reconciler
+        .claim_users("s1", vec![tool_server("time")])
+        .await;
+    let joined = reconciler
+        .claim_users("s2", vec![tool_server("time")])
+        .await;
+    assert_eq!(joined.names(), ["time"]);
+    reconciler.start_claimed(first).await;
+    tokio::time::timeout(Duration::from_secs(60), reconciler.start_claimed(joined))
+        .await
+        .expect("s2 kept waiting for a start that failed");
+    assert!(reconciler.running().await.is_empty());
+}
+
+struct FailingLauncher;
+
+#[async_trait]
+impl ServerLauncher for FailingLauncher {
+    async fn start(&self, server: &ToolServerConfig) -> anyhow::Result<()> {
+        anyhow::bail!("{} failed to start", server.name)
+    }
+
+    async fn stop(&self, _: &str) {}
 }

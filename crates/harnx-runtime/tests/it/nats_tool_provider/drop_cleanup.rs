@@ -32,6 +32,7 @@ impl Toolset for ObservedTimeToolset {
 
 struct DropFixture {
     provider: NatsToolProvider,
+    instance_id: ServerScope,
     calls: NatsInFlightCalls,
     controls: async_nats::Subscriber,
     started: mpsc::UnboundedReceiver<CancellationToken>,
@@ -79,11 +80,16 @@ impl DropFixture {
         let controls = client.subscribe(instance_id.control_subject()).await?;
         client.flush().await?;
         let calls = NatsInFlightCalls::for_instance(&instance_id);
-        let provider =
-            NatsToolProvider::discover(&Config::default(), instance_id, calls.clone(), None)
-                .await?;
+        let provider = NatsToolProvider::discover(
+            &Config::default(),
+            instance_id.clone(),
+            calls.clone(),
+            None,
+        )
+        .await?;
         Ok(Some(Self {
             provider,
+            instance_id,
             calls,
             controls,
             started,
@@ -223,5 +229,46 @@ async fn explicit_abort_schedules_one_cancel_batch() -> Result<()> {
         .await
         .context("explicit abort did not cancel remote tool")?;
     fixture.assert_cancel_retries(&control).await?;
+    Ok(())
+}
+
+/// harnx-mcp-server returns from `main` once its aborted calls return, which
+/// drops every task still waiting to run. The cancel has to be on the wire by
+/// then. The provider runs on a runtime of its own here, dropped as soon as
+/// the call returns, the way the server's process exits.
+#[test]
+fn aborted_call_publishes_its_cancel_before_returning() -> Result<()> {
+    let host = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let Some(mut fixture) = host.block_on(DropFixture::start())? else {
+        return Ok(());
+    };
+    let caller = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    caller.block_on(async {
+        let provider = NatsToolProvider::discover(
+            &Config::default(),
+            fixture.instance_id.clone(),
+            NatsInFlightCalls::for_instance(&fixture.instance_id),
+            None,
+        )
+        .await?;
+        let abort = create_abort_signal();
+        let mut call = Box::pin(provider.call_tool("wait", json!({"seconds": 300.0}), &abort));
+        tokio::select! {
+            _ = &mut call => anyhow::bail!("call returned before abort"),
+            started = tokio::time::timeout(Duration::from_secs(60), fixture.started.recv()) => {
+                started.context("remote call never started")?.context("tool server stopped")?;
+            }
+        }
+        abort.set_ctrlc();
+        assert!(call.await.is_err());
+        anyhow::Ok(())
+    })?;
+    drop(caller);
+    host.block_on(fixture.next_cancel())
+        .context("the aborted call's cancel died with its runtime")?;
     Ok(())
 }
