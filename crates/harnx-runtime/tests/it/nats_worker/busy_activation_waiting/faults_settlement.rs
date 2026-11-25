@@ -5,26 +5,20 @@ use super::*;
 /// the delivery claims cleanly once the fault clears.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn busy_waiter_wake_claim_error_hands_delivery_back_and_deregisters() -> Result<()> {
-    let Some(server) = require_nats_server().await? else {
+    let session_id = "busy-wake-claim-error";
+    let Some((
+        _server,
+        jetstream,
+        ProbedWorker {
+            calls,
+            probe,
+            faults,
+            worker,
+        },
+    )) = busy_fixture(session_id).await?
+    else {
         return Ok(());
     };
-    let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let faults = Arc::new(ActivationFaults::default());
-    let worker = spawn_fault_probe_worker(
-        server.url(),
-        FaultWorkerSpec {
-            worker_id: "busy-wake-error-worker",
-            call_fn: counting_stub_call_fn(Arc::clone(&calls)),
-            probe: Arc::clone(&probe),
-            faults: Arc::clone(&faults),
-            per_session_capacity: None,
-        },
-    )
-    .await?;
-
-    let session_id = "busy-wake-claim-error";
     let prompt = seed_admitted_user(&jetstream, session_id, "wake into an error").await?;
     let foreign_lease =
         acquire_worker_lease(&jetstream, &storage_key(session_id), "foreign-holder").await?;
@@ -79,28 +73,24 @@ async fn busy_waiter_wake_claim_error_hands_delivery_back_and_deregisters() -> R
 /// registered and no turn launches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dead_heartbeat_delivery_is_handed_back_instead_of_parked() -> Result<()> {
-    let Some(server) = require_nats_server().await? else {
+    let session_id = "busy-dead-heartbeat";
+    let Some((
+        _server,
+        jetstream,
+        ProbedWorker {
+            calls,
+            probe,
+            faults,
+            worker,
+        },
+    )) = busy_fixture(session_id).await?
+    else {
         return Ok(());
     };
-    let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let session_id = "busy-dead-heartbeat";
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let faults = Arc::new(ActivationFaults::default());
+    // Set before anything is published, so the first claim sees it.
     faults
         .busy_claims_dead_heartbeat
         .store(true, Ordering::SeqCst);
-    let worker = spawn_fault_probe_worker(
-        server.url(),
-        FaultWorkerSpec {
-            worker_id: "busy-dead-heartbeat-worker",
-            call_fn: counting_stub_call_fn(Arc::clone(&calls)),
-            probe: Arc::clone(&probe),
-            faults: Arc::clone(&faults),
-            per_session_capacity: None,
-        },
-    )
-    .await?;
 
     let foreign_lease =
         publish_foreign_busy_activation(&jetstream, session_id, "foreign-holder").await?;
@@ -129,25 +119,20 @@ async fn dead_heartbeat_delivery_is_handed_back_instead_of_parked() -> Result<()
 /// JetStream would redeliver behind its back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dead_heartbeat_wake_hands_the_parked_delivery_back() -> Result<()> {
-    let Some(server) = require_nats_server().await? else {
+    let session_id = "busy-dead-wake";
+    let Some((
+        _server,
+        jetstream,
+        ProbedWorker {
+            calls,
+            probe,
+            faults,
+            worker,
+        },
+    )) = busy_fixture(session_id).await?
+    else {
         return Ok(());
     };
-    let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let session_id = "busy-dead-wake";
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let faults = Arc::new(ActivationFaults::default());
-    let worker = spawn_fault_probe_worker(
-        server.url(),
-        FaultWorkerSpec {
-            worker_id: "busy-dead-wake-worker",
-            call_fn: counting_stub_call_fn(Arc::clone(&calls)),
-            probe: Arc::clone(&probe),
-            faults: Arc::clone(&faults),
-            per_session_capacity: None,
-        },
-    )
-    .await?;
 
     let foreign_lease =
         publish_foreign_busy_activation(&jetstream, session_id, "foreign-holder").await?;
@@ -188,39 +173,28 @@ async fn dead_heartbeat_wake_hands_the_parked_delivery_back() -> Result<()> {
 /// without re-polling a spent JoinHandle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dead_heartbeat_mid_sleep_hands_the_parked_delivery_back() -> Result<()> {
-    let Some(server) = require_nats_server().await? else {
+    let session_id = "busy-mid-sleep-heartbeat";
+    let Some((
+        _server,
+        jetstream,
+        ProbedWorker {
+            calls,
+            probe,
+            faults,
+            worker,
+        },
+    )) = slow_recheck_fixture(session_id).await?
+    else {
         return Ok(());
     };
-    let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let session_id = "busy-mid-sleep-heartbeat";
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let faults = Arc::new(ActivationFaults::default());
     // The fault stops the delivery's heartbeat when its waiter starts
     // sleeping, after the pre-sleep liveness gates have passed. Setting it
-    // before publishing keeps that deterministic; the lease TTL is the
-    // recheck interval (30s), and the bound asserted below is far under one
-    // recheck, so the handback can only pass through the sleep observing the
-    // heartbeat stopping — not through a recheck whose dead-heartbeat gate
-    // would also settle.
+    // before anything is published keeps that deterministic; the lease TTL is
+    // the recheck interval (30s), and the bound asserted below is far under
+    // one recheck, so the handback can only pass through the sleep observing
+    // the heartbeat stopping — not through a recheck whose dead-heartbeat
+    // gate would also settle.
     faults.stop_parked_heartbeat.store(true, Ordering::SeqCst);
-    let mut daemon = WorkerDaemonConfig::managing("local", "busy-mid-sleep-heartbeat-worker")
-        .with_busy_waiter_probe_for_test(Arc::clone(&probe))
-        .with_activation_faults_for_test(Arc::clone(&faults));
-    daemon.lease = NatsLeaseConfig {
-        ttl: Duration::from_secs(30),
-        renew_interval: Duration::from_secs(10),
-        replicas: 1,
-        ..Default::default()
-    };
-    let readiness = harnx_healthz::Readiness::default();
-    let worker = AbortOnDropHandle::new(tokio::spawn(run_worker_daemon(
-        local_nats_runtime_config(server.url()),
-        daemon,
-        Some(counting_stub_call_fn(Arc::clone(&calls))),
-        Some(readiness.clone()),
-    )));
-    wait_until(CI_SAFE_TIMEOUT, move || readiness.is_ready()).await?;
 
     // The foreign holder keeps renewing, so the waiter parks and sleeps until
     // the fault kills the heartbeat right after the sleep starts. The fault

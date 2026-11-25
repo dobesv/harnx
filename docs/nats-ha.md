@@ -66,10 +66,14 @@ Harnx automatically manages the following JetStream resources:
   which every renewal and every acquisition sets, including one taken over a
   marker. Releasing, reclaiming or deleting a lease leaves a purge marker
   that expires after an hour, the same TTL nats-server gives the markers it
-  leaves for expired leases (not a bucket-wide TTL). This is the split-brain guard:
-  every durable write is fenced on the lease's KV revision, and a worker
-  that loses its lease aborts. If this bucket can't survive a node loss,
-  neither can a session mid-turn on that node.
+  leaves for expired leases (not a bucket-wide TTL). This bucket coordinates
+  single-active-worker ownership via lease-key revision CAS on acquisitions,
+  renewals, releases, and reclaims: durable log writes check the worker's
+  local held state (`is_held()`) and publish with session-log tail CAS
+  (`append_fenced` / `Nats-Expected-Last-Sequence`), not an atomic broker-side
+  lease check, and a worker aborts once local renewal or revalidation detects
+  lease loss (see [Leases & Fencing](#leases--fencing)). If this bucket can't
+  survive a node loss, neither can a session mid-turn on that node.
 - **KV Bucket**: `harnx_sessions` — canonical session state. Each session uses
   `sessions/{storage_key}/meta` for immutable identity plus CAS-updated title,
   variables, overrides, and extensions, and `sessions/{storage_key}/activity`
@@ -821,9 +825,13 @@ what actually happened instead of retrying blindly.
 | Frontend, user `Message` | Advance the tail and retry. A `Cancel` in between just makes the message part of the next turn. |
 | Frontend, cascade, or worker aborting locally, `Cancel` | A terminator already in the tail settles it. If that terminator is a `Cancel` carrying our own `cancellation_id`, our acknowledgement was lost and the append counts as accepted. Otherwise retry at the new tail. |
 
-Worker appends additionally require a held lease and carry its fence token. The
-lease keeps two workers from owning one session; the compare-and-swap closes the
-check-then-write race against a `Cancel` that lands mid-append.
+Worker appends additionally check that the worker's local lease is still held
+(`is_held()`) and stamp its KV revision as `fence_token` on entries that carry
+one. Lease-key CAS keeps two healthy workers from concurrently renewing the same
+lease, while `append_fenced`'s stream-tail compare-and-swap closes the
+check-then-write race against a `Cancel` that lands mid-append (it does not
+atomically verify current lease ownership on the broker; see
+[Leases & Fencing](#leases--fencing)).
 
 ### Requesting an interrupt
 
@@ -1105,18 +1113,96 @@ processes to die.
   the same pid namespace: the lease records a one-way hash of machine id,
   boot id and pid-namespace inode, and reclaim needs a full match. A pod
   restart under Kubernetes lands in a fresh pid namespace, so per-pod restarts
-  still wait the TTL; local mode and deployments that share one pid namespace
-  get the fast path. Everything short of that proof (records without holder
-  identity, a different host, a live pid, a check the platform can't run —
-  Linux only, since only it records a strong host identity) keeps the TTL as
-  the only reclaim path, so a live holder is never reclaimed. Operators see a
-  successful reclaim as
+  wait for broker TTL expiry instead of taking this immediate fast path (or,
+  on worker activation if the lease survives past its TTL, the broker-clock
+  age recovery below); local mode and deployments that share one pid
+  namespace get the fast path. For generic lease acquisitions (GC election
+  and k8s leader election), everything short of that same-host dead-holder
+  proof — records without holder identity, a different host, a live pid, or
+  a platform that can't record a strong host identity (only Linux does) —
+  keeps broker TTL expiry as the only reclaim path, so a live holder is
+  never reclaimed. Operators see a successful reclaim as
   `harnx_nats_operations_total{op="lease_reclaim",outcome="ok"}` plus the
   `reclaimed stale session lease from dead holder` info log. A lost CAS is
   recorded as `outcome="error"` (the delete returned `WrongLastRevision`); the
   `lease_reclaims` counter in the worker's metrics snapshot is internal and
   not exported. The user is not kept waiting either way: frontends return on
   the durable `Cancel`, never on the lease disappearing.
+- A lease that remains present past its own TTL — for example after a worker
+  on another host dies, or when a lease record stays in the KV bucket past
+  expiry — has a second recovery path, scoped strictly to worker activation
+  (preflight and claim). Generic lease acquisitions (the GC election lease,
+  k8s leader election, and scoped leases) keep the legacy behavior above: they
+  never reclaim by age and never ask the broker for the time. On worker
+  activation, the lease is reclaimable only when its age on the broker's
+  clock is strictly more than three effective TTLs
+  (`broker_now - entry.created > 3 * effective_ttl`; equality is not
+  expired), where `effective_ttl` is the larger of the claimant's configured
+  TTL and the observed writer's own TTL. The writer's TTL evidence comes from
+  the same stored message's `Nats-TTL` header (from the `async-nats`-decoded
+  `HeaderMap`; supported harnx writers emit a single `Nats-TTL` header):
+  - An absent header is treated as a legacy default-writer record and plans
+    against the 30 s default-lease floor (`max(claimant_ttl, 30 s)`), never a
+    shorter guess. Headerless custom writers with a TTL above 30 s are
+    outside this compatibility bound unless the claimant's own configured
+    TTL is at least as large.
+  - A present header that is zero, `never`, malformed, overflowing, or
+    otherwise not understood by this build disables age-based reclaim
+    entirely for that lease (a holder provably dead on this host stays
+    reclaimable through the first path regardless).
+  - Duplicate `Nats-TTL` headers on a manual or custom-writer entry are
+    outside the supported writer assumption: NATS Server honors the first
+    `Nats-TTL` header, whereas `async-nats` normalizes duplicate header
+    names with last-wins semantics into `HeaderMap`, so a trailing
+    duplicate hides the first value.
+- Age is judged against the entry's broker `created` timestamp using the
+  broker's own clock, never the worker's UTC or the payload's `acquired_at`
+  string. On contention, the worker sends `STREAM.INFO` to the lease stream
+  (`KV_harnx_leases` by default) and reads top-level `ts`, which is set by
+  the responding server's wall clock. In a clustered deployment, the response
+  is accepted only when `cluster.leader` is non-empty — meaning cluster
+  metadata names a stream leader rather than a leaderless follower-only view;
+  `cluster.leader` does **not** prove the responding server itself is the
+  leader, since another replica can answer `STREAM.INFO`. A solo
+  non-clustered stream has no `cluster` field and no other replica whose
+  clock could disagree. Safety assumes broker wall clocks across replicas
+  remain reasonably synchronized and stable relative to the
+  `3 * effective_ttl` margin, and healthy holders commit renewals in less than
+  their TTL. Broker time removes arbitrary worker UTC skew, but there is no
+  safety guarantee under arbitrary broker clock jumps or unbounded
+  cross-replica skew — a fresh authoritative `entry.created` timestamp cannot
+  cancel a fast responder clock. Age recovery also relies on the same local
+  lease-loss detection and log-tail CAS as ordinary TTL expiry; it does not
+  add broker-side commit or effect fencing against a stalled holder that
+  resumes after takeover (see [Leases & Fencing](#leases--fencing)). Future entry timestamps
+  (`broker_now < entry.created`) and duration overflows never authorize
+  reclaim. A clock request failure (timeout, transport failure, or JetStream
+  API error) settles through the stage's existing error path, the same as a
+  lease read failure, and never authorizes a purge. A successful response
+  without usable time evidence — `ts` missing or malformed, or a clustered
+  response with no `cluster.leader` — treats the age as unknown: the holder
+  stays protected and the activation parks on the normal busy path with a
+  warning log. The reclaim itself is the same revision-checked purge as the
+  dead-holder path, so a holder that renewed meanwhile wins the CAS and keeps
+  the session, and Delete or Purge markers are never age-classified as active
+  leases. Verified against NATS Server 2.11.6 `STREAM.INFO` (`ts`) responses;
+  worker ACLs must allow `STREAM.INFO.KV_<bucket>` and
+  `STREAM.MSG.GET.KV_<bucket>` under the configured JetStream API prefix.
+  Operators see a successful age reclaim as
+  `harnx_nats_operations_total{op="lease_reclaim",outcome="ok"}` plus the
+  `reclaimed stale session lease by broker-clock age` info log, which
+  carries `revision`, `age_secs`, `effective_ttl_secs`, and
+  `reason=broker-age` (plus `holder_worker_id` and `holder_pid`) and never
+  claims the holder died: age alone is not proof of death.
+- The worker activation claim requires its own TTL to be a positive whole
+  number of seconds (create and renewal encode whole seconds on the wire,
+  and the confirmation deadline must equal the TTL actually sent), and it
+  anchors that deadline immediately before the successful create —
+  including one that follows a reclaim purge. An acknowledgement that
+  arrives after the TTL it confirmed means the lease may already have
+  expired by the time the worker learns it owns the key: the claim purges
+  it at its own revision and defers, so no session work ever runs under an
+  expired lease.
 - In local mode the worker and its tool servers die with the frontend
   (parent-death signal on Linux; macOS and Windows still leak processes). In HA
   mode workers are daemons and see the `Cancel` live through their watchers.
@@ -1558,7 +1644,7 @@ Use these operation-specific patterns when adding a NATS caller:
 | Operation | Recovery rule and implementation |
 | --- | --- |
 | Read durable state | `recovery::read` retries transport reads within a fixed deadline. Decode/validate outside the retry. Never translate an unreadable record into absence. |
-| Read a record that was just written | A follower answers KV `get` and `entry` from whatever it has applied: async-nats sends them as direct gets whenever the bucket allows it, and it creates every KV bucket that way. `keys` lists from a consumer, which NATS can place on any replica. Read such records from the stream leader, whether this process wrote them a moment ago or another one did before handing over the work. For a key, use `harnx_nats_common::leader_reads::{entry, get}`, which send `STREAM.MSG.GET` and refuse a key with a wildcard, because the leader treats that subject as a filter. `leader_reads::entry_matching` takes `*` tokens on purpose and answers with the newest key they match, so it suits only a pattern that one key can match, such as the invocation journal's lookup of a call by session and wire call id. The session metadata store reads every key that way (`SessionMetadataStore::leader_entry`), so a frontend sees the admission it just wrote and a worker sees what its frontend wrote before activating it. Nothing answers such a read while the stream elects a leader, where a follower used to, so the store retries it with `leader_reads::retry_transient` for up to `RECOVERY_TIMEOUT`; a stream that doesn't exist fails at once. For a listing, page `STREAM.INFO` with a subjects filter and refuse a page whose `cluster` names no leader: while the stream has no leader, every replica answers that request from its own store. `invocation_journal/leader_reads.rs` does that for the tool invocation journal. The object store has the same issue: async-nats creates `OBJ_harnx_attachments` with `allow_direct`, so the metadata reads behind `get_media` are direct gets a lagging follower can answer with "not found" for a write that was already acknowledged. Prompt admission and cold worker hydration (`harnx-runtime/src/nats_attachments.rs`) confirm a `get_media` miss with `harnx_blob_store::media::leader_media_info`, a raw `STREAM.MSG.GET` on the metadata subject that returns tombstones visibly; a live entry is enough for admission (size and MIME come from the metadata), while hydration fetches the bytes with `read_media_from_leader` (next-by-subject raw gets on the chunk subject, no consumers, which a lagging replica could host) and still validates the digest. `put_media`'s dedup uses the same leader lookup and skips only live objects, so a tombstone or a stale follower entry never suppresses a write. A deployment that restricts JetStream subjects must allow `$JS.API.STREAM.MSG.GET.OBJ_harnx_attachments` for attachment writes and these fallback reads. The upload handler captures the session record at the first accepted part and re-reads it after each stored part whenever the session has a metadata record — a never-created owner (an upload that bypassed session creation) has no record to protect it and stores unrechecked — and when the session was deleted or replaced it purges the just-written object version (`harnx_blob_store::media::purge_media_version`), which deletes the object's metadata message with `STREAM.MSG.DELETE` and purges that version's chunks with `STREAM.PURGE`; credentials that upload attachments need those two subjects on the same stream as well. |
+| Read a record that was just written | A follower answers KV `get` and `entry` from whatever it has applied: async-nats sends them as direct gets whenever the bucket allows it, and it creates every KV bucket that way. `keys` lists from a consumer, which NATS can place on any replica. Read such records from the stream leader, whether this process wrote them a moment ago or another one did before handing over the work. For a key, use `harnx_nats_common::leader_reads::{entry, entry_with_headers, get}`, which send `STREAM.MSG.GET` and refuse a key with a wildcard, because the leader treats that subject as a filter; `entry_with_headers` returns the `kv::Entry` alongside that same stored message's `async-nats`-decoded `HeaderMap` (single-value/last-wins on duplicate header names; not lossless raw wire headers). `leader_reads::entry_matching` takes `*` tokens on purpose and answers with the newest key they match, so it suits only a pattern that one key can match, such as the invocation journal's lookup of a call by session and wire call id. The session metadata store reads every key that way (`SessionMetadataStore::leader_entry`), so a frontend sees the admission it just wrote and a worker sees what its frontend wrote before activating it. Nothing answers such a read while the stream elects a leader, where a follower used to, so the store retries it with `leader_reads::retry_transient` for up to `RECOVERY_TIMEOUT`; a stream that doesn't exist fails at once. For a listing, page `STREAM.INFO` with a subjects filter and refuse a page whose `cluster` names no leader: while the stream has no leader, every replica answers that request from its own store. `invocation_journal/leader_reads.rs` does that for the tool invocation journal. The object store has the same issue: async-nats creates `OBJ_harnx_attachments` with `allow_direct`, so the metadata reads behind `get_media` are direct gets a lagging follower can answer with "not found" for a write that was already acknowledged. Prompt admission and cold worker hydration (`harnx-runtime/src/nats_attachments.rs`) confirm a `get_media` miss with `harnx_blob_store::media::leader_media_info`, a raw `STREAM.MSG.GET` on the metadata subject that returns tombstones visibly; a live entry is enough for admission (size and MIME come from the metadata), while hydration fetches the bytes with `read_media_from_leader` (next-by-subject raw gets on the chunk subject, no consumers, which a lagging replica could host) and still validates the digest. `put_media`'s dedup uses the same leader lookup and skips only live objects, so a tombstone or a stale follower entry never suppresses a write. A deployment that restricts JetStream subjects must allow `$JS.API.STREAM.MSG.GET.OBJ_harnx_attachments` for attachment writes and these fallback reads. The upload handler captures the session record at the first accepted part and re-reads it after each stored part whenever the session has a metadata record — a never-created owner (an upload that bypassed session creation) has no record to protect it and stores unrechecked — and when the session was deleted or replaced it purges the just-written object version (`harnx_blob_store::media::purge_media_version`), which deletes the object's metadata message with `STREAM.MSG.DELETE` and purges that version's chunks with `STREAM.PURGE`; credentials that upload attachments need those two subjects on the same stream as well. |
 | Append a transcript entry | Retain the same message ID, payload, and CAS expectation through `recovery::retry_until`. Retry timeout/broken-pipe errors; a CAS conflict is authoritative. |
 | Mutate session metadata | `cas::update` reads back an ambiguous acknowledgement from the stream leader. Matching persisted bytes confirm the write; an unchanged revision permits retrying the exact CAS. A different value or revision leaves the outcome unknown. |
 | Renew a session lease | Retry the same deduplicated CAS only until the previously confirmed lease deadline. A conflict or expired deadline fences the worker; reconnect never restores lost ownership. |
@@ -1591,9 +1677,16 @@ a newly constructed client alone does not establish recovery.
 Harnx uses a renewable CAS (Compare-And-Swap) lease in NATS KV:
 - **TTL**: ~30 seconds.
 - **Renewal**: Every ~10 seconds.
-- **Fence Token**: The KV revision of the lease. Every write to the durable log is gated by this token.
+- **Fence Token**: The KV revision of the lease, stamped as metadata on durable log entries that carry a `fence_token` field.
 
-If a worker loses its lease (e.g., network partition), it immediately aborts. This prevents "split-brain" scenarios where two workers think they are active.
+Revision CAS on the `harnx_leases` key protects lease acquisition, renewal, release, and stale-lease reclaim so two healthy workers cannot concurrently renew the same lease. Under the broker-clock and renewal bounds in [Latency contract](#latency-contract) (synchronized, stable broker clocks relative to `3 * effective_ttl`, and healthy renewals committing within their TTL), active renewers are protected from age-based reclaim.
+
+This is not a strict storage-enforced no-stale-writes or no-stale-effects guarantee:
+- **Local loss detection**: A worker marks its lease lost and aborts when renewal, deadline tracking, or `revalidate_ownership` detects failure; loss is not detected instantaneously at broker expiry or takeover.
+- **Tail CAS, not atomic lease fencing**: Worker log writes (`FencedSessionLogSink` / `NatsSessionLogBackend`) check the worker's local `is_held()` flag before calling lease-unaware `append_fenced`, which enforces `Nats-Expected-Last-Sequence` on the `SESSION_*` stream to preserve log ordering and `Cancel` detection rather than atomically checking current lease ownership or revision on the broker. On a non-`Cancel` tail conflict, `WriterRule::Turn` rebases `expected_tail` and retries.
+- **Effect boundary**: Pre-dispatch `revalidate_ownership` runs on HITL, tool replay, and handoff boundaries (ordinary tool dispatch relies on `abort_signal`); it confirms ownership up to that renewal CAS and cannot stop a check-then-dispatch race or revoke already in-flight tool calls or external side effects after takeover.
+
+If a worker stalls or pauses past its renewal window and later resumes before detecting loss, it can still append a queued log entry or execute an in-flight tool effect after another worker has acquired the lease. That stale-writer window already exists after ordinary broker TTL expiry; worker-activation age recovery exposes the same window when it reclaims a lease Put that survived past `3 * effective_ttl` on the broker's clock (follow-up fencing is tracked in [issue #2939](https://github.com/dobesv/harnx/issues/2939)).
 
 ### Diagnosing sub-agent completion stalls
 
@@ -1926,7 +2019,9 @@ Workers emit structured logs for:
 Harnx tracks internal counters (exported to logs and future metrics endpoints):
 - `active_sessions_per_worker`: Current active loops.
 - `lease_acquisitions` / `lease_losses`: Lease churn.
-- `lease_reclaims`: Leases taken back from a holder provably dead on this host.
+- `lease_reclaims`: Leases taken back from a stale holder — one provably
+  dead on this host, or one whose age on the broker's clock is strictly
+  past three effective TTLs.
   Internal only, not exported; the exported signal for a reclaim is
   `harnx_nats_operations_total{op="lease_reclaim",outcome="ok"}` plus the
   info log line; lost-CAS attempts have `outcome="error"`.

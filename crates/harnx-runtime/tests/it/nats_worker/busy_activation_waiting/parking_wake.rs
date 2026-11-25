@@ -125,21 +125,13 @@ async fn busy_waiter_survives_a_dropped_watch_on_the_recheck_timer() -> Result<(
         return Ok(());
     };
     let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let faults = Arc::new(ActivationFaults::default());
+    let ProbedWorker {
+        calls,
+        probe,
+        faults,
+        worker,
+    } = ProbedWorker::spawn(server.url(), "busy-dropped-watch-worker", None).await?;
     faults.drop_lease_watch.store(true, Ordering::SeqCst);
-    let worker = spawn_fault_probe_worker(
-        server.url(),
-        FaultWorkerSpec {
-            worker_id: "busy-dropped-watch-worker",
-            call_fn: counting_stub_call_fn(Arc::clone(&calls)),
-            probe: Arc::clone(&probe),
-            faults: Arc::clone(&faults),
-            per_session_capacity: None,
-        },
-    )
-    .await?;
 
     let session_id = "busy-dropped-watch";
     let prompt = seed_admitted_user(&jetstream, session_id, "wait without a watch").await?;
@@ -192,31 +184,22 @@ async fn busy_waiter_survives_a_dropped_watch_on_the_recheck_timer() -> Result<(
 /// lease TTL), not by the recheck timer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn busy_waiter_keeps_its_lease_watch_across_holder_renewals() -> Result<()> {
-    let Some(server) = require_nats_server().await? else {
+    let session_id = "busy-watch-renewal";
+    let Some((
+        _server,
+        jetstream,
+        ProbedWorker {
+            calls,
+            probe,
+            faults: _faults,
+            worker,
+        },
+    )) = slow_recheck_fixture(session_id).await?
+    else {
         return Ok(());
     };
-    let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let session_id = "busy-watch-renewal";
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let mut daemon = WorkerDaemonConfig::managing("local", "busy-watch-renewal-worker")
-        .with_busy_waiter_probe_for_test(Arc::clone(&probe));
     // The recheck interval is the lease TTL: a full recheck costs 30s, so a
     // release-to-claim bound well under it can only pass through the watch.
-    daemon.lease = NatsLeaseConfig {
-        ttl: Duration::from_secs(30),
-        renew_interval: Duration::from_secs(10),
-        replicas: 1,
-        ..Default::default()
-    };
-    let readiness = harnx_healthz::Readiness::default();
-    let worker = AbortOnDropHandle::new(tokio::spawn(run_worker_daemon(
-        local_nats_runtime_config(server.url()),
-        daemon,
-        Some(counting_stub_call_fn(Arc::clone(&calls))),
-        Some(readiness.clone()),
-    )));
-    wait_until(CI_SAFE_TIMEOUT, move || readiness.is_ready()).await?;
 
     // The foreign lease renews every 500ms against a 2s TTL, so several
     // renewal Puts land while the delivery is parked.

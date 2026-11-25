@@ -36,6 +36,7 @@ mod nats_event_fanout;
 mod nats_fixed_admission;
 mod nats_interaction_decision;
 mod nats_lease;
+mod nats_lease_controlled;
 mod nats_lease_markers;
 mod nats_local_server;
 mod nats_macro_run_limits;

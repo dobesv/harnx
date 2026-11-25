@@ -3,5 +3,6 @@
 //! dominated build time; nextest still runs every test in its own process.
 
 mod connect_options;
+mod nats_leader_reads;
 mod nats_websocket;
 mod registry_ttl;

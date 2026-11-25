@@ -18,6 +18,7 @@ use async_nats::jetstream::{
     stream::{LastRawMessageError, LastRawMessageErrorKind},
     ErrorCode,
 };
+use async_nats::HeaderMap;
 use bytes::Bytes;
 use std::future::Future;
 use tokio::time::Instant;
@@ -34,7 +35,33 @@ pub async fn entry(store: &kv::Store, key: &str) -> Result<Option<kv::Entry>> {
         "invalid key {key} in bucket {}",
         store.name
     );
-    entry_matching(store, key).await
+    Ok(entry_matching_with_headers(store, key)
+        .await?
+        .map(|read| read.entry))
+}
+
+/// [`entry`] as one answer with the headers of the same stored message, so a
+/// caller can judge one revision's payload, revision, timestamp and headers
+/// (its `Nats-TTL`, say) together instead of from two reads that a write in
+/// between could make disagree. `leader_reads` does no extra decoding or
+/// filtering, though `async-nats` has already decoded the wire headers into a
+/// [`HeaderMap`] (single-value/last-wins on duplicate header names, not
+/// lossless raw wire bytes). A message stored without headers answers with an
+/// empty map, which says only that the message carries no headers.
+pub async fn entry_with_headers(store: &kv::Store, key: &str) -> Result<Option<EntryWithHeaders>> {
+    ensure!(
+        is_valid_key(key),
+        "invalid key {key} in bucket {}",
+        store.name
+    );
+    entry_matching_with_headers(store, key).await
+}
+
+/// A leader-read [`kv::Entry`] plus the headers of the very message that
+/// revision was written by.
+pub struct EntryWithHeaders {
+    pub entry: kv::Entry,
+    pub headers: HeaderMap,
 }
 
 /// The latest revision, which may be a delete or purge marker, of whichever
@@ -44,6 +71,19 @@ pub async fn entry(store: &kv::Store, key: &str) -> Result<Option<kv::Entry>> {
 /// The leader answers with the most recently written of every matching key,
 /// so callers use this only where at most one key can match.
 pub async fn entry_matching(store: &kv::Store, pattern: &str) -> Result<Option<kv::Entry>> {
+    Ok(entry_matching_with_headers(store, pattern)
+        .await?
+        .map(|read| read.entry))
+}
+
+/// As [`entry_matching`], but the answer also carries the `async-nats`-decoded
+/// [`HeaderMap`] of the message the entry was decoded from. Private because a
+/// wildcard read learns its key only from the answer, while a header-bearing
+/// read is for a key the caller already knows.
+async fn entry_matching_with_headers(
+    store: &kv::Store,
+    pattern: &str,
+) -> Result<Option<EntryWithHeaders>> {
     // A token that only contains a `*`, or a `>`, would match keys the
     // caller never meant.
     ensure!(
@@ -69,15 +109,19 @@ pub async fn entry_matching(store: &kv::Store, pattern: &str) -> Result<Option<k
         .strip_prefix(store.prefix.as_str())
         .unwrap_or(pattern)
         .to_owned();
-    Ok(Some(kv::Entry {
-        bucket: store.name.clone(),
-        key,
-        operation: operation(&message),
-        value: message.payload,
-        revision: message.sequence,
-        delta: 0,
-        created: message.time,
-        seen_current: false,
+    let operation = operation(&message);
+    Ok(Some(EntryWithHeaders {
+        entry: kv::Entry {
+            bucket: store.name.clone(),
+            key,
+            operation,
+            value: message.payload,
+            revision: message.sequence,
+            delta: 0,
+            created: message.time,
+            seen_current: false,
+        },
+        headers: message.headers,
     }))
 }
 

@@ -149,7 +149,7 @@ The `harnx_activation_naks_total` counter tracks activation deliveries that the 
 
 #### Bounded NATS Operations
 
-The `harnx_nats_operation_seconds` and `harnx_nats_operations_total` metrics track 13 bounded operations:
+The `harnx_nats_operation_seconds` and `harnx_nats_operations_total` metrics track 14 bounded operations:
 
 - `stream_lookup`: Fetch stream state (`get_stream`).
 - `stream_create`: Create session or notification stream (`create_stream`).
@@ -158,11 +158,12 @@ The `harnx_nats_operation_seconds` and `harnx_nats_operations_total` metrics tra
 - `consumer_messages`: Pull next message from stream (`messages.next()`). **Caveat:** When the worker is idle and waiting for incoming work, this latency includes idle wait time on the broker stream, not solely server processing.
 - `kv_bucket_open`: Open KV bucket (`get_key_value`).
 - `kv_bucket_create`: Create KV bucket (`create_key_value`). Expected conflict errors during startup fallback to `kv_bucket_open`.
-- `lease_get`: Read session lease record (`bucket.get`).
+- `lease_get`: Read session lease record (`bucket.get` for direct record lookups, or leader-backed `STREAM.MSG.GET` via `leader_reads::entry_with_headers` during lease acquisition assessment).
 - `lease_create`: Acquire session lease with TTL: a publish expecting no prior message, then, over a release or expiry marker, one expecting the marker's revision (`publish_with_headers`).
 - `lease_renew`: CAS update to renew session lease fence token (`publish_with_headers`).
 - `lease_release`: Replace the lease with an expiring purge marker, with revision fencing (`bucket.purge_expect_revision_with_ttl`).
-- `lease_reclaim`: Replace a lease held by a worker that is provably dead on this host with an expiring purge marker, at the observed revision (`bucket.purge_expect_revision_with_ttl`). `outcome="ok"` counts successful reclaims; a lost CAS race (another writer moved first) records `outcome="error"` and is benign.
+- `lease_reclaim`: Replace a stale session lease with an expiring purge marker, at the observed revision (`bucket.purge_expect_revision_with_ttl`). Stale means a holder provably dead on this host, or — on the worker activation path only — a lease whose age on the broker's clock is strictly past three effective TTLs (the larger of the claimant's and the observed writer's TTL). `outcome="ok"` counts successful reclaims; a lost CAS race (another writer moved first) records `outcome="error"` and is benign.
+- `lease_clock`: `STREAM.INFO` request to the lease stream to sample the broker's wall clock for a lease age check (worker activation only). Transport errors, request timeouts, and JetStream API errors fail the operation; a successful broker reply without usable time evidence (missing or invalid `ts`, or a clustered response naming no `cluster.leader`) is not a request failure and leaves the holder protected.
 - `activation_publish`: Publish `SessionActivate` message to work queue.
 
 The `outcome` label is classified as:

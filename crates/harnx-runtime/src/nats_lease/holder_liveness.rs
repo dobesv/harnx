@@ -9,7 +9,10 @@
 //! The safety rule is one-directional: only provable death reclaims. Records
 //! without the identity (written by older binaries), holders on a different
 //! host, pid checks that can't be trusted and unreadable procfs all leave the
-//! TTL as the only reclaim path. A live holder is never reclaimed.
+//! TTL as the only reclaim path. A live holder is never reclaimed. That rule
+//! is liveness-only: the worker-activation age recovery (`nats_lease::acquisition`)
+//! is a separate policy that reclaims by broker-clock age past three effective
+//! TTLs and needs no identity evidence at all.
 //!
 //! The support contract is the process's own procfs: `/proc` is assumed to be
 //! the pid-namespace mount of the comparing process, and the pid-namespace is

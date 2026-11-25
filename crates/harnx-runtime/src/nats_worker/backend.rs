@@ -314,8 +314,11 @@ impl crate::config::session::SessionAppendSink for NatsSessionLogBackend {
 
 /// Worker sink bound to one lease owner.
 ///
-/// Every append is stamped with the lease's revision and refused once the
-/// lease is gone, so a fenced-out worker cannot write behind its replacement.
+/// Every append stamps the lease's revision where supported and is refused
+/// locally once `lease.is_held()` flips to false; the broker checks only the
+/// session log's expected tail (`append_fenced`), not current lease ownership,
+/// so a stalled worker that resumes before detecting lease loss can still write
+/// after takeover.
 ///
 /// HITL also retains the expected stream tail used to derive the decision. A
 /// conditional append that loses forces re-derivation. The continuation
