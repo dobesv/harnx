@@ -1,0 +1,250 @@
+diff --git a/dist/runtime/AgUiThreadController.js b/dist/runtime/AgUiThreadController.js
+index e3d8e716a5d7861c6e21bb020a6604f4e170ba83..32316cb9547edc8f24c478aa1bd48395b5a234a2 100644
+--- a/dist/runtime/AgUiThreadController.js
++++ b/dist/runtime/AgUiThreadController.js
+@@ -1157,7 +1157,7 @@ var AgUiThreadController = class {
+ 		const joinStrategy = this.joinStrategy;
+ 		const hasRunUserBoundary = parent?.message.role === "user" && !resume;
+ 		let pendingError = null;
+-		const assistantParentId = parent ? parentId : this.session.headId;
++		let assistantParentId = parent ? parentId : this.session.headId;
+ 		let assistantMessageId;
+ 		let snapshotAssistantId;
+ 		const importedRunAssistants = /* @__PURE__ */ new Set();
+@@ -1244,11 +1244,13 @@ var AgUiThreadController = class {
+ 				content: this.preserveToolResults(previous.content, snapshot.content, replay.originalContent)
+ 			} : snapshot;
+ 		};
++		let snapshotCheckpoint = false;
+ 		const applyUpdate = (update) => {
+ 			if (!assistantCollided && replayContexts.size && update.content !== void 0) accountProducerResults(update.content);
+ 			let ownerParts;
+ 			let contentOwnerIds;
+ 			const hasStreamContent = Array.isArray(update.content) && update.content.some((part) => part.type !== "data");
++			if (snapshotCheckpoint && assistantMessageId === void 0 && !hasStreamContent) return;
+ 			if (!replayEnded && assistantMessageId === void 0) {
+ 				if (!update.status || update.status.type === "running") return;
+ 				replayEnded = true;
+@@ -1554,6 +1556,11 @@ var AgUiThreadController = class {
+ 						}
+ 					}
+ 					assistantMessageId = nextAssistantMessageId;
++					snapshotCheckpoint = assistantMessageId === void 0;
++					if (snapshotCheckpoint) {
++						assistantParentId = this.session.headId;
++						assistantCollided = false;
++					}
+ 					const imported = assistantMessageId ? this.session.tryGetMessage(assistantMessageId)?.message : void 0;
+ 					const source = event.messages.find((message) => message?.role === "assistant" && message.id === imported?.id);
+ 					latestSnapshot = imported?.role === "assistant" && source ? imported : void 0;
+@@ -2179,6 +2186,10 @@ var AgUiThreadController = class {
+ 				break;
+ 			case "MESSAGES_SNAPSHOT": {
+ 				aggregator.handle(event);
++				if (aggregator.checkpointSnapshot()) {
++					this.importMessagesSnapshot(event.messages, void 0, joinStrategy, runStartMessageIds, hasRunUserBoundary, /* @__PURE__ */ new Map(), void 0, true);
++					return;
++				}
+ 				const previousHeadId = this.session.headId;
+ 				const activeAssistant = activeAssistantId === void 0 ? void 0 : this.session.tryGetMessage(activeAssistantId)?.message;
+ 				const hasActiveText = activeAssistant?.role === "assistant" && activeAssistant.content.some((part) => part.type === "text");
+@@ -2330,7 +2341,7 @@ var AgUiThreadController = class {
+ 		if (this.maybeCompleteAfterToolResults(messageId)) return;
+ 		this.persistSettledAssistant(messageId);
+ 	}
+-	importMessagesSnapshot(rawMessages, activeAssistantId, joinStrategy, runStartMessageIds, hasRunUserBoundary, heldMessages, reconcileSnapshot) {
++	importMessagesSnapshot(rawMessages, activeAssistantId, joinStrategy, runStartMessageIds, hasRunUserBoundary, heldMessages, reconcileSnapshot, authoritative = false) {
+ 		try {
+ 			const activeAssistantItem = activeAssistantId ? this.session.tryGetMessage(activeAssistantId) : void 0;
+ 			const activeMessage = activeAssistantItem?.message;
+@@ -2348,8 +2359,8 @@ var AgUiThreadController = class {
+ 			} catch (error) {
+ 				this.logger.error?.("[agui] failed to import message from snapshot", error);
+ 			}
+-			const snapshotHasReasoning = converted.some((message) => message.role === "assistant" && message.content.some((part) => part.type === "reasoning"));
+-			const snapshotHasActivity = converted.some((message) => message.role === "assistant" && message.content.some(isActivityPart));
++			const snapshotHasReasoning = authoritative || converted.some((message) => message.role === "assistant" && message.content.some((part) => part.type === "reasoning"));
++			const snapshotHasActivity = authoritative || converted.some((message) => message.role === "assistant" && message.content.some(isActivityPart));
+ 			for (let index = 0; index < converted.length; index++) {
+ 				const convertedMessage = converted[index];
+ 				const existing = this.session.tryGetMessage(convertedMessage.id)?.message;
+diff --git a/dist/runtime/adapter/run-aggregator.d.ts b/dist/runtime/adapter/run-aggregator.d.ts
+index 6ee3599eab7411249ffe2112e7c920bda622445b..165d04f77091699081291d2cc91ba3d347e4157d 100644
+--- a/dist/runtime/adapter/run-aggregator.d.ts
++++ b/dist/runtime/adapter/run-aggregator.d.ts
+@@ -55,6 +55,7 @@ export declare class RunAggregator {
+     private firstTokenTime;
+     private totalChunks;
+     constructor(options: RunAggregatorOptions);
++    checkpointSnapshot(): boolean;
+     hasToolCall(toolCallId: string): boolean;
+     isRetained(messageId: string): boolean;
+     /**
+diff --git a/dist/runtime/adapter/run-aggregator.js b/dist/runtime/adapter/run-aggregator.js
+index 0302e3da001f322663754804f2c8d41ef781284d..a54708392dce36f09927a9eb4ca6b2613e09bf78 100644
+--- a/dist/runtime/adapter/run-aggregator.js
++++ b/dist/runtime/adapter/run-aggregator.js
+@@ -136,6 +136,19 @@ var RunAggregator = class {
+ 		this.onRetainedMessage = options.onRetainedMessage;
+ 		this.canRetainMessage = options.canRetainMessage;
+ 	}
++	checkpointSnapshot() {
++		for (const buffer of this.buffers()) if (buffer.openTextFrames.size > 0 || buffer.activeTextMessageIdByScope.size > 0 || buffer.activeReasoningKeyByScope.size > 0 || buffer.hiddenActiveReasoningId !== void 0 || Array.from(buffer.toolCalls.values()).some((call) => call.result === void 0)) return false;
++		const { hasEmittedOpaqueReasoning } = this.current;
++		this.retained.clear();
++		this.unannounced = void 0;
++		this.current = createMessageBuffer();
++		this.current.hasEmittedOpaqueReasoning = hasEmittedOpaqueReasoning;
++		this.buf = this.current;
++		this.pendingSnapshotText.clear();
++		this.serverMessageIdReported = false;
++		this.lastTextMessageId = void 0;
++		return true;
++	}
+ 	hasToolCall(toolCallId) {
+ 		return this.buffers().some((buffer) => buffer.toolCalls.has(toolCallId));
+ 	}
+diff --git a/src/runtime/AgUiThreadController.ts b/src/runtime/AgUiThreadController.ts
+index bad785cbe8b29c00f9407dbc3a4f0307756122a6..8c9f5f3e75122613d16d275c7649588f0812a33f 100644
+--- a/src/runtime/AgUiThreadController.ts
++++ b/src/runtime/AgUiThreadController.ts
+@@ -1997,7 +1997,7 @@ export class AgUiThreadController {
+     const hasRunUserBoundary = parent?.message.role === "user" && !resume;
+ 
+     let pendingError: Error | null = null;
+-    const assistantParentId = parent ? parentId : this.session.headId;
++    let assistantParentId = parent ? parentId : this.session.headId;
+     let assistantMessageId: string | undefined;
+     let snapshotAssistantId: string | undefined;
+     const importedRunAssistants = new Set<string>();
+@@ -2175,6 +2175,7 @@ export class AgUiThreadController {
+         : snapshot;
+     };
+ 
++    let snapshotCheckpoint = false;
+     const applyUpdate = (update: ChatModelRunResult) => {
+       if (
+         !assistantCollided &&
+@@ -2191,6 +2192,10 @@ export class AgUiThreadController {
+       const hasStreamContent =
+         Array.isArray(update.content) &&
+         update.content.some((part) => part.type !== "data");
++      // After a checkpoint the snapshot rows own the earlier parts; only new
++      // stream content may start the next assistant message.
++      if (snapshotCheckpoint && assistantMessageId === undefined && !hasStreamContent)
++        return;
+       if (!replayEnded && assistantMessageId === undefined) {
+         if (!update.status || update.status.type === "running") return;
+         // No matching producer identity arrived: retain native regeneration.
+@@ -2809,6 +2814,11 @@ export class AgUiThreadController {
+             }
+           }
+           assistantMessageId = nextAssistantMessageId;
++          snapshotCheckpoint = assistantMessageId === undefined;
++          if (snapshotCheckpoint) {
++            assistantParentId = this.session.headId;
++            assistantCollided = false;
++          }
+           const imported = assistantMessageId
+             ? this.session.tryGetMessage(assistantMessageId)?.message
+             : undefined;
+@@ -3927,6 +3937,19 @@ export class AgUiThreadController {
+       }
+       case "MESSAGES_SNAPSHOT": {
+         aggregator.handle(event);
++        if (aggregator.checkpointSnapshot()) {
++          this.importMessagesSnapshot(
++            event.messages,
++            undefined,
++            joinStrategy,
++            runStartMessageIds,
++            hasRunUserBoundary,
++            new Map(),
++            undefined,
++            true,
++          );
++          return undefined;
++        }
+         const previousHeadId = this.session.headId;
+         const activeAssistant =
+           activeAssistantId === undefined
+@@ -4237,6 +4260,10 @@ export class AgUiThreadController {
+     hasRunUserBoundary: boolean,
+     heldMessages: ReadonlyMap<string, unknown>,
+     reconcileSnapshot?: SnapshotMessageReconciler,
++    // The snapshot checkpoints a run with nothing in flight, so it replaces
++    // what earlier snapshots or events put on a message instead of merging
++    // reasoning and activity parts into it.
++    authoritative = false,
+   ) {
+     try {
+       const activeAssistantItem = activeAssistantId
+@@ -4279,15 +4306,20 @@ export class AgUiThreadController {
+           );
+         }
+       }
+-      const snapshotHasReasoning = converted.some(
+-        (message) =>
+-          message.role === "assistant" &&
+-          message.content.some((part) => part.type === "reasoning"),
+-      );
+-      const snapshotHasActivity = converted.some(
+-        (message) =>
+-          message.role === "assistant" && message.content.some(isActivityPart),
+-      );
++      const snapshotHasReasoning =
++        authoritative ||
++        converted.some(
++          (message) =>
++            message.role === "assistant" &&
++            message.content.some((part) => part.type === "reasoning"),
++        );
++      const snapshotHasActivity =
++        authoritative ||
++        converted.some(
++          (message) =>
++            message.role === "assistant" &&
++            message.content.some(isActivityPart),
++        );
+       for (let index = 0; index < converted.length; index++) {
+         const convertedMessage = converted[index]!;
+         const existing = this.session.tryGetMessage(
+diff --git a/src/runtime/adapter/run-aggregator.ts b/src/runtime/adapter/run-aggregator.ts
+index a173309520bd40cf93ecc2aab5f0b15f1f7a5649..ec84035be833a92119b22562ab23be7a10304217 100644
+--- a/src/runtime/adapter/run-aggregator.ts
++++ b/src/runtime/adapter/run-aggregator.ts
+@@ -329,6 +329,34 @@ export class RunAggregator {
+     this.canRetainMessage = options.canRetainMessage;
+   }
+ 
++  // A closed round is already represented by the snapshot's rows, so starting
++  // the next message must not publish its buffered parts again. Anything still
++  // open (text, reasoning, an unanswered tool call) stays live.
++  checkpointSnapshot(): boolean {
++    for (const buffer of this.buffers()) {
++      if (
++        buffer.openTextFrames.size > 0 ||
++        buffer.activeTextMessageIdByScope.size > 0 ||
++        buffer.activeReasoningKeyByScope.size > 0 ||
++        buffer.hiddenActiveReasoningId !== undefined ||
++        Array.from(buffer.toolCalls.values()).some(
++          (call) => call.result === undefined,
++        )
++      )
++        return false;
++    }
++    const { hasEmittedOpaqueReasoning } = this.current;
++    this.retained.clear();
++    this.unannounced = undefined;
++    this.current = createMessageBuffer();
++    this.current.hasEmittedOpaqueReasoning = hasEmittedOpaqueReasoning;
++    this.buf = this.current;
++    this.pendingSnapshotText.clear();
++    this.serverMessageIdReported = false;
++    this.lastTextMessageId = undefined;
++    return true;
++  }
++
+   hasToolCall(toolCallId: string): boolean {
+     return this.buffers().some((buffer) => buffer.toolCalls.has(toolCallId));
+   }
