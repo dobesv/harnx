@@ -67,20 +67,17 @@ impl ScriptPythonHandler for Host {
         assert!(!ctx.cancel.is_cancelled());
         match name.as_str() {
             "answer" => {
-                assert_eq!(args, vec![MontyObject::Int(7)]);
+                assert_eq!(args, vec![MontyObject::int(7)]);
                 assert_eq!(
                     kwargs,
-                    vec![(
-                        MontyObject::String("id".into()),
-                        MontyObject::String("step".into())
-                    )]
+                    vec![(MontyObject::string("id"), MontyObject::string("step"))]
                 );
                 ExtFunctionResult::Return(MontyObject::dict(vec![
                     (
-                        MontyObject::String("answer".into()),
-                        MontyObject::Int(self.answer().await),
+                        MontyObject::string("answer"),
+                        MontyObject::int(self.answer().await),
                     ),
-                    (MontyObject::String("ok".into()), MontyObject::Bool(true)),
+                    (MontyObject::string("ok"), MontyObject::bool(true)),
                 ]))
             }
             "host_stop" => {
@@ -96,10 +93,7 @@ impl ScriptPythonHandler for Host {
                 ExcType::ValueError,
                 Some("bad argument".into()),
             )),
-            "callable" => ExtFunctionResult::Return(MontyObject::Function {
-                name: "not_registered".into(),
-                docstring: None,
-            }),
+            "callable" => ExtFunctionResult::Return(MontyObject::function("not_registered", None)),
             _ => panic!("unregistered function dispatched: {name}"),
         }
     }

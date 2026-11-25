@@ -193,7 +193,7 @@ impl ScriptPythonHandler for PythonOperation {
                 .map(crate::script_tools::conversion::to_python)
                 .transpose()
         }) {
-            Ok(object) => ExtFunctionResult::Return(object.unwrap_or(MontyObject::None)),
+            Ok(object) => ExtFunctionResult::Return(object.unwrap_or_else(MontyObject::none)),
             Err(error) => {
                 host.control.stop();
                 ExtFunctionResult::Error(MontyException::new(

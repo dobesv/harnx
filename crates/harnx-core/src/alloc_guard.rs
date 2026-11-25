@@ -71,10 +71,35 @@ fn parse_override(raw: &str) -> Option<usize> {
     raw.trim().parse::<usize>().ok()
 }
 
-/// Global allocator that enforces [`init_from_env`]'s ceiling. Wraps [`System`].
-pub struct HeapGuard;
+/// Global allocator that enforces [`init_from_env`]'s ceiling. Wraps `A`, which
+/// defaults to [`System`]; a binary whose runtime needs its own global
+/// allocator (the script VM's memory meter) hands it in with
+/// [`HeapGuard::wrapping`], since a process has only one.
+pub struct HeapGuard<A = System> {
+    inner: A,
+}
 
-unsafe impl GlobalAlloc for HeapGuard {
+impl HeapGuard<System> {
+    /// A guard over the system allocator.
+    pub const fn new() -> Self {
+        Self { inner: System }
+    }
+}
+
+impl Default for HeapGuard<System> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A> HeapGuard<A> {
+    /// A guard that forwards every allocation to `inner`.
+    pub const fn wrapping(inner: A) -> Self {
+        Self { inner }
+    }
+}
+
+unsafe impl<A: GlobalAlloc> GlobalAlloc for HeapGuard<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let limit = LIMIT_BYTES.load(Ordering::Relaxed);
         if limit != 0 {
@@ -88,14 +113,14 @@ unsafe impl GlobalAlloc for HeapGuard {
                 report_and_abort(live, limit);
             }
         }
-        System.alloc(layout)
+        self.inner.alloc(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if LIMIT_BYTES.load(Ordering::Relaxed) != 0 {
             LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         }
-        System.dealloc(ptr, layout)
+        self.inner.dealloc(ptr, layout)
     }
 }
 
@@ -163,11 +188,12 @@ mod tests {
         // allocation is well under it, so alloc/free must work without tripping.
         let layout = Layout::from_size_align(1024, 8).unwrap();
         unsafe {
-            let p = HeapGuard.alloc(layout);
+            let guard = HeapGuard::new();
+            let p = guard.alloc(layout);
             assert!(!p.is_null());
             *p = 7;
             assert_eq!(*p, 7);
-            HeapGuard.dealloc(p, layout);
+            guard.dealloc(p, layout);
         }
     }
 

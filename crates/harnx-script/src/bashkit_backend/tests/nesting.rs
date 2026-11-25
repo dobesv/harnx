@@ -81,7 +81,7 @@ impl ScriptPythonHandler for Nested {
                 result.error,
             ));
         }
-        ExtFunctionResult::Return(MontyObject::String(result.stdout))
+        ExtFunctionResult::Return(MontyObject::string(result.stdout))
     }
 }
 

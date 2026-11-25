@@ -42,21 +42,23 @@ impl Completed {
         if self.result.status == ScriptStatus::TimedOut {
             return true;
         }
-        // Completion time belongs to the worker, not its starved parent.
-        if self.at < deadline {
-            return false;
-        }
-        if stopped {
+        // BashKit reports Monty's own time limit as exit 124 with this line, and
+        // only when the VM's check fired; a script's own `TimeoutError` is an
+        // ordinary traceback. The limit is the run's remaining time, so it is the
+        // run deadline, even when the VM's timer fires a little before this
+        // one does (a coarse clock does it on Windows).
+        if self.result.exit_code == 124
+            && self.result.error.is_none()
+            && self
+                .result
+                .stderr
+                .lines()
+                .any(|line| line.starts_with("python3: execution timed out after "))
+        {
             return true;
         }
-        if self.result.exit_code == 0 || self.result.error.is_some() {
-            return false;
-        }
-        // BashKit 0.20.2 exposes Monty's VM timeout only as stderr/exit 1.
-        self.result
-            .stderr
-            .lines()
-            .any(|line| line.starts_with("TimeoutError: time limit exceeded:"))
+        // Completion time belongs to the worker, not its starved parent.
+        self.at >= deadline && stopped
     }
 }
 
@@ -251,5 +253,53 @@ fn worker_failure(cancelled: bool, message: String) -> ScriptRun {
         } else {
             ScriptStatus::Error
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completed(exit_code: i32, stderr: &str, at: Instant) -> Completed {
+        Completed {
+            result: ScriptRun {
+                stdout: String::new(),
+                stderr: stderr.to_owned(),
+                exit_code,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                limit_hit: None,
+                error: None,
+                status: ScriptStatus::Error,
+            },
+            at,
+        }
+    }
+
+    #[test]
+    fn a_vm_timeout_that_finishes_just_before_the_deadline_is_the_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let early = deadline - Duration::from_millis(15);
+        let vm_timeout = completed(124, "python3: execution timed out after 0.8s\n", early);
+        assert!(vm_timeout.deadline_hit(deadline, false));
+    }
+
+    #[test]
+    fn a_script_error_before_the_deadline_is_not_a_timeout() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let early = deadline - Duration::from_millis(500);
+        // Exit 1 with a traceback is what a script's own `TimeoutError` is.
+        let raised = completed(1, "TimeoutError: time limit exceeded: 0.8s\n", early);
+        assert!(!raised.deadline_hit(deadline, false));
+        // A bare exit 124 without the VM's line isn't one either.
+        assert!(!completed(124, "", early).deadline_hit(deadline, false));
+    }
+
+    #[test]
+    fn a_run_the_deadline_stopped_is_a_timeout() {
+        let deadline = Instant::now();
+        let after = deadline + Duration::from_millis(5);
+        assert!(completed(130, "", after).deadline_hit(deadline, true));
+        assert!(!completed(130, "", after - Duration::from_millis(10)).deadline_hit(deadline, true));
     }
 }

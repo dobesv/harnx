@@ -10,6 +10,11 @@
 #[macro_use]
 extern crate log;
 
+// Unit tests here run `python3` in-process, which needs the script VM's allocator.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: harnx_script::VmAllocator = harnx_script::VM_ALLOCATOR;
+
 pub mod a2a_events;
 pub mod access;
 pub mod agent_loop;
