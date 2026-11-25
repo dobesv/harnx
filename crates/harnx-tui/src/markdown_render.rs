@@ -16,11 +16,8 @@ use unicode_width::UnicodeWidthStr;
 /// Comes from <https://github.com/sharkdp/bat/raw/5e77ca37e89c873e4490b42ff556370dc5c6ba4f/assets/syntaxes.bin>
 const SYNTAXES: &[u8] = include_bytes!("../../harnx-render/assets/syntaxes.bin");
 
-static SYNTAX_SET: LazyLock<Option<SyntaxSet>> = LazyLock::new(|| {
-    bincode::serde::decode_from_slice(SYNTAXES, bincode::config::legacy())
-        .map(|(set, _): (SyntaxSet, usize)| set)
-        .ok()
-});
+static SYNTAX_SET: LazyLock<Option<SyntaxSet>> =
+    LazyLock::new(|| syntect::dumps::from_uncompressed_data::<SyntaxSet>(SYNTAXES).ok());
 
 /// Language name mappings for syntax detection (e.g., "csharp" -> "C#")
 static LANG_MAPS: LazyLock<std::collections::HashMap<String, String>> = LazyLock::new(|| {
@@ -1296,9 +1293,7 @@ mod tests {
             other => panic!("unknown builtin theme {other}"),
         };
 
-        bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-            .map(|(theme, _): (Theme, usize)| theme)
-            .expect("decode builtin theme")
+        syntect::dumps::from_uncompressed_data::<Theme>(bytes).expect("decode builtin theme")
     }
 
     fn find_span<'a>(rendered: &'a RenderedEntry, needle: &str) -> &'a Span<'static> {

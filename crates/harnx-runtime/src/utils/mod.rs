@@ -39,7 +39,6 @@ pub use harnx_fetch::loader::*;
 pub use harnx_fetch::request::*;
 pub use harnx_spinner::*;
 
-use anyhow::Result;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use is_terminal::IsTerminal;
 use std::sync::LazyLock;
@@ -202,12 +201,6 @@ pub fn temp_file(prefix: &str, suffix: &str) -> PathBuf {
 
 pub fn is_url(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")
-}
-
-/// Also inlined in `harnx_render::decode_bin` — keep in sync.
-pub fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {
-    let (v, _) = bincode::serde::decode_from_slice(data, bincode::config::legacy())?;
-    Ok(v)
 }
 
 #[cfg(test)]
