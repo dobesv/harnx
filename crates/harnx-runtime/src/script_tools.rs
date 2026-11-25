@@ -156,6 +156,7 @@ pub(crate) fn tool_commands(
             description: tool.description.clone(),
             schema: tool.parameters.as_value().clone(),
             output: None,
+            output_schema: None,
         })
         .collect();
     Ok(harnx_script::commands::tool_commands(specs, executor)?)

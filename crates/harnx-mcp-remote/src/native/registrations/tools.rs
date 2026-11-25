@@ -51,6 +51,10 @@ pub fn map_upstream_tool(tool: &rmcp::model::Tool, mrtr_capable: bool) -> ToolSp
         timeout_secs,
         meta: tool.meta.as_ref().map(|meta| meta.0.clone()),
     };
+    let spec = match &tool.output_schema {
+        Some(schema) => spec.with_summarized_output_schema(&Value::Object((**schema).clone())),
+        None => spec,
+    };
     if mrtr_capable {
         spec.with_input_required()
     } else {
@@ -104,5 +108,45 @@ mod tests {
         assert!(!spec.idempotent_hint);
         assert!(!spec.requests_input());
         assert!(map_upstream_tool(&tool, true).requests_input());
+    }
+
+    fn tool_with_output_schema() -> rmcp::model::Tool {
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "count": {"type": "integer", "description": "how many\nmore"},
+            "inner": {"type": "object", "properties": {"deep": {"type": "string"}}},
+        }});
+        rmcp::model::Tool::new("echo", "Echo", Arc::new(serde_json::Map::new()))
+            .with_raw_output_schema(Arc::new(schema.as_object().expect("object").clone()))
+    }
+
+    #[test]
+    fn upstream_output_schema_is_copied_as_a_summary() {
+        let spec = map_upstream_tool(&tool_with_output_schema(), false);
+        assert_eq!(
+            spec.output_schema(),
+            Some(&serde_json::json!({"type": "object", "properties": {
+                "count": {"type": "integer", "description": "how many"},
+                "inner": {"type": "object"},
+            }}))
+        );
+    }
+
+    #[test]
+    fn upstream_tool_without_output_schema_gets_no_key() {
+        let tool = rmcp::model::Tool::new("echo", "Echo", Arc::new(serde_json::Map::new()));
+        assert!(map_upstream_tool(&tool, false).output_schema().is_none());
+    }
+
+    #[test]
+    fn upstream_server_set_output_schema_wins() {
+        let own = serde_json::json!({"properties": {"own": {"type": "string", "x": 1}}});
+        let mut meta = rmcp::model::MetaObject::default();
+        meta.0.insert(
+            harnx_toolset::OUTPUT_SCHEMA_META_KEY.to_string(),
+            own.clone(),
+        );
+        let mut tool = tool_with_output_schema();
+        tool.meta = Some(meta);
+        assert_eq!(map_upstream_tool(&tool, false).output_schema(), Some(&own));
     }
 }

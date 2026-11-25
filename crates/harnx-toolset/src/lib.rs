@@ -44,6 +44,8 @@ mod partial_result;
 pub use partial_result::*;
 mod script_output;
 pub use script_output::*;
+mod output_schema;
+pub use output_schema::*;
 pub mod cleanup;
 
 /// Schema and execution hints for one tool.

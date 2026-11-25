@@ -389,7 +389,10 @@ mod adapter_wire_tests {
                 timeout_policy_spec("with_template", None),
                 timeout_policy_spec("stops_on_new_message", None).with_stop_on_new_message(),
                 timeout_policy_spec("script_shaped", None)
-                    .with_script_output(harnx_toolset::ScriptOutput::default()),
+                    .with_script_output(harnx_toolset::ScriptOutput::default())
+                    .with_output_schema(
+                        serde_json::json!({"properties": {"text": {"type": "string"}}}),
+                    ),
             ]
         }
 
@@ -494,6 +497,11 @@ mod adapter_wire_tests {
     async fn list_tools_keeps_the_script_output_mapping() {
         let mapping = listed_meta("script_shaped", harnx_toolset::SCRIPT_OUTPUT_META_KEY).await;
         assert!(mapping.is_some_and(|value| value.is_object()));
+        let schema = listed_meta("script_shaped", harnx_toolset::OUTPUT_SCHEMA_META_KEY).await;
+        assert_eq!(
+            schema,
+            Some(serde_json::json!({"properties": {"text": {"type": "string"}}}))
+        );
     }
 
     /// Records whether each invocation asked for a script-shaped result.

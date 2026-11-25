@@ -169,6 +169,15 @@ async fn plain_template_gets_the_exec_mapping_and_jsonl_template_does_not() {
     );
     assert!(output("streaming").is_none());
     assert!(output("exec").is_some());
+    let schema = |name: &str| {
+        specs
+            .iter()
+            .find(|spec| spec.name == name)
+            .and_then(|spec| spec.output_schema().cloned())
+    };
+    assert!(schema("exec").is_some());
+    assert_eq!(schema("plain"), schema("exec"));
+    assert!(schema("streaming").is_none());
 
     let result = call(&toolset, "plain", json!({}), true).await;
     assert_eq!(result["structuredContent"]["stdout"], json!("hi\n"));
@@ -271,6 +280,8 @@ async fn wait_that_ends_before_the_command_reports_running() {
     let args = json!({ "execution_id": id, "seconds": 1 });
     let result = spawner.call("wait", args, true).await;
     spawner.terminate(&id).await;
+    let pending_names = declared_properties("wait", &spawner.toolset);
+    assert_declared("wait", &pending_names, &result);
     let fields = &result["structuredContent"];
     assert_eq!(fields["status"], json!("running"), "{result}");
     assert!(fields.get("stdout").is_none());
@@ -288,6 +299,8 @@ async fn status_on_a_running_command_reports_running() {
         .call("status", json!({ "execution_id": id }), true)
         .await;
     spawner.terminate(&id).await;
+    let pending_names = declared_properties("wait", &spawner.toolset);
+    assert_declared("wait", &pending_names, &result);
     let fields = &result["structuredContent"];
     assert_eq!(fields["status"], json!("running"), "{result}");
     assert_eq!(fields["execution_id"], json!(id));
@@ -656,7 +669,83 @@ async fn wait_ended_by_a_new_message_reports_stopped_by() {
         .await
         .expect("tool result");
     spawner.terminate(&id).await;
+    let pending_names = declared_properties("wait", &spawner.toolset);
+    assert_declared("wait", &pending_names, &result);
     let fields = &result["structuredContent"];
     assert_eq!(fields["status"], json!("running"), "{result}");
     assert_eq!(fields["stopped_by"], json!("new_message"));
+}
+
+fn declared_properties(spec_name: &str, toolset: &BashToolset) -> Vec<String> {
+    let schema = toolset
+        .tools()
+        .into_iter()
+        .find(|spec| spec.name == spec_name)
+        .and_then(|spec| spec.output_schema().cloned())
+        .unwrap_or_else(|| panic!("{spec_name} declares no output schema"));
+    schema["properties"]
+        .as_object()
+        .expect("schema properties")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn mapped_tools_declare_their_fields() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let toolset = toolset_in(directory.path()).await;
+    for spec in toolset.tools() {
+        let Some(output) = spec.script_output() else {
+            assert!(spec.output_schema().is_none(), "{}", spec.name);
+            continue;
+        };
+        let names = declared_properties(&spec.name, &toolset);
+        for named in [&output.stdout, &output.stderr, &output.exit_code]
+            .into_iter()
+            .flatten()
+        {
+            assert!(names.contains(named), "{} lacks {named}", spec.name);
+        }
+    }
+}
+
+fn assert_declared(tool: &str, names: &[String], result: &Value) {
+    let fields = result["structuredContent"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{tool} returned no structured content: {result}"));
+    for key in fields.keys() {
+        assert!(names.contains(key), "{tool} emits undeclared {key}");
+    }
+}
+
+#[tokio::test]
+async fn script_result_fields_match_the_declared_schema() {
+    let spawner = Spawner::new().await;
+    let exec_names = declared_properties("exec", &spawner.toolset);
+    let pending_names = declared_properties("spawn", &spawner.toolset);
+    let log_names = declared_properties("read_exec_log", &spawner.toolset);
+    let args = json!({ "command": "echo out", "working_dir": spawner.directory.path() });
+    assert_declared("exec", &exec_names, &spawner.call("exec", args, true).await);
+
+    let running = spawner.spawn("sleep 30", true).await;
+    assert_declared("spawn", &pending_names, &running);
+    let id = running["structuredContent"]["execution_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let status = spawner
+        .call("status", json!({ "execution_id": id }), true)
+        .await;
+    assert_declared("status", &pending_names, &status);
+    spawner.terminate(&id).await;
+
+    let id = log_of(&spawner, "printf 'a\\nb\\n'").await;
+    let finished = spawner
+        .call("wait", json!({ "execution_id": id, "seconds": 20 }), true)
+        .await;
+    assert_declared("wait", &pending_names, &finished);
+    let args = json!({ "execution_id": id, "stream": "stdout" });
+    let log = spawner.call("read_exec_log", args, true).await;
+    assert_declared("read_exec_log", &log_names, &log);
 }

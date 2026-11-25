@@ -49,7 +49,7 @@ fn provider(fetcher: Option<Arc<dyn AttachmentFetcher>>) -> (BashProvider, Arc<T
         base_providers: vec![],
         slot: Some(slot),
         payload_limit: None,
-        script_outputs: Default::default(),
+        script_shapes: Default::default(),
         full_payload: true,
     })
     .with_attachment_fetcher(fetcher);

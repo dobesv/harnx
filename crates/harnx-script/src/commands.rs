@@ -38,6 +38,8 @@ pub struct ToolSpec {
     pub schema: Value,
     /// How the tool's structured result maps to stdout, stderr and exit status.
     pub output: Option<OutputMapping>,
+    /// JSON Schema of the structured result, listed by `help <tool>`.
+    pub output_schema: Option<Value>,
 }
 
 /// Admission stays with the embedder. All commands in a run share this executor,
@@ -138,6 +140,7 @@ impl ScriptCommand for ToolCommand {
                     &self.tool.schema,
                     &self.tool.description,
                     self.tool.output.as_ref(),
+                    self.tool.output_schema.as_ref(),
                 ),
                 ..Default::default()
             });

@@ -840,7 +840,7 @@ fn two_non_null_branches_stay_json_flags() {
 
 #[test]
 fn nullable_flags_are_documented_with_their_type() {
-    let help = crate::help::help("tool", &nullable_schema(), "d", None);
+    let help = crate::help::help("tool", &nullable_schema(), "d", None, None);
     for expected in [
         "--path <string>",
         "--ignore-case / --no-ignore-case",

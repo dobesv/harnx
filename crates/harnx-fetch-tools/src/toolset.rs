@@ -86,6 +86,7 @@ fn tool_spec(name: &str, description: &str) -> ToolSpec {
         summary: Some("the page text; notes about cut-off output on stderr".to_string()),
         ..Default::default()
     })
+    .with_output_schema(crate::script_schema::page_schema())
 }
 
 #[async_trait]

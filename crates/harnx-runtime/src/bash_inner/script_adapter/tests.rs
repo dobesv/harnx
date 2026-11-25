@@ -170,6 +170,7 @@ async fn script(script: &str, executor: Arc<ScriptInnerExecutor>) -> ScriptRun {
         .into_iter()
         .map(|name| ToolSpec {
             output: None,
+            output_schema: None,
             name: name.into(),
             description: format!("Call {name}."),
             schema: if name == "fs_read" {

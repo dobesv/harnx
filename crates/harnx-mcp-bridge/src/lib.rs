@@ -804,7 +804,11 @@ async fn retire_child(manager: &ChildProcessManager, child: &mut Child) -> anyho
     group_stop.context("stop MCP child process group")
 }
 
-fn map_tool(tool: Tool, requests_input: bool) -> ToolSpec {
+fn map_tool(mut tool: Tool, requests_input: bool) -> ToolSpec {
+    // A harnx toolset served over MCP sets `harnx:output_schema` itself and
+    // that value wins; any other server's `outputSchema` fills the gap as a
+    // summary, because the spec rides in every registration record.
+    let output_schema = tool.output_schema.take();
     let annotations = tool.annotations.as_ref();
     // MCP tool listings have no timeout field; harnx tool servers advertise
     // their request-timeout policy in `_meta`
@@ -834,6 +838,10 @@ fn map_tool(tool: Tool, requests_input: bool) -> ToolSpec {
             .unwrap_or(false),
         timeout_secs,
         meta: tool.meta.map(|m| m.0),
+    };
+    let spec = match output_schema {
+        Some(schema) => spec.with_summarized_output_schema(&Value::Object((*schema).clone())),
+        None => spec,
     };
     if requests_input {
         spec.with_input_required()
@@ -1142,6 +1150,47 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("Running {{name}}")
         );
+    }
+
+    fn schema_object() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({"type": "object", "properties": {
+            "count": {"type": "integer", "description": "how many\nmore detail"},
+            "inner": {"type": "object", "properties": {"deep": {"type": "string"}}},
+        }})
+        .as_object()
+        .expect("schema object")
+        .clone()
+    }
+
+    #[test]
+    fn maps_child_output_schema_into_meta() {
+        let key = harnx_toolset::OUTPUT_SCHEMA_META_KEY;
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "count": {"type": "integer", "description": "how many"},
+            "inner": {"type": "object"},
+        }});
+
+        let bare = rmcp::model::Tool::new("echo", "Echo input", serde_json::Map::new())
+            .with_raw_output_schema(std::sync::Arc::new(schema_object()));
+        assert_eq!(
+            map_tool(bare, false).output_schema(),
+            Some(&schema),
+            "a tool with no meta gets one"
+        );
+
+        let with_meta = tool_with_meta(serde_json::json!({ "call_template": "x" }))
+            .with_raw_output_schema(std::sync::Arc::new(schema_object()));
+        let spec = map_tool(with_meta, false);
+        assert_eq!(spec.output_schema(), Some(&schema));
+        assert!(spec.meta.as_ref().unwrap().contains_key("call_template"));
+
+        let none = map_tool(tool_with_meta(serde_json::json!({ "a": 1 })), false);
+        assert!(none.meta.as_ref().unwrap().get(key).is_none());
+
+        let own = serde_json::json!({"type": "object", "properties": {"own": {"type": "string"}}});
+        let child_set = tool_with_meta(serde_json::json!({ key: own.clone() }))
+            .with_raw_output_schema(std::sync::Arc::new(schema_object()));
+        assert_eq!(map_tool(child_set, false).output_schema(), Some(&own));
     }
 
     fn tool_with_meta(meta: serde_json::Value) -> rmcp::model::Tool {

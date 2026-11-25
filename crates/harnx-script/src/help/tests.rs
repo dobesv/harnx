@@ -27,6 +27,7 @@ fn help_has_man_page_sections_and_property_metadata() {
         &schema(),
         "Read a file.\nReturns its contents.",
         None,
+        None,
     );
     let expected = concat!(
         "NAME\n    fs_read - Read a file.\n\n",
@@ -82,7 +83,7 @@ fn json_fallback_documentation_matches_parser_types() {
     ] {
         let schema = json!({"properties":{"camelCase":shape}, "required":["camelCase"]});
         assert!(synopsis("tool", &schema, "").contains("--camel-case <json>"));
-        assert!(help("tool", &schema, "", None).contains("type: json; required"));
+        assert!(help("tool", &schema, "", None, None).contains("type: json; required"));
     }
 }
 
@@ -95,8 +96,8 @@ fn deterministic_property_order_does_not_depend_on_schema_insertion_order() {
         synopsis("tool", &b, "Summary.")
     );
     assert_eq!(
-        help("tool", &a, "Summary.", None),
-        help("tool", &b, "Summary.", None)
+        help("tool", &a, "Summary.", None, None),
+        help("tool", &b, "Summary.", None, None)
     );
 }
 
@@ -105,10 +106,10 @@ fn collisions_and_reserved_json_document_the_escape_hatch() {
     let collision =
         json!({"properties":{"aB":{"type":"string"},"a_b":{"type":"string"}}, "required":["aB"]});
     assert_eq!(synopsis("tool", &collision, ""), "tool --json <object>");
-    assert!(help("tool", &collision, "", None).contains("Conflicting schema flag names"));
+    assert!(help("tool", &collision, "", None, None).contains("Conflicting schema flag names"));
     let reserved = json!({"properties":{"json":{"type":"string"}}, "required":["json"]});
     assert_eq!(synopsis("tool", &reserved, ""), "tool --json <object>");
-    assert!(help("tool", &reserved, "", None).contains("(property \"json\")"));
+    assert!(help("tool", &reserved, "", None, None).contains("(property \"json\")"));
 }
 
 #[test]
@@ -124,7 +125,7 @@ fn unlisted_required_keys_require_json_in_synopsis_and_help() {
         let syntax = synopsis("tool", &schema, "");
         assert!(syntax.ends_with(" --json <object>"), "{syntax}");
         assert!(!syntax.contains("[--json"), "{syntax}");
-        assert!(help("tool", &schema, "", None).contains(&format!("    {syntax}\n")));
+        assert!(help("tool", &schema, "", None, None).contains(&format!("    {syntax}\n")));
         assert!(parse_args(&schema, &[], None).is_err());
         let args = vec!["--json".into(), r#"{"unlisted":1}"#.into()];
         assert_eq!(
@@ -143,7 +144,7 @@ fn help_shows_output_section_for_a_mapped_tool() {
         summary: Some("file text, like cat".into()),
         ..Default::default()
     };
-    let text = help("fs_read", &schema(), "Read a file.", Some(&mapping));
+    let text = help("fs_read", &schema(), "Read a file.", Some(&mapping), None);
     let expected = concat!(
         "\nOUTPUT\n",
         "  file text, like cat\n",
@@ -160,7 +161,7 @@ fn help_lists_stderr_text_before_notes() {
         stderr: Some("notes".into()),
         ..Default::default()
     };
-    let text = help("t", &schema(), "d", Some(&mapping));
+    let text = help("t", &schema(), "d", Some(&mapping), None);
     assert!(
         text.contains("stderr: the `err` field, then notes from `notes`\n"),
         "{text}"
@@ -169,7 +170,7 @@ fn help_lists_stderr_text_before_notes() {
         stderr_text: Some("err".into()),
         ..Default::default()
     };
-    let text = help("t", &schema(), "d", Some(&only_text));
+    let text = help("t", &schema(), "d", Some(&only_text), None);
     assert!(text.contains("  stderr: the `err` field\n"), "{text}");
 }
 
@@ -179,11 +180,67 @@ fn help_leaves_out_output_lines_for_absent_parts() {
         stdout: Some("text".into()),
         ..Default::default()
     };
-    let text = help("fs_read", &schema(), "Read a file.", Some(&mapping));
+    let text = help("fs_read", &schema(), "Read a file.", Some(&mapping), None);
     assert!(text.ends_with("\nOUTPUT\n  stdout: the `text` field\n  -o json prints every field.\n"));
 }
 
 #[test]
 fn help_has_no_output_section_without_a_mapping() {
-    assert!(!help("fs_read", &schema(), "Read a file.", None).contains("OUTPUT"));
+    assert!(!help("fs_read", &schema(), "Read a file.", None, None).contains("OUTPUT"));
+}
+
+fn result_schema() -> Value {
+    json!({"type":"object", "properties":{
+        "exit_code":{"type":"integer", "description":"the command's exit status\nsecond line"},
+        "stdout":{"type":"string"},
+        "notes":{"type":"array", "items":{"type":"string"}},
+        "tags":{"type":"array"},
+        "meta":{"type":"object", "properties":{"a":{"type":"string"}}},
+        "next":{"type":["string","null"], "description":"where to continue"},
+        "either":{"type":["string","integer"]},
+        "free":{},
+        "lead":{"type":"string", "description":"\n  \n  after blank lines  \nlater"}
+    }})
+}
+
+#[test]
+fn help_lists_output_fields() {
+    let text = help("t", &schema(), "d", None, Some(&result_schema()));
+    let expected = concat!(
+        "\nFIELDS (-o json)\n",
+        "  exit_code  integer            the command's exit status\n",
+        "  stdout     string\n",
+        "  notes      array of string\n",
+        "  tags       array\n",
+        "  meta       object\n",
+        "  next       string             where to continue\n",
+        "  either     string or integer\n",
+        "  free       any\n",
+        "  lead       string             after blank lines\n",
+    );
+    assert!(text.ends_with(expected), "{text}");
+}
+
+#[test]
+fn help_fields_follow_the_output_section() {
+    let mapping = OutputMapping {
+        stdout: Some("text".into()),
+        ..Default::default()
+    };
+    let text = help("t", &schema(), "d", Some(&mapping), Some(&result_schema()));
+    assert!(text.find("OUTPUT").unwrap() < text.find("FIELDS (-o json)").unwrap());
+}
+
+#[test]
+fn help_without_properties_prints_no_fields_section() {
+    for schema_value in [
+        json!({"type":"object"}),
+        json!({"type":"object", "properties":{}}),
+        json!({"type":"object", "properties":[1]}),
+        json!("text"),
+    ] {
+        let text = help("t", &schema(), "d", None, Some(&schema_value));
+        assert!(!text.contains("FIELDS"), "{schema_value}");
+    }
+    assert!(!help("t", &schema(), "d", None, None).contains("FIELDS"));
 }

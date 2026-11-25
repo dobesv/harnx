@@ -1,6 +1,7 @@
 mod client;
 pub mod format;
 pub mod net;
+mod script_schema;
 pub mod server;
 mod toolset;
 

@@ -453,6 +453,20 @@ fs_grep --pattern TODO --path src -o json | jq -r '.matches[0].path'
 status are the same in both formats. A mapped tool exits with its `exit_code` field
 on success. `help <tool>` shows an OUTPUT section built from the mapping.
 
+A tool with a shell form also declares its result fields with
+`ToolSpec::with_output_schema(schema)`, stored under `harnx:output_schema`. The
+schema is a JSON Schema object; `help <tool>` lists its top-level properties
+under `FIELDS (-o json)` with their types and the first line of each
+description, so a script author knows what `jq` can select. A tool crate keeps
+the schema honest with a test that builds a real script-style result and checks
+its keys against the schema. A third-party MCP tool needs no mapping for this:
+`harnx-mcp-bridge` and `harnx-mcp-remote`'s native mode store a summary of its
+`outputSchema` (the top-level fields only: type and first description line) in
+the same key unless the server already set one. A field's type is its own
+`type`, else the type a local `$ref` (such as `#/$defs/Id`) points at, else the
+member types of an `anyOf` or `oneOf`; a field whose type can't be read that
+way is listed as `any`.
+
 ## Generated `bash` description
 
 `description::bash_tool_description(tools, concurrent_cap, call_cap)` builds the

@@ -24,6 +24,7 @@ pub fn help(
     schema: &Value,
     description: &str,
     output: Option<&OutputMapping>,
+    output_schema: Option<&Value>,
 ) -> String {
     let properties = properties(schema);
     let mut text = format!(
@@ -76,6 +77,9 @@ pub fn help(
     text.push_str("    --\n        End options. Positional arguments aren't supported.\n");
     if let Some(mapping) = output {
         output_section(&mut text, mapping);
+    }
+    if let Some(schema) = output_schema {
+        fields::fields_section(&mut text, schema);
     }
     text
 }
@@ -218,5 +222,6 @@ fn first_sentence(description: &str) -> String {
     line
 }
 
+mod fields;
 #[cfg(test)]
 mod tests;

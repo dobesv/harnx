@@ -5,6 +5,7 @@ use super::*;
 fn reader() -> ToolSpec {
     ToolSpec {
         output: None,
+        output_schema: None,
         name: "files_fs_read".into(),
         description: "Read source files. More detail stays in --help.".into(),
         schema: json!({"type":"object", "properties":{
@@ -16,6 +17,7 @@ fn reader() -> ToolSpec {
 fn creator(encoding: bool) -> ToolSpec {
     let mut tool = ToolSpec {
         output: None,
+        output_schema: None,
         name: "media_attachment_create".into(),
         description: "Create an attachment.".into(),
         schema: json!({"type":"object", "properties":{
@@ -34,6 +36,7 @@ fn fixture() -> Vec<ToolSpec> {
         reader(),
         ToolSpec {
             output: None,
+            output_schema: None,
             name: "search".into(),
             description: "Search indexed records.\nMore details.".into(),
             schema: json!({"type":"object", "properties":{
@@ -187,7 +190,7 @@ fn description_explains_idiomatic_output() {
     for expected in [
         "exit 1 when nothing matches",
         "Notes about cut-off results go to stderr",
-        "-o json prints the tool's fields",
+        "-o json prints the tool's fields; help <tool> lists them under FIELDS when the tool declares them",
         "line numbers",
         "a tool's own error status",
     ] {

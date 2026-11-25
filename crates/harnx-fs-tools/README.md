@@ -61,7 +61,7 @@ fs_find --pattern '*.rs' --path src | while read -r p; do fs_read --path "$p" | 
 if fs_grep --pattern TODO --path src >/dev/null; then echo found; fi
 ```
 
-`-o json` prints the result's fields instead. A direct call from a model is unchanged except that `fs_read` takes `line_numbers` (default true there, false in a script) and `fs_grep` searches a file when `path` names one.
+`-o json` prints the result's fields instead: `fs_read` gives `text`, `notes`, `path`, `total_lines`, `start_line` and `end_line`; `fs_ls` gives `entries` and `notes`; `fs_find` gives `paths` and `notes`; `fs_grep` gives `matches` (rows of `path`, `line`, `text` and, for context lines, `context`), `notes` and `exit_code`. A direct call from a model is unchanged except that `fs_read` takes `line_numbers` (default true there, false in a script) and `fs_grep` searches a file when `path` names one.
 
 ### Attachment resolution
 
