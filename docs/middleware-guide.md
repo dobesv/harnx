@@ -9,6 +9,8 @@ session activation without listing them in the agent's `use_tools`. On unmanaged
 workers, helper servers must run externally and be available to the worker.
 
 Lifecycle `hooks:` are in-process event scripts now; see the [Hooks Guide](hooks-guide.md).
+To define custom agent-facing tools backed by Bash or Python scripts that can call other tools,
+see the [Script Tools Guide](script-tools.md).
 To call an existing Claude hook command from middleware, use the
 [Claude compatibility tool](middleware-claude-hooks.md).
 
@@ -733,6 +735,8 @@ network builtins. Run `CARGO_BUILD_JOBS=8 cargo nextest run -p harnx-runtime mid
 ## Which calls are wrapped
 
 - **Model calls:** yes.
+- **Calls inside script tools:** yes. Calls made by custom [script tools](script-tools.md)
+  pass through configured tool middleware so policies stay effective.
 - **Calls inside the model's Bash script tool:** yes. Wrapping only the outer
   `bash` tool would let inner calls bypass policy; matching inner tools are wrapped
   too.

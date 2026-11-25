@@ -1,0 +1,25 @@
+# Jira through Atlassian's remote MCP, connected with each user's own
+# Atlassian account. Atlassian supports dynamic client registration, so no
+# OAuth client ID is needed; `offline_access` makes the credential refresh
+# automatically. Set `user_id` (config.yaml) or `HARNX_USER_ID` so sessions
+# have an owner, or run with `--single-user` instead for ownerless local
+# sessions. See docs/tool-credentials.md.
+command: harnx-mcp-remote
+enabled: false
+description: >-
+  Jira, connected with each user's own Atlassian account.
+args:
+  - --url
+  - https://atlassian.com/atlassian-connect/24a718ff-40d0-48d9-95e6-64ee72264183/mcp
+  - --name
+  - jira
+  - --credentials-key-file
+  - /etc/harnx/jira-credentials-key.json
+  - --auth-methods
+  - oauth
+  - --oauth-scope
+  - offline_access
+  - --oauth-scope
+  - read:atlassian
+  - --credential-ttl
+  - 365d

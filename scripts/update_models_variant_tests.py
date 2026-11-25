@@ -116,6 +116,8 @@ class TestOpenAIEffortVariants(unittest.TestCase):
             "gpt-6.1-sol",
             "gpt-6.1-terra",
             "gpt-6-luna",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
         ):
             with self.subTest(name=name):
                 model = self._base(name)
@@ -127,20 +129,24 @@ class TestOpenAIEffortVariants(unittest.TestCase):
                 )
 
     def test_astra_exposes_high_and_max_with_refreshed_prices(self) -> None:
-        base = self._base("gpt-6-astra")
-        base.update(input_price=10, output_price=50)
-        variants = um.openai_effort_variants(base, "openai")
-        self.assertEqual(
-            [v["name"] for v in variants],
-            ["gpt-6-astra:high", "gpt-6-astra:max"],
-        )
-        for variant in variants:
-            effort = variant["name"].rsplit(":", 1)[1]
-            self.assertEqual(variant["real_name"], "gpt-6-astra")
-            self.assertEqual(variant["input_price"], 10)
-            self.assertEqual(variant["output_price"], 50)
-            self.assertEqual(variant["endpoint"], "responses")
-            self.assertIn(f'"effort":"{effort}"', variant["patches"][0])
+        for name, input_price, output_price in (
+            ("gpt-6-astra", 10, 50),
+            ("gpt-6.2-astra", 8, 40),
+        ):
+            with self.subTest(name=name):
+                base = self._base(name)
+                base.update(input_price=input_price, output_price=output_price)
+                variants = um.openai_effort_variants(base, "openai")
+                self.assertEqual(
+                    [v["name"] for v in variants], [f"{name}:high", f"{name}:max"]
+                )
+                for variant in variants:
+                    effort = variant["name"].rsplit(":", 1)[1]
+                    self.assertEqual(variant["real_name"], name)
+                    self.assertEqual(variant["input_price"], input_price)
+                    self.assertEqual(variant["output_price"], output_price)
+                    self.assertEqual(variant["endpoint"], "responses")
+                    self.assertIn(f'"effort":"{effort}"', variant["patches"][0])
 
     def test_terra_only_exposes_the_curated_high_alias(self) -> None:
         variants = um.openai_effort_variants(self._base("gpt-5.6-terra"), "openai")
@@ -149,7 +155,7 @@ class TestOpenAIEffortVariants(unittest.TestCase):
         )
 
     def test_gpt_6_sol_family_exposes_high_and_max(self) -> None:
-        for name in ("gpt-6-sol", "gpt-6.1-sol"):
+        for name in ("gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol"):
             with self.subTest(name=name):
                 base = self._base(name)
                 base["cache_read_price"] = 0.1
@@ -371,8 +377,8 @@ class TestProviderModelRegeneration(unittest.TestCase):
                         regenerated[model["name"]].get("patches"), [GEMINI_THOUGHTS_PATCH]
                     )
 
-    def test_argon_refresh_preserves_single_request_context_and_output_limits(self) -> None:
-        name = "gemini-4-argon"
+    def _refresh_gemini_4(self, name: str) -> dict:
+        """`name` as a refresh leaves it, from the limits the registry lists."""
         fetched = {
             name: {
                 "name": name, "max_input_tokens": 1048576,
@@ -382,18 +388,32 @@ class TestProviderModelRegeneration(unittest.TestCase):
         curated = '.headers["x-custom"] = "preserved"'
         old = {name: {"name": name, "patches": [curated, GEMINI_THOUGHTS_PATCH]}}
         fetched[name] = um.merge_old_fields(fetched[name], old[name])
-        models = um.regenerate_provider_models("gemini", old, fetched)
-        model = models[0]
+        model = um.regenerate_provider_models("gemini", old, fetched)[0]
         self.assertEqual(model["max_input_tokens"], 983040)
         self.assertEqual(model["max_output_tokens"], 65536)
         self.assertTrue(model["require_max_tokens"])
         self.assertEqual(model["input_price"], 2)
         self.assertEqual(model["patches"][0], curated)
         self.assertIn("includeThoughts", model["patches"][1])
+        self.assertIn("del(.temperature)", model["patches"][1])
         self.assertEqual(len(model["patches"]), 2)
         fetched_again = {name: um.merge_old_fields({"name": name}, model)}
         refreshed = um.regenerate_provider_models("gemini", {name: model}, fetched_again)[0]
         self.assertEqual(refreshed["patches"], model["patches"])
+        return model
+
+    def test_gemini_4_refresh_preserves_single_request_context_and_output_limits(self) -> None:
+        # Carbon and Argon halve the output of a non-streaming REST request.
+        for name, halves_rest_output in (
+            ("gemini-4-argon", True),
+            ("gemini-4-carbon", True),
+            ("gemini-4-hydrogen", False),
+            ("gemini-4-neon", False),
+        ):
+            with self.subTest(name=name):
+                patch = self._refresh_gemini_4(name)["patches"][1]
+                self.assertIn(".body.generationConfig.maxOutputTokens", patch)
+                self.assertEqual("32768" in patch, halves_rest_output)
 
     def test_glm_5_3_effort_patch_survives_refresh(self) -> None:
         name = "us.zai.glm-5.3"

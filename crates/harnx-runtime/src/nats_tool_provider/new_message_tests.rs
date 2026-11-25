@@ -45,6 +45,7 @@ fn starts_with_message(provider: &NatsToolProvider, route: &RegisteredTool) -> b
 
 #[test]
 fn new_message_opt_in_is_read_from_the_tool_spec() {
+    let scope = ServerScope::from_string("provider-tests");
     let spec = |name: &str| ToolSpec {
         cancellation_guarantee: Default::default(),
         name: name.into(),
@@ -56,6 +57,9 @@ fn new_message_opt_in_is_read_from_the_tool_spec() {
         meta: None,
     };
     let registration = Registration {
+        user_id: None,
+        ownerless_only: false,
+        connection_id: None,
         package: None,
         config: String::new(),
         server: "time".into(),
@@ -63,7 +67,7 @@ fn new_message_opt_in_is_read_from_the_tool_spec() {
         schema_version: 1,
         proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
     };
-    let (tools, _) = build_registered_tools(None, vec![registration]);
+    let (tools, _) = build_registered_tools(&scope, None, vec![registration]);
     let opted_in = |name: &str| tools[name].stop_on_new_message;
     assert_eq!([opted_in("time_wait"), opted_in("time_now")], [true, false]);
 }

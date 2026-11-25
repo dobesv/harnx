@@ -148,6 +148,8 @@ fn harness_with_post_hook(
         base_providers: vec![Arc::new(FakeTool { value, fail })],
         slot: Some(slot.clone()),
         payload_limit: None,
+        script_outputs: Default::default(),
+        full_payload: true,
     })
     .with_attachment_fetcher(fetcher)
     .with_media_store(store);
@@ -169,6 +171,7 @@ fn harness_with_post_hook(
             middleware
         });
     let ctx = Arc::new(ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn,

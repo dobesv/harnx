@@ -21,6 +21,7 @@ import { SubAgentSessionNotes } from './SubAgentSessionNotes';
 import { MessageAttachments } from './MessageAttachments';
 import { sendPrompt, submitHitlDecision, submitInteractionResponse, InteractionResponseError, uploadAttachment, markRead, markUnread } from './api';
 import { A2UIForm } from './a2ui/A2UIForm';
+import { UrlInteractionBody } from './UrlInteractionBody';
 import { A2uiSurfaceCard } from './a2ui/A2uiSurfaceCard';
 import { useA2uiSurfaces } from './a2ui/A2uiSurfacesContext';
 import { buildData, defaultValue, inputFields } from './a2ui/buildData';
@@ -690,7 +691,8 @@ export const InteractionUI = ({
 
   const isA2ui = interaction.kind === 'a2ui';
   const isConfirm = interaction.kind === 'confirm';
-  const isSupported = isConfirm || isA2ui;
+  const isUrl = interaction.kind === 'url';
+  const isSupported = isConfirm || isA2ui || isUrl;
 
   const initFormValues = useCallback((): Record<string, unknown> => {
     if (interaction.kind === 'a2ui' && interaction.payload) {
@@ -761,7 +763,8 @@ export const InteractionUI = ({
         response: {
           action,
           data,
-          note: trimmedNote || undefined,
+          // Decision 6: a url response carries the action alone — no note.
+          note: isUrl ? undefined : trimmedNote || undefined,
         },
       });
 
@@ -834,6 +837,15 @@ export const InteractionUI = ({
           </p>
         )}
 
+        {isUrl && (
+          <>
+            <p className="aui-interrupt-message">
+              <strong>{interaction.message}</strong>
+            </p>
+            <UrlInteractionBody interaction={interaction} />
+          </>
+        )}
+
         {!isSupported && (
           <>
             <p className="aui-interrupt-message">
@@ -875,23 +887,26 @@ export const InteractionUI = ({
             </>
           ))}
 
-        <div style={{ marginTop: '10px' }}>
-          <label
-            htmlFor="interaction-optional-note"
-            style={{ display: 'block', fontSize: '0.9em', marginBottom: '4px' }}
-          >
-            Optional Note:
-          </label>
-          <input
-            id="interaction-optional-note"
-            type="text"
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            disabled={submitting}
-            placeholder="Reason for approval or denial..."
-            style={{ width: '100%', padding: '6px', boxSizing: 'border-box' }}
-          />
-        </div>
+        {/* url interactions carry no note: the stored response is the action alone. */}
+        {!isUrl && (
+          <div style={{ marginTop: '10px' }}>
+            <label
+              htmlFor="interaction-optional-note"
+              style={{ display: 'block', fontSize: '0.9em', marginBottom: '4px' }}
+            >
+              Optional Note:
+            </label>
+            <input
+              id="interaction-optional-note"
+              type="text"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              disabled={submitting}
+              placeholder="Reason for approval or denial..."
+              style={{ width: '100%', padding: '6px', boxSizing: 'border-box' }}
+            />
+          </div>
+        )}
 
         {error && (
           <div
@@ -922,22 +937,61 @@ export const InteractionUI = ({
               Approve
             </button>
           )}
-          <button
-            type="button"
-            disabled={submitting}
-            onClick={() => handleResponse('deny')}
-            className="aui-interrupt-submit a2ui-btn-deny"
-            style={{
-              backgroundColor: '#c62828',
-              color: 'white',
-              padding: '6px 12px',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: 'pointer',
-            }}
-          >
-            Deny
-          </button>
+          {isUrl && (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => handleResponse('continue')}
+              className="aui-interrupt-submit"
+              data-testid="url-interaction-continue"
+              style={{
+                backgroundColor: '#2e7d32',
+                color: 'white',
+                padding: '6px 12px',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+              }}
+            >
+              Continue
+            </button>
+          )}
+          {isUrl ? (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => handleResponse('cancel')}
+              className="aui-interrupt-submit a2ui-btn-deny"
+              data-testid="url-interaction-cancel"
+              style={{
+                backgroundColor: '#c62828',
+                color: 'white',
+                padding: '6px 12px',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+              }}
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => handleResponse('deny')}
+              className="aui-interrupt-submit a2ui-btn-deny"
+              style={{
+                backgroundColor: '#c62828',
+                color: 'white',
+                padding: '6px 12px',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+              }}
+            >
+              Deny
+            </button>
+          )}
         </div>
 
         {interaction.pendingCount > 0 && (

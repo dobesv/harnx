@@ -1,5 +1,6 @@
 command: harnx-fetch-tools
 description: >-
-  Fetch web pages as markdown, plain text, or JSON. Used by Pytheas,
-  Zosimus, Hephaestus, and other agents to read documentation and URLs.
-  Blocks private IP connections by default for SSRF protection.
+  Fetch web pages as markdown, plain text, or JSON, and PNG, JPEG, GIF,
+  or WebP images up to 5 MiB. Used by Pytheas, Zosimus, Hephaestus, Erato,
+  and other agents to read documentation, URLs, and public images. Blocks
+  private IP connections by default for SSRF protection.

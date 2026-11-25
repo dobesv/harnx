@@ -1,47 +1,22 @@
-use super::{modal, snapshot, tui_with_pending};
+use super::{drawn_screen, drawn_screen_at_tiny_sizes, modal, snapshot, tui_with_pending};
 use crate::interaction_confirmation::{InteractionEvent, ModalState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{backend::TestBackend, Terminal};
 
 #[tokio::test]
 async fn modal_renders_public_message_and_unsupported_kind_without_approve() {
     let mut tui = tui_with_pending().await;
     let mut state = modal(&mut tui).clone();
-    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-    terminal
-        .draw(|frame| tui.render_interaction_modal(frame, frame.area(), &mut state))
-        .unwrap();
-    let screen = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
+    let screen = drawn_screen(&mut tui, &mut state, 100, 12);
     assert!(screen.contains("Allow second?"));
     assert!(screen.contains("1 more pending"));
     assert!(screen.contains("ENTER approve"));
     assert!(!screen.contains("private"));
     state.pending.kind = "future-form".into();
-    terminal
-        .draw(|frame| tui.render_interaction_modal(frame, frame.area(), &mut state))
-        .unwrap();
-    let screen = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
+    let screen = drawn_screen(&mut tui, &mut state, 100, 12);
     assert!(screen.contains("not supported by this client"));
     assert!(screen.contains("Ctrl+D deny"));
     assert!(!screen.contains("ENTER approve"));
-    for (width, height) in [(40, 6), (8, 3), (1, 1), (0, 0)] {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| tui.render_interaction_modal(frame, frame.area(), &mut state))
-            .unwrap();
-    }
+    drawn_screen_at_tiny_sizes(&mut tui, &mut state);
 }
 
 #[tokio::test]

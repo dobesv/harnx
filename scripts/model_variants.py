@@ -31,11 +31,25 @@ GEMINI_SAMPLING_THOUGHTS_PATCH = (
     "del(.temperature) | del(.topP) | del(.topK) | del(.candidateCount)) | "
     + GEMINI_THOUGHTS_PATCH
 )
+# One Gemini 4 request returns at most 65,536 output tokens. Carbon and Argon
+# halve that for a non-streaming REST call; Neon and Hydrogen don't.
+# https://ai.google.dev/gemini-api/docs/generate-content/long-decode
+GEMINI_4_OUTPUT_LIMIT = 65536
 ARGON_REQUEST_PATCH = GEMINI_SAMPLING_THOUGHTS_PATCH + (
     " | .body.generationConfig.maxOutputTokens = "
     "([.body.generationConfig.maxOutputTokens // 65536, "
     '(if (.url | endswith(":generateContent")) then 32768 else 65536 end)] | min)'
 )
+GEMINI_4_REQUEST_PATCH = GEMINI_SAMPLING_THOUGHTS_PATCH + (
+    " | .body.generationConfig.maxOutputTokens = "
+    "([.body.generationConfig.maxOutputTokens // 65536, 65536] | min)"
+)
+GEMINI_4_REQUEST_PATCHES = {
+    "gemini-4-argon": ARGON_REQUEST_PATCH,
+    "gemini-4-carbon": ARGON_REQUEST_PATCH,
+    "gemini-4-hydrogen": GEMINI_4_REQUEST_PATCH,
+    "gemini-4-neon": GEMINI_4_REQUEST_PATCH,
+}
 # Gemini 2.5 and later think, except these models.
 GEMINI_NON_THINKING_MARKERS = ("-image", "-tts", "-native-audio")
 
@@ -54,6 +68,8 @@ OPENAI_EFFORT_VARIANTS = {
     "gpt-6-astra": ("high", "max"),
     "gpt-6-sol": ("high", "max"),
     "gpt-6.1-sol": ("high", "max"),
+    "gpt-6.2-astra": ("high", "max"),
+    "gpt-6.2-sol": ("high", "max"),
 }
 OPENAI_NO_SAMPLING_PATCH = "del(.body.temperature) | del(.body.top_p)"
 OPENAI_SUMMARY_PATCH = '.body.reasoning = {"summary":"auto"}'
@@ -237,6 +253,8 @@ def apply_openai_base_patches(model: dict[str, Any], provider: str) -> None:
         "gpt-6.1-sol",
         "gpt-6.1-terra",
         "gpt-6-luna",
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
     ):
         model["patches"] = [f"{OPENAI_NO_SAMPLING_PATCH} | {OPENAI_SUMMARY_PATCH}"]
 
@@ -276,22 +294,31 @@ def apply_gemini_thoughts(model: dict[str, Any], provider: str) -> None:
     """
     if provider not in ("gemini", "vertexai"):
         return
-    if provider == "gemini" and model["name"] == "gemini-4-argon":
-        apply_argon_limits(model)
+    if provider == "gemini" and model["name"] in GEMINI_4_REQUEST_PATCHES:
+        apply_gemini_4_limits(model)
     elif provider == "gemini" and model["name"] == "gemini-3.8-flash":
         model["patches"] = [GEMINI_SAMPLING_THOUGHTS_PATCH]
     elif "patches" not in model and gemini_thinks(model):
         model["patches"] = [GEMINI_THOUGHTS_PATCH]
 
 
-def apply_argon_limits(model: dict[str, Any]) -> None:
-    """Replace owned Argon rules once, retaining unrelated curated patches."""
-    # Reserve streaming output inside Argon's unified 1,048,576-token window.
-    # https://ai.google.dev/gemini-api/docs/generate-content/long-decode
-    model.update(max_input_tokens=983040, max_output_tokens=65536, require_max_tokens=True)
-    owned = {GEMINI_THOUGHTS_PATCH, GEMINI_SAMPLING_THOUGHTS_PATCH, ARGON_REQUEST_PATCH}
+def apply_gemini_4_limits(model: dict[str, Any]) -> None:
+    """Replace owned Gemini 4 rules once, retaining unrelated curated patches."""
+    # Input, thinking and output share one 1,048,576-token window. The registry
+    # lists that whole window as the output limit, which is only reachable with
+    # long decode, so reserve one request's output inside it instead.
+    model.update(
+        max_input_tokens=1048576 - GEMINI_4_OUTPUT_LIMIT,
+        max_output_tokens=GEMINI_4_OUTPUT_LIMIT,
+        require_max_tokens=True,
+    )
+    owned = {
+        GEMINI_THOUGHTS_PATCH,
+        GEMINI_SAMPLING_THOUGHTS_PATCH,
+        *GEMINI_4_REQUEST_PATCHES.values(),
+    }
     curated = [patch for patch in model.get("patches", []) if patch not in owned]
-    model["patches"] = [*curated, ARGON_REQUEST_PATCH]
+    model["patches"] = [*curated, GEMINI_4_REQUEST_PATCHES[model["name"]]]
 
 
 def apply_bedrock_base_patches(model: dict[str, Any], provider: str) -> None:

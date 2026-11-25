@@ -29,7 +29,9 @@ use ratatui::Terminal;
 #[cfg(test)]
 use ratatui_textarea::Input as TextInput;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::{self, Write};
+use std::pin::Pin;
 use std::sync::Arc;
 
 pub(crate) struct NewSessionSelection {
@@ -731,6 +733,15 @@ impl Tui {
 
     /// Generic run_loop that works with any Backend and EventSource.
     /// Used by production `run()` with Crossterm, and by tests with TestBackend.
+    /// Deep subfutures enter it only through the type-erased seams
+    /// (`handle_key_erased`, `handle_paste_erased`,
+    /// `handle_tui_event_erased`, `poll_pending_exit_cancel_erased`,
+    /// `try_resume_async_hooks_erased`): rustc walks the layout of this
+    /// loop's future cumulatively, and a concrete deep future held across an
+    /// await here can overflow the compiler's query-depth budget (Windows CI,
+    /// PR #2835; see AGENTS.md "Future size and type erasure in
+    /// harnx-runtime"). Any new `.await` of a deep future in this loop must
+    /// go through a `Pin<Box<dyn Future>>` wrapper like those.
     async fn run_loop_inner<B, E>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -775,13 +786,13 @@ impl Tui {
                     Event::Key(key)
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
-                        self.handle_key(key).await?
+                        self.handle_key_erased(key).await?
                     }
                     Event::Mouse(mouse) => {
                         self.handle_mouse(mouse);
                     }
                     Event::Paste(text) => {
-                        self.handle_paste(text).await;
+                        self.handle_paste_erased(text).await;
                     }
                     Event::Resize(_, _) => {}
                     _ => {}
@@ -790,10 +801,10 @@ impl Tui {
 
             let mut drained = 0usize;
             while let Ok(evt) = self.event_rx.try_recv() {
-                self.handle_tui_event(evt).await?;
+                self.handle_tui_event_erased(evt).await?;
                 drained += 1;
             }
-            self.poll_pending_exit_cancel().await;
+            self.poll_pending_exit_cancel_erased().await;
             if drained >= WATCHDOG_EVENT_DRAIN {
                 // A single tick draining this many events means a producer is
                 // flooding the channel faster than the UI consumes it — the
@@ -844,7 +855,7 @@ impl Tui {
 
                 // Check for async hook results that need a follow-up prompt (fix #2)
                 if !self.app.llm_busy {
-                    self.try_resume_async_hooks().await?;
+                    self.try_resume_async_hooks_erased().await?;
                 }
             }
 
@@ -889,6 +900,14 @@ impl Tui {
                 needs_full_redraw.store(true, std::sync::atomic::Ordering::Release);
             })),
         );
+    }
+
+    /// Type-erased seam for the run loop (PR #2835 Windows CI query-depth
+    /// overflow): `Pin<Box<dyn Future>>` stops rustc's cumulative layout
+    /// walk of the loop's future at this await; see AGENTS.md "Future size
+    /// and type erasure in harnx-runtime".
+    fn try_resume_async_hooks_erased(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + '_>> {
+        Box::pin(self.try_resume_async_hooks())
     }
 
     /// Check if an async hook has signalled a resume and automatically start the follow-up prompt.
@@ -1779,6 +1798,42 @@ mod tests {
             "response": {"not": "string"}
         });
         assert_eq!(super::subagent_response_from_output(&wrong_type), None);
+    }
+
+    #[tokio::test]
+    async fn try_resume_async_hooks_erased_resumes_pending_context() {
+        use crate::test_utils::TuiTestHarness;
+
+        let mut harness = TuiTestHarness::new().await;
+        *harness.tui().pending_async_context.lock().await = Some("finish the sweep".to_string());
+
+        harness.tui().try_resume_async_hooks_erased().await.unwrap();
+
+        assert!(harness.tui().pending_async_context.lock().await.is_none());
+        assert!(harness.tui().app.llm_busy);
+        assert!(matches!(
+            harness.tui().app.transcript.last(),
+            Some(TranscriptItem::SystemText(text)) if text == "↩ Async resume: finish the sweep"
+        ));
+
+        harness.drain_and_settle().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_resume_async_hooks_erased_noop_without_pending_context() {
+        use crate::test_utils::TuiTestHarness;
+
+        let mut harness = TuiTestHarness::new().await;
+        let transcript_len = harness.tui().app.transcript.len();
+
+        harness.tui().try_resume_async_hooks_erased().await.unwrap();
+
+        assert!(!harness.tui().app.llm_busy);
+        // No resume item was appended: Tui::init seeds the transcript, so
+        // compare lengths rather than expecting an empty vec.
+        assert_eq!(harness.tui().app.transcript.len(), transcript_len);
+
+        harness.drain_and_settle().await.unwrap();
     }
 }
 

@@ -1,4 +1,4 @@
-//! Actual MCP child -> bridge offload -> worker cache -> OpenAI HTTP request.
+//! Real native toolset or MCP bridge -> worker cache -> OpenAI HTTP request.
 use super::result_fixture::{
     BridgeScript, CapturedProvider, McpBridge, ProviderSession, ResultEnvironment, SessionSpec,
 };
@@ -11,6 +11,8 @@ mod fixture;
 mod image;
 #[path = "image_attachments/malformed.rs"]
 mod malformed;
+#[path = "image_attachments/native.rs"]
+mod native;
 use fixture::{ImageFixture, RemoteImage};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -57,4 +59,14 @@ async fn corrupt_bridge_image_fails_before_same_turn_provider_request() -> Resul
     );
     assert_eq!(fixture.bridge.call_count()?, 1);
     fixture.bridge.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_fetch_large_image_reaches_provider_and_replays() -> Result<()> {
+    native::exercise(native::Source::fetch().await).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_fs_large_image_reaches_provider_and_replays() -> Result<()> {
+    native::exercise(native::Source::fs()?).await
 }

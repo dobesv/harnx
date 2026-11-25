@@ -270,11 +270,21 @@ fn read_attachment_mime(dir: &Path, hash: AttachmentHash<'_>, blob_path: &Path) 
     }
 }
 
+/// `cid:media` content hash: SHA-256 of the full `data:` URL string, not of
+/// the decoded bytes.
+///
+/// Every producer must hash the canonical `data:<mime>;base64,<STANDARD>`
+/// form (standard base64 engine, `;base64,` separator, the exact MIME the
+/// blob is stored with). Hydration re-derives that string from the stored
+/// blob and compares digests (`validate_attachment_digest` in
+/// `harnx-runtime/src/nats_attachments.rs`), so a raw-byte hash or any other
+/// encoding fails download validation.
 pub fn cid_for_data_url(data_url: &str) -> String {
     format!("{CID_PREFIX}{}", sha256(data_url))
 }
 
-/// Build a cid:media URL from a SessionRef and data URL content hash.
+/// Build a cid:media URL from a SessionRef and [`cid_for_data_url`] content
+/// hash.
 ///
 /// Returns `cid:media:<agent>/<sid>/<sha256>` where agent is percent-encoded
 /// (or `_temp` for no-agent sessions).

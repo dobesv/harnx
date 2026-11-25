@@ -92,6 +92,14 @@ impl TestConfigSandbox {
         self.write_agent_with_front_matter(name, "model: openai:gpt-4o", prompt);
     }
 
+    /// Write the `users.yaml` the server loads user aliases from at build
+    /// time. Only meaningful before `Server` is built: the alias snapshot is
+    /// immutable after startup.
+    // qual:test_helper — only the in-crate session-claim race tests use it.
+    pub fn write_user_aliases(&self, body: &str) {
+        fs::write(self.root.join("users.yaml"), body).expect("write users.yaml");
+    }
+
     pub fn write_agent_with_front_matter(&self, name: &str, front_matter: &str, prompt: &str) {
         let body = format!("---\n{front_matter}\n---\n{prompt}\n");
         fs::write(self.root.join("agents").join(format!("{name}.md")), body).expect("write agent");
@@ -171,6 +179,14 @@ pub async fn handoff_identity_for_test(
 }
 
 /// Return whether the optional NATS test dependency is available.
+///
+/// Create the `TestConfigSandbox` before calling this, not after: the shared
+/// local broker is located and registered through
+/// `config_paths::nats_runtime_ports_file()`, which resolves under the state
+/// dir the sandbox installs. A sandbox created after this call redirects the
+/// config to a different state dir than the one the broker was registered
+/// under, so the test either spawns a second broker or connects to the wrong
+/// one.
 pub async fn ensure_test_nats() -> bool {
     if let Err(error) =
         crate::ensure_frontend_nats_owner(harnx_runtime::config::LOCAL_CLUSTER_KEY).await

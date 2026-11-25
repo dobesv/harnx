@@ -306,15 +306,7 @@ impl FsServer {
     }
 
     fn find_files_pattern(search_path: &Path, pattern: &str) -> String {
-        let mut base_str = search_path.display().to_string();
-        #[cfg(windows)]
-        {
-            if let Some(rest) = base_str.strip_prefix(r"\\?\UNC\").map(str::to_owned) {
-                base_str = format!(r"\\{rest}");
-            } else if let Some(rest) = base_str.strip_prefix(r"\\?\").map(str::to_owned) {
-                base_str = rest;
-            }
-        }
+        let mut base_str = without_verbatim_prefix(&search_path.display().to_string());
         if std::path::MAIN_SEPARATOR != '/' {
             base_str = base_str.replace(std::path::MAIN_SEPARATOR, "/");
         }
@@ -414,10 +406,65 @@ impl FsServer {
             ContentBlock::text(summary).with_audience(vec![Role::User]),
         ])))
     }
+    /// A model gets control characters and invalid bytes dropped; a script gets
+    /// the bytes `cat` would print, with invalid UTF-8 shown as U+FFFD.
+    fn decode_file(bytes: &[u8], style: ResultStyle) -> String {
+        let decoded = String::from_utf8_lossy(bytes);
+        match style {
+            ResultStyle::Model => sanitize_output_text(&decoded),
+            ResultStyle::Script => decoded.into_owned(),
+        }
+    }
+
+    /// A script splits on `\n` only, so a CRLF file keeps its `\r`.
+    fn split_file_lines(text: &str, style: ResultStyle) -> Vec<&str> {
+        match style {
+            ResultStyle::Model => text.lines().collect(),
+            ResultStyle::Script => text.split_terminator('\n').collect(),
+        }
+    }
+
+    fn nothing_to_read(path: &str, message: String, style: ResultStyle) -> CallToolResult {
+        match style {
+            ResultStyle::Model => CallToolResult::success(vec![ContentBlock::text(message)]),
+            ResultStyle::Script => empty_read_result(path, message),
+        }
+    }
+
+    /// The lines matching `grep` (all of them without one), numbered from 1.
+    fn matching_lines<'a>(
+        all_lines: &[&'a str],
+        grep: Option<&str>,
+    ) -> Result<Vec<(usize, &'a str)>, ErrorData> {
+        let regex = grep
+            .map(|pattern| {
+                Regex::new(pattern).map_err(|err| {
+                    ErrorData::invalid_params(
+                        format!("invalid grep regex '{pattern}': {err}"),
+                        None,
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(all_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| match &regex {
+                Some(regex) => regex.is_match(line).unwrap_or(false),
+                None => true,
+            })
+            .map(|(index, line)| (index + 1, *line))
+            .collect())
+    }
+
     pub async fn read_file_impl(
         &self,
-        params: ReadFileParams,
+        mut params: ReadFileParams,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
+        params
+            .line_numbers
+            .get_or_insert(style == ResultStyle::Model);
         let path = validate_path(&params.path, &self.allowlist).map_err(invalid_params)?;
 
         let metadata = std::fs::metadata(&path)
@@ -449,41 +496,18 @@ impl FsServer {
             return tool_error(format!("'{}' appears to be a binary file.", params.path));
         }
 
-        let text = sanitize_output_text(&String::from_utf8_lossy(&bytes));
-        let all_lines = text.lines().collect::<Vec<_>>();
+        let text = Self::decode_file(&bytes, style);
+        let all_lines = Self::split_file_lines(&text, style);
 
         if all_lines.is_empty() {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "{} (empty file, 0 lines)",
-                params.path
-            ))]));
+            let message = format!("{} (empty file, 0 lines)", params.path);
+            return Ok(Self::nothing_to_read(&params.path, message, style));
         }
 
-        let grep_regex = if let Some(pattern) = params.grep.as_deref() {
-            Some(Regex::new(pattern).map_err(|err| {
-                ErrorData::invalid_params(format!("invalid grep regex '{pattern}': {err}"), None)
-            })?)
-        } else {
-            None
-        };
-
-        let numbered_lines = all_lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| match &grep_regex {
-                Some(regex) => match regex.is_match(line) {
-                    Ok(true) => Some((index + 1, *line)),
-                    Ok(false) => None,
-                    Err(_) => None,
-                },
-                None => Some((index + 1, *line)),
-            })
-            .collect::<Vec<_>>();
-
+        let numbered_lines = Self::matching_lines(&all_lines, params.grep.as_deref())?;
         if numbered_lines.is_empty() {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "No matching lines found".to_string(),
-            )]));
+            let message = "No matching lines found".to_string();
+            return Ok(Self::nothing_to_read(&params.path, message, style));
         }
 
         let total_matching_lines = numbered_lines.len();
@@ -491,6 +515,21 @@ impl FsServer {
 
         let (numbered_lines, shown_line_start, shown_line_end) =
             Self::paginate_read_lines(&params, numbered_lines, &mut notices)?;
+
+        if style == ResultStyle::Script {
+            return Ok(script_read_result(
+                &params,
+                ReadSelection {
+                    lines: numbered_lines,
+                    total_lines: total_matching_lines,
+                    start_line: shown_line_start,
+                    end_line: shown_line_end,
+                    file_bytes: bytes.len(),
+                    notes: notices,
+                    unterminated_line: (!text.ends_with('\n')).then_some(all_lines.len()),
+                },
+            ));
+        }
 
         render_read_result(
             &params,
@@ -709,9 +748,82 @@ impl FsServer {
         ))
     }
 
+    fn compile_search(
+        params: &SearchFilesParams,
+    ) -> Result<(Regex, Option<glob::Pattern>), ErrorData> {
+        let pattern = if params.ignore_case.unwrap_or(false) {
+            format!("(?i){}", params.pattern)
+        } else {
+            params.pattern.clone()
+        };
+
+        let regex = Regex::new(&pattern).map_err(|err| {
+            ErrorData::invalid_params(format!("invalid regex '{}': {err}", params.pattern), None)
+        })?;
+
+        let include_glob = match params.include.as_deref() {
+            Some(pattern) => Some(glob::Pattern::new(pattern).map_err(|err| {
+                ErrorData::invalid_params(format!("invalid include glob '{pattern}': {err}"), None)
+            })?),
+            None => None,
+        };
+
+        Ok((regex, include_glob))
+    }
+
+    fn model_search_result(
+        results: &[SearchLine],
+        search_location: &str,
+        max_results: usize,
+        limit_reached: bool,
+    ) -> CallToolResult {
+        let match_count = results.len();
+        let raw_output = results
+            .iter()
+            .map(SearchLine::model_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let raw_bytes = raw_output.len();
+        let (output, byte_truncated) = apply_search_notices(raw_output, limit_reached, max_results);
+
+        let summary = search_summary(
+            search_location,
+            &SearchTruncation {
+                match_count,
+                max_results,
+                limit_reached,
+                output_bytes: output.len(),
+                raw_bytes,
+                byte_truncated,
+            },
+        );
+        CallToolResult::success(vec![
+            ContentBlock::text(output).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
+        ])
+    }
+
+    /// Sorted entries capped at the listing limit, the number scanned, and
+    /// whether the cap cut anything.
+    // qual:allow(iosp) — picking the walker and applying the cap need a branch and a length comparison around the calls; splitting them only moves the finding.
+    fn list_entries(path: &Path, recursive: bool) -> (Vec<String>, usize, bool) {
+        let mut entries = Vec::new();
+        let mut scan_count = 0usize;
+        if recursive {
+            walk_dir_recursive(path, path, &mut entries, &mut scan_count);
+        } else {
+            walk_dir_flat(path, &mut entries, &mut scan_count);
+        }
+        entries.sort();
+        let limit_reached = entries.len() > DEFAULT_LS_LIMIT;
+        entries.truncate(DEFAULT_LS_LIMIT);
+        (entries, scan_count, limit_reached)
+    }
+
     pub async fn list_directory_impl(
         &self,
         params: ListDirectoryParams,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
         let path = validate_path(&params.path, &self.allowlist).map_err(invalid_params)?;
 
@@ -725,19 +837,18 @@ impl FsServer {
             ));
         }
 
-        let recursive = params.recursive.unwrap_or(false);
-        let mut entries = Vec::new();
-        let mut scan_count = 0usize;
+        let (entries, scan_count, limit_reached) =
+            Self::list_entries(&path, params.recursive.unwrap_or(false));
 
-        if recursive {
-            walk_dir_recursive(&path, &path, &mut entries, &mut scan_count);
-        } else {
-            walk_dir_flat(&path, &mut entries, &mut scan_count);
+        if style == ResultStyle::Script {
+            let listing = LsListing {
+                path: &params.path,
+                entries,
+                scan_count,
+                limit_reached,
+            };
+            return Ok(script_ls(listing, DEFAULT_MAX_BYTES));
         }
-
-        entries.sort();
-        let limit_reached = entries.len() > DEFAULT_LS_LIMIT;
-        entries.truncate(DEFAULT_LS_LIMIT);
 
         if entries.is_empty() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
@@ -773,77 +884,69 @@ impl FsServer {
     pub(crate) async fn search_files_impl(
         &self,
         params: SearchFilesParams,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
         let search_path = match params.path.as_deref() {
             Some(path) => validate_path(path, &self.allowlist).map_err(invalid_params)?,
             None => default_search_path(&self.allowlist)?,
         };
 
-        let pattern = if params.ignore_case.unwrap_or(false) {
-            format!("(?i){}", params.pattern)
-        } else {
-            params.pattern.clone()
-        };
-
-        let regex = Regex::new(&pattern).map_err(|err| {
-            ErrorData::invalid_params(format!("invalid regex '{}': {err}", params.pattern), None)
-        })?;
-
-        let include_glob = match params.include.as_deref() {
-            Some(pattern) => Some(glob::Pattern::new(pattern).map_err(|err| {
-                ErrorData::invalid_params(format!("invalid include glob '{pattern}': {err}"), None)
-            })?),
-            None => None,
-        };
+        let target =
+            open_search_target(&search_path, params.path.as_deref().unwrap_or("workspace"))?;
+        let (regex, include_glob) = Self::compile_search(&params)?;
 
         let context_lines = params.context_lines.unwrap_or(0);
         let max_results = params.max_results.unwrap_or(DEFAULT_GREP_LIMIT);
         let mut results = Vec::new();
-        search_recursive(
-            &search_path,
-            &search_path,
-            &regex,
+        let single_file = matches!(target, SearchTarget::File(_));
+        let search = GrepSearch {
+            regex: &regex,
+            include_glob: include_glob.as_ref(),
             context_lines,
-            max_results + 1,
-            include_glob.as_ref(),
-            &mut results,
-        );
+            max_results: max_results + 1,
+        };
+        search.run(&search_path, target, &mut results);
 
-        if results.is_empty() {
+        // Decided before the cap: a zero limit still found something. Rows
+        // are only collected around a match, so any row means a match.
+        let found_match = !results.is_empty();
+        let limit_reached = results.len() > max_results;
+        results.truncate(max_results);
+        if style == ResultStyle::Script {
+            let given = params.path.as_deref();
+            let prefix = match (single_file, given) {
+                (true, Some(given)) => {
+                    relabel_rows(&mut results, given);
+                    None
+                }
+                _ => path_prefix(given, &search_path),
+            };
+            let cut = GrepCut {
+                location: params.path.as_deref().unwrap_or("workspace"),
+                max_results,
+                limit_reached,
+                found_match,
+                path_prefix: prefix.as_deref(),
+            };
+            return Ok(script_grep(results, cut, DEFAULT_MAX_BYTES));
+        }
+        if !found_match {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "No matches found".to_string(),
             )]));
         }
-
-        let limit_reached = results.len() > max_results;
-        results.truncate(max_results);
-        let match_count = results.len();
-
-        let raw_output = results.join("\n");
-        let raw_bytes = raw_output.len();
-        let (output, byte_truncated) = apply_search_notices(raw_output, limit_reached, max_results);
-
-        let search_location = params.path.as_deref().unwrap_or("workspace");
-        let summary = search_summary(
-            search_location,
-            &SearchTruncation {
-                match_count,
-                max_results,
-                limit_reached,
-                output_bytes: output.len(),
-                raw_bytes,
-                byte_truncated,
-            },
-        );
-        Ok(CallToolResult::success(vec![
-            ContentBlock::text(output).with_audience(vec![Role::Assistant]),
-            ContentBlock::text(summary).with_audience(vec![Role::User]),
-        ]))
+        Ok(Self::model_search_result(
+            &results,
+            params.path.as_deref().unwrap_or("workspace"),
+            max_results,
+            limit_reached,
+        ))
     }
 
     pub(crate) async fn find_files_impl(
         &self,
         params: FindFilesParams,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
         let search_path = match params.path.as_deref() {
             Some(path) => validate_path(path, &self.allowlist).map_err(invalid_params)?,
@@ -867,15 +970,26 @@ impl FsServer {
 
         let mut paths = Self::collect_found_paths(&search_path, glob_results, max_results);
 
-        if paths.is_empty() {
+        // Decided before the cap: a zero limit still found something.
+        let found_any = !paths.is_empty();
+        paths.sort();
+        let limit_reached = paths.len() > max_results;
+        paths.truncate(max_results);
+        if style == ResultStyle::Script {
+            strip_search_root(&mut paths, &search_path);
+            let prefix = path_prefix(params.path.as_deref(), &search_path);
+            return Ok(script_find(
+                paths,
+                max_results,
+                limit_reached,
+                (prefix.as_deref(), DEFAULT_MAX_BYTES),
+            ));
+        }
+        if !found_any {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "No files found matching pattern".to_string(),
             )]));
         }
-
-        paths.sort();
-        let limit_reached = paths.len() > max_results;
-        paths.truncate(max_results);
         let path_count = paths.len();
 
         let mut output = paths.join("\n");
@@ -929,5 +1043,76 @@ impl FsServer {
             &params.commit_id[..8.min(params.commit_id.len())],
             new_commit_id.to_hex(),
         ))]))
+    }
+}
+
+impl GrepSearch<'_> {
+    fn run(&self, search_path: &Path, target: SearchTarget, results: &mut Vec<SearchLine>) {
+        match target {
+            // `grep PATTERN FILE` searches that file; `include` only filters
+            // files found by walking a directory.
+            SearchTarget::File(content) => {
+                let base = search_path.parent().unwrap_or(search_path);
+                search_file(self, base, search_path, &content, results);
+            }
+            SearchTarget::Dir(read_dir) => {
+                search_recursive(self, search_path, read_dir, results);
+            }
+        }
+    }
+}
+
+/// What a search target holds once it is open.
+enum SearchTarget {
+    Dir(std::fs::ReadDir),
+    File(Vec<u8>),
+}
+
+/// Open the path the caller named, once, and report why it can't be searched.
+///
+/// Entries met while walking a directory are skipped when unreadable, too
+/// large or binary, as `grep -rs` does. The path the caller named is
+/// different: skipping it would return no rows, which a script reads as
+/// "nothing matched" and a model as "No matches found", although nothing was
+/// searched. Anything that is neither a directory nor a regular file is
+/// refused unopened, since reading a FIFO blocks until a writer appears.
+fn open_search_target(search_path: &Path, given: &str) -> Result<SearchTarget, ErrorData> {
+    let cannot = |err: std::io::Error| internal_error(format!("cannot search '{given}': {err}"));
+    let metadata = std::fs::metadata(search_path).map_err(cannot)?;
+    if metadata.is_dir() {
+        return std::fs::read_dir(search_path)
+            .map(SearchTarget::Dir)
+            .map_err(cannot);
+    }
+    if !metadata.is_file() {
+        return Err(internal_error(format!(
+            "'{given}' is not a regular file or directory"
+        )));
+    }
+    if metadata.len() > SEARCH_FILE_MAX_BYTES {
+        return Err(internal_error(format!(
+            "'{given}' is too large to search ({} bytes, max {})",
+            metadata.len(),
+            format_size(SEARCH_FILE_MAX_BYTES as usize)
+        )));
+    }
+    let content = std::fs::read(search_path).map_err(cannot)?;
+    if is_binary_content(&content) {
+        return Err(internal_error(format!(
+            "'{given}' appears to be a binary file."
+        )));
+    }
+    Ok(SearchTarget::File(content))
+}
+
+/// Name the searched file by the argument exactly as the caller gave it. The
+/// rows carry the canonical file name, which differs from the argument for a
+/// symlink and has other separators on Windows, so rebuilding the path from
+/// parts would not name the file the caller passed.
+fn relabel_rows(results: &mut [SearchLine], given: &str) {
+    for line in results {
+        if let SearchLine::Row { path, .. } = line {
+            *path = given.to_string();
+        }
     }
 }

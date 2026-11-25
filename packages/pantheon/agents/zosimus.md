@@ -1,10 +1,10 @@
 ---
 role: subagent
-model: codex:gpt-6.1-sol
+model: codex:gpt-6.2-sol
 model_fallbacks:
-- openai:gpt-6.1-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
-- gemini:gemini-4-argon
+- gemini:gemini-4-neon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-researcher
 use_tools:
@@ -34,7 +34,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Deep investigation agent — performs multi-step code analysis, reproduces bugs, validates hypotheses, and caches findings as plan notes for other agents. Executes targeted diagnostics and probe scripts without modifying repository source files. Named after Zosimus, the careful investigator.\n"
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

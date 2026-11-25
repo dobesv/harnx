@@ -1,9 +1,9 @@
 ---
 role: subagent
-model: gemini:gemini-3.8-flash
+model: gemini:gemini-4-hydrogen
 model_fallbacks:
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
 - bedrock:us.zai.glm-5.3
 compaction_agent: compact-argus
@@ -29,7 +29,7 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 description: "Task verification agent — independently verifies work completed by other agents by reading changed files, running tests and diagnostics, and cross-checking claims against actual results. Returns structured PASS/FAIL verdicts with evidence. Named after Argus (AR-gus) Panoptes, the hundred-eyed giant who never slept.\n"
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

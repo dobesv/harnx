@@ -75,22 +75,40 @@ impl Server {
         let Some((rules, identities)) = self.access(req) else {
             return true;
         };
-        let Some(agent) = url.session().agent.as_deref() else {
-            return false;
-        };
-        let owner = match self
-            .read_session_owner(self.config.default_cluster_key(), &url.session().owner())
-            .await
+        // The blob route serves from the default cluster, so the source owner
+        // is read there too; prompt ingress passes its destination cluster.
+        let cluster = self.config.default_cluster_key();
+        let store = match crate::session_access::open_session_metadata_readonly(
+            &self.config,
+            cluster,
+        )
+        .await
         {
-            Ok(Some(owner)) => owner,
+            Ok(Some(store)) => store,
+            // No session metadata exists yet: no source is attributable, so
+            // fail closed with the same 404 the blob route already returns
+            // when the broker is down.
             Ok(None) => return false,
             Err(error) => {
-                debug!("CID session metadata read failed for {url}: {error:#}");
+                log::warn!(
+                    "CID authorization in cluster '{cluster}' could not read session metadata: {}",
+                    crate::nats_access::sanitized_error_chain(&error)
+                );
                 return false;
             }
         };
         let caller = identities.caller();
-        rules.can_access_session(agent, caller.view(), owner.as_deref())
+        let check = crate::session_access::SourceCheck {
+            store: &store,
+            rules,
+            caller: caller.view(),
+            cluster,
+            default_cluster: self.config.default_cluster_for_display(),
+        };
+        matches!(
+            check.access(url).await,
+            crate::session_access::SourceAccess::Authorized
+        )
     }
 }
 

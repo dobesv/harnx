@@ -7,6 +7,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use harnx_attachment_tools::AttachmentToolset;
 use harnx_core::{
     agent_config::AgentConfig,
+    instance::ServerScope,
     tool::{ToolDeclaration, Tools},
 };
 use harnx_script::{
@@ -23,6 +24,7 @@ const PNG: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 fn declarations() -> Vec<ToolDeclaration> {
+    let scope = ServerScope::from_string("provider-tests");
     let mut declarations = Vec::new();
     for (package, active_package, server, expected_name) in [
         (None, None, "attachments", "attachments_attachment_create"),
@@ -41,6 +43,9 @@ fn declarations() -> Vec<ToolDeclaration> {
         (None, None, "media-tools", "media-tools_attachment_create"),
     ] {
         let registration = Registration {
+            user_id: None,
+            ownerless_only: false,
+            connection_id: None,
             package: package.map(str::to_owned),
             config: "attachments".into(),
             server: server.into(),
@@ -48,7 +53,7 @@ fn declarations() -> Vec<ToolDeclaration> {
             schema_version: 1,
             proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
         };
-        let (routes, tools) = build_registered_tools(active_package, vec![registration]);
+        let (routes, tools) = build_registered_tools(&scope, active_package, vec![registration]);
         let create = tools
             .into_iter()
             .find(|tool| tool.name == expected_name)
@@ -168,6 +173,7 @@ async fn generated_attachment_idiom_roundtrips_png_through_native_toolset() {
         });
         let commands = tool_commands(
             vec![ToolSpec {
+                output: None,
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 schema: tool.parameters.as_value().clone(),

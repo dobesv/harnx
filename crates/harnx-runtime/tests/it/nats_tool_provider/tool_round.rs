@@ -291,6 +291,7 @@ async fn dispatch_journals_the_round_it_is_handed() -> Result<()> {
                 "time_get_current_time",
                 json!({"timezone": "UTC"}),
                 ToolCallOrigin {
+                    structured_result: false,
                     tool_call_id: Some(call_id),
                     tool_round,
                 },
@@ -336,6 +337,7 @@ async fn a_provider_opens_the_journal_once_for_all_its_calls() -> Result<()> {
                 "time_get_current_time",
                 json!({"timezone": timezone}),
                 ToolCallOrigin {
+                    structured_result: false,
                     tool_call_id: Some(call_id),
                     tool_round: Some(3),
                 },

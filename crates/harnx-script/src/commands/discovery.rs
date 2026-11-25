@@ -110,10 +110,14 @@ impl Discovery {
         match name {
             "tools" => Some(TOOLS_HELP.into()),
             "help" => Some(HELP_HELP.into()),
-            _ => self
-                .catalog
-                .get(name)
-                .map(|tool| help::help(&tool.name, &tool.schema, &tool.description)),
+            _ => self.catalog.get(name).map(|tool| {
+                help::help(
+                    &tool.name,
+                    &tool.schema,
+                    &tool.description,
+                    tool.output.as_ref(),
+                )
+            }),
         }
     }
 }

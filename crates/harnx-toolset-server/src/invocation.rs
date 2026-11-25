@@ -158,6 +158,9 @@ fn invocation_context(
         // tool's requestState, delivered beside the arguments, never in them.
         input_responses: request.input_responses.clone().unwrap_or_default(),
         request_state: request.request_state.clone().unwrap_or(Value::Null),
+        // The caller's harnx user identity, stamped by the worker from the
+        // trusted session owner (or operator identity); never from args.
+        user_id: request.user_id.clone(),
     }
 }
 

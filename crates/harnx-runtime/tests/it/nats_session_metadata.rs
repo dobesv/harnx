@@ -10,9 +10,10 @@ use harnx_core::execution_context::{
 };
 use harnx_core::require_nextest;
 use harnx_runtime::nats_session_metadata::{
-    read_cursor_key, read_invalidation_subject, SessionExtensionUpdate, SessionInitializer,
-    SessionMetadata, SessionMetadataPatch, SessionMetadataStore, SessionOverrideUpdate,
-    SessionReadState, ToolContextEntry, TOOL_CONTEXT_NAMESPACE,
+    read_cursor_key, read_invalidation_subject, store_context, tool_context,
+    SessionExtensionUpdate, SessionInitializer, SessionMetadata, SessionMetadataPatch,
+    SessionMetadataStore, SessionOverrideUpdate, SessionReadState, ToolContextEntry,
+    TOOL_CONTEXT_NAMESPACE,
 };
 use serde_json::json;
 
@@ -532,6 +533,225 @@ async fn private_tool_context_updates_are_reserved_and_merge_concurrently() -> R
     let context = store.get_tool_context(&session_id).await?.unwrap();
     assert!(!context.values.contains_key("sandbox"));
     assert!(context.values.contains_key("workspace"));
+    Ok(())
+}
+
+/// The conditional tool-context replace applies only while the current
+/// value matches the one the caller observed: a value written by a
+/// concurrent writer is left alone instead of being overwritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_tool_context_replace_applies_only_while_expected() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let local_id = format!("metadata-cas-context-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
+    let entry = ToolContextEntry {
+        session_id: &session_id,
+        key: "sandbox",
+    };
+
+    // Expected absent and the key is absent: applies.
+    assert!(
+        store
+            .replace_tool_context_value_if(
+                entry,
+                None,
+                json!({"version": 1, "sandbox_id": "sandbox-1"}),
+            )
+            .await?
+    );
+    // Expected matches the current value: applies.
+    assert!(
+        store
+            .replace_tool_context_value_if(
+                entry,
+                Some(&json!({"version": 1, "sandbox_id": "sandbox-1"})),
+                json!({"version": 1, "sandbox_id": "sandbox-2"}),
+            )
+            .await?
+    );
+    // Expected is the value from before the last write: skipped, the newer
+    // value stays.
+    assert!(
+        !store
+            .replace_tool_context_value_if(
+                entry,
+                Some(&json!({"version": 1, "sandbox_id": "sandbox-1"})),
+                json!({"version": 1, "sandbox_id": "sandbox-3"}),
+            )
+            .await?
+    );
+    // Expected absent but a value exists: skipped.
+    assert!(
+        !store
+            .replace_tool_context_value_if(
+                entry,
+                None,
+                json!({"version": 1, "sandbox_id": "sandbox-4"}),
+            )
+            .await?
+    );
+
+    let context = store
+        .get_tool_context(&session_id)
+        .await?
+        .expect("session metadata exists");
+    assert_eq!(context.values["sandbox"]["sandbox_id"], "sandbox-2");
+    Ok(())
+}
+
+/// A conditional replace that loses its own revision conflict reports
+/// `false`, even though its first attempt consented: the first attempt
+/// writes a racing binding that advances the revision between the patch
+/// loop's read and its update, so the CAS retries, the precondition now
+/// fails against the fresh record, and the per-attempt `applied` flag must
+/// reflect the skip, not the discarded first consent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conditional_replace_that_loses_a_revision_conflict_reports_false() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let local_id = format!("metadata-cas-lose-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
+    store
+        .replace_tool_context_value(
+            ToolContextEntry {
+                session_id: &session_id,
+                key: "sandbox",
+            },
+            json!({"version": 1, "sandbox_id": "sandbox-0"}),
+        )
+        .await?;
+
+    let racing_store = store.clone();
+    let racing_session = session_id.clone();
+    let mut first_attempt = true;
+    let applied = store
+        .patch_if(&session_id, move |metadata| {
+            let mut context = tool_context(metadata)?;
+            if first_attempt {
+                first_attempt = false;
+                // Advance the revision between this attempt's read and its
+                // update, forcing the store's CAS loop into a retry.
+                let write = racing_store.clone();
+                let key = racing_session.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        write
+                            .replace_tool_context_value(
+                                ToolContextEntry {
+                                    session_id: &key,
+                                    key: "sandbox",
+                                },
+                                json!({"version": 1, "sandbox_id": "sandbox-raced"}),
+                            )
+                            .await
+                    })
+                })?;
+            }
+            if context.values.get("sandbox")
+                != Some(&json!({"version": 1, "sandbox_id": "sandbox-0"}))
+            {
+                return Ok(false);
+            }
+            context.values.insert(
+                "sandbox".into(),
+                json!({"version": 1, "sandbox_id": "sandbox-a"}),
+            );
+            store_context(metadata, context)?;
+            Ok(true)
+        })
+        .await?;
+
+    assert!(
+        !applied,
+        "the retry's skip must win over the discarded first consent"
+    );
+    // The racing write kept the field; the losing replace never landed.
+    let context = store.get_tool_context(&session_id).await?.unwrap();
+    assert_eq!(context.values["sandbox"]["sandbox_id"], "sandbox-raced");
+    Ok(())
+}
+
+/// A conditional replace that loses a revision conflict to a writer that
+/// touched a different part of the record still applies on the retry: the
+/// retry re-evaluates the precondition against the fresh record, consents
+/// again, and its write wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conditional_replace_applies_after_losing_a_revision_conflict() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let local_id = format!("metadata-cas-retry-{}", uuid::Uuid::new_v4());
+    let session_id = seed_metadata(&store, &local_id).await?;
+    store
+        .replace_tool_context_value(
+            ToolContextEntry {
+                session_id: &session_id,
+                key: "sandbox",
+            },
+            json!({"version": 1, "sandbox_id": "sandbox-0"}),
+        )
+        .await?;
+
+    let racing_store = store.clone();
+    let racing_session = session_id.clone();
+    let mut first_attempt = true;
+    let applied = store
+        .patch_if(&session_id, move |metadata| {
+            let mut context = tool_context(metadata)?;
+            if first_attempt {
+                first_attempt = false;
+                // Advance the revision without touching the sandbox value,
+                // so the retry's precondition still holds.
+                let write = racing_store.clone();
+                let key = racing_session.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        write
+                            .patch(&key, |metadata| {
+                                metadata.title.value = Some("raced".to_string());
+                                Ok(())
+                            })
+                            .await
+                    })
+                })?;
+            }
+            if context.values.get("sandbox")
+                != Some(&json!({"version": 1, "sandbox_id": "sandbox-0"}))
+            {
+                return Ok(false);
+            }
+            context.values.insert(
+                "sandbox".into(),
+                json!({"version": 1, "sandbox_id": "sandbox-a"}),
+            );
+            store_context(metadata, context)?;
+            Ok(true)
+        })
+        .await?;
+
+    assert!(applied, "the conditional replace must win its retry");
+    let record = store
+        .get(&session_id)
+        .await?
+        .expect("session metadata exists");
+    let context = tool_context(&record.metadata)?;
+    assert_eq!(context.values["sandbox"]["sandbox_id"], "sandbox-a");
+    assert_eq!(record.metadata.title.value.as_deref(), Some("raced"));
     Ok(())
 }
 

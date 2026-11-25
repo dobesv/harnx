@@ -110,6 +110,30 @@ fn modal(tui: &mut Tui) -> &mut InteractionModal {
     state
 }
 
+/// Draw the modal once on a test terminal of the given size and return the
+/// rendered screen as one string.
+fn drawn_screen(tui: &mut Tui, state: &mut InteractionModal, width: u16, height: u16) -> String {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| tui.render_interaction_modal(frame, frame.area(), state))
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
+/// Tiny terminal areas must render without panicking.
+fn drawn_screen_at_tiny_sizes(tui: &mut Tui, state: &mut InteractionModal) {
+    for (width, height) in [(40, 6), (8, 3), (1, 1), (0, 0)] {
+        let _ = drawn_screen(tui, state, width, height);
+    }
+}
+
 fn decide(tui: &mut Tui, key: InteractionKey, result: InteractionDecisionOutcome) {
     tui.handle_interaction_event(InteractionEvent::Decided {
         generation: tui.interactions.generation,
@@ -194,6 +218,104 @@ async fn unsupported_kind_is_deny_only_even_for_direct_submit() {
     tui.submit_interaction(true);
     assert!(!modal(&mut tui).submitting);
     assert!(tui.interactions.decisions.is_empty());
+}
+
+#[tokio::test]
+async fn url_modal_renders_the_link_with_continue_and_cancel() {
+    let mut entries = requests();
+    ready(&mut entries);
+    let mut pending = pending_confirmation(&entries).unwrap().unwrap();
+    pending.kind = "url".into();
+    pending.message = "Connect Jira".into();
+    pending.payload = json!({
+        "url": "https://example.com/connect/abc",
+        "message": "Connect Jira"
+    });
+    let config = crate::tests::test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.app.modal = None;
+    tui.interactions.target = Some(("origin-session".into(), "origin-cluster".into()));
+    snapshot(&mut tui, Some(pending));
+    let mut state = modal(&mut tui).clone();
+    let screen = drawn_screen(&mut tui, &mut state, 100, 12);
+    assert!(screen.contains("Connect Jira"), "{screen}");
+    // The URL is the link text: always visible (plain-text fallback).
+    assert!(
+        screen.contains("https://example.com/connect/abc"),
+        "{screen}"
+    );
+    assert!(screen.contains("ENTER continue"), "{screen}");
+    assert!(screen.contains("Ctrl+D cancel"), "{screen}");
+    assert!(!screen.contains("not supported by this client"), "{screen}");
+    // No note area: the stored response is the action alone.
+    assert!(!screen.contains("Note (optional)"), "{screen}");
+    drawn_screen_at_tiny_sizes(&mut tui, &mut state);
+}
+
+#[tokio::test]
+async fn url_modal_wrapped_at_narrow_widths_renders_in_backend_without_target_corruption() {
+    let mut entries = requests();
+    ready(&mut entries);
+    let mut pending = pending_confirmation(&entries).unwrap().unwrap();
+    pending.kind = "url".into();
+    pending.message = "Connect Jira".into();
+    let long_url = "https://example.com/oauth/authorize?client_id=12345&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fcallback&state=xyz";
+    pending.payload = json!({
+        "url": long_url,
+        "message": "Connect Jira"
+    });
+    let config = crate::tests::test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.app.modal = None;
+    tui.interactions.target = Some(("origin-session".into(), "origin-cluster".into()));
+    snapshot(&mut tui, Some(pending));
+    let mut state = modal(&mut tui).clone();
+
+    for width in [30, 45, 60, 90] {
+        let screen = drawn_screen(&mut tui, &mut state, width, 14);
+        assert!(screen.contains("Connect Jira"), "width {width}: {screen}");
+        assert!(screen.contains("ENTER continue"), "width {width}: {screen}");
+    }
+}
+
+#[test]
+fn url_actions_map_enter_to_continue_and_ctrl_d_to_cancel() {
+    use super::decision::resolve_decision_action;
+    assert_eq!(resolve_decision_action("url", true), Some("continue"));
+    assert_eq!(resolve_decision_action("url", false), Some("cancel"));
+    assert_eq!(resolve_decision_action("confirm", true), Some("approve"));
+    assert_eq!(resolve_decision_action("confirm", false), Some("deny"));
+    assert_eq!(resolve_decision_action("future-form", true), None);
+    assert_eq!(resolve_decision_action("future-form", false), Some("deny"));
+    let response = super::decision::decision_response_for("continue", String::new());
+    assert_eq!(response.action, "continue");
+    assert!(response.data.is_empty(), "url responses carry no data");
+}
+
+#[tokio::test]
+async fn url_modal_enter_after_idle_gate_starts_submission() {
+    let mut entries = requests();
+    ready(&mut entries);
+    let mut pending = pending_confirmation(&entries).unwrap().unwrap();
+    pending.kind = "url".into();
+    pending.payload = json!({"url": "https://example.com/connect/abc", "message": "Connect Jira"});
+    let config = crate::tests::test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.app.modal = None;
+    tui.interactions.target = Some(("origin-session".into(), "origin-cluster".into()));
+    snapshot(&mut tui, Some(pending));
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    // A fresh keypress cannot accidentally continue (same idle gate as confirm).
+    tui.handle_interaction_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        .await;
+    tui.handle_interaction_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await;
+    assert!(!modal(&mut tui).submitting, "idle gate must hold");
+    // After the gate, Enter submits continue.
+    modal(&mut tui).last_key_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    tui.handle_interaction_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await;
+    assert!(modal(&mut tui).submitting, "Enter past the gate continues");
 }
 
 #[test]

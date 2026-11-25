@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::bash_inner::MAX_RETAINED_TRACE_ENTRIES;
+use crate::structured_provider::StructuredProvider;
 
 mod python;
 
@@ -191,19 +192,54 @@ fn harness(inner: Arc<dyn ToolProvider>, extra: Vec<Arc<dyn ToolProvider>>) -> H
     harness_with_attachments(inner, extra, None)
 }
 
+/// Same wiring as `harness`, but with the model-round payload shape.
+fn model_harness(inner: Arc<dyn ToolProvider>, extra: Vec<Arc<dyn ToolProvider>>) -> Harness {
+    build_harness(inner, extra, None, false)
+}
+
 fn harness_with_attachments(
     inner: Arc<dyn ToolProvider>,
     extra: Vec<Arc<dyn ToolProvider>>,
     fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
 ) -> Harness {
+    build_harness(inner, extra, fetcher, true)
+}
+
+fn build_harness(
+    inner: Arc<dyn ToolProvider>,
+    extra: Vec<Arc<dyn ToolProvider>>,
+    fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
+    full_payload: bool,
+) -> Harness {
+    build_harness_with(
+        inner,
+        extra,
+        fetcher,
+        full_payload,
+        (inner_declarations(), Default::default()),
+    )
+}
+
+fn build_harness_with(
+    inner: Arc<dyn ToolProvider>,
+    extra: Vec<Arc<dyn ToolProvider>>,
+    fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
+    full_payload: bool,
+    (declarations, script_outputs): (
+        Vec<harnx_core::tool::ToolDeclaration>,
+        std::collections::BTreeMap<String, harnx_toolset::ScriptOutput>,
+    ),
+) -> Harness {
     let slot = Arc::new(BashEvalContextSlot::default());
     let bash = Arc::new(
         BashProvider::new(BashProviderConfig {
             active: true,
-            inner_declarations: inner_declarations(),
+            inner_declarations: declarations,
             base_providers: vec![inner.clone()],
             slot: Some(slot.clone()),
             payload_limit: None,
+            script_outputs,
+            full_payload,
         })
         .with_attachment_fetcher(fetcher),
     );
@@ -211,6 +247,7 @@ fn harness_with_attachments(
     providers.extend(extra);
     providers.push(inner);
     let ctx = Arc::new(ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,
@@ -247,6 +284,7 @@ async fn run(
             BASH_TOOL_NAME,
             bash_call(script),
             ToolCallOrigin {
+                structured_result: false,
                 tool_call_id: Some("outer-1"),
                 tool_round: Some(1),
             },
@@ -254,6 +292,41 @@ async fn run(
             Arc::new(CollectingProgress(Mutex::new(Vec::new()))),
         )
         .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn model_round_payload_carries_output_once() {
+    let (bash, _slot, _ctx) = model_harness(FakeProvider::new(), Vec::new());
+    let abort = create_abort_signal();
+    let payload = ok(run(&bash, "echo marker-7; fs_read --path a > /dev/null", &abort).await).value;
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["exit_code"], 0);
+    for key in ["stdout", "stderr", "trace"] {
+        assert!(payload.get(key).is_none(), "{key} duplicated in {payload}");
+    }
+    assert_eq!(payload["stdout_truncated"], false);
+    assert_eq!(
+        payload.to_string().matches("marker-7").count(),
+        1,
+        "{payload}"
+    );
+    let text = payload["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("- fs_read ok"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn model_round_failure_keeps_output_in_the_partial_result_once() {
+    let (bash, _slot, _ctx) = model_harness(FakeProvider::new(), Vec::new());
+    let abort = create_abort_signal();
+    let error = recoverable(run(&bash, "echo marker-7; exit 3", &abort).await, "exit 3");
+    let partial = partial_result_of(&error).expect("partial result");
+    assert_eq!(partial["exit_code"], 3);
+    assert!(partial.get("stdout").is_none(), "{partial}");
+    assert_eq!(
+        partial.to_string().matches("marker-7").count(),
+        1,
+        "{partial}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -415,6 +488,81 @@ async fn dropped_trace_count_surfaces_in_result() {
     assert_eq!(payload["trace_dropped"], 4);
     let text = payload["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("4 further inner call(s)"), "{text}");
+    let section = trace_section(&payload);
+    assert!(
+        section
+            .trim_end()
+            .ends_with("4 further inner call(s) beyond the retained-trace cap"),
+        "{section}"
+    );
+}
+
+fn trace_section(payload: &Value) -> String {
+    let text = payload["content"][0]["text"].as_str().unwrap();
+    text.split("## inner call trace\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ten_calls_are_listed_and_eleven_are_grouped() {
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let abort = create_abort_signal();
+    let ten = ok(run(&bash, &"fs_read --path a >/dev/null\n".repeat(10), &abort).await).value;
+    assert_eq!(trace_section(&ten).lines().count(), 10, "{ten}");
+    let eleven = ok(run(&bash, &"fs_read --path a >/dev/null\n".repeat(11), &abort).await).value;
+    let section = trace_section(&eleven);
+    assert_eq!(section.lines().count(), 1, "{section}");
+    assert!(section.starts_with("- fs_read ×11 ok "), "{section}");
+    // Operator payload keeps every row.
+    assert_eq!(eleven["trace"].as_array().map(Vec::len), Some(11));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grouped_trace_names_the_first_failure() {
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let abort = create_abort_signal();
+    // The last command succeeds, so the script itself exits 0.
+    let script = format!(
+        "set +e\n{}broken --path x\n{}",
+        "fs_read --path a >/dev/null\n".repeat(6),
+        "fs_read --path a >/dev/null\n".repeat(5)
+    );
+    let payload = ok(run(&bash, &script, &abort).await).value;
+    let section = trace_section(&payload);
+    assert!(section.contains("- fs_read ×11 ok "), "{section}");
+    assert!(section.contains("- broken ×1 tool_error "), "{section}");
+    assert!(
+        section.contains("first failure: broken tool_error "),
+        "{section}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grouped_trace_keeps_one_line_per_tool_and_status_in_first_seen_order() {
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let abort = create_abort_signal();
+    // The failing tool is seen first, then a succeeding one, then the failing
+    // one again: each (tool, status) still gets a single line, in the order
+    // it first appeared.
+    let script = format!(
+        "set +e\nbroken --path x\n{}broken --path y\nbroken --path z\n{}",
+        "fs_read --path a >/dev/null\n".repeat(6),
+        "fs_read --path a >/dev/null\n".repeat(3)
+    );
+    let payload = ok(run(&bash, &script, &abort).await).value;
+    let section = trace_section(&payload);
+    let prefixes: Vec<String> = section
+        .lines()
+        .filter(|line| line.starts_with("- "))
+        .map(|line| line.split(' ').take(4).collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(
+        prefixes,
+        ["- broken ×3 tool_error", "- fs_read ×9 ok"],
+        "{section}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -425,6 +573,8 @@ async fn missing_slot_fails_closed() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        script_outputs: Default::default(),
+        full_payload: false,
     });
     let abort = create_abort_signal();
     let error = recoverable(run(&bash, "fs_read --path a", &abort).await, "no slot");
@@ -442,6 +592,8 @@ async fn inactive_provider_does_not_claim_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        script_outputs: Default::default(),
+        full_payload: false,
     });
     assert!(!bash.has_tool(BASH_TOOL_NAME));
 }
@@ -486,6 +638,8 @@ async fn replay_reports_interrupted_for_bash_only() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        script_outputs: Default::default(),
+        full_payload: false,
     });
     let abort = create_abort_signal();
     let replay_bash = match bash
@@ -557,6 +711,8 @@ async fn inactive_provider_replay_falls_through_for_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
+        script_outputs: Default::default(),
+        full_payload: false,
     });
     let abort = create_abort_signal();
     let replay = bash
@@ -670,10 +826,13 @@ async fn command_scoped_catalog_stays_active_and_fails_closed_without_tools() {
         base_providers: Vec::new(),
         slot: Some(slot.clone()),
         payload_limit: None,
+        script_outputs: Default::default(),
+        full_payload: false,
     }));
     assert!(bash.has_tool(BASH_TOOL_NAME));
 
     let ctx = slot.install(ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,
@@ -726,3 +885,92 @@ async fn command_scoped_catalog_stays_active_and_fails_closed_without_tools() {
 }
 
 mod output;
+
+fn faketool_declarations() -> Vec<harnx_core::tool::ToolDeclaration> {
+    let mut declarations = inner_declarations();
+    declarations.truncate(1);
+    declarations[0].name = "faketool".to_string();
+    declarations
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inner_calls_ask_for_structured_results() {
+    let provider = Arc::new(StructuredProvider {
+        origins: Mutex::new(Vec::new()),
+    });
+    let (bash, _slot, _ctx) = build_harness_with(
+        provider.clone(),
+        Vec::new(),
+        None,
+        true,
+        (faketool_declarations(), Default::default()),
+    );
+    let abort = create_abort_signal();
+    ok(run(&bash, "faketool --path a", &abort).await);
+    assert_eq!(*provider.origins.lock().unwrap(), vec![true]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mapped_tool_prints_idiomatic_output() {
+    let provider = Arc::new(StructuredProvider {
+        origins: Mutex::new(Vec::new()),
+    });
+    let outputs = std::collections::BTreeMap::from([(
+        "faketool".to_string(),
+        harnx_toolset::ScriptOutput {
+            stdout: Some("text".into()),
+            stderr: Some("notes".into()),
+            ..Default::default()
+        },
+    )]);
+    let (bash, _slot, _ctx) = build_harness_with(
+        provider,
+        Vec::new(),
+        None,
+        true,
+        (faketool_declarations(), outputs),
+    );
+    let abort = create_abort_signal();
+    let payload = ok(run(&bash, "faketool --path a | wc -l", &abort).await).value;
+    assert_eq!(
+        payload["stdout"].as_str().map(str::trim),
+        Some("3"),
+        "{payload}"
+    );
+    assert_eq!(payload["stderr"], "faketool: 2 more lines\n", "{payload}");
+}
+
+/// The two types are bridged by a serde round trip, which drops a field one
+/// side lacks without a word. Both sides are written out in full so adding a
+/// field to either breaks this test.
+#[test]
+fn script_output_converts_with_every_field() {
+    let output = harnx_toolset::ScriptOutput {
+        stdout: Some("out".into()),
+        row: Some("{a}:{b}".into()),
+        stderr_text: Some("err".into()),
+        stderr: Some("notes".into()),
+        exit_code: Some("status".into()),
+        error_exit_code: Some(7),
+        summary: Some("like cat".into()),
+    };
+    let harnx_toolset::ScriptOutput {
+        stdout,
+        row,
+        stderr_text,
+        stderr,
+        exit_code,
+        error_exit_code,
+        summary,
+    } = output.clone();
+    let expected = harnx_script::commands::OutputMapping {
+        stdout,
+        row,
+        stderr_text,
+        stderr,
+        exit_code,
+        error_exit_code,
+        summary,
+    };
+    assert_eq!(super::output_mapping(&output), Some(expected));
+}

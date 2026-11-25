@@ -142,6 +142,7 @@ async fn documented_errexit_exceptions_and_pipeline_statuses_match_backend() {
 
 fn spawn_tool() -> ToolSpec {
     ToolSpec {
+        output: None,
         name: "bash_spawn".into(),
         description: "Spawn a background command, optionally waiting for completion.".into(),
         // Optional Schemars objects can be nullable references, not inline objects.
@@ -169,10 +170,10 @@ fn generated_guide_advertises_nested_wait_as_optional_json() {
     assert!(description.contains(
         "- bash_spawn --command <string> [--wait <json>] [--json <object>]  # Spawn a background command, optionally waiting for completion."
     ), "{description}");
-    assert!(description.contains("objects/complex values take quoted JSON"));
+    assert!(description.contains("objects and multi-type values take quoted JSON"));
     assert!(!description.contains("--wait-secs"));
     assert!(!description.contains("--timeout-secs"));
-    let help = crate::help::help(&tool.name, &tool.schema, &tool.description);
+    let help = crate::help::help(&tool.name, &tool.schema, &tool.description, None);
     assert!(help.contains("--wait <json>"), "{help}");
     assert!(!help.contains("--head-lines"), "{help}");
 }

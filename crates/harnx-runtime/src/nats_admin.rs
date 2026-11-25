@@ -2,19 +2,30 @@ use crate::{
     config::Config,
     nats_lease::NatsLeaseConfig,
     nats_session_log::stream_name_for_session,
-    nats_session_metadata::{SessionMetadataStore, SESSION_METADATA_BUCKET},
+    nats_session_metadata::{metadata_key, SessionMetadataStore, SESSION_METADATA_BUCKET},
 };
 use anyhow::{Context, Result};
 use async_nats::jetstream::{
     context::{DeleteStreamErrorKind, GetStreamErrorKind, KeyValueErrorKind},
-    kv::Operation,
+    kv::{Operation, PurgeErrorKind},
     ErrorCode,
 };
 use std::error::Error as _;
 #[cfg(test)]
+mod canonical_deletion_tests;
+#[cfg(test)]
 mod deletion_tests;
 
 pub(crate) mod a2a;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalMetadataPurge {
+    /// No live canonical record was observed at the start of the cascade.
+    Absent,
+    Purged,
+    /// The conditional purge was rejected; the observed revision is no longer current.
+    RevisionChanged,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDeleteResult {
@@ -22,6 +33,7 @@ pub struct SessionDeleteResult {
     pub lease_deleted: bool,
     pub metadata_keys_deleted: usize,
     pub attachments_deleted: usize,
+    pub canonical_metadata: CanonicalMetadataPurge,
 }
 
 impl SessionDeleteResult {
@@ -77,41 +89,75 @@ pub(crate) async fn delete_session_state(
     session_id: &str,
     stream: StreamDeletion,
 ) -> Result<SessionDeleteResult> {
-    let a2a = A2aDeletion::begin(jetstream, session_id).await?;
+    let mut metadata = SessionMetadataDeletion::begin(jetstream, session_id).await?;
     let mut stream_deleted =
         stream == StreamDeletion::First && delete_session_stream(jetstream, session_id).await?;
-    let result = delete_session_leftovers(jetstream, lease_bucket, session_id).await?;
-    a2a.finish(session_id).await?;
+    let mut result = delete_session_leftovers(jetstream, lease_bucket, session_id).await?;
+    metadata.finish_a2a(session_id).await?;
     if stream == StreamDeletion::Last {
         stream_deleted = delete_session_stream(jetstream, session_id).await?;
     }
-    Ok(SessionDeleteResult {
-        stream_deleted,
-        ..result
-    })
+    result.stream_deleted = stream_deleted;
+    result.canonical_metadata = metadata.purge_canonical(session_id).await?;
+    result.metadata_keys_deleted +=
+        usize::from(result.canonical_metadata == CanonicalMetadataPurge::Purged);
+    Ok(result)
 }
 
-/// The A2A admission fence a session deletion holds from start to finish.
-struct A2aDeletion {
+/// Holds the A2A fence during cleanup and remembers which canonical record can
+/// be purged once cleanup succeeds.
+struct SessionMetadataDeletion {
     metadata: Option<SessionMetadataStore>,
+    canonical_revision: Option<u64>,
     fence: Option<a2a::DeletionFence>,
 }
 
-impl A2aDeletion {
+impl SessionMetadataDeletion {
     async fn begin(jetstream: &async_nats::jetstream::Context, session_id: &str) -> Result<Self> {
-        let metadata = a2a::metadata(jetstream).await?;
-        let fence = match &metadata {
-            Some(metadata) => a2a::fence(metadata, session_id).await?,
-            None => None,
+        let mut deletion = Self {
+            metadata: a2a::metadata(jetstream).await?,
+            canonical_revision: None,
+            fence: None,
         };
-        Ok(Self { metadata, fence })
+        if let Some(store) = &deletion.metadata {
+            // No payload decoding: an operator can still delete malformed metadata.
+            let key = metadata_key(session_id);
+            deletion.canonical_revision = store
+                .leader_entry(&key)
+                .await
+                .with_context(|| format!("Failed to inspect session metadata key '{key}'"))?
+                .filter(|entry| entry.operation == Operation::Put)
+                .map(|entry| entry.revision);
+            deletion.fence = a2a::fence(store, session_id).await?;
+        }
+        Ok(deletion)
     }
 
-    async fn finish(self, session_id: &str) -> Result<()> {
-        if let (Some(fence), Some(metadata)) = (self.fence, self.metadata) {
-            fence.finish(&metadata, session_id).await?;
+    async fn finish_a2a(&mut self, session_id: &str) -> Result<()> {
+        if let (Some(fence), Some(metadata)) = (self.fence.take(), &self.metadata) {
+            fence.finish(metadata, session_id).await?;
         }
         Ok(())
+    }
+
+    async fn purge_canonical(self, session_id: &str) -> Result<CanonicalMetadataPurge> {
+        let (Some(metadata), Some(revision)) = (self.metadata, self.canonical_revision) else {
+            // Orphan cleanup (or a retry) must not mark an absent key or purge a later PUT.
+            return Ok(CanonicalMetadataPurge::Absent);
+        };
+        let key = metadata_key(session_id);
+        match harnx_nats_common::markers::purge(metadata.kv_store(), &key, Some(revision)).await {
+            Ok(()) => Ok(CanonicalMetadataPurge::Purged),
+            Err(error) if error.kind() == PurgeErrorKind::WrongLastRevision => {
+                log::warn!(
+                    "skipped canonical session metadata purge: key={key} observed_revision={revision} no longer current"
+                );
+                Ok(CanonicalMetadataPurge::RevisionChanged)
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to delete session metadata key '{key}'"))
+            }
+        }
     }
 }
 
@@ -135,6 +181,7 @@ async fn delete_session_leftovers(
         lease_deleted,
         metadata_keys_deleted,
         attachments_deleted,
+        canonical_metadata: CanonicalMetadataPurge::Absent,
     })
 }
 
@@ -186,7 +233,7 @@ async fn purge_session_metadata(
         Err(error) => return Err(error).context("failed to open session metadata for deletion"),
     };
     SessionMetadataStore::from_store(store, jetstream.client().clone())
-        .purge_session_prefix(session_id)
+        .purge_session_prefix_except_metadata(session_id)
         .await
 }
 

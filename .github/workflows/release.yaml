@@ -77,12 +77,14 @@ jobs:
         # harnx-k8s-sandbox-tools in one shard ran their links at once and
         # made the Windows shard take 51 minutes, likely from running out of
         # the runner's 16 GB. Each package ships the binary named after it,
-        # except harnx-sandbox-common, which ships harnx-sandbox-exec.
+        # except harnx-sandbox-common (harnx-sandbox-exec) and
+        # harnx-credentials (harnx-credentials-keygen).
         shard:
         - name: harnx
           packages: >-
             harnx harnx-bash-tools harnx-fetch-tools harnx-plans-tools
             harnx-k8s-creds harnx-mcp-remote harnx-sandbox-run harnx-sandbox-common
+            harnx-credentials
         - name: serve
           packages: >-
             harnx-serve harnx-fs-tools harnx-proxy-auth harnx-exa-tools
@@ -196,6 +198,8 @@ jobs:
           bin=$package
           if [[ "$package" == harnx-sandbox-common ]]; then
             bin=harnx-sandbox-exec
+          elif [[ "$package" == harnx-credentials ]]; then
+            bin=harnx-credentials-keygen
           fi
 
           name=$bin-$version-$target
@@ -250,12 +254,12 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: 12.21.0
+          version: 12.22.0
 
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
-          node-version: '24.22.3'
+          node-version: '26.13.1'
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
@@ -389,7 +393,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-worker harnx-attachment-tools harnx-bash-tools harnx-fs-tools harnx-exa-tools harnx-fetch-tools harnx-grep-tools harnx-plans-tools harnx-mcp-bridge harnx-mcp-remote harnx-a2a-server harnx-time-tools harnx-claude-hook-tools harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec; do
+            for bin in harnx harnx-serve harnx-worker harnx-attachment-tools harnx-bash-tools harnx-fs-tools harnx-exa-tools harnx-fetch-tools harnx-grep-tools harnx-plans-tools harnx-mcp-bridge harnx-mcp-remote harnx-a2a-server harnx-time-tools harnx-claude-hook-tools harnx-aws-creds harnx-k8s-creds harnx-k8s-sandbox-tools harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec harnx-credentials-keygen; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1

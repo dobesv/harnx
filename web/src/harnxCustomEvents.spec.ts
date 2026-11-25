@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, parsePendingInteraction, parseA2uiSurface, type HarnxCustomEventCallbacks } from './harnxCustomEvents';
+import { handleHarnxCustomEvent, NAVIGATION_CONTROL_EVENTS, parseHistoryReasoning, parsePendingInteraction, parseA2uiSurface, type HarnxCustomEventCallbacks } from './harnxCustomEvents';
 
 const callbacks = (isForeground: boolean): HarnxCustomEventCallbacks => ({
   onStatus: () => {},
@@ -287,6 +287,45 @@ describe('pending_interaction events and parsing', () => {
       });
     });
 
+    it('extracts the url for url interactions from payload or top-level field', () => {
+      const fromPayload = parsePendingInteraction({
+        interaction_id: 'int-url',
+        request_seq: 3,
+        tool_call_id: 'tool-connect',
+        kind: 'url',
+        message: 'Connect Jira',
+        pending_count: 0,
+        payload: { url: 'https://example.com/connect/abc', message: 'Connect Jira' },
+      });
+      expect(fromPayload).toMatchObject({
+        kind: 'url',
+        url: 'https://example.com/connect/abc',
+        payload: { url: 'https://example.com/connect/abc', message: 'Connect Jira' },
+      });
+
+      const topLevel = parsePendingInteraction({
+        interaction_id: 'int-url',
+        request_seq: 3,
+        tool_call_id: 'tool-connect',
+        kind: 'url',
+        message: 'Connect Jira',
+        pending_count: 0,
+        url: 'https://example.com/connect/abc',
+      });
+      expect(topLevel?.url).toBe('https://example.com/connect/abc');
+
+      // A url interaction without a usable link parses but leaves url unset.
+      const bare = parsePendingInteraction({
+        interaction_id: 'int-url',
+        request_seq: 3,
+        tool_call_id: 'tool-connect',
+        kind: 'url',
+        message: 'Connect Jira',
+        pending_count: 0,
+      });
+      expect(bare?.url).toBeUndefined();
+    });
+
     it('returns null when value is null (authoritative clear signal)', () => {
       expect(parsePendingInteraction(null)).toBeNull();
     });
@@ -554,6 +593,52 @@ describe('pending_interaction events and parsing', () => {
 
         expect(onA2uiSurface).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe('history_reasoning events and parsing', () => {
+    it('is included in NAVIGATION_CONTROL_EVENTS', () => {
+      expect(NAVIGATION_CONTROL_EVENTS).toContain('history_reasoning');
+    });
+
+    it('parses valid maps including empty map and filters non-string or blank entries', () => {
+      expect(parseHistoryReasoning({})).toEqual({});
+      expect(
+        parseHistoryReasoning({
+          'msg-1': ['first thought', '  ', 123, 'second thought'],
+          '': ['ignored-blank-key'],
+          'msg-2': 'not-an-array',
+          'msg-3': ['   '],
+        }),
+      ).toEqual({
+        'msg-1': ['first thought', 'second thought'],
+      });
+    });
+
+    it('returns undefined for malformed non-object payloads', () => {
+      expect(parseHistoryReasoning(null)).toBeUndefined();
+      expect(parseHistoryReasoning(undefined)).toBeUndefined();
+      expect(parseHistoryReasoning([])).toBeUndefined();
+      expect(parseHistoryReasoning('invalid')).toBeUndefined();
+      expect(parseHistoryReasoning(42)).toBeUndefined();
+    });
+
+    it('dispatches parsed map to onHistoryReasoning callback and ignores malformed values', () => {
+      const onHistoryReasoning = vi.fn();
+      handleHarnxCustomEvent(
+        'history_reasoning',
+        { 'assistant-1': ['Step 1', 'Step 2'] },
+        { ...callbacks(true), onHistoryReasoning },
+      );
+      expect(onHistoryReasoning).toHaveBeenCalledWith({ 'assistant-1': ['Step 1', 'Step 2'] });
+
+      handleHarnxCustomEvent('history_reasoning', {}, { ...callbacks(true), onHistoryReasoning });
+      expect(onHistoryReasoning).toHaveBeenLastCalledWith({});
+
+      onHistoryReasoning.mockClear();
+      handleHarnxCustomEvent('history_reasoning', null, { ...callbacks(true), onHistoryReasoning });
+      handleHarnxCustomEvent('history_reasoning', ['bad'], { ...callbacks(true), onHistoryReasoning });
+      expect(onHistoryReasoning).not.toHaveBeenCalled();
     });
   });
 });

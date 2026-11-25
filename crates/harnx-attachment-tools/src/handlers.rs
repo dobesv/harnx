@@ -3,8 +3,7 @@
 //! Implements `attachment_read` and `attachment_create` operations over NATS.
 
 use anyhow::{Context, Result};
-use async_nats::jetstream::object_store::ObjectStore;
-use harnx_blob_store::{media_cid_url, put_media, resolve};
+use harnx_blob_store::{media::AttachmentsBucket, media_cid_url, put_media, resolve};
 use harnx_core::cid_url::CidUrl;
 use harnx_core::crypto::hex_encode;
 use harnx_core::safety::{format_size, truncate_output, TruncateOpts};
@@ -301,7 +300,7 @@ fn decode_attachment_content(content: String, encoding: Option<&str>) -> Result<
 
 /// Create a text or base64-encoded binary attachment in NATS object store.
 pub async fn attachment_create(
-    store: &ObjectStore,
+    store: &AttachmentsBucket,
     caller_session: Option<&harnx_toolset::SessionRef>,
     params: AttachmentCreateParams,
 ) -> Result<CallToolResult> {

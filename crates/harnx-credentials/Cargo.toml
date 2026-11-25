@@ -1,0 +1,32 @@
+[package]
+name = "harnx-credentials"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Encrypted per-principal tool credentials and OAuth coordination over NATS"
+
+[dependencies]
+async-nats = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+harnx-nats-common = { workspace = true }
+oauth2 = { workspace = true }
+ring = { workspace = true }
+rmcp = { workspace = true, features = ["auth"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+harnx-test-bins = { path = "../harnx-test-bins" }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "harnx-credentials-keygen"
+path = "src/bin/keygen.rs"

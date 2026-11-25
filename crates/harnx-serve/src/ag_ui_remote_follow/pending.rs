@@ -83,7 +83,7 @@ pub(super) fn completion_events(
     let usage = UsageContextSnapshot::from_session(&session);
     let attachments = crate::ag_ui::message_attachment_snapshot_events(&snapshot.messages, history);
     Ok(snapshot
-        .events()
+        .live_events()
         .into_iter()
         .chain(attachments)
         .chain(crate::ag_ui::control_snapshot_events(history, Some(&usage)))

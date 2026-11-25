@@ -2,9 +2,9 @@
 role: assistant
 model: claude:claude-sonnet-5-5
 model_fallbacks:
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
-- gemini:gemini-3.8-flash
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
+- gemini:gemini-4-hydrogen
 - bedrock:us.zai.glm-5.3
 compaction_agent: compact-coder
 
@@ -58,7 +58,7 @@ description: >
   the web for docs, and manages local plans to track multi-step tasks.
   Designed for solo coding sessions without the full Pantheon orchestration
   overhead.
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

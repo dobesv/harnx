@@ -191,6 +191,7 @@ mod tests {
             tool_round: None,
             input_responses: None,
             request_state: None,
+            user_id: None,
         }
     }
 

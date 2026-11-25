@@ -1,6 +1,6 @@
 ---
 role: subagent
-model: gemini:gemini-3.8-flash
+model: gemini:gemini-4-hydrogen
 model_fallbacks:
 - codex:gpt-6.1-terra
 - openai:gpt-6.1-terra
@@ -44,7 +44,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Visual engineering, frontend, and UI/UX specialist — bridges the gap between the invisible code and the visible UI. Named after Iris (EYE-ris), Goddess of the Rainbow.\n"
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

@@ -12,11 +12,12 @@ use harnx_core::tool::{
     ToolProviderOutput,
 };
 use harnx_toolset::{
-    ControlMessage, Registration, ToolErrorPayload, ToolReply, ToolRequest, ToolSpec,
-    CAPABILITY_NEW_MESSAGE_PENDING, CAPABILITY_TOOL_PROGRESS, HDR_CALL_ID, HDR_CONTENT_TYPE,
+    registration_kv_key, user_key_segment, ControlMessage, Registration, RegistrationAudience,
+    ToolErrorPayload, ToolReply, ToolRequest, ToolSpec, CAPABILITY_NEW_MESSAGE_PENDING,
+    CAPABILITY_STRUCTURED_RESULT, CAPABILITY_TOOL_PROGRESS, HDR_CALL_ID, HDR_CONTENT_TYPE,
     HDR_IDEMPOTENCY_KEY, HDR_INSTANCE_ID,
 };
-use harnx_toolset_server::{registration_key, TOOL_REGISTRY_BUCKET};
+use harnx_toolset_server::TOOL_REGISTRY_BUCKET;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
@@ -117,6 +118,31 @@ struct RegisteredTool {
     /// durable interaction path for rounds containing it even with no
     /// middleware configured (T4.3).
     requests_input: bool,
+    /// The KV key this tool's registration was discovered under, so liveness
+    /// checks watch the same entry dispatch resolved (a user-scoped tool's
+    /// registration lives under `{scope}.{identity}.u.{U}`, not the server's
+    /// global key).
+    registration_key: String,
+    /// Which sessions the registration is visible to (invariant (b): dispatch
+    /// re-checks even though discovery already filtered by session owner).
+    audience: RegistrationAudience,
+    /// How the tool's structured result reads inside a `bash` script.
+    script_output: Option<harnx_toolset::ScriptOutput>,
+}
+
+impl RegisteredTool {
+    /// Invariant (b) of the user-credentials plan: a user-scoped tool may only
+    /// dispatch for its own owner, an ownerless-only tool only for a session
+    /// without an owner. Global registrations dispatch for anyone.
+    fn visible_to(&self, session_owner: Option<&str>) -> bool {
+        match &self.audience {
+            RegistrationAudience::Global => true,
+            RegistrationAudience::User(segment) => {
+                session_owner.is_some_and(|owner| user_key_segment(owner) == *segment)
+            }
+            RegistrationAudience::OwnerlessOnly => session_owner.is_none(),
+        }
+    }
 }
 
 struct PendingToolRequest {
@@ -139,6 +165,14 @@ pub struct NatsToolProvider {
     parent_agent: Option<String>,
     /// Caller's local session id for cid: URL construction.
     parent_local_session_id: Option<String>,
+    /// The session owner this snapshot was discovered for (the canonical
+    /// `UserPrincipals.user_id`, `None` for an ownerless session). Every
+    /// dispatch through this provider stamps it onto `ToolRequest.user_id`
+    /// and guards audience visibility against it. For operator calls the
+    /// worker overrides the config's principals to the operator identity
+    /// before discovery, so this carries the operator, not the session
+    /// owner (decision 11).
+    session_owner: Option<String>,
     tools: HashMap<String, RegisteredTool>,
     registrations: Vec<Registration>,
     active_package: Option<String>,
@@ -176,25 +210,60 @@ enum DiscoveryPolicy<'a> {
     Strict(Option<&'a str>),
 }
 
+/// The registry revision evidence a discovery scan captured.
+///
+/// `Sequence(0)` is a proof, not an absence: the stream did not exist when
+/// the scan started. `Unread` means the pre-scan revision read failed and
+/// the scan's snapshot carries no revision proof — the discovery cache must
+/// not store a fabricated 0 in its place, or a later bucket deletion would
+/// probe `Some(0)`, match, and serve removed tools until the TTL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegistryRevision {
+    /// The registry stream's sequence when the scan started.
+    Sequence(u64),
+    /// The pre-scan revision read failed; no proof exists.
+    Unread,
+}
+
+/// Upper bound on a cached lookup's freshness probe. A partitioned broker
+/// must not stall every completion for the client's default 10 s request
+/// timeout; the probe degrades to the watch-epoch fallback after this.
+const REGISTRY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl<'a> DiscoveryPolicy<'a> {
+    /// The package the snapshot is scoped to, and whether discovery must
+    /// fail (`Strict`) instead of degrading when the registry is not
+    /// authoritative for it.
+    fn parts(self) -> (Option<&'a str>, bool) {
+        match self {
+            DiscoveryPolicy::BestEffort(package) => (package, false),
+            DiscoveryPolicy::Strict(package) => (package, true),
+        }
+    }
+}
+
 async fn discover_registrations(
     jetstream: &async_nats::jetstream::Context,
     instance_id: &ServerScope,
+    session_owner: Option<&str>,
     strict: bool,
 ) -> anyhow::Result<(Option<async_nats::jetstream::kv::Store>, Vec<Registration>)> {
     match open_registry_store(jetstream).await {
-        Ok(Some(store)) => match registration_snapshot_in(&store, instance_id).await {
-            Ok(registrations) => Ok((Some(store), registrations)),
-            Err(error) => {
-                if strict {
-                    return Err(error);
+        Ok(Some(store)) => {
+            match registration_snapshot_in(&store, instance_id, session_owner).await {
+                Ok(registrations) => Ok((Some(store), registrations)),
+                Err(error) => {
+                    if strict {
+                        return Err(error);
+                    }
+                    log::warn!(
+                        "tool registration discovery failed under scope '{}': {error:#}",
+                        instance_id.as_str()
+                    );
+                    Ok((Some(store), Vec::new()))
                 }
-                log::warn!(
-                    "tool registration discovery failed under scope '{}': {error:#}",
-                    instance_id.as_str()
-                );
-                Ok((Some(store), Vec::new()))
             }
-        },
+        }
         Ok(None) => Ok((None, Vec::new())),
         Err(error) => {
             if strict {
@@ -209,6 +278,18 @@ async fn discover_registrations(
         }
     }
 }
+
+/// Boxed-erased future from [`NatsToolProvider::open_discovery_transport`]:
+/// the broker connect chain must not appear as a concrete type in callers'
+/// future trees (E0275 in dependent crates).
+type DiscoveryTransportFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = anyhow::Result<(async_nats::Client, async_nats::Subscriber, usize)>,
+            > + Send
+            + 'a,
+    >,
+>;
 
 impl NatsToolProvider {
     /// Dispatch one trusted frontend request with its already-persisted outer scope.
@@ -231,6 +312,7 @@ impl NatsToolProvider {
                 name: tool_name,
                 arguments,
                 origin: ToolCallOrigin {
+                    structured_result: false,
                     tool_call_id: Some(tool_call_id),
                     tool_round: None,
                 },
@@ -249,8 +331,11 @@ impl NatsToolProvider {
         in_flight: NatsInFlightCalls,
         active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let policy = DiscoveryPolicy::BestEffort(active_package);
-        Self::discover_inner(config, instance_id, in_flight, policy).await
+        Ok(
+            Self::discover_with_registry_revision(config, instance_id, in_flight, active_package)
+                .await?
+                .0,
+        )
     }
 
     /// Operator discovery must distinguish an empty catalog from a failed scan.
@@ -261,7 +346,56 @@ impl NatsToolProvider {
         active_package: Option<&str>,
     ) -> anyhow::Result<Self> {
         let policy = DiscoveryPolicy::Strict(active_package);
+        Self::discover_inner(config, instance_id, in_flight, policy)
+            .await
+            .map(|(provider, _)| provider)
+    }
+
+    /// Like [`Self::discover`], but also returns the registry revision
+    /// evidence the scan captured (decision 5b), so the discovery cache can
+    /// prove freshness without a second connection: both the revision read
+    /// and the scan run on this discovery's own transport.
+    pub(crate) async fn discover_with_registry_revision(
+        config: &Config,
+        instance_id: ServerScope,
+        in_flight: NatsInFlightCalls,
+        active_package: Option<&str>,
+    ) -> anyhow::Result<(Self, RegistryRevision)> {
+        let policy = DiscoveryPolicy::BestEffort(active_package);
         Self::discover_inner(config, instance_id, in_flight, policy).await
+    }
+
+    /// The registry stream sequence as seen through this snapshot's own
+    /// connection, or `None` when the probe cannot reach the broker. Used by
+    /// the discovery cache's freshness check: probing through the snapshot's
+    /// client avoids the per-call connection cost of `Config::nats_client`
+    /// (PR #2835 macOS CI latency).
+    ///
+    /// A missing registry stream is sequence 0, not a failure: deleting the
+    /// whole bucket must invalidate a snapshot cached with a later revision
+    /// (decision 5b), or the removed tools stay advertised until the TTL.
+    /// Only a transport/API error maps to `None`, where the watch epoch
+    /// alone vouches for the snapshot — the pre-change best-effort behavior.
+    // Type-erased box for the same reason as the discovery transport: the
+    // JetStream get_stream chain must not appear as a concrete type in
+    // dependent crates' future trees.
+    pub(crate) fn registry_revision_probe(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send + '_>> {
+        // Bound the probe's reply wait: a partitioned broker must not stall
+        // every cached lookup for the client's default 10 s request timeout.
+        let jetstream = async_nats::jetstream::context::ContextBuilder::new()
+            .timeout(REGISTRY_PROBE_TIMEOUT)
+            .build(self.client.clone());
+        Box::pin(async move {
+            match crate::tool_registry_watch::registry_state_revision(&jetstream).await {
+                Ok(revision) => Some(revision.unwrap_or(0)),
+                Err(error) => {
+                    log::debug!("tool registry freshness check failed: {error:#}");
+                    None
+                }
+            }
+        })
     }
 
     async fn discover_inner(
@@ -269,54 +403,80 @@ impl NatsToolProvider {
         instance_id: ServerScope,
         in_flight: NatsInFlightCalls,
         policy: DiscoveryPolicy<'_>,
-    ) -> anyhow::Result<Self> {
-        let (active_package, strict) = match policy {
-            DiscoveryPolicy::BestEffort(package) => (package, false),
-            DiscoveryPolicy::Strict(package) => (package, true),
-        };
-        let cluster = config.default_cluster_key();
-        let journal_replicas = config
-            .resolve_nats_server(cluster)
-            .await?
-            .resolved_replicas();
-        let client = config.nats_client(cluster).await?;
-        let control_subject = instance_id.control_subject();
-        let control_subscription = client.subscribe(control_subject).await?;
-        client.flush().await?;
+    ) -> anyhow::Result<(Self, RegistryRevision)> {
+        let (active_package, strict) = policy.parts();
+        let (client, control_subscription, journal_replicas) =
+            Self::open_discovery_transport(config, &instance_id).await?;
+
+        // Trusted identity for this snapshot: the session owner (or the
+        // operator identity the worker stamped for an operator call). Never
+        // derived from model arguments.
+        let session_owner = config
+            .extract_agent()
+            .user_principals()
+            .and_then(|principals| principals.user_id.clone())
+            .filter(|owner| !owner.trim().is_empty());
 
         let jetstream = async_nats::jetstream::new(client.clone());
-        let (registry, mut registrations) =
-            discover_registrations(&jetstream, &instance_id, strict).await?;
-        for registration in &registrations {
-            anyhow::ensure!(registration.proto_version == harnx_toolset_server::TOOL_PROTOCOL_VERSION,
-                "incompatible tool protocol {} from '{}'; expected v{}; upgrade workers and tool servers together",
-                registration.proto_version, registration.server, harnx_toolset_server::TOOL_PROTOCOL_VERSION);
-        }
-        registrations.sort_by_key(|registration| match registration.package.as_deref() {
-            Some(package) if Some(package) == active_package => 0,
-            None => usize::from(active_package.is_some()),
-            Some(_) => 2,
-        });
-        let (tools, declarations) = build_registered_tools(active_package, registrations.clone());
+        // Decision 5b: read the registry sequence *before* the scan, on this
+        // same connection (`scan_start_revision` — a write the broker acked
+        // before that read is in both the scan and the sequence; a write
+        // acked after it bumps the sequence past the stored value, so the
+        // next completion's comparison catches it and rescans).
+        let revision = scan_start_revision(&jetstream).await;
+        let (registry, registrations) =
+            discover_registrations(&jetstream, &instance_id, session_owner.as_deref(), strict)
+                .await?;
+        let registrations = ordered_registrations(registrations, active_package)?;
+        let (tools, declarations) =
+            build_registered_tools(&instance_id, active_package, registrations.clone());
         let (parent_session_id, parent_agent, parent_local_session_id) =
             resolve_parent_identity(config);
 
-        Ok(Self {
-            run_context: config.run_context.clone(),
-            client,
-            instance_id,
-            parent_session_id,
-            parent_agent,
-            parent_local_session_id,
-            tools,
-            registrations,
-            active_package: active_package.map(str::to_string),
-            declarations,
-            registry,
-            journal_replicas,
-            journal: Default::default(),
-            progress_dispatcher: ProgressDispatcher::new(control_subscription),
-            in_flight,
+        Ok((
+            Self {
+                run_context: config.run_context.clone(),
+                client,
+                instance_id,
+                parent_session_id,
+                parent_agent,
+                parent_local_session_id,
+                session_owner,
+                tools,
+                registrations,
+                active_package: active_package.map(str::to_string),
+                declarations,
+                registry,
+                journal_replicas,
+                journal: Default::default(),
+                progress_dispatcher: ProgressDispatcher::new(control_subscription),
+                in_flight,
+            },
+            revision,
+        ))
+    }
+
+    /// The broker pieces a discovery snapshot needs: the shared client, the
+    /// subscribed control channel for progress and cancellation, and the
+    /// replica count the snapshot's journal writes must reach.
+    // Type-erased box: resolving the broker (possibly starting the shared
+    // local server) and connecting reach the deep async-nats/rustls future
+    // chain, and a concrete boxed future would still overflow dependent
+    // crates' trait-solver recursion budget (E0275).
+    fn open_discovery_transport<'a>(
+        config: &'a Config,
+        instance_id: &'a ServerScope,
+    ) -> DiscoveryTransportFuture<'a> {
+        Box::pin(async move {
+            let cluster = config.default_cluster_key();
+            let journal_replicas = config
+                .resolve_nats_server(cluster)
+                .await?
+                .resolved_replicas();
+            let client = config.nats_client(cluster).await?;
+            let control_subscription = client.subscribe(instance_id.control_subject()).await?;
+            client.flush().await?;
+            Ok((client, control_subscription, journal_replicas))
         })
     }
 
@@ -326,8 +486,15 @@ impl NatsToolProvider {
             &self.registrations,
             self.active_package.as_deref(),
         ) {
+            // Union semantics (decision 4): one identity can carry a global
+            // registration plus one in this session's audience. Pick the
+            // registration whose tools contain the raw name — not just the
+            // first registration with the identity — so KV iteration order
+            // never decides the result. `self.registrations` is ordered by
+            // [`registration_order`], so ties resolve deterministically.
             let registration = self.registrations.iter().find(|registration| {
                 ServerIdentity::identity_token(registration) == identity_token
+                    && registration.tools.iter().any(|spec| spec.name == raw_name)
             })?;
             let spec = registration
                 .tools
@@ -340,14 +507,54 @@ impl NatsToolProvider {
                 request_timeout: request_timeout(spec.timeout_secs),
                 stop_on_new_message: spec.stops_on_new_message(),
                 requests_input: spec.requests_input(),
+                registration_key: registration_kv_key(self.instance_id.as_str(), registration),
+                audience: registration.audience(),
+                script_output: spec.script_output(),
             });
         }
 
         // Raw aliases keep persisted calls from before server-prefixed naming routable.
         self.tools.get(tool_name).cloned()
     }
+    /// Mappings by agent-visible tool name. Each declaration resolves to its
+    /// own route, so a raw-name alias never becomes a key.
+    pub(crate) fn script_outputs(
+        &self,
+    ) -> std::collections::BTreeMap<String, harnx_toolset::ScriptOutput> {
+        self.declarations
+            .iter()
+            .filter_map(|declaration| {
+                let route = self.resolve_route(&declaration.name)?;
+                Some((declaration.name.clone(), route.script_output?))
+            })
+            .collect()
+    }
+
     pub fn declarations(&self) -> &[ToolDeclaration] {
         &self.declarations
+    }
+
+    /// Every name this provider can route. The route-map keys cover the
+    /// agent-visible names and the raw aliases kept through the naming
+    /// transition; `has_tool` additionally accepts the per-registration
+    /// agent-visible name (`parse_agent_tool_name`'s bare-name fallback,
+    /// `server_identity.rs`), which cross-package registrations resolve
+    /// under without appearing as a map key — so yield it too. The
+    /// config-level collision view records these names so the
+    /// model-visible tool list cannot advertise a script tool whose name
+    /// the provider serves.
+    pub fn route_names(&self) -> impl Iterator<Item = String> {
+        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        for registration in &self.registrations {
+            for spec in &registration.tools {
+                names.push(ServerIdentity::agent_visible_name(
+                    registration.package.as_deref(),
+                    registration,
+                    &spec.name,
+                ));
+            }
+        }
+        names.into_iter()
     }
 
     pub fn declarations_for_use_tools(&self, use_tools: Option<&str>) -> Vec<ToolDeclaration> {
@@ -417,6 +624,53 @@ impl NatsToolProvider {
 
     pub fn in_flight_calls(&self) -> NatsInFlightCalls {
         self.in_flight.clone()
+    }
+
+    /// A provider for tool-round snapshot tests: direct control over the
+    /// route map (raw aliases included), the declaration list, and the
+    /// registrations whose names `parse_agent_tool_name` can fall back to,
+    /// without registration plumbing. Only `has_tool`, `route_names`, and
+    /// `declarations_for_use_tools` consult those fields in that context.
+    #[cfg(test)]
+    pub(crate) async fn snapshot_test_provider(
+        client: &async_nats::Client,
+        routes: Vec<(&str, &str, &str)>,
+        declarations: Vec<ToolDeclaration>,
+        registrations: Vec<Registration>,
+    ) -> anyhow::Result<NatsToolProvider> {
+        let instance_id = ServerScope::new();
+        let control_subscription = client.subscribe(instance_id.control_subject()).await?;
+        Ok(NatsToolProvider {
+            run_context: None,
+            client: client.clone(),
+            instance_id,
+            session_owner: None,
+            parent_session_id: None,
+            parent_agent: None,
+            parent_local_session_id: None,
+            tools: routes
+                .into_iter()
+                .map(|(name, server, raw_name)| {
+                    (
+                        name.to_string(),
+                        RegisteredTool {
+                            server: server.into(),
+                            selector_server: server.into(),
+                            raw_name: raw_name.into(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            registrations,
+            active_package: None,
+            declarations,
+            registry: None,
+            journal_replicas: 1,
+            journal: Default::default(),
+            progress_dispatcher: ProgressDispatcher::new(control_subscription),
+            in_flight: NatsInFlightCalls::default(),
+        })
     }
 
     /// Describe this snapshot's discovery for the zero-registration guard.
@@ -528,7 +782,63 @@ impl NatsToolProvider {
     }
 }
 
+/// Deterministic order over one scope's registrations: by server identity
+/// token, then by audience (global, ownerless-only, then user registrations
+/// by user key segment). Discovery sorts with this before building the tool
+/// map, so KV iteration order never decides which registration wins a
+/// same-name tool (decision 4) and `resolve_route` picks are reproducible.
+fn registration_order(left: &Registration, right: &Registration) -> std::cmp::Ordering {
+    registration_sort_key(left).cmp(&registration_sort_key(right))
+}
+
+/// Reject registrations from a different tool protocol, then order them for
+/// discovery: the active package's registrations first, then the
+/// deterministic identity order (decision 4, "several registrations per
+/// identity" — KV iteration order must not decide which of one identity's
+/// global/user/ownerless registrations wins a same-name tool).
+fn ordered_registrations(
+    mut registrations: Vec<Registration>,
+    active_package: Option<&str>,
+) -> anyhow::Result<Vec<Registration>> {
+    for registration in &registrations {
+        anyhow::ensure!(
+            registration.proto_version == harnx_toolset_server::TOOL_PROTOCOL_VERSION,
+            "incompatible tool protocol {} from '{}'; expected v{}; upgrade workers and tool servers together",
+            registration.proto_version,
+            registration.server,
+            harnx_toolset_server::TOOL_PROTOCOL_VERSION
+        );
+    }
+    registrations.sort_by_key(|registration| match registration.package.as_deref() {
+        Some(package) if Some(package) == active_package => 0,
+        None => usize::from(active_package.is_some()),
+        Some(_) => 2,
+    });
+    registrations.sort_by(registration_order);
+    Ok(registrations)
+}
+
+/// The comparison key for [`registration_order`]: identity token first,
+/// then the audience rank.
+fn registration_sort_key(registration: &Registration) -> (String, (u8, String)) {
+    (
+        ServerIdentity::identity_token(registration),
+        audience_rank(registration),
+    )
+}
+
+/// Audience rank: global before ownerless-only before user registrations,
+/// users ordered by their key segment.
+fn audience_rank(registration: &Registration) -> (u8, String) {
+    match registration.audience() {
+        RegistrationAudience::Global => (0, String::new()),
+        RegistrationAudience::OwnerlessOnly => (1, String::new()),
+        RegistrationAudience::User(segment) => (2, segment),
+    }
+}
+
 fn registered_tool(
+    scope: &ServerScope,
     active_package: Option<&str>,
     registration: &Registration,
     spec: ToolSpec,
@@ -546,6 +856,7 @@ fn registered_tool(
     let kind = spec.kind().map(|k| k.into());
     let stop_on_new_message = spec.stops_on_new_message();
     let requests_input = spec.requests_input();
+    let script_output = spec.script_output();
     let parameters = match JsonSchema::from_tool_schema(spec.input_schema) {
         Ok(parameters) => parameters,
         Err(error) => {
@@ -566,6 +877,9 @@ fn registered_tool(
         request_timeout: request_timeout(spec.timeout_secs),
         stop_on_new_message,
         requests_input,
+        registration_key: registration_kv_key(scope.as_str(), registration),
+        audience: registration.audience(),
+        script_output,
     };
     let declaration = ToolDeclaration {
         name: name.clone(),
@@ -590,15 +904,16 @@ fn request_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
     }
 }
 fn build_registered_tools(
+    scope: &ServerScope,
     active_package: Option<&str>,
     mut registrations: Vec<Registration>,
 ) -> (HashMap<String, RegisteredTool>, Vec<ToolDeclaration>) {
-    registrations.sort_by(|left, right| left.server.cmp(&right.server));
+    registrations.sort_by(registration_order);
     let mut registered = HashMap::new();
     for registration in registrations {
         for spec in registration.tools.clone() {
             let Some((name, route, declaration)) =
-                registered_tool(active_package, &registration, spec)
+                registered_tool(scope, active_package, &registration, spec)
             else {
                 continue;
             };
@@ -672,6 +987,7 @@ impl ToolProvider for NatsToolProvider {
                 name: tool_name,
                 arguments,
                 origin: ToolCallOrigin {
+                    structured_result: false,
                     tool_call_id,
                     tool_round: None,
                 },
@@ -702,6 +1018,22 @@ impl ToolProvider for NatsToolProvider {
             Some(progress),
         ))
         .await
+    }
+}
+
+/// The registry sequence a scan starts under, or why none exists.
+///
+/// Read strictly before the scan on the same connection (decision 5b).
+/// A failed read is not a fabricated sequence: the scan's snapshot must
+/// carry no revision proof, or a later bucket deletion (probe `Some(0)`)
+/// would match a cached 0 and stay stale until the TTL.
+async fn scan_start_revision(jetstream: &async_nats::jetstream::Context) -> RegistryRevision {
+    match crate::tool_registry_watch::registry_state_revision(jetstream).await {
+        Ok(sequence) => RegistryRevision::Sequence(sequence.unwrap_or(0)),
+        Err(error) => {
+            log::debug!("tool registry revision read failed before scan: {error:#}");
+            RegistryRevision::Unread
+        }
     }
 }
 
@@ -742,17 +1074,31 @@ async fn open_registry_store(
 async fn registration_snapshot(
     client: &async_nats::Client,
     instance_id: &ServerScope,
+    session_owner: Option<&str>,
 ) -> anyhow::Result<Vec<Registration>> {
     let jetstream = async_nats::jetstream::new(client.clone());
     let Some(store) = open_registry_store(&jetstream).await? else {
         return Ok(Vec::new());
     };
-    registration_snapshot_in(&store, instance_id).await
+    registration_snapshot_in(&store, instance_id, session_owner).await
+}
+
+/// Whether one discovered registration is visible to a session with this
+/// owner (invariant (a) of the user-credentials plan).
+fn registration_visible_to(registration: &Registration, session_owner: Option<&str>) -> bool {
+    match registration.audience() {
+        RegistrationAudience::Global => true,
+        RegistrationAudience::User(segment) => {
+            session_owner.is_some_and(|owner| user_key_segment(owner) == segment)
+        }
+        RegistrationAudience::OwnerlessOnly => session_owner.is_none(),
+    }
 }
 
 async fn registration_snapshot_in(
     store: &async_nats::jetstream::kv::Store,
     instance_id: &ServerScope,
+    session_owner: Option<&str>,
 ) -> anyhow::Result<Vec<Registration>> {
     let mut keys = store.keys().await?;
     let prefix = format!("{instance_id}.");
@@ -771,10 +1117,27 @@ async fn registration_snapshot_in(
                 continue;
             }
         };
-        let identity_token = ServerIdentity::identity_token(&registration);
-        if key == registration_key(instance_id, &identity_token) {
-            registrations.push(registration);
+        // The key must be exactly the one this registration's identity and
+        // audience publish under. The old rule accepted only the bare
+        // `{scope}.{identity_token}` shape, which is still the only one a
+        // pre-change worker sees; `.u.{U}` and `.anon` keys are new, and any
+        // other suffix stays ignored.
+        let expected_key = registration_kv_key(instance_id.as_str(), &registration);
+        if key != expected_key {
+            log::warn!(
+                "ignoring NATS tool registration '{key}' filed under the wrong \
+                 audience key '{expected_key}'"
+            );
+            continue;
         }
+        // Audience filter (invariant (a)): a session with an owner sees global
+        // registrations plus its own; an ownerless session sees global plus
+        // ownerless-only. Another user's or an ownerless-only registration
+        // is simply out of this session's visible set — not a warning.
+        if !registration_visible_to(&registration, session_owner) {
+            continue;
+        }
+        registrations.push(registration);
     }
     Ok(registrations)
 }
@@ -814,7 +1177,7 @@ pub async fn describe_discovery(
     client: &async_nats::Client,
     scope: &ServerScope,
 ) -> anyhow::Result<DiscoveryReport> {
-    let registrations = registration_snapshot(client, scope).await?;
+    let registrations = registration_snapshot(client, scope, None).await?;
     let found = registrations.len();
     Ok(DiscoveryReport {
         found,
@@ -824,12 +1187,135 @@ pub async fn describe_discovery(
 
 #[cfg(test)]
 mod tests {
+
+    /// A global registration whose only varying fields are `server` and
+    /// `tools`; every other wire field keeps its default shape.
+    fn global_registration(server: &str, tools: Vec<ToolSpec>) -> Registration {
+        Registration {
+            user_id: None,
+            ownerless_only: false,
+            connection_id: None,
+            package: None,
+            config: String::new(),
+            server: server.to_string(),
+            tools,
+            schema_version: 1,
+            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
+        }
+    }
     use super::{
-        build_registered_tools, request_timeout, with_physical_invocation, NatsInFlightCalls,
-        NatsToolProvider, ProgressDispatcher, RegisteredTool, DEFAULT_REQUEST_TIMEOUT,
+        build_registered_tools, registration_order, request_timeout, with_physical_invocation,
+        NatsInFlightCalls, NatsToolProvider, ProgressDispatcher, RegisteredTool,
+        DEFAULT_REQUEST_TIMEOUT,
     };
     use harnx_core::instance::ServerScope;
     use harnx_toolset::{Registration, ToolSpec, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY};
+
+    /// One identity's global registration plus its user-scoped one, with a
+    /// same-name tool in both, in both possible KV iteration orders. Decision
+    /// 4: which registration a name routes to must not depend on that order,
+    /// and a same-name conflict resolves to the global registration.
+    #[test]
+    fn union_routing_is_independent_of_kv_iteration_order() {
+        fn spec(name: &str) -> ToolSpec {
+            ToolSpec {
+                cancellation_guarantee: Default::default(),
+                name: name.to_string(),
+                description: String::new(),
+                input_schema: json!({ "type": "object" }),
+                idempotent_hint: true,
+                read_only_hint: true,
+                timeout_secs: Some(30),
+                meta: None,
+            }
+        }
+        fn registration(user_id: Option<&str>, tools: &[&str]) -> Registration {
+            Registration {
+                package: None,
+                config: String::new(),
+                server: "creds".to_string(),
+                tools: tools.iter().map(|name| spec(name)).collect(),
+                schema_version: 1,
+                proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
+                user_id: user_id.map(str::to_string),
+                ownerless_only: false,
+                connection_id: None,
+            }
+        }
+
+        let scope = ServerScope::new();
+        let global = registration(None, &["manage"]);
+        let user = registration(Some("alice"), &["personal"]);
+        // Whichever order the KV scan yields the two registrations in, the
+        // sort inside `build_registered_tools` and `registration_order` puts
+        // them in the same deterministic order, so the routes agree.
+        let mut global_first = vec![global.clone(), user.clone()];
+        let mut user_first = vec![user.clone(), global.clone()];
+        let (tools_global_first, declarations_global_first) =
+            build_registered_tools(&scope, None, std::mem::take(&mut global_first));
+        let (tools_user_first, declarations_user_first) =
+            build_registered_tools(&scope, None, std::mem::take(&mut user_first));
+
+        // The union is present either way: global and user tools side by side,
+        // each routed to its own registration.
+        let route = |tools: &HashMap<String, RegisteredTool>, name: &str| {
+            tools
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .audience
+                .clone()
+        };
+        for tools in [&tools_global_first, &tools_user_first] {
+            assert!(
+                tools.contains_key("creds_manage"),
+                "management tool missing"
+            );
+            assert_eq!(
+                route(tools, "creds_manage"),
+                harnx_toolset::RegistrationAudience::Global
+            );
+            assert_eq!(
+                route(tools, "creds_personal"),
+                harnx_toolset::RegistrationAudience::User(harnx_toolset::user_key_segment("alice"))
+            );
+        }
+        // And the whole snapshots agree, not just the routed entries.
+        let summarize = |tools: &HashMap<String, RegisteredTool>| {
+            tools
+                .iter()
+                .map(|(name, route)| (name.clone(), route.registration_key.clone()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(summarize(&tools_global_first), summarize(&tools_user_first));
+        assert_eq!(
+            declarations_global_first
+                .iter()
+                .map(|declaration| declaration.name.clone())
+                .collect::<Vec<_>>(),
+            declarations_user_first
+                .iter()
+                .map(|declaration| declaration.name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // `registration_order` itself ranks global before user for one
+        // identity, from either input order.
+        let mut user_leading = [user.clone(), global.clone()];
+        user_leading.sort_by(registration_order);
+        assert_eq!(
+            user_leading[0].audience(),
+            harnx_toolset::RegistrationAudience::Global
+        );
+        let mut global_leading = [global, user];
+        global_leading.sort_by(registration_order);
+        assert_eq!(
+            global_leading[0].audience(),
+            harnx_toolset::RegistrationAudience::Global
+        );
+    }
+
     use opentelemetry::global;
     use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
     use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -844,6 +1330,7 @@ mod tests {
     /// A dispatch of the transcript call `id`, made outside any recorded round.
     fn transcript_call(id: &str) -> harnx_core::tool::ToolCallOrigin<'_> {
         harnx_core::tool::ToolCallOrigin {
+            structured_result: false,
             tool_call_id: Some(id),
             tool_round: None,
         }
@@ -862,6 +1349,7 @@ mod tests {
             run_context: None,
             parent_agent: None,
             parent_local_session_id: None,
+            session_owner: None,
             tools: HashMap::new(),
             registrations: Vec::new(),
             active_package: None,
@@ -1087,14 +1575,99 @@ mod tests {
         });
     }
 
+    fn mapped_registration() -> Registration {
+        read_registration("fs", true)
+    }
+
+    fn read_registration(server: &str, mapped: bool) -> Registration {
+        let output = harnx_toolset::ScriptOutput {
+            stdout: Some("text".into()),
+            ..Default::default()
+        };
+        let mut spec = ToolSpec {
+            cancellation_guarantee: Default::default(),
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({ "type": "object" }),
+            idempotent_hint: true,
+            read_only_hint: true,
+            timeout_secs: None,
+            meta: None,
+        };
+        if mapped {
+            spec = spec.with_script_output(output);
+        }
+        global_registration(server, vec![spec])
+    }
+
+    #[test]
+    fn registered_tool_keeps_the_script_output() {
+        harnx_core::require_nextest();
+        let registration = mapped_registration();
+        let spec = registration.tools[0].clone();
+        let scope = ServerScope::from_string("provider-tests");
+        let (name, route, _) =
+            super::registered_tool(&scope, None, &registration, spec).expect("registers");
+        assert_eq!(name, "fs_read");
+        assert_eq!(
+            route.script_output.and_then(|output| output.stdout),
+            Some("text".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn script_outputs_are_keyed_by_visible_name() -> anyhow::Result<()> {
+        harnx_core::require_nextest();
+        let broker = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(broker.url()).await?;
+        let mut provider = make_test_provider(&client).await;
+        let registrations = vec![mapped_registration()];
+        (provider.tools, provider.declarations) = build_registered_tools(
+            &ServerScope::from_string("provider-tests"),
+            None,
+            registrations.clone(),
+        );
+        provider.registrations = registrations;
+        let outputs = provider.script_outputs();
+        assert_eq!(outputs["fs_read"].stdout.as_deref(), Some("text"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn script_outputs_ignore_raw_name_aliases() -> anyhow::Result<()> {
+        harnx_core::require_nextest();
+        let broker = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(broker.url()).await?;
+        let mut provider = make_test_provider(&client).await;
+        // Both servers expose a tool whose raw name is `read`; only `fs` maps it.
+        let registrations = vec![
+            read_registration("fs", true),
+            read_registration("other", false),
+        ];
+        (provider.tools, provider.declarations) = build_registered_tools(
+            &ServerScope::from_string("provider-tests"),
+            None,
+            registrations.clone(),
+        );
+        provider.registrations = registrations;
+        let outputs = provider.script_outputs();
+        assert_eq!(outputs.keys().collect::<Vec<_>>(), ["fs_read"]);
+        assert!(!outputs.contains_key("other_read"));
+        assert!(!outputs.contains_key("read"));
+        Ok(())
+    }
+
     #[test]
     fn prefixes_registered_tool_with_server_and_keeps_raw_route_name() {
+        let scope = ServerScope::from_string("provider-tests");
         harnx_core::require_nextest();
-        let registration = Registration {
-            package: None,
-            config: String::new(),
-            server: "fs".to_string(),
-            tools: vec![ToolSpec {
+        let registration = global_registration(
+            "fs",
+            vec![ToolSpec {
                 cancellation_guarantee: Default::default(),
                 name: "read".to_string(),
                 description: "Read a file".to_string(),
@@ -1109,11 +1682,9 @@ mod tests {
                 timeout_secs: None,
                 meta: None,
             }],
-            schema_version: 1,
-            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
-        };
+        );
 
-        let (tools, declarations) = build_registered_tools(None, vec![registration]);
+        let (tools, declarations) = build_registered_tools(&scope, None, vec![registration]);
 
         assert_eq!(declarations[0].name, "fs_read");
         assert_eq!(
@@ -1145,15 +1716,14 @@ mod tests {
     /// (any third-party MCP server) keeps the backstop.
     #[test]
     fn bridged_spawn_wait_policy_survives_the_default_request_backstop() {
+        let scope = ServerScope::from_string("provider-tests");
         harnx_core::require_nextest();
 
         const BASH_WAIT_DEFAULT_SECS: u64 = 120;
         let timeout_for = |timeout_secs: Option<u64>| {
-            let registration = Registration {
-                package: None,
-                config: String::new(),
-                server: "wrapped".to_string(),
-                tools: vec![ToolSpec {
+            let registration = global_registration(
+                "wrapped",
+                vec![ToolSpec {
                     cancellation_guarantee: Default::default(),
                     name: "tool".to_string(),
                     description: String::new(),
@@ -1163,11 +1733,9 @@ mod tests {
                     timeout_secs,
                     meta: None,
                 }],
-                schema_version: 1,
-                proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
-            };
+            );
 
-            let (tools, _) = build_registered_tools(None, vec![registration]);
+            let (tools, _) = build_registered_tools(&scope, None, vec![registration]);
             tools
                 .get("wrapped_tool")
                 .or_else(|| tools.get("tool"))
@@ -1187,21 +1755,15 @@ mod tests {
     /// stops reaching `ToolDeclaration` the TUI falls back to a YAML dump.
     #[test]
     fn carries_native_toolset_templates_into_tool_declarations() {
+        let scope = ServerScope::from_string("provider-tests");
         harnx_core::require_nextest();
         use harnx_toolset::Toolset;
 
         let specs = harnx_time_tools::TimeToolset::new().tools();
         assert!(!specs.is_empty());
-        let registration = Registration {
-            package: None,
-            config: String::new(),
-            server: "time".to_string(),
-            tools: specs.clone(),
-            schema_version: 1,
-            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
-        };
+        let registration = global_registration("time", specs.clone());
 
-        let (_, declarations) = build_registered_tools(None, vec![registration]);
+        let (_, declarations) = build_registered_tools(&scope, None, vec![registration]);
 
         assert_eq!(declarations.len(), specs.len());
         for declaration in &declarations {
@@ -1218,6 +1780,7 @@ mod tests {
     /// and custom specs can also set kind via `with_kind`.
     #[test]
     fn propagates_spec_kind_into_tool_declaration() {
+        let scope = ServerScope::from_string("provider-tests");
         harnx_core::require_nextest();
         use harnx_toolset::{ToolProgressKind, Toolset};
 
@@ -1225,16 +1788,9 @@ mod tests {
         let time_specs = harnx_time_tools::TimeToolset::new().tools();
         assert!(!time_specs.is_empty(), "time-tools should have tools");
 
-        let time_registration = Registration {
-            package: None,
-            config: String::new(),
-            server: "time".to_string(),
-            tools: time_specs.clone(),
-            schema_version: 1,
-            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
-        };
+        let time_registration = global_registration("time", time_specs.clone());
 
-        let (_, time_declarations) = build_registered_tools(None, vec![time_registration]);
+        let (_, time_declarations) = build_registered_tools(&scope, None, vec![time_registration]);
 
         // Verify time tools have expected kinds (all Other per task spec)
         for decl in &time_declarations {
@@ -1259,16 +1815,10 @@ mod tests {
         }
         .with_kind(ToolProgressKind::Search);
 
-        let custom_registration = Registration {
-            package: None,
-            config: String::new(),
-            server: "custom".to_string(),
-            tools: vec![custom_spec],
-            schema_version: 1,
-            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
-        };
+        let custom_registration = global_registration("custom", vec![custom_spec]);
 
-        let (_, custom_declarations) = build_registered_tools(None, vec![custom_registration]);
+        let (_, custom_declarations) =
+            build_registered_tools(&scope, None, vec![custom_registration]);
         assert_eq!(custom_declarations.len(), 1);
         assert_eq!(
             custom_declarations[0].kind,
@@ -1288,16 +1838,10 @@ mod tests {
             meta: None,
         };
 
-        let no_kind_registration = Registration {
-            package: None,
-            config: String::new(),
-            server: "nokind".to_string(),
-            tools: vec![no_kind_spec],
-            schema_version: 1,
-            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
-        };
+        let no_kind_registration = global_registration("nokind", vec![no_kind_spec]);
 
-        let (_, no_kind_declarations) = build_registered_tools(None, vec![no_kind_registration]);
+        let (_, no_kind_declarations) =
+            build_registered_tools(&scope, None, vec![no_kind_registration]);
         assert_eq!(no_kind_declarations.len(), 1);
         assert_eq!(
             no_kind_declarations[0].kind, None,
@@ -1307,6 +1851,7 @@ mod tests {
 
     #[test]
     fn builds_tool_declaration_templates_from_tool_spec_meta() {
+        let scope = ServerScope::from_string("provider-tests");
         harnx_core::require_nextest();
         let meta = json!({
             "call_template": "Calling {{tool}}",
@@ -1315,11 +1860,9 @@ mod tests {
         .as_object()
         .expect("meta object")
         .clone();
-        let registration = Registration {
-            package: None,
-            config: String::new(),
-            server: "template-server".to_string(),
-            tools: vec![ToolSpec {
+        let registration = global_registration(
+            "template-server",
+            vec![ToolSpec {
                 cancellation_guarantee: Default::default(),
                 name: "template_tool".to_string(),
                 description: "Tool with display templates".to_string(),
@@ -1329,11 +1872,9 @@ mod tests {
                 timeout_secs: None,
                 meta: Some(meta),
             }],
-            schema_version: 1,
-            proto_version: harnx_toolset_server::TOOL_PROTOCOL_VERSION,
-        };
+        );
 
-        let (_, declarations) = build_registered_tools(None, vec![registration]);
+        let (_, declarations) = build_registered_tools(&scope, None, vec![registration]);
 
         assert_eq!(declarations.len(), 1);
         assert_eq!(
@@ -1512,6 +2053,7 @@ mod tests {
             run_context: None,
             parent_agent: None,
             parent_local_session_id: None,
+            session_owner: None,
             tools: HashMap::from([(
                 "stream".to_string(),
                 RegisteredTool {

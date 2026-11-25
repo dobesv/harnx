@@ -23,7 +23,7 @@ mod parse;
 mod render;
 
 pub use parse::parse;
-pub use render::render;
+pub use render::{render, render_url};
 
 #[cfg(test)]
 mod tests;

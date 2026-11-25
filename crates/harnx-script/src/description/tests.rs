@@ -4,6 +4,7 @@ use super::*;
 
 fn reader() -> ToolSpec {
     ToolSpec {
+        output: None,
         name: "files_fs_read".into(),
         description: "Read source files. More detail stays in --help.".into(),
         schema: json!({"type":"object", "properties":{
@@ -14,6 +15,7 @@ fn reader() -> ToolSpec {
 
 fn creator(encoding: bool) -> ToolSpec {
     let mut tool = ToolSpec {
+        output: None,
         name: "media_attachment_create".into(),
         description: "Create an attachment.".into(),
         schema: json!({"type":"object", "properties":{
@@ -31,6 +33,7 @@ fn fixture() -> Vec<ToolSpec> {
         creator(true),
         reader(),
         ToolSpec {
+            output: None,
             name: "search".into(),
             description: "Search indexed records.\nMore details.".into(),
             schema: json!({"type":"object", "properties":{
@@ -165,3 +168,38 @@ fn pipeline_falls_back_without_a_compatible_reader() {
 }
 
 mod execution;
+
+#[test]
+fn description_says_when_to_script_and_how_flags_and_output_behave() {
+    let text = bash_tool_description(&fixture(), 8, 1000);
+    for expected in [
+        "Worth it for loops, many calls, or filtering a large result",
+        "call the tool directly",
+        "optional ones too",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[test]
+fn description_explains_idiomatic_output() {
+    let text = bash_tool_description(&fixture(), 8, 1000);
+    for expected in [
+        "exit 1 when nothing matches",
+        "Notes about cut-off results go to stderr",
+        "-o json prints the tool's fields",
+        "line numbers",
+        "a tool's own error status",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[test]
+fn pipeline_with_only_a_reader_asks_for_its_text() {
+    let text = bash_tool_description(&[reader()], 8, 1000);
+    assert!(
+        text.contains("files_fs_read --path src/lib.rs -o text | grep -n 'TODO' | head -3"),
+        "{text}"
+    );
+}

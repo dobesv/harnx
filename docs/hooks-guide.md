@@ -7,7 +7,9 @@ spawning or supervising any external hook process.
 
 For scripts that wrap tool calls (the old `PreToolUse`/`PostToolUse` use
 cases: deny, ask, mutate arguments and results), use
-[tool middleware](middleware-guide.md). Existing Claude-protocol hook commands
+[tool middleware](middleware-guide.md). To define custom agent-facing tools
+implemented as in-process Bash or Python scripts that can call other tools,
+see the [Script Tools Guide](script-tools.md). Existing Claude-protocol hook commands
 can run through the [Claude hooks compatibility tool](middleware-claude-hooks.md).
 
 ## Events and operations

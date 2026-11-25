@@ -44,7 +44,7 @@ The `config.yaml` file contains global behavior and appearance settings.
 
 ### LLM
 
-- **model**: Specify the default model to use (e.g., `openai:gpt-4o`).
+- **model**: Specify the default model to use (e.g., `openai:gpt-6.2-sol`).
 
 ### Behavior
 
@@ -59,6 +59,7 @@ The `config.yaml` file contains global behavior and appearance settings.
 - **tool_use**: Set to `false` to disable all tool use globally.
 - **use_tools**: Which tools to enable by default (`*` for all).
 - **toolsets**: Group tools into named sets for easy assignment.
+- **script_tools**: Define custom in-process script tools backed by Bash or Python. See the [Script Tools Guide](script-tools.md).
 
 ## Clients (`clients/`)
 
@@ -66,7 +67,7 @@ Each LLM provider is configured in its own YAML file within the `clients/` direc
 
 For a complete list of supported providers and their specific configuration options, see the [**LLM Providers Reference**](providers.md).
 
-**Note:** The **filename** (without `.yaml`) is used as the client's ID in `model` settings (e.g., `openai:gpt-4`). Any `name` field inside the file is ignored.
+**Note:** The **filename** (without `.yaml`) is used as the client's ID in `model` settings (e.g., `openai:gpt-6.2-sol`). Any `name` field inside the file is ignored.
 
 ### General Client Options
 
@@ -104,18 +105,17 @@ To target specific models, use `if/then` within the expression:
 ```yaml
 type: openai
 patches:
-  chat_completions:
-    - 'if .body.model == "o4-mini" then .body.reasoning_effort = "low" end'
-    - 'if .body.model == "o3" then .body.reasoning_effort = "medium" end'
-    - 'if .body.model == "gpt-4.1" then .body.reasoning_effort = "high" end'
+  responses:
+    - 'if .body.model == "gpt-6.2-sol" then .body.reasoning = {"effort":"low","summary":"auto"} end'
+    - 'if .body.model == "gpt-6.2-astra" then .body.reasoning = {"effort":"xhigh","summary":"auto"} end'
 ```
 
 For prefix or pattern matching, use `test` within the expression:
 
 ```yaml
 patches:
-  chat_completions:
-    - 'if (.body.model | test("gpt-5.*")) then .body.reasoning_effort = "high" end'
+  responses:
+    - 'if (.body.model | test("^gpt-6\\.2-")) then .body.reasoning = {"effort":"high","summary":"auto"} end'
 ```
 
 ### Reasoning Summaries and Defaults
@@ -161,6 +161,18 @@ patches:
 Tool servers provide external tools to Harnx. Native toolset servers (such as `harnx-attachment-tools`, `harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, `harnx-exa-tools`, `harnx-fetch-tools`, `harnx-grep-tools`, and `harnx-claude-hook-tools`) run directly without a bridge wrapper, while external stdio MCP servers run via `harnx-mcp-bridge`. Each server is defined in a file under `tool_servers/` (such as `tool_servers/fs.yaml` or `tool_servers/exa.yaml`).
 
 The **filename** (without `.yaml`) is used as the server name.
+
+### Per-User Credentials (`harnx-mcp-remote` native mode)
+
+Remote MCP servers can run so that every user connects their **own** account
+(OAuth or a pasted token) and sees only their own upstream tools. Run
+`harnx-mcp-remote` with `--credentials-key-file` (no bridge), and manage
+connections with `harnx credentials list|connect|disconnect` or the TUI
+`.credentials` command. See [Tool Server Credentials](tool-credentials.md)
+for setup; ready-made server configs are in
+[`example_config/tool_servers/jira-oauth.yaml`](../example_config/tool_servers/jira-oauth.yaml),
+[`github-token.yaml`](../example_config/tool_servers/github-token.yaml) and
+[`pendo-token.yaml`](../example_config/tool_servers/pendo-token.yaml).
 
 ### Native Tool Server Example
 
@@ -499,7 +511,7 @@ Override the local allowance for a target agent in its Markdown front matter (`<
 
 ```yaml
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 run_limits:
   timeout_secs: 7200
 ---
@@ -578,14 +590,15 @@ You can also override the title agent for a specific agent in its front matter:
 
 ```yaml
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 title_agent: title-writer
 ---
 ```
 
-**Do not configure a reasoning model** (e.g. OpenAI `o1`/`o3`, DeepSeek-R1) as
-the `title_agent`. Such models spend their token budget on internal reasoning
-and often return an empty or truncated title. Use a standard chat model.
+**Do not configure a model that reasons at length** (a `:high` or `:max`
+effort alias, DeepSeek-R1) as the `title_agent`. Such models spend their token
+budget on internal reasoning and often return an empty or truncated title. Use
+a small, fast model such as `openai:gpt-6-luna`.
 
 To set a title manually, use the [`.set title`](tui-guide.md) command in the
 TUI. A manually set title freezes automatic regeneration for the rest of the
@@ -612,14 +625,18 @@ nats_lease_acquisition_timeout_secs: 60
   `harnx-worker` daemons collect inactive sessions older than that many days during
   periodic hourly sweeps.
 
-  Purged resources include:
-  - Transcript stream: `SESSION_<sha256(id)>`
-  - Leases: `harnx_leases`
-  - Metadata keys: `sessions/{id}/*` in `harnx_sessions` (including read and unread tracking)
-  - Invocation journal: `harnx_tool_invocations`
-  - Media objects: `media/<owner>/` in `harnx_attachments`
-  - Plans KV: `plan/<owner>/` in `harnx_plans`
-  (where `<owner>` is `session_key(agent, id)`).
+  Purged resources are removed in cascade order (where `<owner>` is `session_key(agent, id)`):
+  1. Transcript stream: `SESSION_<sha256(owner)>` (first on normal deletion and retention GC; last on orphan-stream GC)
+  2. Leases: `harnx_leases`
+  3. Invocation journal: `harnx_tool_invocations` (retaining a 1-hour tombstone)
+  4. Non-canonical metadata keys: `sessions/<owner>/*` in `harnx_sessions` (activity, read/unread state, tasks, A2A keys), keeping `sessions/<owner>/meta`
+  5. Private interaction checkpoints: `harnx_interaction_checkpoints`
+  6. Media objects: `media/<owner>/` in `harnx_attachments`
+  7. Plans KV: `plan/<owner>/` in `harnx_plans`
+  8. A2A external cleanup (task events, first-message reservation, recovery registry, scoped lease)
+  9. Canonical metadata key: `sessions/<owner>/meta` in `harnx_sessions` (removed last, conditioned on the revision read at start)
+
+  Because canonical metadata (`sessions/<owner>/meta`) is purged last, a failure at any earlier step leaves the session with its old owner, prevents other prompt-only users from claiming the ID, and lets a later retention GC pass or `harnx delete session` retry finish cleanup. If the canonical record's revision changed during deletion, the final purge is skipped instead of deleting the newer record; `harnx delete session` prints `Incomplete deletion of remote session '<session>' on cluster '<cluster>' (canonical metadata purge skipped because its revision changed; ...)` including `metadata_keys_deleted` to stderr and exits `1`, and retention GC counts `skipped_metadata_changed` instead of `deleted`. Retrying deletion rewrites the invocation journal's 1-hour tombstone, which refuses journaled tool calls on the reused ID for another hour (it does not delay claiming the ID). Once deletion completes, the ID can be reused by anyone with `prompt` scope. For sessions whose deletion failed before canonical-last ordering, finish retrying `harnx delete session` to remove leftover media or plans before enabling or upgrading to a `harnx-serve` with client-chosen claims.
 
   When unset, workers emit a startup warning that automatic expiry is disabled
   and remote session state will grow unbounded.
@@ -734,7 +751,7 @@ serve_role_headers:
 
 `harnx-serve` and `harnx-a2a-server` support optional, identity-based access control rules defined in `access.yaml`.
 
-When access rules are enabled, incoming requests are matched against the rules by caller identity. The servers decide which agents the caller can see, which sessions they can create or access, and which attachments they can retrieve. When no rules file is configured, access control is disabled and servers remain open as before.
+When access rules are enabled, incoming requests are matched against the rules by caller identity. The servers decide which agents the caller can see, which sessions they can create or access, and which attachments they can retrieve or supply to a prompt. When no rules file is configured, access control is disabled and servers remain open as before.
 
 ### File Location and Options
 
@@ -868,7 +885,12 @@ When access rules are enabled:
 - **Hidden agent**: An agent on which the caller holds no scopes returns HTTP `404 Not Found` (or JSON-RPC `-32001` `task not found` in A2A). The response is identical to an unknown agent, preventing enumeration.
 - **Foreign or forbidden session**: Accessing a session owned by another user without `admin` scope returns HTTP `404 Not Found` (or JSON-RPC `-32001`).
 - **Session creation without `prompt`**: Attempting to create a session with only `admin` scope returns HTTP `403 Forbidden` (`session creation requires prompt scope`) in `harnx-serve`, or JSON-RPC code `-32010` in `harnx-a2a-server`.
-- **Pre-allocation required in harnx-serve**: When access rules are active, callers must create and reserve a session ID via `POST /v1/agents/{agent}/sessions` before prompting. Implicit session creation on unreserved session IDs returns HTTP `404 Not Found`.
+- **Client-chosen session IDs in harnx-serve**: Callers with `prompt` scope can create a session with a client-chosen ID by sending a first prompt to `POST /v1/agents/{agent}/sessions/{session}`, or reserve a server-generated short ID via `POST /v1/agents/{agent}/sessions`:
+  - **Qualifying first prompts**: For JSON-RPC (`Content-Type: application/json`), a `session/prompt` request with nonblank `text` or non-empty `attachment_refs`, and no `resume` entries (attachment-only prompts still require a `text` field, which may be `""`). Attachment refs are validated before reservation (denials, malformed refs, or `>32` `cid:media` refs return the guard's HTTP `404 Not Found`; preflight broker outages return HTTP `503`, leaving the ID unclaimed). On unseen IDs, broker outages during metadata reservation also return HTTP `503` with the guard's JSON error body, not JSON-RPC `-32003` (including post-connect KV write timeouts, broken pipes, or no responders), without admitting the prompt, though a reservation outage after canonical KV creation committed can leave the ID claimed by the caller so a same-caller retry resolves as owned. For SSE (`Accept: text/event-stream`), a valid AG-UI run input with no `resume` decisions whose last supported message (after dropping unknown roles) is a nonblank `user` message.
+  - **Scope enforcement**: Callers without `prompt` scope (such as `admin`-only callers) receive HTTP `403 Forbidden` (`session creation requires prompt scope`) on a qualifying creating prompt to an unseen ID, with nothing created.
+  - **Non-creating requests return 404**: Any other request on an unseen ID — non-prompt JSON-RPC methods, blank or `resume`-bearing prompts, promptless or `resume`-bearing SSE runs, malformed bodies, non-`POST` methods, and deeper subroutes — returns HTTP `404 Not Found` for refused requests, like a session the caller cannot access. For `POST /v1/agents/{agent}/sessions/{session}` (with a claimable ID and no deeper segments), both unseen and foreign-owned IDs reject a declared `Content-Length` over 20 MiB immediately with the guard's `404` before reading any body bytes, and otherwise run the same bounded body read (20 MiB cap, 30-second deadline) before deciding; bodies over the cap or unfinished at the deadline return HTTP `404` either way (never `413`). Any ingress or reverse proxy in front of `harnx-serve` must allow request bodies of at least 20 MiB and at least a 30-second upload time for claim-candidate `POST` requests. For refused `404` outcomes, status, body, and application headers are identical across unseen and foreign IDs; this parity doesn't cover every partial-outage outcome. Processing time can differ slightly for `prompt`-scope callers because only the unseen-ID path parses the buffered body and checks `cid:media` refs (an accepted limitation since `prompt`-scope callers already learn existence from create versus `404`).
+  - **Session ID format**: `{session}` must be a safe path segment (non-empty, no `/`, `\`, `.`, or `..`) with no leading or trailing whitespace and satisfy the runtime's `SessionRef` format (`[A-Za-z0-9_-]+`, at least 6 characters, matching attachment uploads); refused IDs (such as `demo`, `pr.12`, or whitespace-padded IDs) receive the opaque guard HTTP `404` without claiming or falling back to a generated ID.
+  - **ID reuse after deletion**: Session deletion purges canonical metadata (`sessions/<owner>/meta`) last. A partially deleted session stays with its old owner until deletion is re-run (`harnx delete session` or a later retention GC pass), and retrying deletion rewrites the invocation journal's 1-hour tombstone, which refuses journaled tool calls on the reused ID for another hour without delaying the claim itself. Once fully deleted, anyone with `prompt` scope can reuse the ID. See the [`harnx-serve` README](../crates/harnx-serve/README.md#behavior-under-rules) for upgrade ordering and deletion limitations.
 
 ### CID Attachments and Plans (`/v1/cid/*`)
 
@@ -876,6 +898,7 @@ Attachments and plans addressed by canonical `cid:` URLs embed an owning session
 - The server checks the caller's session permissions before resolving the blob or updating activity timestamps.
 - Unauthorized callers receive HTTP `404 Not Found` (with no ETag leaked).
 - Temp or inline sessions without a named agent (`SessionRef.agent == None`) return `404`.
+- **Prompt attachment refs**: On existing, accessible sessions, a `cid:media:` ref supplied to the JSON-RPC `session/prompt` control plane is authorized the same way, against the session that uploaded it (matching owner, alias expansion, or admin scope on that agent, normalized for the destination cluster), before the prompt is admitted. At most 32 `cid:media` refs are accepted per prompt; a longer list is rejected with `-32602` (HTTP 400) before any broker work. An unauthorized, unattributed, or undecodable source returns the generic JSON-RPC error `-32005` (`attachment not found`) for the whole ref list, with no session log append or turn activation; only confirmed broker outage during the check returns `-32003` (HTTP 503), logged server-side at `warn`. Prompts without `cid:media` refs do no extra broker work. Same-session refs, a caller's own cross-session refs, and admin callers work; without access rules a ref is a bearer capability. For creating prompts on unseen IDs, pre-reservation attachment validation maps unauthorized, malformed, and `>32` `cid:media` refs to the guard's HTTP `404 Not Found` (and broker outage to HTTP `503`).
 - **Cache policy**: Responses emit `Cache-Control: private, no-store`.
 - **Cache purge recommendation**: Enabling access rules does not invalidate entries previously cached by shared reverse proxies or CDNs. When turning on access rules in an existing deployment, purge shared HTTP caches for `/v1/cid/*`.
 
@@ -970,7 +993,7 @@ When an authenticated caller makes a request, the server expands the caller's id
 
 #### Caller expansion only, stored ownership preserved
 Alias expansion applies **only** to the incoming caller during request authorization:
-- In `harnx-serve`, new sessions created via `POST /v1/agents/{agent}/sessions` record the caller's raw incoming identity (`user_id`) in session metadata, not an alias entry name or other identities in the group. The session's read-only `user_principals` property records the caller's principals snapshot (`user_id`, expanded `users`, `groups`, `roles`) for prompt and tool customization.
+- In `harnx-serve`, new sessions (created via `POST /v1/agents/{agent}/sessions` or a first prompt to `/v1/agents/{agent}/sessions/{session}`) record the caller's raw incoming identity (`user_id`) in session metadata, not an alias entry name or other identities in the group. The session's read-only `user_principals` property records the caller's principals snapshot (`user_id`, expanded `users`, `groups`, `roles`) for prompt and tool customization.
 - In `harnx-a2a-server`, new contexts and tasks record the caller's raw incoming identity as the stored owner in the A2A binding. Stored owner identities are never expanded.
 - When an authorized caller later accesses or resumes a session, their expanded caller identities are checked against the stored session owner. Configured groups and roles never grant session or context ownership.
 

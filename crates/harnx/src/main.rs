@@ -3,6 +3,7 @@ mod cli;
 mod cli_event_sink;
 mod cli_replay_sink;
 mod compact;
+mod credentials_cmd;
 mod interact;
 mod main_runtime;
 mod oneshot_nats;
@@ -42,6 +43,7 @@ use harnx_core::agent_config::collect_agent_variables;
 use harnx_core::event::{AgentEventSink, AgentSource};
 use harnx_render::{render_error, MarkdownRender};
 use harnx_runtime::config::SessionMeta;
+use harnx_runtime::nats_admin::{CanonicalMetadataPurge, SessionDeleteResult};
 use harnx_runtime::utils::*;
 
 use anyhow::{bail, Context, Result};
@@ -183,6 +185,7 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
             | Commands::Call(_)
             | Commands::Interact(_)
             | Commands::Surface(_)
+            | Commands::Credentials(_)
             | Commands::Compact(_)),
         ) => {
             let exit_code = run_command(command, &cli).await?;
@@ -213,6 +216,7 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
                     harnx_runtime::operator_tools::OperatorToolCommand::Call {
                         name: args.name.clone(),
                         args_json: args.args_json.clone(),
+                        tool_input: None,
                     },
                     args.json,
                 )
@@ -232,6 +236,9 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
         Commands::List(list_args) => run_list_command(list_args, cli).await,
         Commands::Interact(interact_args) => interact::run_interact_command(interact_args).await,
         Commands::Surface(surface_args) => surface::run_surface_command(surface_args).await,
+        Commands::Credentials(credentials_args) => {
+            credentials_cmd::run(cli, credentials_args).await
+        }
         Commands::Compact(compact_args) => compact::run_compact_command(compact_args, cli).await,
     }
 }
@@ -669,23 +676,41 @@ async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<(
     )
     .await?;
 
-    if result.removed_anything() {
-        println!(
-            "Deleted remote session '{}' on cluster '{}' (stream_deleted={}, lease_deleted={}, attachments_deleted={})",
-            delete_args.session_id,
-            delete_args.cluster,
-            result.stream_deleted,
-            result.lease_deleted,
-            result.attachments_deleted
-        );
-    } else {
-        println!(
-            "Remote session '{}' on cluster '{}' not found; nothing to delete.",
-            delete_args.session_id, delete_args.cluster
-        );
-    }
-
+    println!(
+        "{}",
+        session_delete_report(&delete_args.session_id, &delete_args.cluster, &result)?
+    );
     Ok(())
+}
+
+fn session_delete_report(
+    session: &str,
+    cluster: &str,
+    result: &SessionDeleteResult,
+) -> Result<String> {
+    let revision_changed = result.canonical_metadata == CanonicalMetadataPurge::RevisionChanged;
+    let (status, detail) = if revision_changed {
+        (
+            "Incomplete deletion of remote session",
+            "canonical metadata purge skipped because its revision changed; ",
+        )
+    } else if result.removed_anything() {
+        ("Deleted remote session", "")
+    } else {
+        return Ok(format!(
+            "Remote session '{session}' on cluster '{cluster}' not found; nothing to delete."
+        ));
+    };
+    let report = format!(
+        "{status} '{session}' on cluster '{cluster}' ({detail}stream_deleted={}, \
+         lease_deleted={}, metadata_keys_deleted={}, attachments_deleted={})",
+        result.stream_deleted,
+        result.lease_deleted,
+        result.metadata_keys_deleted,
+        result.attachments_deleted
+    );
+    anyhow::ensure!(!revision_changed, "{report}");
+    Ok(report)
 }
 
 fn legacy_info_flag(cli: &Cli) -> bool {
@@ -1224,6 +1249,27 @@ use harnx_runtime::bootstrap::setup_logger;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_delete_report_returns_error_on_revision_conflict() {
+        for metadata_keys_deleted in [0, 2] {
+            let result = SessionDeleteResult {
+                stream_deleted: false,
+                lease_deleted: false,
+                metadata_keys_deleted,
+                attachments_deleted: 0,
+                canonical_metadata: CanonicalMetadataPurge::RevisionChanged,
+            };
+            let report = session_delete_report("thread", "local", &result)
+                .unwrap_err()
+                .to_string();
+            assert!(report.starts_with("Incomplete deletion of remote session 'thread'"));
+            assert!(
+                report.contains("canonical metadata purge skipped because its revision changed")
+            );
+            assert!(report.contains(&format!("metadata_keys_deleted={metadata_keys_deleted}")));
+        }
+    }
 
     #[test]
     fn attachment_mime_helpers_handle_parameters() {

@@ -13,6 +13,17 @@ impl CapturedProvider {
         calls: &'static [(&'static str, &'static str)],
         response: &'static str,
     ) -> Result<Self> {
+        let calls = calls
+            .iter()
+            .map(|&(name, id)| (name, id, "{}".to_owned()))
+            .collect();
+        Self::start_with_arguments(calls, response).await
+    }
+
+    pub async fn start_with_arguments(
+        calls: Vec<(&'static str, &'static str, String)>,
+        response: &'static str,
+    ) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}/v1", listener.local_addr()?);
         let shutdown = CancellationToken::new();
@@ -27,7 +38,7 @@ impl CapturedProvider {
                 let request = read_http_json(&mut socket).await?;
                 let first = requests.is_empty();
                 let message = if first {
-                    initial_calls(&request, calls)?
+                    initial_calls(&request, &calls)?
                 } else {
                     json!({"role": "assistant", "content": response})
                 };
@@ -54,9 +65,9 @@ impl CapturedProvider {
     }
 }
 
-fn initial_calls(request: &Value, specs: &[(&str, &str)]) -> Result<Value> {
+fn initial_calls(request: &Value, specs: &[(&str, &str, String)]) -> Result<Value> {
     let mut calls = Vec::new();
-    for &(suffix, id) in specs {
+    for (suffix, id, arguments) in specs {
         let name = request["tools"]
             .as_array()
             .context("tool declarations")?
@@ -64,12 +75,12 @@ fn initial_calls(request: &Value, specs: &[(&str, &str)]) -> Result<Value> {
             .find_map(|tool| {
                 tool["function"]["name"]
                     .as_str()
-                    .filter(|name| name.ends_with(suffix))
+                    .filter(|name| name.ends_with(*suffix))
             })
             .with_context(|| format!("missing {suffix}"))?;
-        calls.push(
-            json!({"id": id, "type": "function", "function": {"name": name, "arguments": "{}"}}),
-        );
+        calls.push(json!({
+            "id": id, "type": "function", "function": {"name": name, "arguments": arguments}
+        }));
     }
     Ok(json!({"role": "assistant", "content": null, "tool_calls": calls}))
 }

@@ -66,6 +66,39 @@ async fn proxy_requires_or_resolves_an_ambient_session_binding() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn structured_result_capability_reaches_the_pod_call() -> Result<()> {
+    harnx_core::require_nextest();
+    let Some(fixture) = ToolsetFixture::start("session-1", Some("claim-ambient")).await? else {
+        return Ok(());
+    };
+    let context = ToolInvocationContext {
+        call_id: "call-structured".to_string(),
+        invoking_session_id: Some(harnx_core::session_identity::session_key(
+            Some("coder"),
+            "session-1",
+        )),
+        capabilities: BTreeSet::from([harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_string()]),
+        ..Default::default()
+    };
+    fixture
+        .bash
+        .invoke_with_context(ToolInvocation {
+            tool: "exec".to_string(),
+            args: json!({"command": "pwd"}),
+            context,
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+
+    let calls = fixture.caller.calls.lock();
+    assert!(calls[0]
+        .capabilities
+        .contains(harnx_toolset::CAPABILITY_STRUCTURED_RESULT));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn proxy_explicit_override_is_one_call_and_not_forwarded() -> Result<()> {
     let Some(fixture) = ToolsetFixture::start("session-1", Some("claim-ambient")).await? else {
         return Ok(());

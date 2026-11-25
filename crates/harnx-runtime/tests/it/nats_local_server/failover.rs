@@ -112,8 +112,14 @@ async fn in_flight_rpc_returns_after_broker_owner_exit_without_reinvocation() ->
     let caller = client(&owner).await?;
     let responder = client(&owner).await?;
     let mut requests = responder.subscribe("failover-rpc").await?;
-    responder.flush().await?;
-    let waiting_parent = tokio::spawn(async move {
+    // `flush` only writes the client's buffer. A round trip on the same
+    // connection proves the server has registered the subscription, so the
+    // caller's request, sent on another connection, can't beat it and come
+    // back with "no responders".
+    async_nats::jetstream::new(responder.clone())
+        .query_account()
+        .await?;
+    let mut waiting_parent = tokio::spawn(async move {
         rpc::request(
             &caller,
             "failover-rpc".into(),
@@ -123,17 +129,31 @@ async fn in_flight_rpc_returns_after_broker_owner_exit_without_reinvocation() ->
         )
         .await
     });
-    let request = tokio::time::timeout(Duration::from_secs(5), requests.next())
-        .await
-        .context("request delivery timed out")?
-        .context("request delivered")?;
+    // Backstops only, sized for a degraded CI runner; nextest's slow-timeout
+    // catches a real hang. If the caller gives up before its request arrives,
+    // report how it ended instead of an anonymous delivery timeout.
+    let backstop = Duration::from_secs(60);
+    let request = tokio::time::timeout(backstop, async {
+        tokio::select! {
+            request = requests.next() => request.context("responder subscription closed"),
+            ended = &mut waiting_parent => {
+                anyhow::bail!("caller ended before its request was delivered: {ended:?}")
+            }
+        }
+    })
+    .await
+    .context("request delivery timed out")??;
     let _activity = rpc::RequestActivity::start(&responder, &request);
     let target = rpc::ReplyTarget::from_message(&request)?;
     drop(owner);
     let reply = tokio::spawn(async move { target.send(&responder, "finished").await });
-    let result = tokio::time::timeout(Duration::from_secs(10), waiting_parent).await???;
+    let result = tokio::time::timeout(backstop, waiting_parent)
+        .await
+        .context("reply after owner exit timed out")???;
     assert_eq!(result.payload.as_ref(), b"finished");
-    tokio::time::timeout(Duration::from_secs(3), reply).await???;
+    tokio::time::timeout(backstop, reply)
+        .await
+        .context("reply receipt timed out")???;
     assert!(
         tokio::time::timeout(Duration::from_millis(300), requests.next())
             .await

@@ -63,10 +63,23 @@ Every proxied bash/fs schema has an optional `sandbox_id`. Resolution order is:
 3. a recoverable error telling the agent to call `sandbox_connect`.
 
 An explicit override affects one call and does not replace the ambient binding.
-`sandbox_connect` creates or attaches, waits until the sandbox is usable, and
-then binds it to the invoking session. The binding lives in the private,
-versioned `dev.harnx.tool_context` session-metadata extension. It is excluded
-from redacted HTTP metadata and model-visible tool arguments.
+An ID-less `sandbox_connect` reuses the sandbox already bound to the invoking
+session; if there is no bound sandbox, it creates one. It binds a claim after
+successful activation, and also binds it on activation failure unless the claim
+is proven absent, so the next connect can resume it. That delayed bind only
+applies while the session's binding is still the one the connect observed when
+it started: if a concurrent connect has bound another sandbox in the meantime,
+the failed connect leaves that binding alone and destroys its own
+now-untracked claim instead of leaking it — but only after re-reading the
+binding, and never when the bind write's commit status is unknown (there the
+claim is left to its TTL; a destroy that fails or times out is logged only).
+The destroy runs under a 30-second deadline and the re-read has its own
+request bound (~15s), so a degraded metadata store can hold a failed
+connect's error for roughly a minute before it returns. The re-read and the
+delete are not atomic: a binding can change in the short window between
+them, which the TTL eventually reconciles. The binding lives in the
+private, versioned `dev.harnx.tool_context` session-metadata extension. It is
+excluded from redacted HTTP metadata and model-visible tool arguments.
 
 New sub-agent sessions receive a snapshot of their parent's tool context, so a
 delegated implementation or review agent starts in the same sandbox without
@@ -200,11 +213,26 @@ Serving routes through NATS:
 `sandbox_connect` resolves the sandbox in order: an explicit non-empty
 `sandbox_id` argument wins; otherwise it reuses the sandbox bound to the
 invoking session, creating a `SandboxClaim` from the configured warm pool only
-when no usable binding exists. A stored binding with an unknown version or blank
+when no valid binding exists. A stored binding with an unknown version or blank
 ID is treated as unusable and replaced by the next connect. Malformed binding
-metadata still errors rather than silently creating a duplicate. The claim name is
-derived from the Harnx tool-call ID, so a redelivered creation request converges
-on the same claim. Optional `repos` are
+metadata still errors rather than silently creating a duplicate. When the bound
+sandbox's claim has expired or been deleted in Kubernetes, an ID-less connect
+disconnects it, creates a replacement, and rebinds the session to the new
+sandbox instead of failing. A newly created claim whose activation fails for an
+error other than not-found is still bound, so the next connect resumes it rather
+than creating another claim. If the claim is proven absent, it is not bound; if
+a concurrent connect replaced the session's binding first, the delayed bind is
+skipped and the untracked claim is destroyed instead of leaked — but only after
+re-reading the binding, and never when the bind write's commit status is
+unknown (there the claim is left to its TTL; a destroy that fails or times out
+is logged only). An
+explicit `sandbox_id` that no longer exists still fails with `sandbox not found`,
+and transient, timeout, auth, or cancellation errors never trigger a replacement.
+If a bound sandbox never becomes usable, escape it with `sandbox_release`
+(`destroy: true`, which clears the matching binding) or attach elsewhere with
+`sandbox_connect` and an explicit `sandbox_id`. The claim name is derived from
+the Harnx tool-call ID, so a redelivered creation request converges on the same
+claim. Optional `repos` are
 cloned through the bash server's `exec` tool after the sandbox is ready; each
 result reports its path, checked-out branch, or an error. Clone destinations must be below
 `/workspace`, and authentication/network-shaped failures are retried up to

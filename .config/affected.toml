@@ -88,8 +88,9 @@ test = ["harnx"]
 on-affected = ["harnx-claude-hook-tools"]
 test = ["harnx"]
 
+# Runtime tests launch the native filesystem, fetch and bash servers by path.
 [[test-edge]]
-on-affected = ["harnx-fs-tools"]
+on-affected = ["harnx-fs-tools", "harnx-fetch-tools", "harnx-bash-tools"]
 test = ["harnx-runtime"]
 
 # Runtime attachment/result round tests launch the MCP bridge by path.

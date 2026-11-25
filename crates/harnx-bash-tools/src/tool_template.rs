@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use minijinja::value::Serde;
 use minijinja::{Environment, UndefinedBehavior};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -175,7 +176,8 @@ impl ToolTemplate {
         env.add_filter("quote", |value: &str| -> String {
             format!("'{}'", value.replace('\'', r#"'\''"#))
         });
-        env.render_str(&self.script, context).map_err(Into::into)
+        env.render_str(&self.script, Serde(context))
+            .map_err(Into::into)
     }
 }
 

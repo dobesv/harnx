@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use harnx_core::instance::ServerScope;
-use harnx_fs_tools::{FsServer, FsToolset, ListDirectoryParams, ReadFileParams};
+use harnx_fs_tools::{FsServer, FsToolset, ListDirectoryParams, ReadFileParams, ResultStyle};
 use harnx_tool_allow::ResolvedAllowlist;
 use harnx_toolset::{
     Registration, ToolErrorPayload, ToolReply, ToolRequest, HDR_CALL_ID, HDR_IDEMPOTENCY_KEY,
@@ -158,6 +158,7 @@ async fn invoke(
     let request_id = uuid::Uuid::new_v4();
     let call_id = format!("fs-{tool}-{request_id}");
     let request = ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -285,9 +286,12 @@ async fn assert_envelope_parity(
     direct_allowlist.insert_rwx(root_path);
     let direct_server = FsServer::new(direct_allowlist);
     let direct_read = direct_server
-        .read_file_impl(serde_json::from_value::<ReadFileParams>(json!({
-            "path": file_arg
-        }))?)
+        .read_file_impl(
+            serde_json::from_value::<ReadFileParams>(json!({
+                "path": file_arg
+            }))?,
+            ResultStyle::Model,
+        )
         .await?;
     let bridged_read_value = serde_json::to_value(direct_read)?;
     assert_eq!(read_value, bridged_read_value);
@@ -298,9 +302,12 @@ async fn assert_envelope_parity(
         .map_err(|error| anyhow::anyhow!("ls failed: {error:?}"))?;
     assert_content_envelope(&ls_value);
     let direct_ls = direct_server
-        .list_directory_impl(serde_json::from_value::<ListDirectoryParams>(json!({
-            "path": root_arg
-        }))?)
+        .list_directory_impl(
+            serde_json::from_value::<ListDirectoryParams>(json!({
+                "path": root_arg
+            }))?,
+            harnx_fs_tools::ResultStyle::Model,
+        )
         .await?;
     let bridged_ls_value = serde_json::to_value(direct_ls)?;
     assert_eq!(ls_value, bridged_ls_value);

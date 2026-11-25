@@ -91,6 +91,7 @@ impl Fixture {
             None => toolset,
         };
         let request = ToolRequest {
+            user_id: None,
             input_responses: None,
             request_state: None,
             operation_id: "operation".into(),

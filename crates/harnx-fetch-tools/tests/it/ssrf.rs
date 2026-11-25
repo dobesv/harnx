@@ -78,6 +78,16 @@ async fn fetch(
 }
 
 #[tokio::test]
+async fn image_url_on_private_literal_is_rejected_before_dial() {
+    let blocked = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/image.png", blocked.local_addr().unwrap());
+    let server = FetchServer::new(false);
+    let error = fetch(&server, url, None).await.unwrap_err();
+    assert!(error.contains("blocked by private-IP policy"), "{error}");
+    assert_listener_untouched(&blocked).await;
+}
+
+#[tokio::test]
 async fn private_dns_answer_is_rejected_before_any_connection() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -190,22 +200,24 @@ fn redirect_client() -> reqwest::Client {
 }
 
 #[tokio::test]
-async fn live_redirect_policy_blocks_private_literal_before_dial() {
+async fn live_image_redirect_blocks_private_literal_before_dial() {
     let blocked = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let blocked_url = format!("http://{}/private", blocked.local_addr().unwrap());
+    let blocked_url = format!("http://{}/private.png", blocked.local_addr().unwrap());
     let start = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/start"))
+        .and(path("/start.png"))
         .respond_with(ResponseTemplate::new(302).insert_header("location", blocked_url))
         .expect(1)
         .mount(&start)
         .await;
 
+    // Exercise the production redirect policy over HTTP, with a loopback first hop
+    // that the full guarded client would reject before reaching the redirect.
     let error = redirect_client()
-        .get(format!("{}/start", start.uri()))
+        .get(format!("{}/start.png", start.uri()))
         .send()
         .await
-        .expect_err("production redirect policy must reject the private hop");
+        .expect_err("production redirect policy must reject the private image hop");
     assert!(error.is_redirect(), "unexpected request error: {error}");
     assert_listener_untouched(&blocked).await;
 }

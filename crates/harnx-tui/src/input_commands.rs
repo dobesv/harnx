@@ -27,6 +27,15 @@ impl InfoOverlayType {
     }
 }
 
+/// Commands that rewrite the transcript; `finish_command` rebuilds the view
+/// after them instead of resuming at the old position.
+fn is_mutation_command(line: &str) -> bool {
+    let line_cmd = line.trim_start();
+    line_cmd.starts_with(".edit message ")
+        || line_cmd.starts_with(".delete message ")
+        || line_cmd.starts_with(".rewind ")
+}
+
 impl Tui {
     pub(crate) async fn submit_dot_command(&mut self, text: String) -> Result<()> {
         let attachments_snapshot = self.app.attachments.clone();
@@ -250,19 +259,36 @@ impl Tui {
             record(line);
             return Ok(());
         }
+        if let Some(action) = crate::credentials::parse_credentials_dot_command(line) {
+            match action {
+                Ok(action) => self.start_credentials_command(action),
+                Err(error) => self.report_command_error(&error),
+            }
+            return Ok(());
+        }
         if harnx_runtime::operator_tools::is_operator_tool_command(line) {
             match harnx_runtime::operator_tools::parse_operator_line(line) {
                 Ok(command) => self.start_operator_tool_command(command),
-                Err(error) => self
-                    .app
-                    .transcript
-                    .push(TranscriptItem::ErrorText(pretty_error_string(&error))),
+                Err(error) => self.report_command_error(&error),
             }
             return Ok(());
         }
         if self.try_handle_info_overlay(line.trim_start()).await {
             return Ok(());
         }
+        self.run_config_command(line).await
+    }
+
+    /// A failed command parse is reported like any other command output.
+    fn report_command_error(&mut self, error: &anyhow::Error) {
+        self.app
+            .transcript
+            .push(TranscriptItem::ErrorText(pretty_error_string(error)));
+    }
+
+    /// Run the line through the config command runner, then finish it with
+    /// the transcript and UI updates `finish_command` owns.
+    async fn run_config_command(&mut self, line: &str) -> Result<()> {
         let prev_session = self
             .config
             .read()
@@ -295,15 +321,11 @@ impl Tui {
         };
 
         let clean = strip_ansi(&captured).trim_end_matches('\n').to_string();
-        let line_cmd = line.trim_start();
-        let is_mutation_command = line_cmd.starts_with(".edit message ")
-            || line_cmd.starts_with(".delete message ")
-            || line_cmd.starts_with(".rewind ");
 
         self.finish_command(
             result,
             clean,
-            (line, prev_session, prev_agent, is_mutation_command),
+            (line, prev_session, prev_agent, is_mutation_command(line)),
         )
         .await;
 

@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::nats_admin::{self, kv_bucket_missing};
+use crate::nats_admin::{self, kv_bucket_missing, CanonicalMetadataPurge};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_session_metadata::{ListedSession, SessionMetadataStore, SESSION_METADATA_BUCKET};
 use crate::session_stream_gc::{
@@ -21,6 +21,8 @@ pub struct RemoteCleanupStats {
     pub scanned: usize,
     pub deleted: usize,
     pub skipped_active: usize,
+    /// Final canonical purge rejected because the record's revision changed during deletion.
+    pub skipped_metadata_changed: usize,
     pub errors: usize,
     /// `SESSION_` streams with no session metadata and no write for the
     /// retention window.
@@ -419,6 +421,11 @@ async fn handle_candidate(
             )
             .await
             {
+                Ok(result)
+                    if result.canonical_metadata == CanonicalMetadataPurge::RevisionChanged =>
+                {
+                    stats.skipped_metadata_changed += 1;
+                }
                 Ok(_) => stats.deleted += 1,
                 Err(error) => {
                     stats.errors += 1;

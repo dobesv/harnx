@@ -4,6 +4,8 @@ import type { ToolCallUpdatePatch } from './toolUpdates';
 import { parseToolUpdateEvent } from './toolUpdates';
 import { parseCompactionMetadata, type CompactionMetadata } from './compactionMetadata';
 export { parseCompactionMetadata } from './compactionMetadata';
+import type { HistoryReasoningMap } from './types';
+export type { HistoryReasoningMap } from './types';
 import type { A2uiSurfaceEvent, A2uiSurfaceResolution } from './a2ui/surfaceState';
 export type { A2uiSurfaceEvent, A2uiSurfaceResolution } from './a2ui/surfaceState';
 
@@ -19,6 +21,7 @@ export const NAVIGATION_CONTROL_EVENTS = [
   'session_attach_boundary',
   'session_handoff',
   'message_attachments',
+  'history_reasoning',
   'session_compaction',
   'session_compacting_started',
   'session_compacting_completed',
@@ -35,6 +38,8 @@ export interface PendingInteraction {
   message: string;
   pendingCount: number;
   payload?: unknown;
+  /** Present for `url` interactions: the https or loopback-http link the user opens (decision 6). */
+  url?: string;
 }
 
 export interface MessageAttachmentMeta {
@@ -59,6 +64,8 @@ export interface HarnxCustomEventCallbacks {
   onHitlPendingApproval?: (toolCallId: string, summary: string) => void;
   /** Called when a message_attachments CUSTOM event is received. */
   onMessageAttachments?: (messageId: string, attachments: MessageAttachmentMeta[]) => void;
+  /** Called when a history_reasoning CUSTOM event is received. */
+  onHistoryReasoning?: (reasoning: HistoryReasoningMap) => void;
   /** Called when session_compacting_started is received. */
   onCompactingStarted?: (compactionId?: string) => void;
   /** Called when session_compacting_completed is received. */
@@ -219,6 +226,14 @@ export function parsePendingInteraction(value: unknown): PendingInteraction | nu
     if (rec.payload !== undefined) {
       interaction.payload = rec.payload;
     }
+    if (kind === 'url' && typeof rec.url === 'string' && rec.url.length > 0) {
+      interaction.url = rec.url;
+    } else if (kind === 'url') {
+      const payloadUrl = eventRecord(rec.payload).url;
+      if (typeof payloadUrl === 'string' && payloadUrl.length > 0) {
+        interaction.url = payloadUrl;
+      }
+    }
     return interaction;
   }
   return undefined;
@@ -294,6 +309,30 @@ export function parseA2uiSurface(value: unknown): A2uiSurfaceEvent | undefined {
   return result;
 }
 
+export function parseHistoryReasoning(value: unknown): HistoryReasoningMap | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const parsed: HistoryReasoningMap = {};
+  for (const [messageId, entries] of Object.entries(value as Record<string, unknown>)) {
+    if (messageId.trim().length === 0 || !Array.isArray(entries)) {
+      continue;
+    }
+    const thoughts = entries.filter(
+      (entry): entry is string => typeof entry === 'string' && entry.trim().length > 0,
+    );
+    if (thoughts.length > 0) {
+      Object.defineProperty(parsed, messageId, {
+        value: thoughts,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return parsed;
+}
+
 const handlers: Record<string, CustomEventHandler> = {
   status: (callbacks, value) => callbacks.onStatus(stringField(value, 'text') || null),
   usage: (callbacks, value) => {
@@ -340,6 +379,12 @@ const handlers: Record<string, CustomEventHandler> = {
     const parsed = parseMessageAttachments(value);
     if (!parsed) return;
     callbacks.onMessageAttachments?.(parsed.messageId, parsed.attachments);
+  },
+  history_reasoning: (callbacks, value) => {
+    const parsed = parseHistoryReasoning(value);
+    if (parsed !== undefined) {
+      callbacks.onHistoryReasoning?.(parsed);
+    }
   },
   session_compacting_started: (callbacks, value) => {
     const compactionId = stringField(value, 'compaction_id');

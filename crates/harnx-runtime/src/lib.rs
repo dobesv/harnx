@@ -44,12 +44,15 @@ pub mod nats_tool_provider;
 pub mod nats_worker;
 pub mod operator_tools;
 pub mod remote_session_cleanup;
+pub mod script_tool_provider;
 mod script_tools;
 pub mod server_identity;
 pub mod session_history;
 pub mod session_meta_tool;
 pub mod session_stream_gc;
 pub mod session_stream_orphans;
+#[cfg(test)]
+mod structured_provider;
 pub mod surfaces;
 pub mod terminated_result;
 #[cfg(test)]
@@ -60,6 +63,7 @@ pub mod tool;
 pub mod tool_context;
 pub mod tool_loop_guard;
 pub mod tool_output;
+pub mod tool_registry_watch;
 pub mod tool_reservation_client;
 mod tool_selector;
 pub mod users;

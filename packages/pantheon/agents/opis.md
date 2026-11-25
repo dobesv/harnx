@@ -2,9 +2,9 @@
 role: subagent
 model: bedrock:us.zai.glm-5.3
 model_fallbacks:
-- gemini:gemini-3.8-flash
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
+- gemini:gemini-4-hydrogen
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
 compaction_agent: compact-reliability
 use_tools:
@@ -27,7 +27,7 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 description: "Performance & scalability specialist — reviews diffs for throughput, latency, and resource-usage regressions including N+1 queries, unbounded result sets, missing indexes, superlinear algorithms, render inefficiencies, memory growth, and redundant work. Named after Opis (OH-pis), guardian of accountability and consequences.\n"
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

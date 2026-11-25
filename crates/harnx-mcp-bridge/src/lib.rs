@@ -10,7 +10,7 @@ use harnx_core::child_process::ChildProcessManager;
 use harnx_core::instance::HARNX_SERVER_SCOPE;
 use harnx_toolset::{ToolInvocation, ToolInvokeError, ToolSpec, Toolset};
 
-pub mod result_limits;
+pub use harnx_toolset_server::result_limits;
 use result_limits::ResultLimits;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
@@ -593,10 +593,17 @@ impl BridgeToolset {
 fn prepare_call_tool_params(
     tool: &str,
     arguments: Option<serde_json::Map<String, Value>>,
+    structured_result: bool,
 ) -> CallToolRequestParams {
     let mut params = CallToolRequestParams::new(tool.to_owned());
     if let Some(arguments) = arguments {
         params = params.with_arguments(arguments);
+    }
+    if structured_result {
+        params.meta.get_or_insert_default().insert(
+            harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_owned(),
+            Value::Bool(true),
+        );
     }
     harnx_telemetry::propagate::inject_current_into_mcp(&mut params);
     params
@@ -619,7 +626,7 @@ impl Toolset for BridgeToolset {
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
         let result = self
-            .dispatch(tool, args, Default::default(), Value::Null, cancel)
+            .dispatch(tool, args, CallExtras::default(), cancel)
             .await?;
         self.result_limits.normalize(result, None).await
     }
@@ -628,6 +635,7 @@ impl Toolset for BridgeToolset {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Value, ToolInvokeError> {
+        let structured_result = invocation.context.wants_structured_result();
         let session = invocation
             .context
             .invoking_session
@@ -640,13 +648,27 @@ impl Toolset for BridgeToolset {
             .dispatch(
                 &invocation.tool,
                 invocation.args,
-                invocation.context.input_responses,
-                invocation.context.request_state,
+                CallExtras {
+                    input_responses: invocation.context.input_responses,
+                    request_state: invocation.context.request_state,
+                    structured_result,
+                },
                 invocation.cancel,
             )
             .await?;
         self.result_limits.normalize(result, session.as_ref()).await
     }
+}
+
+/// What a `tools/call` carries beside the tool name and arguments.
+#[derive(Default)]
+struct CallExtras {
+    /// Accepted answers to the latest tool challenge, on a rerun.
+    input_responses: std::collections::BTreeMap<String, harnx_toolset::ToolInputResponse>,
+    /// Opaque state the latest challenge asked to have echoed back.
+    request_state: Value,
+    /// Whether the caller wants the result's data in `structuredContent`.
+    structured_result: bool,
 }
 
 impl BridgeToolset {
@@ -669,10 +691,14 @@ impl BridgeToolset {
         &self,
         tool: &str,
         args: Value,
-        input_responses: std::collections::BTreeMap<String, harnx_toolset::ToolInputResponse>,
-        request_state: Value,
+        extras: CallExtras,
         cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
+        let CallExtras {
+            input_responses,
+            request_state,
+            structured_result,
+        } = extras;
         let arguments = match args {
             Value::Object(arguments) => Some(arguments),
             Value::Null => None,
@@ -682,7 +708,7 @@ impl BridgeToolset {
                 ));
             }
         };
-        let mut params = prepare_call_tool_params(tool, arguments);
+        let mut params = prepare_call_tool_params(tool, arguments, structured_result);
         if !input_responses.is_empty() {
             params.input_responses = Some(harnx_toolset_server::mrtr::responses_to_mrtr(
                 &input_responses,
@@ -843,6 +869,8 @@ impl ClientHandler for BridgeClientHandler {
 #[cfg(test)]
 mod mrtr_tests;
 #[cfg(test)]
+mod structured_result_tests;
+#[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use super::BridgeToolset;
@@ -881,12 +909,39 @@ mod tests {
             let params = prepare_call_tool_params(
                 "test_tool",
                 serde_json::json!({ "value": 1 }).as_object().cloned(),
+                false,
             );
             let traceparent = params.traceparent().expect("traceparent in MCP _meta");
             assert!(
                 traceparent.starts_with(&format!("00-{expected_trace_id}-")),
                 "traceparent {traceparent} did not carry trace ID {expected_trace_id}"
             );
+        });
+    }
+
+    #[test]
+    fn prepare_call_tool_params_marks_a_structured_result_request() {
+        harnx_core::require_nextest();
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("mcp-bridge-structured-result-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("mcp_bridge_structured_result_test");
+            let _entered = span.enter();
+            let key = harnx_toolset::CAPABILITY_STRUCTURED_RESULT;
+            let params = prepare_call_tool_params("test_tool", None, true);
+            let meta = params.meta.as_ref().expect("request _meta");
+            assert_eq!(meta.get(key), Some(&serde_json::Value::Bool(true)));
+            assert!(
+                params.traceparent().is_some(),
+                "traceparent stays beside it"
+            );
+
+            let params = prepare_call_tool_params("test_tool", None, false);
+            let meta = params.meta.as_ref().expect("request _meta");
+            assert!(meta.get(key).is_none());
         });
     }
 
@@ -1022,10 +1077,7 @@ mod tests {
 
     #[cfg(unix)]
     fn plans_tools_binary() -> Option<std::path::PathBuf> {
-        let mut dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        if dir.file_name().is_some_and(|name| name == "deps") {
-            dir.pop();
-        }
+        let dir = harnx_core::bin_dir_of_exe(&std::env::current_exe().ok()?);
         let binary = dir.join("harnx-plans-tools");
         binary.is_file().then_some(binary)
     }
@@ -1218,10 +1270,7 @@ mod tests {
 
     #[cfg(unix)]
     fn bash_tools_binary() -> Option<std::path::PathBuf> {
-        let mut dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        if dir.file_name().is_some_and(|name| name == "deps") {
-            dir.pop();
-        }
+        let dir = harnx_core::bin_dir_of_exe(&std::env::current_exe().ok()?);
         let binary = dir.join("harnx-bash-tools");
         binary.is_file().then_some(binary)
     }
@@ -1233,10 +1282,7 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 let mut path = std::env::current_exe().expect("locate current test executable");
-                path.pop();
-                if path.ends_with("deps") {
-                    path.pop();
-                }
+                path = harnx_core::bin_dir_of_exe(&path);
                 path.join("harnx-plans-tools")
             });
         assert!(
@@ -1271,10 +1317,7 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 let mut path = std::env::current_exe().expect("locate current test executable");
-                path.pop();
-                if path.ends_with("deps") {
-                    path.pop();
-                }
+                path = harnx_core::bin_dir_of_exe(&path);
                 path.join("harnx-plans-tools")
             });
         assert!(

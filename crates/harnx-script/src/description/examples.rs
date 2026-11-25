@@ -23,7 +23,9 @@ pub(super) fn pipeline(tools: &[&ToolSpec]) -> String {
             "Generic illustration, not an extra installed tool: requires an fs_read --path command in bash_tools:",
         ),
     };
-    format!("\nWorked pipeline: {instruction}\n```bash\n{name} --path src/lib.rs -o text | rg -n 'TODO' | head -3\n```\n")
+    // A reader with no shell form may return structuredContent, which would
+    // pipe JSON into grep, so ask for its text.
+    format!("\nWorked pipeline: {instruction}\n```bash\n{name} --path src/lib.rs -o text | grep -n 'TODO' | head -3\n```\n")
 }
 
 /// Keep the idiom accurate for older text-only attachment toolsets and custom
@@ -49,7 +51,7 @@ fn string_option<'a>(tool: &'a ToolSpec, flag: &str, value: Option<&str>) -> Opt
     let props = properties(&tool.schema);
     flag_table(&props).ok()?;
     let property = props.iter().find(|prop| prop.flag == flag)?;
-    let schema = property.schema;
+    let schema = property.value;
     if scalar(schema) != Some(Scalar::String) {
         return None;
     }

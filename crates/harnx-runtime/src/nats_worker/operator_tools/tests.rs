@@ -147,6 +147,24 @@ impl FixtureTools {
     }
 }
 
+/// A `fixture_echo` call carrying `args_json` verbatim and no input answers.
+fn echo_call(args_json: &str) -> OperatorToolCommand {
+    OperatorToolCommand::Call {
+        name: "fixture_echo".into(),
+        args_json: args_json.into(),
+        tool_input: None,
+    }
+}
+
+/// A session-metadata tool call carrying `args_json` verbatim.
+fn session_meta_call(tool_name: &str, args_json: &str) -> OperatorToolCommand {
+    OperatorToolCommand::Call {
+        name: tool_name.into(),
+        args_json: args_json.into(),
+        tool_input: None,
+    }
+}
+
 async fn call(
     client: &async_nats::Client,
     request: &OperatorToolRequest,
@@ -204,6 +222,7 @@ impl LiveOperatorFixture {
         let worker = spawn_operator_worker(&global, &readiness, &model_calls);
         let session = operator_session(&client, identity.id, identity.agent).await?;
         let request = OperatorToolRequest {
+            user_id: None,
             version: 1,
             session_key: session.storage_key().into(),
             use_tools: None,
@@ -358,38 +377,14 @@ impl LiveOperatorFixture {
             client, request, ..
         } = self;
         let seen = &self.tools.seen;
-        let mutated = call(
-            client,
-            request,
-            OperatorToolCommand::Call {
-                name: "fixture_echo".into(),
-                args_json: r#"{"text":"mutate"}"#.into(),
-            },
-        )
-        .await;
+        let mutated = call(client, request, echo_call(r#"{"text":"mutate"}"#)).await;
         assert!(mutated.error.is_none(), "{mutated:?}");
         assert!(mutated.output.contains("mutated with spaces"));
         let count = seen.lock().unwrap().len();
-        let denied = call(
-            client,
-            request,
-            OperatorToolCommand::Call {
-                name: "fixture_echo".into(),
-                args_json: r#"{"text":"deny"}"#.into(),
-            },
-        )
-        .await;
+        let denied = call(client, request, echo_call(r#"{"text":"deny"}"#)).await;
         assert_eq!(denied.error.as_deref(), Some("policy denied"));
         assert_eq!(seen.lock().unwrap().len(), count);
-        let invalid = call(
-            client,
-            request,
-            OperatorToolCommand::Call {
-                name: "fixture_echo".into(),
-                args_json: r#"{"text":123}"#.into(),
-            },
-        )
-        .await;
+        let invalid = call(client, request, echo_call(r#"{"text":123}"#)).await;
         assert!(invalid.error.is_some());
         assert_eq!(seen.lock().unwrap().len(), count);
         Ok(())
@@ -404,20 +399,17 @@ impl LiveOperatorFixture {
         let written = call(
             client,
             request,
-            OperatorToolCommand::Call {
-                name: crate::session_meta_tool::WRITE_TOOL_NAME.into(),
-                args_json: r#"{"set":[{"name":"github_issue","value":2296}]}"#.into(),
-            },
+            session_meta_call(
+                crate::session_meta_tool::WRITE_TOOL_NAME,
+                r#"{"set":[{"name":"github_issue","value":2296}]}"#,
+            ),
         )
         .await;
         assert!(written.error.is_none(), "{written:?}");
         let read = call(
             client,
             request,
-            OperatorToolCommand::Call {
-                name: crate::session_meta_tool::READ_TOOL_NAME.into(),
-                args_json: "{}".into(),
-            },
+            session_meta_call(crate::session_meta_tool::READ_TOOL_NAME, "{}"),
         )
         .await;
         assert!(read.error.is_none(), "{read:?}");
@@ -447,6 +439,7 @@ impl LiveOperatorFixture {
         waiting.command = OperatorToolCommand::Call {
             name: "fixture_wait".into(),
             args_json: r#"{"text":"wait"}"#.into(),
+            tool_input: None,
         };
         let waiting_task = tokio::spawn({
             let client = client.clone();
@@ -484,6 +477,7 @@ impl LiveOperatorFixture {
             OperatorToolCommand::Call {
                 name: "fixture_delegate".into(),
                 args_json: r#"{"text":"delegate"}"#.into(),
+                tool_input: None,
             },
         )
         .await;
@@ -731,6 +725,7 @@ async fn managed_operator_invocation_applies_agent_middleware() -> Result<()> {
     )
     .await?;
     let request = OperatorToolRequest {
+        user_id: None,
         version: 1,
         session_key: session.storage_key().into(),
         use_tools: None,
@@ -738,6 +733,7 @@ async fn managed_operator_invocation_applies_agent_middleware() -> Result<()> {
         command: OperatorToolCommand::Call {
             name: crate::session_history::TOOL_NAME.into(),
             args_json: "{}".into(),
+            tool_input: None,
         },
         json: true,
         bash_timeout_secs: None,

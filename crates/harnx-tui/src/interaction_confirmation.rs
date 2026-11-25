@@ -16,6 +16,7 @@ pub(crate) use shared::{
 mod child;
 mod child_decision;
 mod decision;
+mod footer;
 mod observe;
 pub(crate) use child::{answerable, pending_for_progress, ChildClient};
 mod render;
@@ -56,7 +57,7 @@ pub(super) fn pending_confirmation(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_else(|| head.summary())
             .to_string(),
-        payload: if head.request.kind == "a2ui" {
+        payload: if head.request.kind == "a2ui" || head.request.kind == "url" {
             head.request.payload.clone()
         } else {
             serde_json::Value::Null

@@ -30,10 +30,10 @@ use serde_json::json;
 
 const TOKEN: &str = "bash-script-mode-test-token";
 
-struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+pub(crate) struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
 impl EnvGuard {
-    fn install(values: &[(&'static str, &str)]) -> Self {
+    pub(crate) fn install(values: &[(&'static str, &str)]) -> Self {
         let old = values
             .iter()
             .map(|(name, _)| (*name, std::env::var_os(name)))
@@ -61,7 +61,7 @@ impl Drop for EnvGuard {
     }
 }
 
-fn time_server_config(command: &str) -> ToolServerConfig {
+pub(crate) fn time_server_config(command: &str) -> ToolServerConfig {
     ToolServerConfig {
         middleware: Default::default(),
         name: "time".to_string(),
@@ -75,19 +75,22 @@ fn time_server_config(command: &str) -> ToolServerConfig {
     }
 }
 
-fn time_server_binary() -> Result<PathBuf> {
+pub(crate) fn time_server_binary() -> Result<PathBuf> {
     if let Some(path) = option_env!("CARGO_BIN_EXE_harnx-time-tools") {
         return Ok(PathBuf::from(path));
     }
+    workspace_binary("harnx-time-tools")
+}
+
+/// The built binary of a workspace package, built on demand when the test
+/// binary's own target directory does not have it yet.
+fn workspace_binary(package: &str) -> Result<PathBuf> {
     let mut path = std::env::current_exe().context("resolve test executable")?;
-    path.pop();
-    if path.file_name().is_some_and(|name| name == "deps") {
-        path.pop();
-    }
+    path = harnx_core::bin_dir_of_exe(&path);
     path.push(if cfg!(windows) {
-        "harnx-time-tools.exe"
+        format!("{package}.exe")
     } else {
-        "harnx-time-tools"
+        package.to_string()
     });
     if path.is_file() {
         return Ok(path);
@@ -100,23 +103,52 @@ fn time_server_binary() -> Result<PathBuf> {
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .arg("build")
         .arg("-p")
-        .arg("harnx-time-tools")
+        .arg(package)
         .current_dir(workspace)
         .status()
-        .context("build harnx-time-tools for script-mode e2e")?;
-    anyhow::ensure!(status.success(), "building harnx-time-tools failed");
-    anyhow::ensure!(
-        path.is_file(),
-        "harnx-time-tools not found at {}",
-        path.display()
-    );
+        .with_context(|| format!("build {package} for script-mode e2e"))?;
+    anyhow::ensure!(status.success(), "building {package} failed");
+    anyhow::ensure!(path.is_file(), "{package} not found at {}", path.display());
     Ok(path)
 }
 
-/// Bash-only agent: `bash_tools: time_*` and no `use_tools`.
-fn script_mode_config() -> Arc<ConfigLock> {
+/// Start `servers` under `instance_id` against a token-authenticated broker
+/// and wait for the time tool's registration. Both script-mode e2es and the
+/// script-tools cold-start e2e need this exact sequence; one copy keeps the
+/// fixtures identical.
+pub(crate) async fn start_time_server(
+    server_url: &str,
+    token: &str,
+    instance_id: &ServerScope,
+    servers: &[ToolServerConfig],
+) -> Result<ToolServerSupervisor> {
+    start_tool_servers(server_url, token, instance_id, servers, "__time__time").await
+}
+
+/// As [`start_time_server`], waiting for the registration `identity` names.
+async fn start_tool_servers(
+    server_url: &str,
+    token: &str,
+    instance_id: &ServerScope,
+    servers: &[ToolServerConfig],
+    identity: &str,
+) -> Result<ToolServerSupervisor> {
+    let client = async_nats::ConnectOptions::new()
+        .token(token.to_string())
+        .connect(server_url)
+        .await?;
+    let start = ToolServerStartConfig::new(client.clone(), instance_id.clone(), server_url, token);
+    let supervisor =
+        ToolServerSupervisor::start_local_with_timeout(start, servers, Duration::from_secs(60))
+            .await?;
+    wait_for_registration(&client, instance_id, identity).await?;
+    Ok(supervisor)
+}
+
+/// Bash-only agent: `bash_tools` set to `patterns` and no `use_tools`.
+fn script_mode_config(patterns: &[&str]) -> Arc<ConfigLock> {
     let mut agent = AgentConfig::from_prompt("test");
-    agent.set_bash_tools(Some(vec!["time_*".to_string()]));
+    agent.set_bash_tools(Some(patterns.iter().map(|p| p.to_string()).collect()));
     let config = Config {
         agent: Some(Agent::new(agent)),
         ..Config::default()
@@ -124,19 +156,20 @@ fn script_mode_config() -> Arc<ConfigLock> {
     Arc::new(ConfigLock::new(config))
 }
 
-async fn wait_for_time_registration(
+async fn wait_for_registration(
     client: &async_nats::Client,
     instance_id: &ServerScope,
+    identity: &str,
 ) -> Result<()> {
     let store = async_nats::jetstream::new(client.clone())
         .get_key_value(harnx_toolset_server::TOOL_REGISTRY_BUCKET)
         .await?;
-    let key = harnx_toolset_server::registration_key(instance_id, "__time__time");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let key = harnx_toolset_server::registration_key(instance_id, identity);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while store.get(&key).await?.is_none() {
         anyhow::ensure!(
             Instant::now() < deadline,
-            "time tool server never registered"
+            "tool server '{identity}' never registered"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -157,6 +190,56 @@ fn assert_time_tools_active(config: &ConfigLock) {
     );
 }
 
+/// Start one tool server and an agent whose `bash_tools` select `patterns`,
+/// with the server's declarations cached the way the agent loop caches them
+/// before a tool round.
+async fn start_script_server(
+    server_url: &str,
+    server: ToolServerConfig,
+    identity: &str,
+    patterns: &[&str],
+) -> Result<(ServerScope, ToolServerSupervisor, Arc<ConfigLock>)> {
+    let instance_id = ServerScope::new();
+    let supervisor =
+        start_tool_servers(server_url, TOKEN, &instance_id, &[server], identity).await?;
+    let config = script_mode_config(patterns);
+    harnx_runtime::tool_context::refresh_nats_tool_declarations(&config, &instance_id).await;
+    Ok((instance_id, supervisor, config))
+}
+
+/// Run one `bash` call for `script` through the runtime's real wiring and
+/// return its output.
+async fn run_bash_script(
+    config: &Arc<ConfigLock>,
+    instance_id: &ServerScope,
+    script: &str,
+) -> Result<serde_json::Value> {
+    let slot = Arc::new(BashEvalContextSlot::default());
+    let mut params = BuildToolEvalContextParams::new(config, instance_id);
+    params.bash_context_slot = Some(slot.clone());
+    let ctx = Arc::new(harnx_runtime::tool::build_tool_eval_context(params).await);
+    slot.set(&ctx);
+    assert!(
+        ctx.providers[0].has_tool("bash"),
+        "BashProvider must lead the provider list"
+    );
+
+    let abort = create_abort_signal();
+    let mut results = eval_tool_calls(
+        &ctx,
+        vec![ToolCall::new(
+            "bash".to_string(),
+            json!({"script": script}),
+            Some("bash-1".to_string()),
+            None,
+        )],
+        &abort,
+    )
+    .await?;
+    anyhow::ensure!(results.len() == 1, "one bash call, one result");
+    Ok(results.remove(0).output)
+}
+
 /// Full-stack e2e: a real NATS broker, a real tool server process, a real
 /// agent config, the real runtime context construction, and a `bash` call
 /// that runs `time_get_current_time … | wc -l` through BashKit and the
@@ -175,68 +258,108 @@ async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
         (HARNX_NATS_URL_ENV, server.url()),
         (HARNX_NATS_TOKEN_ENV, TOKEN),
     ]);
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(server.url())
-        .await?;
     let instance_id = ServerScope::new();
-    let start =
-        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
-    let servers = [time_server_config(&binary)];
-    let supervisor =
-        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_secs(5))
-            .await?;
-    wait_for_time_registration(&client, &instance_id).await?;
+    let supervisor = start_time_server(
+        server.url(),
+        TOKEN,
+        &instance_id,
+        &[time_server_config(&binary)],
+    )
+    .await?;
 
-    let config = script_mode_config();
+    let config = script_mode_config(&["time_*"]);
     // The declaration cache is what bash_tools resolution reads; the agent
     // loop refreshes it before tool rounds, and so must this test.
     harnx_runtime::tool_context::refresh_nats_tool_declarations(&config, &instance_id).await;
     assert_time_tools_active(&config);
 
-    let slot = Arc::new(BashEvalContextSlot::default());
-    let mut params = BuildToolEvalContextParams::new(&config, &instance_id);
-    params.bash_context_slot = Some(slot.clone());
-    let ctx = Arc::new(harnx_runtime::tool::build_tool_eval_context(params).await);
-    slot.set(&ctx);
-    assert!(
-        ctx.providers[0].has_tool("bash"),
-        "BashProvider must lead the provider list"
-    );
-
-    let abort = create_abort_signal();
-    let results = eval_tool_calls(
-        &ctx,
-        vec![ToolCall::new(
-            "bash".to_string(),
-            json!({"script": "time_get_current_time --timezone UTC | wc -l"}),
-            Some("bash-1".to_string()),
-            None,
-        )],
-        &abort,
+    let output = run_bash_script(
+        &config,
+        &instance_id,
+        "time_get_current_time --timezone UTC | wc -l",
     )
     .await?;
     drop(supervisor);
-    assert_eq!(results.len(), 1);
-    let output = &results[0].output;
+    let output = &output;
     assert_eq!(output["status"], "ok", "{}", output);
     assert_eq!(output["exit_code"], 0);
-    assert_eq!(output["trace"][0]["name"], "time_get_current_time");
-    assert_eq!(output["trace"][0]["status"], "ok");
-    // One JSON result line through `wc -l`.
-    let stdout = output["stdout"].as_str().expect("stdout text");
-    assert_eq!(stdout.trim(), "1", "{}", output);
+    assert!(output.get("stdout").is_none(), "{}", output);
     let text = output["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("status: ok"), "{text}");
-    assert!(text.contains("<!-- start stdout -->"), "{text}");
+    assert!(text.contains("- time_get_current_time ok"), "{text}");
+    // One JSON result line through `wc -l`.
+    let stdout_block = text
+        .split("<!-- start stdout -->")
+        .nth(1)
+        .and_then(|rest| rest.split("<!-- end stdout -->").next())
+        .expect("stdout block");
+    assert!(stdout_block.contains('1'), "{text}");
+    Ok(())
+}
+
+/// The stdout block of a `bash` result's report.
+fn stdout_block(output: &serde_json::Value) -> String {
+    let text = output["content"][0]["text"].as_str().unwrap_or_default();
+    text.split("<!-- start stdout -->")
+        .nth(1)
+        .and_then(|rest| rest.split("<!-- end stdout -->").next())
+        .unwrap_or_else(|| panic!("stdout block in {text}"))
+        .trim()
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+        .to_string()
+}
+
+/// A file tool reached through the MCP bridge prints its shell form in a
+/// script: the request for a structured result crosses the bridge and the
+/// advertised mapping tells the script which field is stdout.
+#[tokio::test(flavor = "multi_thread")]
+async fn bridged_file_tool_prints_its_shell_form() -> Result<()> {
+    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(TOKEN.to_string()),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let bridge = workspace_binary("harnx-mcp-bridge")?;
+    let fs_tools = workspace_binary("harnx-fs-tools")?;
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("notes.txt");
+    std::fs::write(&file, "alpha\nbeta\n")?;
+    let _env = EnvGuard::install(&[
+        (HARNX_NATS_URL_ENV, server.url()),
+        (HARNX_NATS_TOKEN_ENV, TOKEN),
+    ]);
+    let mut fs_server = time_server_config(&bridge.to_string_lossy());
+    fs_server.name = "fs".to_string();
+    fs_server.args = ["--name", "fs", "--"]
+        .into_iter()
+        .map(str::to_string)
+        .chain([
+            fs_tools.to_string_lossy().into_owned(),
+            "--mcp-stdio".to_string(),
+            "--allow-read".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        ])
+        .collect();
+    let (instance_id, supervisor, config) =
+        start_script_server(server.url(), fs_server, "__fs__fs", &["fs_read"]).await?;
+
+    let script = format!("fs_read --path {} | head -1", file.display());
+    let output = run_bash_script(&config, &instance_id, &script).await?;
+    drop(supervisor);
+    assert_eq!(output["status"], "ok", "{output}");
+    assert_eq!(stdout_block(&output), "alpha", "{output}");
     Ok(())
 }
 
 /// Recovery: after worker loss the engine replays the call across providers
 /// in order; an active BashProvider must answer `bash` with the interrupted
 /// report so the script is never rerun (J-RHAD-r2-1). Active means the
-/// agent's `bash_tools` actually resolve against registered declarations
-/// (PR3 review F9), so this test stands up the real NATS broker and time
+/// agent's `bash_tools` actually resolve against registered declarations,
+/// so this test stands up the real NATS broker and time
 /// tool server like the pipeline e2e above. It needs no dispatch: the
 /// provider answers from its own policy before any remote replay.
 #[tokio::test(flavor = "multi_thread")]
@@ -253,20 +376,16 @@ async fn interrupted_bash_replays_as_reported_not_rerun() -> Result<()> {
         (HARNX_NATS_URL_ENV, server.url()),
         (HARNX_NATS_TOKEN_ENV, TOKEN),
     ]);
-    let client = async_nats::ConnectOptions::new()
-        .token(TOKEN.to_string())
-        .connect(server.url())
-        .await?;
     let instance_id = ServerScope::new();
-    let start =
-        ToolServerStartConfig::new(client.clone(), instance_id.clone(), server.url(), TOKEN);
-    let servers = [time_server_config(&binary)];
-    let supervisor =
-        ToolServerSupervisor::start_local_with_timeout(start, &servers, Duration::from_secs(5))
-            .await?;
-    wait_for_time_registration(&client, &instance_id).await?;
+    let supervisor = start_time_server(
+        server.url(),
+        TOKEN,
+        &instance_id,
+        &[time_server_config(&binary)],
+    )
+    .await?;
 
-    let config = script_mode_config();
+    let config = script_mode_config(&["time_*"]);
     harnx_runtime::tool_context::refresh_nats_tool_declarations(&config, &instance_id).await;
     assert!(
         config.read().bash_tools_active(),
@@ -309,14 +428,14 @@ async fn interrupted_bash_replays_as_reported_not_rerun() -> Result<()> {
     Ok(())
 }
 
-/// PR3 review F9: when no declarations resolve (script mode inactive), even
-/// a bare `bash` call must fall through replay untouched so a
+/// When no declarations resolve (script mode inactive), even a bare `bash`
+/// call must fall through replay untouched so a
 /// tool-server-native `bash` keeps normal NATS journal recovery. The
 /// provider-internal halves of both cases are covered in
 /// `bash_provider::tests`; this pins the engine-level fall-through.
 #[tokio::test(flavor = "multi_thread")]
 async fn inactive_script_mode_leaves_bash_replay_to_other_providers() -> Result<()> {
-    let config = script_mode_config();
+    let config = script_mode_config(&["time_*"]);
     // No tool servers: `bash_tools: time_*` resolves to nothing, so the
     // synthesized declaration — and the provider's active flag — stay off.
     assert!(
@@ -357,8 +476,8 @@ async fn inactive_script_mode_leaves_bash_replay_to_other_providers() -> Result<
     Ok(())
 }
 
-/// PR3 round-2 review R4: the fall-through above must actually reach NATS
-/// journal recovery. Seeds the journal the way a completed tool-server-native
+/// The fall-through above must actually reach NATS journal recovery.
+/// Seeds the journal the way a completed tool-server-native
 /// `bash` call leaves it — one row under (session, round, tool-call id) with
 /// its final reply — and asserts replay hands back the saved reply instead
 /// of a synthetic interruption.
@@ -386,7 +505,7 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
 
     // No tool servers: script mode stays inactive, so the bare `bash` name
     // belongs to the journaled external tool.
-    let config = script_mode_config();
+    let config = script_mode_config(&["time_*"]);
     assert!(
         !config.read().bash_tools_active(),
         "no registered declarations means script mode is inactive"
@@ -395,6 +514,7 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
     let instance_id = ServerScope::new();
     let mut params = BuildToolEvalContextParams::new(&config, &instance_id);
     params.bash_context_slot = Some(slot.clone());
+    // qual:allow(dry, fragment) reason: "the replay e2es share the ctx-build + ToolCall fixture by design and diverge in what they assert about replay; deduplicating it would hide the replay policy under a fixture"
     let ctx = Arc::new(harnx_runtime::tool::build_tool_eval_context(params).await);
     slot.set(&ctx);
     let call = ToolCall::new(
@@ -431,6 +551,7 @@ async fn inactive_script_mode_bash_replay_recovers_journaled_reply() -> Result<(
 
 async fn seed_journaled_bash_reply(client: &async_nats::Client) -> Result<()> {
     let request = harnx_toolset::ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: None,
@@ -465,5 +586,43 @@ async fn seed_journaled_bash_reply(client: &async_nats::Client) -> Result<()> {
             },
         )
         .await?;
+    Ok(())
+}
+
+/// `bash_exec` in a script behaves like a command: it prints the command's
+/// stdout and stderr on the matching streams and exits with its status.
+#[tokio::test(flavor = "multi_thread")]
+async fn bash_exec_in_a_script_behaves_like_a_command() -> Result<()> {
+    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(TOKEN.to_string()),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let binary = workspace_binary("harnx-bash-tools")?;
+    let dir = tempfile::tempdir()?;
+    let _env = EnvGuard::install(&[
+        (HARNX_NATS_URL_ENV, server.url()),
+        (HARNX_NATS_TOKEN_ENV, TOKEN),
+    ]);
+    let mut bash_server = time_server_config(&binary.to_string_lossy());
+    bash_server.name = "bash".to_string();
+    bash_server.args = vec![
+        "--no-sandbox".to_string(),
+        "--allow-read".to_string(),
+        dir.path().to_string_lossy().into_owned(),
+    ];
+    let (instance_id, supervisor, config) =
+        start_script_server(server.url(), bash_server, "__bash__bash", &["bash_exec"]).await?;
+
+    let script = r#"bash_exec --command 'echo hi' | tr a-z A-Z
+bash_exec --command 'exit 3' || echo "status=$?"
+bash_exec --command 'echo e >&2' 2>&1 >/dev/null
+bash_exec --command 'echo hi' -o json | jq -r .exit_code"#;
+    let output = run_bash_script(&config, &instance_id, script).await?;
+    drop(supervisor);
+    assert_eq!(output["status"], "ok", "{output}");
+    assert_eq!(stdout_block(&output), "HI\nstatus=3\ne\n0", "{output}");
     Ok(())
 }

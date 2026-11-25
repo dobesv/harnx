@@ -192,6 +192,9 @@ async fn add_collision_registration(
     let jetstream = async_nats::jetstream::new(client.clone());
     let store = jetstream.get_key_value(TOOL_REGISTRY_BUCKET).await?;
     let registration = Registration {
+        user_id: None,
+        ownerless_only: false,
+        connection_id: None,
         package: None,
         config: String::new(),
         server: "collision".to_string(),
@@ -229,6 +232,9 @@ async fn add_duplicate_registrations(
         .await?;
     for server in ["alpha", "beta"] {
         let registration = Registration {
+            user_id: None,
+            ownerless_only: false,
+            connection_id: None,
             package: None,
             config: String::new(),
             server: server.to_string(),

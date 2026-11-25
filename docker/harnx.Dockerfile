@@ -35,5 +35,6 @@ COPY linux-${TARGETARCH}/harnx-pkg /usr/local/bin/harnx-pkg
 COPY linux-${TARGETARCH}/harnx-proxy-auth /usr/local/bin/harnx-proxy-auth
 COPY linux-${TARGETARCH}/harnx-sandbox-run /usr/local/bin/harnx-sandbox-run
 COPY linux-${TARGETARCH}/harnx-sandbox-exec /usr/local/bin/harnx-sandbox-exec
+COPY linux-${TARGETARCH}/harnx-credentials-keygen /usr/local/bin/harnx-credentials-keygen
 COPY web-assets/ /usr/local/share/harnx/web-assets/
 ENV HARNX_WEB_ASSETS=/usr/local/share/harnx/web-assets

@@ -1,3 +1,4 @@
+use crate::script_result::ResultStyle;
 use crate::server::{
     location_args, EditFileParams, FindFilesParams, FsServer, InsertParams, ListDirectoryParams,
     ReReplaceParams, ReadFileParams, RollbackParams, SearchFilesParams, WriteAttachmentParams,
@@ -7,8 +8,8 @@ use crate::tool_templates;
 use async_trait::async_trait;
 use harnx_tool_allow::ResolvedAllowlist;
 use harnx_toolset::{
-    ToolInvocation, ToolInvokeError, ToolProgressKind, ToolProgressLocation, ToolProgressPatch,
-    ToolProgressStatus, ToolSpec, Toolset,
+    ScriptOutput, ToolInvocation, ToolInvokeError, ToolProgressKind, ToolProgressLocation,
+    ToolProgressPatch, ToolProgressStatus, ToolSpec, Toolset,
 };
 use rmcp::model::{CallToolResult, ErrorData, Tool};
 use rmcp::schemars::JsonSchema;
@@ -159,6 +160,12 @@ fn discovered_locations(
     if value.get("isError").and_then(Value::as_bool) == Some(true) {
         return None;
     }
+    // A script-style result's first text block is the user summary and its
+    // paths carry the script's own prefix, so neither can be parsed for
+    // locations.
+    if value.get("structuredContent").is_some() {
+        return None;
+    }
     let text = value
         .get("content")?
         .as_array()?
@@ -217,15 +224,44 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             "Read a text file with line numbers, pagination, grep filtering, and smart truncation. Prefer this tool over shell commands like sed, cat, head, tail. Use offset+limit to read specific line ranges instead of sed -n. Also reads local image files (PNG, JPEG, GIF, WebP, up to 5MB) and returns them as viewable images for vision-capable models — use this to view/inspect an image file by its path.",
             true,
             tool_templates::READ_CALL,
-        ),
+        )
+        .with_script_output(ScriptOutput {
+            stdout: Some("text".to_string()),
+            stderr: Some("notes".to_string()),
+            summary: Some(
+                "file text, like cat; --line-numbers adds `N: ` prefixes".to_string(),
+            ),
+            ..Default::default()
+        }),
         spec::<WriteFileParams>("write", "Write or create a file, replacing its contents. To copy attachment bytes (including binary), use write_attachment.", false, tool_templates::WRITE_CALL),
         spec::<WriteAttachmentParams>("write_attachment", "Copy exact bytes from a cid:media: attachment, or rendered Markdown from a cid:plan: URL, to a file. Creates or overwrites destination. No text decoding.", false, tool_templates::WRITE_ATTACHMENT_CALL),
         spec::<EditFileParams>("edit", "Replace exact text within an existing file.", false, tool_templates::EDIT_CALL),
         spec::<InsertParams>("insert", "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N; omit insert_line (or set N = total lines) to append to the end of the file. Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.", false, tool_templates::INSERT_CALL),
         spec::<ReReplaceParams>("re_replace", "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.", false, tool_templates::RE_REPLACE_CALL),
-        spec::<ListDirectoryParams>("ls", "List directory contents, optionally recursively. Prefer this tool over running bash ls.", true, tool_templates::LS_CALL),
-        spec::<SearchFilesParams>("grep", "Search file contents with regex and optional context lines. Prefer this tool over running bash grep.", true, tool_templates::GREP_CALL),
-        spec::<FindFilesParams>("find", "Find files by glob pattern. Prefer this tool over running bash find.", true, tool_templates::FIND_CALL),
+        spec::<ListDirectoryParams>("ls", "List directory contents, optionally recursively. Prefer this tool over running bash ls.", true, tool_templates::LS_CALL)
+        .with_script_output(ScriptOutput {
+            stdout: Some("entries".to_string()),
+            stderr: Some("notes".to_string()),
+            summary: Some("one entry per line, like ls -1".to_string()),
+            ..Default::default()
+        }),
+        spec::<SearchFilesParams>("grep", "Search file contents with regex and optional context lines. Prefer this tool over running bash grep.", true, tool_templates::GREP_CALL)
+        .with_script_output(ScriptOutput {
+            stdout: Some("matches".to_string()),
+            row: Some("{path}:{line}:{text}".to_string()),
+            stderr: Some("notes".to_string()),
+            exit_code: Some("exit_code".to_string()),
+            error_exit_code: Some(2),
+            summary: Some("path:line:text per line, path usable as --path, like grep -n; exit 1 when nothing matched".to_string()),
+            ..Default::default()
+        }),
+        spec::<FindFilesParams>("find", "Find files by glob pattern. Prefer this tool over running bash find.", true, tool_templates::FIND_CALL)
+        .with_script_output(ScriptOutput {
+            stdout: Some("paths".to_string()),
+            stderr: Some("notes".to_string()),
+            summary: Some("one path per line, usable as --path, like find".to_string()),
+            ..Default::default()
+        }),
         spec::<RollbackParams>("rollback_file", "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.", false, tool_templates::ROLLBACK_FILE_CALL),
     ]
 }
@@ -259,7 +295,10 @@ impl Toolset for FsToolset {
         args: Value,
         _cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
-        let result = self.server.invoke_tool_value(tool, args).await;
+        let result = self
+            .server
+            .invoke_tool_value(tool, args, ResultStyle::Model)
+            .await;
         map_result(result)
     }
 
@@ -271,9 +310,14 @@ impl Toolset for FsToolset {
             invocation.context.progress.update(patch);
         }
         let location_args = location_args(&invocation.args);
+        let style = if invocation.context.wants_structured_result() {
+            ResultStyle::Script
+        } else {
+            ResultStyle::Model
+        };
         let result = self
             .server
-            .invoke_tool_value(&invocation.tool, invocation.args)
+            .invoke_tool_value(&invocation.tool, invocation.args, style)
             .await;
         if let Ok(result) = &result {
             if let Some(patch) =
@@ -518,6 +562,123 @@ mod tests {
                 && patches[index].locations.as_ref().is_some_and(|locations| {
                     locations.len() == 1 && locations[0].path.is_absolute()
                 })
+        }));
+    }
+
+    #[test]
+    fn ls_find_grep_specs_declare_script_output() {
+        let specs = builtin_tool_specs();
+        let output = |name: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .and_then(|spec| spec.script_output())
+                .unwrap()
+        };
+        assert_eq!(output("ls").stdout.as_deref(), Some("entries"));
+        assert_eq!(output("find").stdout.as_deref(), Some("paths"));
+        let grep = output("grep");
+        assert_eq!(grep.stdout.as_deref(), Some("matches"));
+        assert_eq!(grep.row.as_deref(), Some("{path}:{line}:{text}"));
+        assert_eq!(grep.exit_code.as_deref(), Some("exit_code"));
+        assert_eq!(grep.error_exit_code, Some(2));
+        for name in ["ls", "find", "grep"] {
+            assert_eq!(output(name).stderr.as_deref(), Some("notes"));
+            assert!(output(name).summary.is_some());
+        }
+    }
+
+    #[test]
+    fn read_spec_declares_script_output() {
+        let spec = builtin_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "read")
+            .unwrap();
+        let output = spec.script_output().unwrap();
+        assert_eq!(output.stdout.as_deref(), Some("text"));
+        assert_eq!(output.stderr.as_deref(), Some("notes"));
+        assert!(output.summary.is_some());
+        let others = builtin_tool_specs()
+            .into_iter()
+            .filter(|spec| {
+                !["read", "ls", "find", "grep"].contains(&spec.name.as_str())
+                    && spec.script_output().is_some()
+            })
+            .count();
+        assert_eq!(others, 0);
+    }
+
+    #[tokio::test]
+    async fn structured_result_capability_selects_script_style() {
+        let root = TestDir::new();
+        let root_path = root.0.canonicalize().unwrap();
+        let file = root_path.join("s.txt");
+        std::fs::write(&file, "a\nb\n").unwrap();
+        let mut allowlist = ResolvedAllowlist::new();
+        allowlist.insert_rwx(root_path);
+        let toolset = FsToolset::new(allowlist);
+        let call = |wants: bool| {
+            let mut context = harnx_toolset::ToolInvocationContext::default();
+            if wants {
+                context
+                    .capabilities
+                    .insert(harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_string());
+            }
+            ToolInvocation {
+                tool: "read".to_string(),
+                args: json!({"path": file.to_string_lossy()}),
+                context,
+                cancel: CancellationToken::new(),
+            }
+        };
+        let script = toolset.invoke_with_context(call(true)).await.unwrap();
+        assert_eq!(script["structuredContent"]["text"], "a\nb\n");
+        let model = toolset.invoke_with_context(call(false)).await.unwrap();
+        assert!(model.get("structuredContent").is_none());
+        assert_eq!(model["content"][0]["text"], "1: a\n2: b");
+    }
+
+    #[tokio::test]
+    async fn script_style_find_does_not_report_its_summary_as_a_location() {
+        let root = TestDir::new();
+        let root_path = root.0.canonicalize().unwrap();
+        std::fs::write(root_path.join("a.txt"), "x\n").unwrap();
+        std::fs::write(root_path.join("b.txt"), "x\n").unwrap();
+        let root_arg = root_path.to_string_lossy().into_owned();
+        let mut allowlist = ResolvedAllowlist::new();
+        allowlist.insert_read(root_path);
+        let toolset = FsToolset::new(allowlist);
+        let recorder = std::sync::Arc::new(RecordingProgress::default());
+        let mut context = harnx_toolset::ToolInvocationContext {
+            progress: harnx_toolset::ToolProgressHandle::new(recorder.clone()),
+            ..Default::default()
+        };
+        context
+            .capabilities
+            .insert(harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_string());
+        let result = toolset
+            .invoke_with_context(ToolInvocation {
+                tool: "find".to_string(),
+                args: json!({"pattern": "*.txt", "path": root_arg}),
+                context,
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result["structuredContent"]["paths"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let patches = recorder.0.lock().unwrap();
+        assert!(patches.iter().all(|patch| {
+            patch.locations.as_ref().is_none_or(|locations| {
+                locations
+                    .iter()
+                    .all(|location| !location.path.to_string_lossy().contains("Found"))
+            })
         }));
     }
 

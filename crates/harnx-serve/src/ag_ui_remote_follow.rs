@@ -32,10 +32,7 @@ use harnx_runtime::{
     nats_event_sink::{AdvisoryEnvelope, JetstreamContext, SessionEventStream},
     nats_lease::session_has_active_lease,
 };
-use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender},
-    oneshot,
-};
+use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use tokio_stream::StreamExt as _;
 
 use crate::ag_ui::{GuardedEventStream, UsageContextSnapshot};
@@ -43,8 +40,9 @@ use crate::ag_ui::{GuardedEventStream, UsageContextSnapshot};
 use crate::{
     ag_ui::{frame_event, AgUiError, AgUiSink},
     ag_ui_attach::session_attach_boundary_event,
-    ag_ui_sync::{frame_run_boundary_event, frame_run_error_event, history_warning_event},
+    ag_ui_sync::{frame_run_boundary_event, frame_run_error_event},
     session_actor::SubscribeResult,
+    transcript_snapshot::SnapshotFeatures,
 };
 
 /// Poll interval for checking lease status and refreshing history.
@@ -100,6 +98,7 @@ pub(crate) struct EventStreamParams<'a> {
     pub(crate) run_id: &'a str,
     pub(crate) thread_id: &'a str,
     pub(crate) subscription: &'a SubscribeResult,
+    pub(crate) features: SnapshotFeatures,
     pub(crate) eligible: bool,
 }
 
@@ -128,6 +127,7 @@ pub(crate) async fn resolve_event_stream(
         run_id: params.run_id,
         thread_id: params.thread_id,
         subscription: params.subscription,
+        features: params.features,
     })
     .await?;
     Ok(Some(stream))
@@ -163,38 +163,27 @@ struct RemoteFollowStreamParams<'a> {
     run_id: &'a str,
     thread_id: &'a str,
     subscription: &'a SubscribeResult,
+    features: SnapshotFeatures,
 }
 
 async fn build_remote_follow_ag_ui_stream(
     params: RemoteFollowStreamParams<'_>,
 ) -> Result<GuardedEventStream, AgUiError> {
-    let initial_events = crate::transcript_snapshot::snapshot_events(
+    let snapshot_frame = crate::ag_ui_attach::initial_attach_frame(
         params.subscription.snapshot.clone(),
-        params.subscription.compaction.as_ref(),
-    )
-    .into_iter()
-    .chain(
-        params
-            .subscription
-            .history_warnings
-            .iter()
-            .cloned()
-            .map(history_warning_event),
+        params.subscription.history_warnings.clone(),
+        true,
+        params.features,
     );
-    let initial_frames = initial_events
-        .filter_map(|event| {
-            frame_event(&event)
-                .map_err(|err| log::warn!("failed to serialize initial AG-UI frame: {err}"))
-                .ok()
-        })
-        .collect::<String>();
-    let snapshot_frame = (!initial_frames.is_empty()).then(|| Bytes::from(initial_frames));
     let attachment_frames = params
         .subscription
         .log_entries
         .as_deref()
         .map(|entries| {
-            super::ag_ui::message_attachment_snapshot_events(&params.subscription.snapshot, entries)
+            super::ag_ui::message_attachment_snapshot_events(
+                &params.subscription.snapshot.messages,
+                entries,
+            )
         })
         .unwrap_or_default()
         .into_iter()
@@ -210,6 +199,7 @@ async fn build_remote_follow_ag_ui_stream(
         snapshot_frame,
         attachment_frames,
         session_base: params.subscription.session_base.clone(),
+        features: params.features,
     })
     .await
     .map_err(|err| AgUiError::Internal(format!("Remote follow failed: {err}")))
@@ -238,23 +228,12 @@ async fn build_remote_follow_event_stream(
     let interrupt_watch = RemoteInterruptWatch::bind(&jetstream, params.session_id, through_seq);
 
     if let Some(terminal) = pending::terminal_from_history(event_stream.history(), through_seq) {
-        // The worker may have finished since the actor's subscription snapshot.
-        let hydration_frames = pending::completion_events(
+        return complete_remote_attach(
+            params,
+            terminal,
             event_stream.history(),
-            params.session_id,
-            params.session_base.as_ref(),
-        )?
-        .into_iter()
-        .filter_map(|event| frame_event(&event).ok().map(Bytes::from))
-        .collect();
-        return Ok(completed_remote_stream(
             [started_frame, boundary_frame],
-            params
-                .snapshot_frame
-                .filter(|_| params.session_base.is_none()),
-            hydration_frames,
-            remote_terminal_frame(terminal, params.thread_id, params.run_id),
-        ));
+        );
     }
 
     let claim_watchdog = if session_has_active_lease(&jetstream, params.session_id).await? {
@@ -280,7 +259,31 @@ async fn build_remote_follow_event_stream(
         through_seq,
         claim_watchdog,
         session_base: params.session_base,
+        features: params.features,
     }))
+}
+
+// The worker may have finished since the actor's subscription snapshot.
+fn complete_remote_attach(
+    params: RemoteEventStreamParams<'_>,
+    terminal: RemoteFollowTerminal,
+    history: &[(u64, SessionLogEntry)],
+    boundary: [Bytes; 2],
+) -> Result<GuardedEventStream> {
+    let hydration_frames =
+        pending::completion_events(history, params.session_id, params.session_base.as_ref())?
+            .into_iter()
+            .flat_map(|event| params.features.expand_live_event(event))
+            .filter_map(|event| frame_event(&event).ok().map(Bytes::from))
+            .collect();
+    Ok(completed_remote_stream(
+        boundary,
+        params
+            .snapshot_frame
+            .filter(|_| params.session_base.is_none()),
+        hydration_frames,
+        remote_terminal_frame(terminal, params.thread_id, params.run_id),
+    ))
 }
 
 struct RemoteEventStreamParams<'a> {
@@ -292,6 +295,7 @@ struct RemoteEventStreamParams<'a> {
     snapshot_frame: Option<Bytes>,
     attachment_frames: Vec<Bytes>,
     session_base: Option<harnx_core::session::Session>,
+    features: SnapshotFeatures,
 }
 
 struct LiveFollowParams {
@@ -308,6 +312,7 @@ struct LiveFollowParams {
     through_seq: u64,
     claim_watchdog: Option<harnx_runtime::nats_session::SessionLeaseWatchdog>,
     session_base: Option<harnx_core::session::Session>,
+    features: SnapshotFeatures,
 }
 
 fn build_live_follow_stream(params: LiveFollowParams) -> GuardedEventStream {
@@ -349,7 +354,8 @@ fn build_live_follow_stream(params: LiveFollowParams) -> GuardedEventStream {
         .chain(params.snapshot_frame)
         .chain(params.attachment_frames)
         .chain(control_frames);
-    let event_frames = event_frames_with_guard(rx, live, attached_seq, guard.clone());
+    let event_frames =
+        event_frames_with_guard(rx, live, attached_seq, guard.clone(), params.features);
     let thread_id = params.thread_id;
     let run_id = params.run_id;
     let terminal_stream = futures::stream::once(async move {
@@ -694,18 +700,7 @@ pub(crate) fn terminal_after_lease_poll(
         .then(|| RemoteFollowTerminal::Error(WORKER_LOST_MESSAGE.to_string()))
 }
 
-impl AgUiSink {
-    /// Creates a sink for the remote-follow path.
-    ///
-    /// Uses an unbounded internal event channel; the bounded wire-frame channel
-    /// applies async backpressure without discarding lifecycle events.
-    pub(crate) fn new_for_remote_follow(
-        tx: UnboundedSender<Event>,
-        message_id: ag_ui_core::types::ids::MessageId,
-    ) -> Self {
-        Self::with_snapshot(tx, message_id, false, None)
-    }
-}
-
 #[cfg(test)]
 mod compaction_tests;
+#[cfg(test)]
+mod reasoning_tests;

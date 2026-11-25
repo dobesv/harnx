@@ -19,7 +19,7 @@ for retention priorities, research sources, and evaluation guidance.
 Install from GHCR (replace `v0.1.0` with the current release):
 
 ```sh
-harnx-pkg add ghcr.io/dobesv/harnx-packages/coding v0.4.21
+harnx-pkg add ghcr.io/dobesv/harnx-packages/coding v0.4.23
 ```
 
 Use a harnx build containing the model and client updates accompanying this package refresh.
@@ -47,10 +47,10 @@ OpenAI API model:
 
 | Agent | Ordered model chain |
 |-------|---------------------|
-| `coder` | Sonnet 5.5 → Codex Sol 6.1 → OpenAI Sol 6.1 → Gemini 3.8 Flash → Bedrock GLM 5.3 |
+| `coder` | Sonnet 5.5 → Codex Sol 6.2 → OpenAI Sol 6.2 → Gemini 4 Hydrogen → Bedrock GLM 5.3 |
 | `compact-coder` | Codex Luna → OpenAI Luna → Gemini 3.5 Flash-Lite → Haiku 5.5 → Bedrock Luna |
 
-Sol 6.1 preserves coding quality when Sonnet is unavailable; Luna and Flash-Lite
+Sol 6.2 preserves coding quality when Sonnet is unavailable; Luna and Flash-Lite
 keep compaction inexpensive. Haiku 5.5 supplies a lower-cost Claude compaction
 fallback with a 1M context window. Opus overrides use 5.5.
 
@@ -85,7 +85,7 @@ update), use a patch file placed next to the installed package directory:
 
 ```yaml
 agents:
-  - 'if .name == "coder" then .model = "codex:gpt-6.1-sol" end'
+  - 'if .name == "coder" then .model = "codex:gpt-6.2-sol" end'
   - 'if .name == "compact-coder" then .model = "gemini:gemini-3.5-flash-lite" end'
 ```
 
@@ -114,7 +114,7 @@ The package includes ready-to-use tool server configs in `tool_servers/`. Bundle
 | `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Opts into repository and development-tool allow batches. |
 | `plans.yaml` | `plans_*` | None (bundled binary) | NATS-backed plan/task tracking using canonical `cid:plan:` URLs. |
 | `time.yaml` | `time_*` | None (bundled binary) | Current time and wait utilities. |
-| `fetch.yaml` | `fetch_*` | None (bundled binary) | Fetches URLs as markdown or text. No API key. |
+| `fetch.yaml` | `fetch_*` | None (bundled binary) | Fetches URLs as markdown, text, or JSON, and PNG, JPEG, GIF, or WebP images up to 5 MiB. No API key. |
 | `exa.yaml` | `exa_*` | None (bundled binary) | Web search via Exa. Requires `EXA_API_KEY`. |
 | `context7.yaml` | `context7_*` | Node.js / npx | Library docs lookup. No API key. |
 | `grep.yaml` | `grep_*` | None (bundled binary) | GitHub code search via grep.app. No API key. |

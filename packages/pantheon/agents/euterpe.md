@@ -1,9 +1,9 @@
 ---
 role: subagent
-model: gemini:gemini-3.8-flash
+model: gemini:gemini-4-hydrogen
 model_fallbacks:
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
 - bedrock:us.zai.glm-5.3
 compaction_agent: compact-reviewer
@@ -27,7 +27,7 @@ use_tools:
 - harnx_agent_session_history_read
 - attachments_attachment_read
 description: "Coding conventions specialist — validates adherence to project patterns, naming conventions, file organization, import ordering, type safety, and documentation standards. Named after Euterpe (yoo-TUR-pee), the Muse of music and harmony.\n"
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

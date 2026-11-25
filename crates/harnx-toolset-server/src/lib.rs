@@ -19,6 +19,7 @@ use invocation::{
 };
 mod mcp;
 pub mod mrtr;
+pub mod result_limits;
 #[cfg(test)]
 use mcp::call_tool_result_from_value;
 pub use mcp::McpToolsetAdapter;
@@ -30,6 +31,7 @@ pub use runner::{
 };
 mod name;
 mod progress;
+mod registration_handle;
 mod registration_identity;
 pub mod schema;
 mod subscriptions;
@@ -43,6 +45,10 @@ pub use filter::{
 };
 pub use lifecycle::{RegistrationShutdown, ServeLifecycle};
 pub use name::{toolset_name_from_args, validate_toolset_name, NamedToolset, NAME_FLAG};
+pub use registration_handle::{
+    ConditionalDelete, RegistrationAudience as HandleAudience, RegistrationHandle,
+    RegistrationHandleError, StoredRegistration,
+};
 pub use registration_identity::RegistrationIdentity;
 // Re-export globset for callers who need to construct filters
 pub use globset;
@@ -243,7 +249,6 @@ pub async fn serve_with_client_and_identity(
 /// Serve a toolset using an existing NATS connection, exiting cleanly (and
 /// running exit cleanup while the connection is still usable) when the
 /// lifecycle's shutdown token is cancelled, in addition to the usual failure exits.
-// qual:api
 pub async fn serve_with_shutdown(
     toolset: Arc<dyn Toolset>,
     instance_id: ServerScope,
@@ -309,6 +314,9 @@ async fn setup_subscriptions(
         tools: toolset.tools(),
         schema_version: TOOL_SCHEMA_VERSION,
         proto_version: TOOL_PROTOCOL_VERSION,
+        user_id: None,
+        ownerless_only: false,
+        connection_id: None,
     };
     let (registry, journal) =
         ensure_control_stores(&settings.connection.client, settings.connection.replicas).await?;

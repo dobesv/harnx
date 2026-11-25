@@ -2,9 +2,9 @@
 role: assistant
 model: claude:claude-opus-5-5
 model_fallbacks:
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
-- gemini:gemini-4-argon
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
+- gemini:gemini-4-neon
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-researcher
 use_tools:
@@ -77,7 +77,7 @@ description: "Strategic planner \u2014 researches with Metis and Pytheas before 
   \ then hands off to Atlas for execution. Named after Daedalus (DED-uh-lus), the\
   \ master architect of Greek myth. The single entry point for the full plan-to-execution\
   \ pipeline.\n"
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: async_delegation
   description: Preferred async delegation protocol (session_send/session_wait)

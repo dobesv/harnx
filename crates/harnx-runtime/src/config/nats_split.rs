@@ -199,7 +199,9 @@ impl Config {
             .cloned()
     }
 
-    pub(crate) fn default_user_id_for_cluster(&self, cluster: &str) -> Option<String> {
+    /// The operator identity CLI/TUI credential commands act for: the same
+    /// default `harnx list`/session stamping uses, resolved for a cluster key.
+    pub fn default_user_id_for_cluster(&self, cluster: &str) -> Option<String> {
         self.default_user_id(
             self.nats_servers
                 .iter()
@@ -318,13 +320,47 @@ impl Config {
         self.nats_server(cluster_key).map(Cow::Borrowed)
     }
 
-    pub async fn nats_client(&self, cluster_key: &str) -> Result<async_nats::Client> {
-        let server = self.resolve_nats_server(cluster_key).await?;
-        Self::connect_nats_server(&server).await.with_context(|| {
-            format!(
-                "Failed to connect to NATS cluster '{}' at '{}'",
-                cluster_key, server.url
-            )
+    /// The JetStream replica count to use for this cluster's buckets.
+    ///
+    /// Resolves the reserved `__local__` identity the same way
+    /// [`Config::nats_client`] does, so it also covers front-end local
+    /// routing of `__local__` to a managed or external cluster. Unlike
+    /// `nats_server(cluster).resolved_replicas()`, it does not fail for
+    /// `__local__`.
+    pub async fn resolve_nats_replicas(&self, cluster_key: &str) -> Result<usize> {
+        Ok(self
+            .resolve_nats_server(cluster_key)
+            .await?
+            .resolved_replicas())
+    }
+
+    /// Type-erased box: resolving the local cluster may start or join the
+    /// shared broker, and the connect chain's future (async-nats connect
+    /// into the rustls ECH types) is deep enough that a concrete future
+    /// here pushes dependent crates' auto-trait evaluation past the
+    /// recursion limit (E0275). Erasing the type cuts that chain for every
+    /// caller. `Client` is owned, so no borrow escapes the box.
+    ///
+    /// Every call opens a fresh connection — there is no pool. Fine for
+    /// one-shot startup connects; hot paths (per-lookup freshness probes,
+    /// per-dispatch, per-completion checks) must reuse an existing client
+    /// (`jetstream::Context` or provider snapshot) instead. A connect costs
+    /// hundreds of milliseconds (~213 ms measured locally), and PR #2835's
+    /// per-probe connects added ~1.3 s to delegated child dispatch — enough
+    /// to push a macOS CI test past its inherited 5 s deadline.
+    pub fn nats_client<'a>(
+        &'a self,
+        cluster_key: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<async_nats::Client>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let server = self.resolve_nats_server(cluster_key).await?;
+            Self::connect_nats_server(&server).await.with_context(|| {
+                format!(
+                    "Failed to connect to NATS cluster '{}' at '{}'",
+                    cluster_key, server.url
+                )
+            })
         })
     }
 

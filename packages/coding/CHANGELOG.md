@@ -1,6 +1,55 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.4.23 (2026-11-24)
+
+### Features
+
+- file tools behave like shell commands in bash scripts (#2847)
+- script tools' Bash bodies get the tools' shell forms (#2853)
+- commands and fetches behave like shell commands in bash… (#2856)
+
+### Fixes
+
+- update dependency @radix-ui/react-dropdown-menu to v2.2.1 (#2884)
+- update rust crate lru to 0.19 (#2892)
+- give the claim continuation's run request its snapshot features (#2905)
+
+## 0.4.22 (2026-11-23)
+
+### Features
+
+- stream live progress from JSONL tool templates (#2714)
+- make script-mode tool commands pipeable (#2838)
+- move shipped agents to GPT-6.2, Fable 5.2 and Gemini 4 (#2839)
+- return image blocks and offload large tool images (#2844)
+- Migrate coding bash tool execution from legacy hooks to in-process proxy-auth middleware, backed by the dedicated `proxy_auth` tool server.
+
+#### Return MCP image blocks from `harnx-fetch-tools` (`fetch_html`, `fetch_markdown`, `fetch_txt`, `fetch_json`, `fetch_readable`) for PNG, JPEG, GIF, and WebP responses up to 5 MiB. Unsupported image formats (such as SVG and AVIF) and images over 5 MiB return clear errors, while existing SSRF protections and `fetch_youtube_transcript` behavior remain unchanged.
+
+When a successful native NATS tool reply exceeds the completion budget because of inline images, the toolset server now stores those images as session-owned `cid:media:` attachments and replaces them with `resource_link` blocks so the model still receives them. This covers `fs_read`, `fetch_*`, `attachment_read`, and the Kubernetes sandbox gateway.
+
+Also allow `erato` in `pantheon` to call `fetch_fetch_markdown` for public image URLs without a sandbox, and update the `pantheon` and `coding` fetch tool configs and READMEs for image support.
+
+#### Move the shipped agents to GPT-6.2 Astra and Sol, Claude Fable 5.2 and the Gemini 4 Carbon, Neon and Hydrogen models.
+
+Oracle and Plato use GPT-6.2 Astra at maximum effort, then Fable 5.2 and Gemini 4 Carbon. Every Sol 6.1 slot becomes Sol 6.2 at the same price. Gemini 3.8 Flash slots become Gemini 4 Hydrogen, which costs twice 3.8 Flash's introductory price until December 31, 2026 and the same afterwards. The other Gemini 4 Argon slots, including Minos, become Gemini 4 Neon.
+
+The model catalog adds `:high` and `:max` aliases for `gpt-6.2-astra` and `gpt-6.2-sol` and drops their sampling parameters. Gemini 4 Carbon, Neon and Hydrogen now reserve one request's 65,536 output tokens inside their shared 1,048,576-token window instead of listing the whole window as the output limit.
+
+### Fixes
+
+- update rust crate a2a_server_lf to v0.5.3 (#2579)
+- have Clio rebase before it squashes (#2731)
+- update assistant-ui (#2745)
+- update dependency @assistant-ui/react-markdown to v0.14.26 (#2749)
+- update dependency @ag-ui/client to v1.0.4 (#2748)
+- return the final reply from sub-agent waits, not a transcript page (#2806)
+- update assistant-ui (#2822)
+- update dependency @ag-ui/client to v1.0.5 (#2824)
+- Update package README tool servers table to document in-process proxy-auth middleware and the bundled `proxy_auth` tool server.
+- Compaction summaries no longer report an agent's instructions to its delegates as the user's own requests. The summarizer now receives the transcript as speaker-tagged elements (`<user>`, `<assistant>`, `<tool_call>`, `<tool_result>`, `<runtime_note>`) instead of headings, our own tag names inside message text are escaped, and a `<kept_after_summary>` block shows which messages, including the user's latest prompt, are replayed verbatim after the summary. The packaged compaction prompts and the built-in summarizer prompt explain the tags.
+
 ## 0.4.21 (2026-11-16)
 
 ### Fixes

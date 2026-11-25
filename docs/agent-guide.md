@@ -20,7 +20,7 @@ Here's a complete example showing all available front-matter fields:
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 temperature: 0
 top_p: 0.9
 use_tools:
@@ -65,7 +65,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | `string` | global default | LLM model ID (e.g. `openai:gpt-4o`, `claude:claude-3-5-sonnet`). If omitted, uses the globally configured model. |
+| `model` | `string` | global default | LLM model ID (e.g. `openai:gpt-6.2-sol`, `claude:claude-sonnet-5-5`). If omitted, uses the globally configured model. |
 | `role` | `string` | `assistant` | Agent purpose: `assistant` (interactive agent shown in menus), `subagent` (internal agent invoked via delegation), or `compaction` (session compaction agent). |
 | `temperature` | `float` | global default | Controls randomness (0 = deterministic, 1 = creative). Inherited from global config when `model` is omitted. |
 | `top_p` | `float` | global default | Nucleus sampling parameter. Alternative to temperature. Inherited from global config when `model` is omitted. |
@@ -155,7 +155,7 @@ The Markdown body below the front-matter `---` fence is the agent's system promp
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 ---
 You are a helpful assistant that explains things clearly and concisely.
 ```
@@ -385,6 +385,7 @@ When `bash_tools` is configured and resolves to a non-empty set of tools, Harnx 
 - **Selector syntax**: Uses the same list, comma-separated string, glob, brace expansion, and toolset syntax as `use_tools`.
 - **Independent tool sets**: `bash_tools` is independent of `use_tools`. A tool can be exposed directly in `use_tools`, inside `bash_tools`, or in both.
 - **Excluded tools**: Control-flow tools (`switch_agent`, `*_session_handoff`, `ask_user`) and `bash` itself cannot be placed inside `bash_tools`; they remain at the direct conversation boundary.
+- **Script tools**: [Script tools](script-tools.md) are selectable in `bash_tools` like any other tool; a script-mode script then calls them as commands. They still cannot call `bash` or each other.
 - **Reserved name and migration**: While `bash_tools` resolves to tools, the bare name `bash` belongs to script mode. If a tool server registers a native bare `bash` tool, it is replaced while script mode is active. Qualified names like `<server>_bash` continue to work normally.
 - **No glob shadowing**: `use_tools` wildcard globs like `*` or `bash*` never match or synthesize the script-mode `bash` tool.
 - **Session override**: `.set bash_tools <selectors>` updates the active session's record; tool selection overlays that record on the active agent, so the change takes effect immediately but stays scoped to the session — switching sessions (the TUI picker keeps the agent) does not carry the override into other sessions. `.set bash_tools null` disables script mode for the session; unlike `use_tools`, the clear persists as an empty selector list rather than an unset override, so a restarted worker keeps script mode off instead of falling back to the agent file's `bash_tools`.
@@ -401,7 +402,7 @@ bash_tools:
 - **In-process shell**: Scripts run in an in-process BashKit subshell with an isolated virtual filesystem. Working directory is `/tmp`. Scripts have no host filesystem access and no network access.
 - **Embedded Python (`python` / `python3`)**: Scripts can invoke embedded Python using `python` or `python3` (`-c`, a virtual script file, or stdin/heredoc). It runs Monty Python, an in-process interpreter subset, not CPython.
   - **Environment and filesystem**: Code runs within the virtual filesystem (`/tmp` and read-only `/attachments`). It has no access to the host filesystem, host network, or host environment variables.
-  - **Tool isolation**: Python cannot call tools. There is no external tool bridge or tool global inside the interpreter; scripts run tool commands in Bash and pass results via `/tmp`.
+  - **Tool isolation**: Python cannot call tools. There is no external tool bridge or tool global inside the interpreter; scripts run tool commands in Bash and pass results via `/tmp`. For Python that calls tools directly, define a [script tool](script-tools.md) with a `python:` body — its `call_tool(name, args)` goes through the same allowlisted inner-call path as Bash.
   - **Language subset**: Simple classes work, but inheritance, metaclasses, third-party packages, and the `re` module are not supported.
   - **Resource limits**: Python is constrained only by cooperative VM limits, not hard OS-level process or memory isolation. Each invocation has a default 64 MiB ceiling for heap allocations and collected print buffers, plus the script's remaining wall-clock time (the default run timeout is 86,400 seconds). Exceeding memory within VM-tracked allocations yields exit 1 with a `MemoryError` diagnostic on stderr rather than a typed limit hit. While bytecode loops respond to cancellation, native operations and unpolled result exports do not stop cleanly and can block or crash the worker. Each Python call is also charged against a shared script work budget, capping a single script at approximately 95 Python invocations (failing on the 96th); batch per-item loops into a single Python invocation rather than re-running the interpreter in a shell loop.
   - **Known crash risks and host impact**: Under BashKit 0.20.2 / Monty 0.0.19, several operations allocate outside the 64 MiB VM budget or ignore timeouts, causing host memory exhaustion or an unrecoverable `SIGABRT` that terminates the entire worker host process. Confirmed failure examples include (non-exhaustive):
@@ -414,19 +415,19 @@ bash_tools:
 - **Attachments**: `/attachments` is a read-only mount of session media. Read a file at `/attachments/<full-media-cid>` (for example `/attachments/cid:media:<agent>/<session>/<sha256>`); bytes are fetched on first read and cached for the rest of the run. Files over 10 MB fail rather than truncate, listings are empty, and writes fail with a read-only error. `test -f` and other metadata probes answer from object metadata alone — they never download or consume the cache. If the cache is full, subsequent reads fail fast before downloading any content. Images, audio and embedded resources returned by inner tools are stored as attachments before the script sees them, so commands print `[attachment: <cid> (<mime>, <size>)] path=/attachments/<cid>` in place of the inline image, audio or resource blocks. Data URIs embedded inside ordinary text are left as they are. If an upload fails after retries, the inner call fails as a tool error with the inline media discarded; scripts running `set +e` continue.
 - **Attachment access**: Reading from `/attachments` doesn't go through the `attachment_read` tool, so it isn't limited by `use_tools`/`bash_tools` and doesn't run tool middleware. A script can read any media CID it names that the worker's broker credentials can read, which is the same rule `attachment_read` applies. If an agent must not read attachments, don't give it script mode.
 - **Error handling**: `set -e` is enabled by default: the script stops when a command fails, following POSIX `set -e` rules — failures of non-final pipeline members, commands guarded with `&&`/`||` or `if`, and background jobs don't stop the run. Scripts can use `set +e` to handle non-zero exit codes.
-- **Command mappings**: Each inner tool becomes a command with the same name. Tool parameters map to kebab-case long options (e.g. `--file-path`, `--max-output-bytes`). Scalar values accept `--flag value` or `--flag=value`; booleans accept `--flag` / `--no-flag`; repeated arrays accept multiple flags. Complex or nested objects take JSON literals or `--json '<json>'` (or `--json -` for stdin).
+- **Command mappings**: Each inner tool becomes a command with the same name. Tool parameters map to kebab-case long options (e.g. `--file-path`, `--max-output-bytes`). Scalar values accept `--flag value` or `--flag=value`; booleans accept `--flag` / `--no-flag`; repeated arrays accept multiple flags. Optional parameters declared nullable (`type: ["string", "null"]`, `nullable: true`, or `anyOf` of one type and null) take plain values like other optional parameters, and a nullable array of scalars repeats its flag; passing `null` for them requires `--json`. Complex or nested objects, and values with two or more non-null types, take JSON literals or `--json '<json>'` (or `--json -` for stdin).
 - **Discovery**: Scripts can run `tools [pattern]` to list available commands and their synopses, `help <tool>` for full parameter documentation, or `<tool> --help`.
-- **Output formatting**: Commands default to JSON when the tool produces structured content, or plain text otherwise. Passing `-o json` or `-o text` overrides this per command.
+- **Shell-style output for file tools**: `fs_read` prints file text like `cat`, `fs_ls` one entry per line like `ls -1`, `fs_find` one path per line like `find`, and `fs_grep` `path:line:text` rows like `grep -n`. Data goes to stdout, notes about cut-off results go to stderr as `fs_read: <note>`, and the exit status follows the tool: `fs_grep` exits 1 when nothing matched (a bare call then ends the script under the default `set -e`; use `if`, `||` or `|| true`) and 2 on an error, including a `--path` that can't be read, is over the search size limit or is a binary file. The paths `fs_find` and `fs_grep` print start with the `--path` you gave, so they can be passed to `fs_read --path`. `fs_read` adds no line-number prefixes in a script unless you pass `--line-numbers` (a direct model call numbers lines by default). `fs_read` adds no final newline to a file that has none (unless a line or byte cap cuts the output, which a note on stderr reports), and `fs_grep --path` may name a file. The shell form applies to native tool servers and to tools reached through `harnx-mcp-bridge` or the sandbox gateway; a server older than this feature answers in the direct-call style and the command prints that text. `-o json` prints the tool's fields instead, and `help <tool>` shows an OUTPUT section. Example: `fs_find --pattern '*.rs' --path src | while read -r p; do fs_read --path "$p" | grep -n TODO | head -3; done`. A tool opts in with `ToolSpec::with_script_output`; see the [harnx-script README](../crates/harnx-script/README.md#shell-style-tool-output).
+- **Shell-style output for commands and fetches**: `bash_exec` and command templates print the command's stdout and stderr on the matching streams and exit with its status like `bash -c`: 124 when the command's own `timeout_secs` fires, 125 for any error from `bash_exec`, a template, `bash_spawn`, `bash_wait` or `bash_status` (a command that could not start, an unknown execution id, a bridged result over the bridge's limit; `bash_read_exec_log` errors exit 1), 130 when a new message stopped it, 128 plus the signal number when a signal ended it. Under `set -e` a failing command ends the script unless it is used in `if` or followed by `||` or `|| true`. Output over `max_output_bytes` keeps whole lines from the start and a stderr note names `bash_read_exec_log` and the `--offset` to continue from, and a read of a long log ends with the `--offset` that continues it; `head_lines` and `tail_lines` are ignored in a script. `bash_spawn`, `bash_wait` and `bash_status` report a finished command the same way and a running one as a line of status JSON. `bash_read_exec_log` prints plain lines (`--line-numbers` adds numbers). The fetch tools print the page text, with notes about cut-off output and the `start_index` that continues it on stderr, and a fetched image becomes an `[attachment: ...]` line with a readable `/attachments/<cid>` path; failures exit 1. Details: [bash tools](../crates/harnx-bash-tools/README.md#output-in-bash-scripts), [fetch tools](../crates/harnx-fetch-tools/README.md#output-in-bash-scripts).
+- **Output formatting**: Without a shell form, commands default to JSON when the tool produces structured content, or plain text otherwise. Passing `-o json` or `-o text` overrides this per command. Text output leaves out content blocks whose `annotations.audience` is an array that doesn't include `assistant`, such as one-line summaries meant for the person watching. An error message applies the same filter but falls back to all of its text when nothing else is left. `-o json` on a result without `structuredContent` still prints every block.
 - **Exit codes**:
   - `0`: Success (rendered output on stdout).
   - `1`: Tool error (message on stderr; partial results on stdout if available).
   - `2`: Usage error (flag or schema mismatch on stderr; command is not dispatched).
-  - `3`: Approval required (`needs approval: <tool>; call it directly instead of from bash`). Tools requiring human approval fail fast rather than hanging the script.
-  - `4`: Blocked by policy, middleware, or hook.
-  - `5`: Rejected.
+  - `126`: The command exists but may not run: approval required (`needs approval: <tool>; call it directly instead of from bash`; tools requiring human approval fail fast rather than hanging the script), blocked by policy, middleware, or hook (`blocked: <reason>`), or rejected (`rejected: <reason>`).
   - `127`: Unknown command (with did-you-mean suggestions).
 - **Middleware and concurrency**: Inner tool calls pass through configured tool middleware. Parallel jobs (`&` and pipelines) are supported up to a concurrency cap of 8 simultaneous inner calls per script.
-- **Trace and persistence**: The `bash` result includes a compact inner-call trace whose argument summaries show only keys and value shapes (type and length), so the generated trace, live progress, and `failed_call` summaries don't repeat values a script piped in from content the model hasn't seen. Usage errors and tool error messages on stderr can still quote the values they reject. Inner calls get no session-log rows of their own; the transcript records only the outer `bash` call. The NATS invocation journal still records each inner call's full request for retry and recovery.
+- **Trace and persistence**: The `bash` result carries the script's output once, inside the rendered report (`content`); the separate `stdout`, `stderr` and `trace` fields appear only in `harnx call bash --json`. The report includes a compact inner-call trace whose argument summaries show only keys and value shapes (type and length), so the generated trace, live progress, and `failed_call` summaries don't repeat values a script piped in from content the model hasn't seen. Usage errors and tool error messages on stderr can still quote the values they reject. A run with more than 10 inner calls groups its `## inner call trace` by tool and status, one line each with the call count, outcome, output bytes and elapsed time, and then names the first failing call in full (`first failure: <call>`) when one failed. Runs with 10 or fewer calls list each call on its own line. Inner calls get no session-log rows of their own; the transcript records only the outer `bash` call. The NATS invocation journal still records each inner call's full request for retry and recovery.
 - **Worker interruption**: If a worker restarts while a script runs, the invocation is reported as interrupted and never automatically re-run, avoiding duplicate side effects.
 
 ### Attachment Tools
@@ -564,7 +565,7 @@ This agent gives coding tools and delegation instructions only to callers in the
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 use_tools:
   - jira
   - confluence
@@ -1147,7 +1148,7 @@ A minimal agent at `<config-dir>/agents/grammar-genie.md`:
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 temperature: 0
 ---
 Your task is to take the text provided and rewrite it into a clear,
@@ -1162,7 +1163,7 @@ An agent with access to filesystem and shell tools:
 
 ```markdown
 ---
-model: claude:claude-3-5-sonnet
+model: claude:claude-sonnet-5-5
 use_tools:
   - fs_*
   - bash_exec
@@ -1206,7 +1207,7 @@ An agent that uses RAG to answer questions from project docs:
 
 ```markdown
 ---
-model: openai:gpt-4o
+model: openai:gpt-6.2-sol
 documents:
   - project-docs/architecture.md
   - project-docs/api-reference.md
@@ -1222,7 +1223,7 @@ documentation. If the docs don't cover something, say so clearly.
 
 Agent prompts are rendered using [MiniJinja](https://github.com/mitsuhiko/minijinja). In addition to the custom variables defined in front-matter, several dynamic variables are available:
 
-- `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-4o`). This updates automatically if the agent falls back to a different model.
+- `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-6.2-sol`). This updates automatically if the agent falls back to a different model.
 - `{{ tools }}`: A list of available tools. You can iterate over them: `{% for t in tools %}- {{ t.name }}: {{ t.description }}{% endfor %}`.
 - `{{ __os__ }}`, `{{ __arch__ }}`, `{{ __shell__ }}`, `{{ __cwd__ }}`, `{{ __now__ }}`, `{{ __locale__ }}`: Environment and system information.
 - `__user__`: The session creator's caller-principals snapshot, with exactly four fields: `user_id`, `users` (expanded user aliases), `groups`, and `roles`. When a session has no stored snapshot but does have a `user_id` (such as a legacy session), Harnx returns user-id-only principals (`user_id` set, `users: [user_id]`, empty `groups` and `roles`). Only an anonymous session gets a null `user_id` (`none`) and empty lists. Agent and session variables cannot override `__user__`. The snapshot stays fixed for the session and is inherited by subagents and handoffs; it customizes prompts, not access checks. See [Agent Patches (`patches`)](#agent-patches-patches) for tool tailoring and caveats.

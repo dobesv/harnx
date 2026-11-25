@@ -29,6 +29,7 @@ what you need:
 | `harnx-k8s-creds`       | Kubernetes credential provider service and bash middleware tool                 | [K8s Creds](docs/k8s-creds.md)                   |
 | `harnx-k8s-sandbox-tools` | Native NATS gateway routing bash and filesystem tools into Kubernetes Agent Sandboxes | [Guide](docs/kubernetes-sandbox-tools.md)       |
 | `harnx-proxy-auth`      | TLS-intercepting auth proxy that injects credentials for bash middleware       | [README](crates/harnx-proxy-auth/README.md)      |
+| `harnx-credentials-keygen` | Generate a key file for encrypted tool credentials                           | [Tool Credentials](docs/tool-credentials.md#key-files) |
 | `harnx-mcp-server`      | MCP server exposing harnx tools and agents-as-tools over stdio or Streamable HTTP | [README](crates/harnx-mcp-server/README.md)      |
 | `harnx-a2a-server`      | A2A server exposing harnx agents over JSON-RPC and SSE                          | [README](crates/harnx-a2a-server/README.md)      |
 
@@ -274,6 +275,7 @@ Harnx supports custom dark and light themes, which highlight response text and c
 - [Prometheus Metrics](docs/metrics.md)
 - [Health & Readiness Endpoint](docs/healthz.md)
 - [Configuration Guide](docs/configuration-guide.md)
+- [Script Tools Guide](docs/script-tools.md)
 - [Tool Confirmation Guide](docs/tool-confirmation-guide.md)
 - [Custom Theme](docs/custom-theme.md)
 - [FAQ](docs/faq.md)

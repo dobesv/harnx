@@ -10,6 +10,8 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 use ratatui_textarea::{Input as TextInput, Key};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 /// Upper bound on the durable mark-read performed while exiting via idle Ctrl+D.
@@ -164,6 +166,17 @@ impl Tui {
             _ => {} // consume all other keys to prevent bleed to input
         }
         Ok(())
+    }
+
+    /// Type-erased seam for the run loop (PR #2835 Windows CI query-depth
+    /// overflow): `Pin<Box<dyn Future>>` stops rustc's cumulative layout
+    /// walk of the loop's future at this await; see AGENTS.md "Future size
+    /// and type erasure in harnx-runtime".
+    pub(super) fn handle_key_erased(
+        &mut self,
+        key: KeyEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + '_>> {
+        Box::pin(self.handle_key(key))
     }
 
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {

@@ -26,6 +26,7 @@ async fn call_bash_e2e_selection_purity_and_failures() -> anyhow::Result<()> {
     let sample = sample.to_string_lossy().into_owned();
     fixture.assert_agentless_inferred(&sample).await?;
     fixture.assert_shell_and_failures(&sample).await?;
+    fixture.assert_idiomatic_file_tools(&sample).await?;
     fixture.assert_named_selection(&sample).await?;
     drop(fixture);
     server.kill()?;
@@ -39,9 +40,7 @@ struct BashCliFixture {
 
 impl BashCliFixture {
     fn configure(nats_url: &str) -> anyhow::Result<Self> {
-        let fs_tools = std::env::current_exe()?
-            .parent()
-            .and_then(|dir| dir.parent())
+        let fs_tools = Some(harnx_core::bin_dir_of_exe(&std::env::current_exe()?))
             .map(|dir| dir.join(format!("harnx-fs-tools{}", std::env::consts::EXE_SUFFIX)))
             .filter(|path| path.is_file())
             .ok_or_else(|| anyhow::anyhow!("build harnx-fs-tools before this test"))?;
@@ -206,6 +205,71 @@ impl BashCliFixture {
         let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(payload["partial_result"]["exit_code"], 3, "{payload}");
 
+        // Without --json the CLI behaves like `bash -c`.
+        let (code, output) = self
+            .run(&["call", "bash", "echo out; echo err >&2; exit 3"])
+            .await;
+        assert_eq!(
+            code,
+            Some(3),
+            "the script's status is the CLI's: {output:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("err"), "{stderr}");
+        assert!(!stderr.contains("error:"), "{stderr}");
+
+        Ok(())
+    }
+
+    /// The file tools behave like cat, ls, find and grep inside a script:
+    /// data on stdout, no in-band decoration, a meaningful exit status.
+    async fn assert_idiomatic_file_tools(&self, sample: &str) -> anyhow::Result<()> {
+        let sample = bash_path(sample);
+        let dir = bash_path(&self.dir.path().to_string_lossy());
+        // Script-style paths start with the --path argument as given.
+        let grep_path = format!("{}/sample.txt\n", self.dir.path().to_string_lossy());
+        // Each case is one script: labelled lines for the success shapes,
+        // then a grep -> read round trip through the JSON path.
+        let cases = [
+            (
+                format!(
+                    "echo \"read: $(fs_read --path {sample} | head -1)\"\n\
+                     echo \"numbered: $(fs_read --path {sample} --line-numbers | head -1)\"\n\
+                     set +e; fs_grep --pattern no-such-text-here --path {dir}; echo \"status=$?\"; set -e\n\
+                     if fs_grep --pattern reserved --path {dir} >/dev/null; then echo found; fi\n\
+                     echo \"grep: $(fs_grep --pattern reserved --path {dir} | grep -c ':1:reserved content$')\"\n\
+                     echo \"find: $(fs_find --pattern '*.txt' --path {dir} | grep -c txt)\"\n\
+                     echo \"ls: $(fs_ls --path {dir} | grep -c sample.txt)\"\n\
+                     fs_find --pattern '*.txt' --path {dir} | while read -r p; do echo \"loop: $(fs_read --path \"$p\")\"; done"
+                ),
+                "read: reserved content\nnumbered: 1: reserved content\nstatus=1\nfound\ngrep: 1\nfind: 1\nls: 1\nloop: reserved content\n"
+                    .to_string(),
+            ),
+            (
+                format!(
+                    "p=$(fs_grep --pattern reserved --path {dir} -o json | jq -r '.matches[0].path'); echo \"$p\"; fs_read --path \"$p\""
+                ),
+                format!("{grep_path}reserved content\n"),
+            ),
+        ];
+        for (script, expected) in cases {
+            let (code, output) = self
+                .run(&["call", "bash", &script, "--tools", "fs_*"])
+                .await;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(code, Some(0), "{script}: {stdout} {stderr}");
+            assert_eq!(stdout.trim(), expected.trim(), "{script}");
+            assert!(stderr.trim().is_empty(), "{script}: stderr {stderr:?}");
+        }
+        // Default set -e: a search with no match ends the script.
+        let script = format!("fs_grep --pattern no-such-text-here --path {dir}; echo after");
+        let (code, output) = self
+            .run(&["call", "bash", &script, "--tools", "fs_*"])
+            .await;
+        assert_eq!(code, Some(1), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("after"));
         Ok(())
     }
 

@@ -146,6 +146,7 @@ impl InterruptedTurn {
     /// the same string.
     fn request(&self, call_id: &str) -> ToolRequest {
         ToolRequest {
+            user_id: None,
             input_responses: None,
             request_state: None,
             run_context: None,

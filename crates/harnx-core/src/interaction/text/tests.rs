@@ -6,7 +6,7 @@ mod graph;
 use serde_json::{json, Map, Value};
 
 use crate::interaction::response::build_data;
-use crate::interaction::text::{parse, render};
+use crate::interaction::text::{parse, render, render_url};
 
 /// The guide's deploy form (no context entries, exercising the plain path).
 fn payload() -> Value {
@@ -239,4 +239,22 @@ fn resolved_dynamic_action_and_option_labels_remain_answerable() {
     let answer = parse(&form, "Launch choice=Canary").unwrap();
     assert_eq!(answer.action, "deploy");
     assert_eq!(answer.data["choice"], json!(["staging"]));
+}
+
+#[test]
+fn render_url_prints_link_and_how_to_answer() {
+    let payload = json!({
+        "url": "https://example.com/connect/abc",
+        "message": "Connect Jira"
+    });
+    let text = render_url(&payload);
+    assert!(text.contains("Connect Jira"), "{text}");
+    assert!(text.contains("https://example.com/connect/abc"), "{text}");
+    assert!(text.contains("answer `continue`"), "{text}");
+    assert!(text.contains("`cancel`"), "{text}");
+    // A bare payload without a message still prints the link.
+    let bare = json!({ "url": "http://127.0.0.1:8931/connect/abc" });
+    let text = render_url(&bare);
+    assert!(text.contains("http://127.0.0.1:8931/connect/abc"), "{text}");
+    assert!(!text.starts_with("\n"), "{text}");
 }

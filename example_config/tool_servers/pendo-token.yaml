@@ -1,0 +1,21 @@
+# Pendo through its MCP server, connected with each user's own Pendo
+# integration key. Pendo keys go in the custom `x-pendo-integration-key`
+# header with no scheme, so `--token-scheme` is empty: the pasted key is sent
+# as the raw header value. See docs/tool-credentials.md.
+command: harnx-mcp-remote
+enabled: false
+description: >-
+  Pendo, connected with each user's own integration key.
+args:
+  - --url
+  - https://mcp.pendo.io/mcp
+  - --name
+  - pendo
+  - --credentials-key-file
+  - /etc/harnx/pendo-credentials-key.json
+  - --auth-methods
+  - token
+  - --token-header
+  - x-pendo-integration-key
+  - --token-scheme
+  - ''

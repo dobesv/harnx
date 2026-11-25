@@ -92,7 +92,15 @@ Harnx automatically manages the following JetStream resources:
   - Workers bump `last_attention_seq` on `TurnEnd` (final message) and `HitlApprovalRequested`.
   - Invalidation subject: `harnx.session.{storage_key}.read.invalidated` (separate from metadata invalidation).
 - **KV Bucket**: `harnx_tool_registry` — tool server discovery, with a
-  per-registration TTL.
+  per-registration TTL. One server identity can hold several registrations:
+  global (bare `{scope}.{identity}`), user-scoped (`{scope}.{identity}.u.{user}`)
+  and ownerless-only (`{scope}.{identity}.anon`); a session sees the global ones
+  plus the one registration in its audience. Workers re-read the bucket's
+  stream sequence before every completion, so a registration published before
+  `<server>_connect` returns is visible on the very next completion without
+  waiting out the 30 s discovery cache; the async KV watch is only best-effort
+  early invalidation, never the guarantee (`crates/harnx-runtime/src/tool_registry_watch.rs`).
+  See [Tool Server Credentials](tool-credentials.md).
 - **Streams**: `SESSION_<sha256(id)>` (Subject: `sessions.{id}.log`) stores only the
   durable append-only conversation history. Agent identity, settings, rendered
   prompts, and titles do not belong in this stream. Hash the exact, case-sensitive
@@ -111,7 +119,11 @@ Harnx automatically manages the following JetStream resources:
   `media/<owner>/<hash>` where `owner` is `session_key(agent, sid)` (see
   `harnx_core::cid_url::CidUrl::kv_key`). Session deletion purges each object's
   chunk and metadata subjects, leaving nothing; the object store's own `delete`
-  would leave a metadata entry marked deleted that stays forever.
+  would leave a metadata entry marked deleted that stays forever. Object-store
+  reads (`get_media`) are direct gets that a lagging follower can answer with
+  "not found" for an already-acknowledged write; read-after-write checks confirm
+  misses with stream-leader reads (see "Read a record that was just written"
+  under [Recovery contract](#recovery-contract-and-shared-implementation)).
 - **KV Bucket**: `harnx_plans` — stores plan index, task, and note documents
   under `plan/<owner>/<slug>/...` keys. The bucket honours the cluster's configured
   `replicas` count (`ensure_plans_bucket`). Documents are retained indefinitely
@@ -155,12 +167,16 @@ resources unable to tolerate a node loss.
 
 For NATS sessions, a local `cid:` file is only a cache entry. Inline user
 payloads are uploaded before their `cid:` is appended to the transcript. Locally
-created tool images are uploaded before the durable turn boundary. A worker can
+created tool images are uploaded before the durable turn boundary. Web UI
+multipart uploads (`POST /v1/agents/<agent>/sessions/<sid>/attachments`) are
+published to `harnx_attachments` by the upload handler itself, so the returned
+ref is readable by any replica even before the prompt is sent. A worker can
 backfill a legacy local-only blob, but fails the turn if the blob exists in
 neither place. HTTP(S) attachment URLs remain external references and are
 intentionally not copied into the object store.
 
-Bridge-offloaded image `resource_link` parts use canonical `cid:media:` URLs.
+Offloaded image `resource_link` parts (from native NATS tool replies or
+`harnx-mcp-bridge`) use canonical `cid:media:` URLs.
 Workers hydrate missing image blobs before each agent model call, including the next
 call in the same turn, and when replaying a session on another worker. Cached
 and downloaded blobs are checked against the SHA-256 of the full data URI,
@@ -627,6 +643,32 @@ boundary.
 Each worker also serves its own sub-agent toolset in-process. When several
 workers share a scope they all register that toolset under the same key and
 join one queue group, so any worker may serve any sub-agent request.
+
+### Per-User Credentials for Remote Tool Servers
+
+A remote MCP server can run in native mode so every user connects their own
+account (OAuth or a token) instead of sharing one upstream credential. The
+server needs the cluster connection env vars and `HARNX_SERVER_SCOPE` like any
+independently deployed tool server, plus its key file:
+
+```bash
+# Tool server container (native per-user credential mode)
+HARNX_NATS_URL=nats://nats:4222 HARNX_NATS_TOKEN=… \
+  HARNX_SERVER_SCOPE=shared harnx-mcp-remote \
+  --url https://atlassian.com/…/mcp --name jira \
+  --credentials-key-file /etc/harnx/jira-credentials-key.json \
+  --auth-methods oauth --oauth-scope offline_access \
+  --public-base-url https://harnx.example.com/mcp-remote/ \
+  --http-bind 0.0.0.0:8080
+```
+
+The public base URL must be routed to the server's HTTP port (an ingress
+subpath or a dedicated host), and a hosted deployment must also set
+`--trusted-user-header` so the request's user identity is authenticated. The
+credential itself never passes through NATS or tool arguments; users enter it
+on the connect page. Connection management from any front-end:
+`harnx credentials list|connect|disconnect` or the TUI `.credentials`
+command. See [Tool Server Credentials](tool-credentials.md) for details.
 
 ## Using Remote Agents
 
@@ -1516,7 +1558,7 @@ Use these operation-specific patterns when adding a NATS caller:
 | Operation | Recovery rule and implementation |
 | --- | --- |
 | Read durable state | `recovery::read` retries transport reads within a fixed deadline. Decode/validate outside the retry. Never translate an unreadable record into absence. |
-| Read a record that was just written | A follower answers KV `get` and `entry` from whatever it has applied: async-nats sends them as direct gets whenever the bucket allows it, and it creates every KV bucket that way. `keys` lists from a consumer, which NATS can place on any replica. Read such records from the stream leader, whether this process wrote them a moment ago or another one did before handing over the work. For a key, use `harnx_nats_common::leader_reads::{entry, get}`, which send `STREAM.MSG.GET` and refuse a key with a wildcard, because the leader treats that subject as a filter. `leader_reads::entry_matching` takes `*` tokens on purpose and answers with the newest key they match, so it suits only a pattern that one key can match, such as the invocation journal's lookup of a call by session and wire call id. The session metadata store reads every key that way (`SessionMetadataStore::leader_entry`), so a frontend sees the admission it just wrote and a worker sees what its frontend wrote before activating it. Nothing answers such a read while the stream elects a leader, where a follower used to, so the store retries it with `leader_reads::retry_transient` for up to `RECOVERY_TIMEOUT`; a stream that doesn't exist fails at once. For a listing, page `STREAM.INFO` with a subjects filter and refuse a page whose `cluster` names no leader: while the stream has no leader, every replica answers that request from its own store. `invocation_journal/leader_reads.rs` does that for the tool invocation journal. |
+| Read a record that was just written | A follower answers KV `get` and `entry` from whatever it has applied: async-nats sends them as direct gets whenever the bucket allows it, and it creates every KV bucket that way. `keys` lists from a consumer, which NATS can place on any replica. Read such records from the stream leader, whether this process wrote them a moment ago or another one did before handing over the work. For a key, use `harnx_nats_common::leader_reads::{entry, get}`, which send `STREAM.MSG.GET` and refuse a key with a wildcard, because the leader treats that subject as a filter. `leader_reads::entry_matching` takes `*` tokens on purpose and answers with the newest key they match, so it suits only a pattern that one key can match, such as the invocation journal's lookup of a call by session and wire call id. The session metadata store reads every key that way (`SessionMetadataStore::leader_entry`), so a frontend sees the admission it just wrote and a worker sees what its frontend wrote before activating it. Nothing answers such a read while the stream elects a leader, where a follower used to, so the store retries it with `leader_reads::retry_transient` for up to `RECOVERY_TIMEOUT`; a stream that doesn't exist fails at once. For a listing, page `STREAM.INFO` with a subjects filter and refuse a page whose `cluster` names no leader: while the stream has no leader, every replica answers that request from its own store. `invocation_journal/leader_reads.rs` does that for the tool invocation journal. The object store has the same issue: async-nats creates `OBJ_harnx_attachments` with `allow_direct`, so the metadata reads behind `get_media` are direct gets a lagging follower can answer with "not found" for a write that was already acknowledged. Prompt admission and cold worker hydration (`harnx-runtime/src/nats_attachments.rs`) confirm a `get_media` miss with `harnx_blob_store::media::leader_media_info`, a raw `STREAM.MSG.GET` on the metadata subject that returns tombstones visibly; a live entry is enough for admission (size and MIME come from the metadata), while hydration fetches the bytes with `read_media_from_leader` (next-by-subject raw gets on the chunk subject, no consumers, which a lagging replica could host) and still validates the digest. `put_media`'s dedup uses the same leader lookup and skips only live objects, so a tombstone or a stale follower entry never suppresses a write. A deployment that restricts JetStream subjects must allow `$JS.API.STREAM.MSG.GET.OBJ_harnx_attachments` for attachment writes and these fallback reads. The upload handler captures the session record at the first accepted part and re-reads it after each stored part whenever the session has a metadata record — a never-created owner (an upload that bypassed session creation) has no record to protect it and stores unrechecked — and when the session was deleted or replaced it purges the just-written object version (`harnx_blob_store::media::purge_media_version`), which deletes the object's metadata message with `STREAM.MSG.DELETE` and purges that version's chunks with `STREAM.PURGE`; credentials that upload attachments need those two subjects on the same stream as well. |
 | Append a transcript entry | Retain the same message ID, payload, and CAS expectation through `recovery::retry_until`. Retry timeout/broken-pipe errors; a CAS conflict is authoritative. |
 | Mutate session metadata | `cas::update` reads back an ambiguous acknowledgement from the stream leader. Matching persisted bytes confirm the write; an unchanged revision permits retrying the exact CAS. A different value or revision leaves the outcome unknown. |
 | Renew a session lease | Retry the same deduplicated CAS only until the previously confirmed lease deadline. A conflict or expired deadline fences the worker; reconnect never restores lost ownership. |
@@ -1667,11 +1709,25 @@ and final reply metadata. This is a per-record/message limit, not a whole-sessio
 limit. Native results that fit aren't subject to the MCP bridge's 128 KiB
 presentation cap.
 
-An oversized terminal reply is stored as an `application/json` attachment under
-the trusted invoking session, then replaced by an explicit recoverable size error
-with its `cid:media:` reference. Without trusted ownership, the error says the
-original wasn't retained. Read retained output with `attachment_read` byte paging;
-don't blindly retry side-effecting tools. The first bounded completion committed
+When a successful reply exceeds that budget because of inline `image/*` blocks
+and has a trusted invoking session owner, the server stores those decoded
+images in `harnx_attachments` and replaces them in place with `resource_link`
+blocks (`cid:media:...`, `mimeType`, byte `size`, and original `annotations` and
+`_meta`) if the projected reply fits the budget. This lets `fs_read`, `fetch_*`,
+`attachment_read`, and the Kubernetes sandbox gateway deliver large images
+without hitting the 1 MiB default `max_payload` ceiling. Image uploads are
+checked against the budget before writing and must succeed before the link is
+committed; a failed upload stays fatal rather than falling back to an oversized
+reply or a dangling link.
+
+Replies that fit stay inline with no bucket access. Otherwise (when there is no
+trusted owner, the reply is an error, no eligible image blocks are present, or
+the projected reply still exceeds the budget), an oversized terminal reply is
+stored as an `application/json` attachment under the trusted invoking session,
+then replaced by an explicit recoverable size error with its `cid:media:`
+reference. Without trusted ownership, the error says the original wasn't retained.
+Read retained output with `attachment_read` byte paging; don't blindly retry
+side-effecting tools. The first bounded completion committed
 by journal CAS is delivered unchanged and reused on replay, without rerunning the
 tool or hydrating the large original into the reply. Fatal and interrupted
 outcomes keep their categories. Attachment outages and other non-size storage or
@@ -1756,21 +1812,42 @@ For summarizer retention priorities, research, and evaluation guidance, see
 
 Session logs, leases, canonical metadata, attachment blobs, and plan documents
 persist in JetStream until explicitly deleted or collected. Manual deletion
-purges:
-- Transcript stream: `SESSION_<sha256(id)>`
-- Leases: `harnx_leases`
-- Metadata keys: `sessions/{id}/*` in `harnx_sessions` (including read and unread tracking)
-- Invocation journal: `harnx_tool_invocations`
-- Media objects: `media/<owner>/` in `harnx_attachments`
-- Plans KV: `plan/<owner>/` in `harnx_plans`
-(where `<owner>` is `session_key(agent, id)`).
+and worker retention GC run the same cascade (where `<owner>` is
+`session_key(agent, id)`):
+1. Capture the canonical metadata KV revision (`sessions/<owner>/meta`, if present) and acquire the A2A deletion fence if A2A state exists (purging `sessions/<owner>/a2a/context`).
+2. Delete the transcript stream: `SESSION_<sha256(owner)>` (first for `harnx delete session` and retention GC; last for orphan-stream GC so an interrupted orphan cleanup still leaves the stream discoverable).
+3. Delete the worker lease in `harnx_leases`.
+4. Purge invocation journal entries in `harnx_tool_invocations` (leaving a 1-hour deletion tombstone).
+5. Purge non-canonical metadata keys (`sessions/<owner>/*` in `harnx_sessions`, including activity, read/unread tracking, tasks, and remaining A2A keys), keeping `sessions/<owner>/meta`.
+6. Purge private interaction checkpoints in `harnx_interaction_checkpoints`.
+7. Delete media objects (`media/<owner>/` in `harnx_attachments`) and plans (`plan/<owner>/` in `harnx_plans`).
+8. Finish A2A cleanup (`a2a.tasks.<owner>.*`, `a2a/first-messages/<hash>`, `a2a.registry.<hash>`, and release the A2A scoped lease).
+9. Purge the canonical metadata key `sessions/<owner>/meta` last, conditioned on the revision captured at start (a no-op if no live canonical record existed at start).
 
 ```bash
 harnx delete session <session_id> --agent <agent> --cluster local
 ```
 
+Because `sessions/<owner>/meta` is purged last, any failure earlier in the
+cascade leaves the canonical record in place with its old owner. Other
+prompt-only users cannot claim the ID while partial state remains, and
+re-running `harnx delete session` or waiting for the next eligible retention GC
+pass finishes cleanup. If the canonical record's revision changed between the
+start of deletion and the final purge, the final purge is skipped rather than
+removing the newer record: `harnx delete session` prints the error
+`Incomplete deletion of remote session '<session>' on cluster '<cluster>' (canonical metadata purge skipped because its revision changed; ...)`
+including `metadata_keys_deleted` to stderr and exits `1`, while retention GC increments `skipped_metadata_changed`
+instead of `deleted`. Once the canonical record is gone, anyone with `prompt`
+scope can reuse the ID.
+
 There is no separate control-plane state to reap: interruption leaves nothing
 behind but log entries, which the same deletion removes.
+
+**Upgrade order, rollback, and limitations:**
+- On clusters with access rules, upgrade every component that deletes sessions (`harnx` CLI, and `harnx-worker` instances running retention or orphan GC) and let in-flight old cleanup runs finish **before** upgrading `harnx-serve`. Older deleters purge canonical metadata before media and plans, which can leave claimable partial deletions.
+- **Rollback:** Roll back `harnx-serve` **before** rolling back the deleters (`harnx` CLI and `harnx-worker`), so older deleters that purge canonical metadata first do not run alongside a server that allows client-chosen ID creation under access rules.
+- Deletions run by older versions before canonical-last ordering purge metadata before media and leftovers, so failed runs can leave media or plans behind after the stream and metadata are gone. After upgrading, another user could claim such an ID and reach those leftovers via `/v1/cid/*`, and a later retry could delete the new session. Finish retrying any incomplete deletions with `harnx delete session <session_id> --agent <agent> --cluster <cluster>` before enabling or upgrading to a `harnx-serve` with client-chosen claims.
+- Reusing a deleted ID within one hour can cause journaled tool calls to fail against the invocation journal's 1-hour tombstone, and retrying deletion rewrites that tombstone for another hour (without delaying the claim itself). Active SSE streams on another `harnx-serve` process or in-flight workers at deletion time are not fenced by session incarnations.
 
 ### Automatic Session Garbage Collection
 
@@ -1787,17 +1864,13 @@ Each worker only collects expired sessions in its own cluster
 with zero workers deployed, no automatic garbage collection runs for that
 cluster until at least one worker joins.
 
-Automatic collection uses the exact same deletion path as manual cleanup. In
-the normal case it removes:
-- Transcript stream: `SESSION_<sha256(id)>`
-- Leases: `harnx_leases`
-- Metadata keys: `sessions/{id}/*` in `harnx_sessions` (including read and unread tracking)
-- Invocation journal: `harnx_tool_invocations`
-- Media objects: `media/<owner>/` in `harnx_attachments`
-- Plans KV: `plan/<owner>/` in `harnx_plans`
-(where `<owner>` is `session_key(agent, id)`).
-Workers also verify that candidate sessions are inactive before deletion,
-skipping any session with an active or reactivated lease.
+Automatic collection uses the exact same deletion cascade as manual cleanup,
+deleting the transcript stream first and purging canonical `sessions/<owner>/meta`
+last. Because canonical metadata stays present until every earlier step
+succeeds, a session whose deletion failed partway remains selectable by the
+next eligible retention pass. Workers also verify that candidate sessions are
+inactive before deletion, skipping any session with an active or reactivated
+lease.
 
 Retention is controlled by `cleanup_remote_sessions_days` in `config.yaml` or
 the `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS` environment variable. Configure the

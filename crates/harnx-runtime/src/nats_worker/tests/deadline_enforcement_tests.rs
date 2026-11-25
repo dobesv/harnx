@@ -582,17 +582,13 @@ async fn journal_retired_delegation(
         .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// qual:allow(complexity, max_function_lines=160) reason: "End-to-end expiry replay fixture: journals a completed child round and replays it without a live tool server; the scenario is one linear flow."
-async fn expired_worker_replay_recovers_completed_child_without_live_tool_server_or_redispatch() {
-    let _env_guard = env_lock().await;
-    let Some((url, _nats, _dir)) = spawn_test_nats().await else {
-        return;
-    };
-    let seeded = seed_remote_config(&url);
-    let _env = subagent_test_env(&url, &seeded);
-    let root = session(&url, "expired-saved-child").await;
-    let original_time = chrono::Utc::now() - chrono::Duration::seconds(30);
+/// Seed the parent run as an external authority did 30s ago: reserve the
+/// admission, enqueue its delegation prompt, and store expired run limits
+/// with a 1s call timeout.
+async fn admit_expired_parent_run(
+    root: &NatsSession,
+    original_time: chrono::DateTime<chrono::Utc>,
+) -> crate::nats_session_metadata::RunLimitsRecord {
     let mut intent = crate::nats_session_metadata::InvocationAdmission::new(
         &crate::nats_session_metadata::AdmissionAuthority::External {
             admitted_at: original_time,
@@ -631,17 +627,13 @@ async fn expired_worker_replay_recovers_completed_child_without_live_tool_server
         .put_invocation_limits(root.storage_key(), &parent)
         .await
         .unwrap();
-    let child = session(&url, "completed-before-replay")
-        .await
-        .with_inherited_admission(
-            parent.clone(),
-            "original-child-wire".into(),
-            original_time,
-            crate::nats_session_metadata::InvocationEdgeKind::Delegation,
-            None,
-        );
+    parent
+}
+
+/// Journal the child turn as it completed before the parent expired: the
+/// delegated prompt, one assistant answer, then the turn end.
+async fn journal_completed_child_turn(child: &NatsSession, child_log: &NatsSessionLog) {
     let child_prompt = child.enqueue_text("original child work").await.unwrap();
-    let child_log = NatsSessionLog::new(child.jetstream().clone(), child.storage_key());
     child_log
         .append_event_async(&SessionLogEntry::Message {
             id: None,
@@ -663,6 +655,15 @@ async fn expired_worker_replay_recovers_completed_child_without_live_tool_server
         })
         .await
         .unwrap();
+}
+
+/// Journal the parent round that delegated to the child, and build the
+/// replayed request the invocation journal expects for it.
+async fn journal_parent_delegation_round(
+    root: &NatsSession,
+    parent: &crate::nats_session_metadata::RunLimitsRecord,
+    original_time: chrono::DateTime<chrono::Utc>,
+) -> (NatsSessionLog, harnx_toolset::ToolRequest) {
     let parent_log = NatsSessionLog::new(root.jetstream().clone(), root.storage_key());
     let round = parent_log
         .append_event_async(&SessionLogEntry::ToolCalls {
@@ -680,10 +681,11 @@ async fn expired_worker_replay_recovers_completed_child_without_live_tool_server
         .await
         .unwrap();
     let request = harnx_toolset::ToolRequest {
+        user_id: None,
         input_responses: None,
         request_state: None,
         run_context: Some(harnx_toolset::AutonomousRunContext {
-            snapshot: serde_json::to_value(&parent).unwrap(),
+            snapshot: serde_json::to_value(parent).unwrap(),
             started_at_ms: original_time.timestamp_millis().try_into().unwrap(),
         }),
         replay: None,
@@ -698,6 +700,33 @@ async fn expired_worker_replay_recovers_completed_child_without_live_tool_server
         capabilities: Default::default(),
         tool_round: Some(round),
     };
+    (parent_log, request)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_worker_replay_recovers_completed_child_without_live_tool_server_or_redispatch() {
+    let _env_guard = env_lock().await;
+    let Some((url, _nats, _dir)) = spawn_test_nats().await else {
+        return;
+    };
+    let seeded = seed_remote_config(&url);
+    let _env = subagent_test_env(&url, &seeded);
+    let root = session(&url, "expired-saved-child").await;
+    let original_time = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let parent = admit_expired_parent_run(&root, original_time).await;
+    let child = session(&url, "completed-before-replay")
+        .await
+        .with_inherited_admission(
+            parent.clone(),
+            "original-child-wire".into(),
+            original_time,
+            crate::nats_session_metadata::InvocationEdgeKind::Delegation,
+            None,
+        );
+    let child_log = NatsSessionLog::new(child.jetstream().clone(), child.storage_key());
+    journal_completed_child_turn(&child, &child_log).await;
+    let (parent_log, request) =
+        journal_parent_delegation_round(&root, &parent, original_time).await;
     let journal =
         harnx_toolset_server::invocation_journal::InvocationJournal::ensure(root.jetstream(), 1)
             .await

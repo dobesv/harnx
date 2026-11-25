@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,41 @@ use wait::{is_deadline, WaitContext};
 
 // Keep the existing activity annotation so upgraded gateways retain idle history.
 pub const LAST_ACTIVITY_ANNOTATION: &str = "kagent/last-activity";
+
+/// The sandbox claim does not exist in Kubernetes: it expired or was deleted.
+///
+/// Typed so callers can distinguish a genuinely missing sandbox from
+/// transient API failures and react (for example, `sandbox_connect` replaces
+/// an ambient binding that points at a deleted sandbox). Display keeps the
+/// historical `sandbox not found: {id}` message.
+#[derive(Debug)]
+pub(crate) struct SandboxNotFoundError {
+    id: String,
+}
+
+impl SandboxNotFoundError {
+    pub(crate) fn new(id: &str) -> Self {
+        Self { id: id.to_string() }
+    }
+}
+
+// qual:allow(dry, boilerplate) reason: "One trivial Display in the crate; adding a derive_more dependency or a single-use macro for one impl costs more than the impl itself."
+impl fmt::Display for SandboxNotFoundError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "sandbox not found: {}", self.id)
+    }
+}
+
+impl std::error::Error for SandboxNotFoundError {}
+
+/// Whether the error (or any error in its chain, including inside
+/// `TerminalError`) reports a missing sandbox claim.
+// qual:allow(coupling, deh) reason: "anyhow keeps a source error typed only inside its chain; chain-downcast is this crate's established lookup pattern (see wait.rs is_deadline and toolsets.rs lifecycle_error)."
+pub(crate) fn is_sandbox_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|source| source.downcast_ref::<SandboxNotFoundError>().is_some())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxCondition {
@@ -164,7 +200,7 @@ impl SandboxManager {
         let record = self
             .retry_api(&context, || self.api.get(id))
             .await?
-            .with_context(|| format!("sandbox not found: {id}"))?;
+            .ok_or_else(|| SandboxNotFoundError::new(id))?;
         self.maybe_extend(&record, &context).await;
         self.retry_api(&context.with_operation("bump_activity"), || {
             self.api.bump_activity(id, Utc::now())
@@ -213,7 +249,7 @@ impl SandboxManager {
                 record = self
                     .retry_api(&context, || self.api.get(id))
                     .await?
-                    .with_context(|| format!("sandbox not found: {id}"))?;
+                    .ok_or_else(|| SandboxNotFoundError::new(id))?;
             }
         }
         .await
@@ -331,7 +367,9 @@ fn deadline_status(mut last_status: SandboxStatus, error: anyhow::Error) -> Resu
     last_status.timed_out = true;
     Ok(last_status)
 }
-fn claim_name(call_id: &str) -> String {
+// Claim names derive from the call ID so a redelivered create converges on
+// the same claim. Exposed crate-wide for tests that script the replacement.
+pub(crate) fn claim_name(call_id: &str) -> String {
     let mut name = "sandbox-".to_string();
     for byte in Sha256::digest(call_id.as_bytes()).iter().take(16) {
         write!(&mut name, "{byte:02x}").expect("writing to a string cannot fail");

@@ -16,20 +16,26 @@ mod agent_access;
 mod agent_resolve;
 mod attachments;
 mod cid;
+mod history_projection;
 mod interrupt_resume;
 mod last_turn;
 mod models_catalog;
 mod nats_access;
+mod nats_redaction;
+mod parking_gate;
 mod request_identity;
 mod serve_shutdown;
 mod session_access;
 pub mod session_actor;
 mod session_actor_types;
+mod session_claim;
+mod session_claim_reservation;
 mod session_history;
 pub(crate) mod session_pagination;
 pub mod session_routes;
 mod stalled_turn;
 mod transcript_snapshot;
+mod upload_storage;
 mod web_url;
 
 pub use serve_shutdown::{ShutdownConfig, StreamDrainConfig};
@@ -44,6 +50,10 @@ mod access_tests;
 #[cfg(test)]
 mod cid_route_tests;
 #[cfg(test)]
+mod nats_access_tests;
+#[cfg(test)]
+mod nats_session_claim_tests;
+#[cfg(test)]
 mod nats_user_identity_tests;
 #[cfg(test)]
 mod nats_web_session_url_tests;
@@ -55,8 +65,8 @@ use session_access::list_target_sessions;
 
 pub(crate) use agent_resolve::{is_safe_agent_path, is_safe_path_segment, resolve_agent_target};
 pub(crate) use nats_access::{
-    sanitize_nats_cluster_error, sanitize_nats_session_error, serve_nats_client,
-    serve_nats_jetstream,
+    nats_cluster_unavailable, sanitize_nats_cluster_error, sanitize_nats_session_error,
+    serve_nats_client, serve_nats_jetstream,
 };
 
 use crate::ag_ui::AgUiError;
@@ -79,6 +89,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::stream::StreamExt;
+use harnx_blob_store::media::AttachmentsBucket;
 #[cfg(test)]
 use harnx_core::attachments::store_attachment_bytes_async;
 use harnx_core::attachments::{collect_cid_refs, CID_PREFIX};
@@ -379,6 +390,22 @@ pub struct Server {
     session_registry: SessionRegistry,
     /// Root directory for web-ui static assets served over HTTP.
     web_assets: PathBuf,
+    /// Per-resolved-cluster upload transport cache: one shared JetStream
+    /// context plus a resettable bucket-ensured memo per cluster, reused by
+    /// every upload. See [`upload_storage`].
+    upload_storage: upload_storage::UploadStorage,
+    /// F6 test seam: parks an acknowledged upload part between its put and
+    /// the session incarnation recheck when a test arms it. Unarmed it is
+    /// a no-op; production never arms it.
+    upload_recheck_gate: parking_gate::ParkingGate,
+    /// T2 test seam: parks a deferred session claim between the guard's
+    /// missing-owner read and the leader reread and reservation when a test
+    /// arms it, so creation races can be forced deterministically. Unarmed
+    /// it is a no-op; production never arms it.
+    session_claim_gate: parking_gate::ParkingGate,
+    /// How long a cached bucket serves before the next upload re-ensures it,
+    /// bounding the retry rate of a failed best-effort replica raise.
+    upload_bucket_recheck: Duration,
     shutdown: serve_shutdown::ServeShutdown,
 }
 
@@ -394,6 +421,35 @@ impl Server {
     fn display_ref(&self, target: &ResolvedAgentTarget) -> String {
         target.display_ref_with_default_cluster(self.default_cluster_for_display())
     }
+}
+
+/// Escape a request-derived agent or session value for an HTML **text
+/// node**. That is all this helper guarantees — it is not sufficient for
+/// URLs, JavaScript, CSS or unquoted attributes. `is_safe_path_segment`
+/// accepts markup: it rejects only empty values, non-`Normal` path
+/// components, and `/` or `\` (leading/trailing whitespace is rejected
+/// separately, by `claimable_session_id`, which also enforces the
+/// runtime's ID alphabet for deferred claims). The page still renders
+/// request-derived values whose provenance has no such contract — rules-
+/// off session IDs and agent names can be arbitrary markup — so an
+/// unescaped sink is stored XSS against any admin who opens the page
+/// (#2855).
+fn escape_html_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        escaped.push_str(match character {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            _ => {
+                escaped.push(character);
+                continue;
+            }
+        });
+    }
+    escaped
 }
 
 type RouteMatch = (String, Option<String>, AgentsRoute);
@@ -497,6 +553,10 @@ impl Server {
             rags: Config::list_rags(),
             session_registry,
             web_assets,
+            upload_storage: upload_storage::UploadStorage::default(),
+            upload_recheck_gate: parking_gate::ParkingGate::default(),
+            session_claim_gate: parking_gate::ParkingGate::default(),
+            upload_bucket_recheck: upload_storage::DEFAULT_BUCKET_RECHECK_INTERVAL,
             shutdown: serve_shutdown::ServeShutdown::new(stream_drain),
         })
     }
@@ -614,7 +674,11 @@ impl Server {
             }
             Err(err) => {
                 status = finalize_err_status(StatusCode::OK, &err);
-                error!("{method} {uri} {} {err}", status.as_u16());
+                error!(
+                    "{method} {uri} {} {}",
+                    status.as_u16(),
+                    crate::nats_access::sanitized_error_chain(&err)
+                );
                 ret_err(err)
             }
         };
@@ -636,7 +700,7 @@ impl Server {
         mut req: hyper::Request<Incoming>,
     ) -> (&'static str, Result<AppResponse>) {
         if let Err(err) = self.guard_agent_request(&mut req).await {
-            return ("/v1/agents/*", Err(err));
+            return ("/v1/agents/*", Err(guard_error_status(err)));
         }
         let method = req.method().clone();
         let uri = req.uri().clone();
@@ -875,6 +939,13 @@ impl Server {
             web_base_url: web_url::inferred_base_url(req.headers(), req.uri()),
             user_id: RequestIdentity::user_id(&req),
             user_principals: RequestIdentity::of(&req).stampable_principals(),
+            attachment_access: self.access_rules.as_deref().map(|rules| {
+                crate::ag_ui_rpc::RequestAccess {
+                    rules,
+                    config: &self.config,
+                    identity: RequestIdentity::of(&req),
+                }
+            }),
         };
         handle_ag_ui_rpc(req, target, session, context).await
     }
@@ -942,6 +1013,7 @@ impl Server {
                     req,
                     &target,
                     session_name.as_deref().expect("session route has a name"),
+                    &scoped,
                 )
                 .await
             }
@@ -981,7 +1053,18 @@ impl Server {
         req: hyper::Request<Incoming>,
         target: &ResolvedAgentTarget,
         session: &str,
+        scoped: &harnx_runtime::config::GlobalConfig,
     ) -> Result<AppResponse> {
+        // A deferred claim means the guard found no owner record and this
+        // POST may create the session; classification, reservation and
+        // authorization run before any dispatch (plan design steps 3-5).
+        if let Some(claim) = req
+            .extensions()
+            .get::<crate::session_claim::DeferredSessionClaim>()
+            .cloned()
+        {
+            return self.handle_deferred_claim(req, target, claim, scoped).await;
+        }
         match negotiate_agents_route(req.method(), req.headers(), AgentsRoute::Session)? {
             AgentsRepresentation::Html => {
                 self.session_html_page(&self.display_ref(target), session)
@@ -993,7 +1076,7 @@ impl Server {
     }
 
     fn agent_html_page(&self, agent: &str) -> Result<AppResponse> {
-        let html = format!("<h1>agent: {agent}</h1>");
+        let html = format!("<h1>agent: {}</h1>", escape_html_text(agent));
         let res = Response::builder()
             .header("Content-Type", "text/html; charset=utf-8")
             .body(Full::new(Bytes::from(html)).boxed())?;
@@ -1001,7 +1084,7 @@ impl Server {
     }
 
     fn session_html_page(&self, _agent: &str, session: &str) -> Result<AppResponse> {
-        let html = format!("<h1>session: {session}</h1>");
+        let html = format!("<h1>session: {}</h1>", escape_html_text(session));
         let res = Response::builder()
             .header("Content-Type", "text/html; charset=utf-8")
             .body(Full::new(Bytes::from(html)).boxed())?;
@@ -1100,65 +1183,298 @@ impl Server {
         Ok(response)
     }
 
+    /// Park the current upload part between its acknowledged put and its
+    /// session-incarnation recheck when the F6 test gate is armed; a no-op
+    /// otherwise.
+    async fn wait_at_upload_recheck_gate(&self) {
+        self.upload_recheck_gate.wait().await;
+    }
+
+    /// The broker connection and the `harnx_attachments` bucket for uploads
+    /// to one resolved cluster, from the Server-owned cache: the first upload
+    /// to a cluster connects and ensures single-flight, every later upload
+    /// clones the cached handles. For the local cluster the shared frontend
+    /// broker must be running before any JetStream I/O; failing to bring it
+    /// up is an availability failure, not a server fault. A successful
+    /// connect is cached even when the bucket ensure fails — the working
+    /// connection must not be discarded — but the bucket memo is cached only
+    /// with a successful ensure. No lock is held across the I/O other than
+    /// this cluster's single-flight init, so puts never serialize.
+    // qual:allow(iosp) reason: "the single-flight init reads its own state and must classify its own ensure failures in place; the Err arm has to move the storage in before handing the client to the classifier, and splitting it would scatter which state a failing request leaves behind."
+    async fn attachments_bucket(
+        &self,
+        target: &ResolvedAgentTarget,
+    ) -> Result<(async_nats::Client, AttachmentsBucket)> {
+        let cluster = target.cluster();
+        if let Err(error) = ensure_frontend_nats_owner(cluster).await {
+            return Err(nats_cluster_unavailable(cluster, error));
+        }
+        let entry = self.upload_storage.entry(cluster).await;
+        let mut state = entry.storage.lock().await;
+
+        if let Some(storage) = state.as_mut() {
+            self.cached_upload_bucket(&entry, storage, cluster).await
+        } else {
+            let jetstream = serve_nats_jetstream(&self.config, cluster).await?;
+            upload_storage::count_connect(&entry);
+            match self.ensure_upload_bucket(&entry, &jetstream, cluster).await {
+                Ok(bucket) => {
+                    let storage =
+                        upload_storage::ClusterStorage::new(jetstream, Some(bucket.clone()));
+                    let client = storage.client.clone();
+                    *state = Some(storage);
+                    Ok((client, bucket))
+                }
+                Err(error) => {
+                    // Keep the working connection, leave the memo unset so the
+                    // next upload retries the ensure, and fail this request.
+                    let storage = upload_storage::ClusterStorage::new(jetstream, None);
+                    let client = storage.client.clone();
+                    *state = Some(storage);
+                    Err(Self::classify_upload_ensure_failure(
+                        client.connection_state(),
+                        cluster,
+                        error,
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The bucket for a cluster with a cached connection: straight from the
+    /// memo while it is fresh enough, otherwise re-ensured (the bounded-rate
+    /// retry of a failed best-effort replica raise), or re-ensured on the
+    /// kept connection when the memo was reset because the stream was gone.
+    // qual:allow(iosp) reason: "one ordered memo decision: serve while fresh, re-raise past the interval, otherwise fall to the unset-memo retry below; each branch names a different memo state and splitting them hides which state serves which failure."
+    async fn cached_upload_bucket(
+        &self,
+        entry: &upload_storage::ClusterEntry,
+        storage: &mut upload_storage::ClusterStorage,
+        cluster: &str,
+    ) -> Result<(async_nats::Client, AttachmentsBucket)> {
+        let client = storage.client.clone();
+        if let Some(bucket) = storage.bucket.clone() {
+            if storage.ensured_at.elapsed() < self.upload_bucket_recheck {
+                return Ok((client, bucket));
+            }
+            // The memo is old enough that the best-effort replica raise
+            // should be retried. A failed re-ensure keeps the old memo
+            // serving — a raise that cannot succeed now must not break
+            // uploads — and pushes its next retry past the recheck
+            // interval instead of once per upload.
+            match self
+                .ensure_upload_bucket(entry, &storage.jetstream, cluster)
+                .await
+            {
+                Ok(fresh) => {
+                    storage.bucket = Some(fresh.clone());
+                    storage.ensured_at = std::time::Instant::now();
+                    Ok((client, fresh))
+                }
+                Err(error) => {
+                    storage.ensured_at = std::time::Instant::now();
+                    log::warn!(
+                        "re-ensuring the upload bucket for cluster '{cluster}' failed; \
+                         keeping the cached bucket: {}",
+                        crate::nats_access::sanitized_error_chain(&error)
+                    );
+                    Ok((client, bucket))
+                }
+            }
+        } else {
+            self.ensure_unmemoed_upload_bucket(entry, storage, cluster)
+                .await
+        }
+    }
+
+    /// The memo-unset path: the last ensure failed (or the stream was
+    /// reset), so there is no bucket to serve. A connected broker retries
+    /// per upload — store-level failures fail fast (D2). A down
+    /// connection defers unconditionally instead: an ensure attempt could
+    /// only queue behind the single-flight lock until the client's request
+    /// timeout, so every upload during an outage gets an instant 503
+    /// rather than a slow one, and nothing retries until the connection is
+    /// back (C7) — at which point recovery is immediate.
+    // qual:allow(iosp) reason: "the deferral check, the ensure attempt and its memo bookkeeping must read as one retry step; extracting the bookkeeping would let a success path forget to record the fresh ensure."
+    async fn ensure_unmemoed_upload_bucket(
+        &self,
+        entry: &upload_storage::ClusterEntry,
+        storage: &mut upload_storage::ClusterStorage,
+        cluster: &str,
+    ) -> Result<(async_nats::Client, AttachmentsBucket)> {
+        let connected =
+            storage.client.connection_state() == async_nats::connection::State::Connected;
+        if !connected {
+            return Err(nats_cluster_unavailable(
+                cluster,
+                anyhow::anyhow!("broker connection is down; upload bucket ensure deferred"),
+            ));
+        }
+        let client = storage.client.clone();
+        match self
+            .ensure_upload_bucket(entry, &storage.jetstream, cluster)
+            .await
+        {
+            Ok(bucket) => {
+                storage.bucket = Some(bucket.clone());
+                storage.ensured_at = std::time::Instant::now();
+                Ok((client, bucket))
+            }
+            Err(error) => Err(Self::classify_upload_ensure_failure(
+                storage.client.connection_state(),
+                cluster,
+                error,
+            )),
+        }
+    }
+
+    /// Resolve the configured replica count and ensure the bucket on one
+    /// cluster's connection, counting each attempt for the reuse and
+    /// retry-rate test seams (an attempt that fails still counts: the
+    /// rate-limit test must observe attempts, not successes).
+    async fn ensure_upload_bucket(
+        &self,
+        entry: &upload_storage::ClusterEntry,
+        jetstream: &async_nats::jetstream::Context,
+        cluster: &str,
+    ) -> Result<AttachmentsBucket> {
+        let replicas = self.config.resolve_nats_replicas(cluster).await?;
+        upload_storage::count_ensure(entry);
+        let bucket =
+            harnx_blob_store::media::ensure_attachments_bucket(jetstream, replicas).await?;
+        Ok(bucket)
+    }
+
+    /// A failed bucket ensure has no typed classification of its own, but a
+    /// failure on a lost or reconnecting connection is unavailability, same
+    /// as a failed put (F3); on a live connection the wrapper kinds in
+    /// `is_nats_unavailable` classify the rest. The original chain is
+    /// logged by `nats_cluster_unavailable`, not returned to the client.
+    /// Takes the connection state, not the client, so tests cover the
+    /// branch without a broker.
+    fn classify_upload_ensure_failure(
+        connection: async_nats::connection::State,
+        cluster: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if connection != async_nats::connection::State::Connected {
+            return nats_cluster_unavailable(cluster, error);
+        }
+        error
+    }
+
+    /// After a store-class put failure, drop the cluster's bucket memo when
+    /// the object-store stream is definitively gone, so the next upload
+    /// re-ensures it on the kept connection. Transient probe failures keep
+    /// the memo: only the typed stream-not-found answer resets it.
+    async fn refresh_upload_bucket_on_missing_stream(&self, cluster: &str) {
+        let entry = self.upload_storage.entry(cluster).await;
+        let jetstream = {
+            let state = entry.storage.lock().await;
+            match state.as_ref() {
+                Some(storage) => storage.jetstream.clone(),
+                None => return,
+            }
+        };
+        let stream_name = harnx_blob_store::media::attachments_stream_name();
+        match jetstream.get_stream(&stream_name).await {
+            Err(error) if harnx_blob_store::media::attachments_stream_missing(&error.kind()) => {
+                let mut state = entry.storage.lock().await;
+                if let Some(storage) = state.as_mut() {
+                    if storage.bucket.take().is_some() {
+                        log::warn!(
+                            "attachment object store '{stream_name}' is gone; \
+                             the next upload re-ensures it"
+                        );
+                    }
+                }
+            }
+            // A live stream (or a probe that could not answer) keeps the memo.
+            _ => {}
+        }
+    }
+
+    /// Test seam: shrink the bucket recheck interval to observe re-ensures.
+    #[cfg(test)]
+    pub(crate) fn set_upload_bucket_recheck_interval(&mut self, interval: Duration) {
+        self.upload_bucket_recheck = interval;
+    }
+
+    /// Test seam: this cluster's successful-connect and bucket-ensure counts.
+    #[cfg(test)]
+    pub(crate) async fn upload_storage_counts(&self, cluster: &str) -> (usize, usize) {
+        let entry = self.upload_storage.entry(cluster).await;
+        (
+            entry.connects.load(std::sync::atomic::Ordering::Relaxed),
+            entry.ensures.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Test seam: the cached connection's state for one cluster, `None`
+    /// until the first upload initializes its storage.
+    #[cfg(test)]
+    pub(crate) async fn upload_connection_state(
+        &self,
+        cluster: &str,
+    ) -> Option<async_nats::connection::State> {
+        let entry = self.upload_storage.entry(cluster).await;
+        let storage = entry.storage.lock().await;
+        storage
+            .as_ref()
+            .map(|storage| storage.client.connection_state())
+    }
+
     async fn upload_session_attachments<B>(&self, req: hyper::Request<B>) -> Result<AppResponse>
     where
         B: Body<Data = Bytes> + Send + Unpin,
         <B as Body>::Error: std::fmt::Display,
     {
-        if req.method() != Method::POST {
-            bail!("Method Not Allowed");
-        }
-        let path = req.uri().path().to_string();
-        let (agent_ref, session) =
-            parse_session_attachments_path(&path).ok_or_else(|| anyhow!("Not Found"))?;
-
-        if request_is_oversized(req.headers()) {
-            return json_response_with_status(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
-            );
-        }
-
-        let Some(boundary) = multer::parse_boundary(
-            req.headers()
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| anyhow!("Bad Request"))?,
-        )
-        .ok() else {
-            bail!("Bad Request");
-        };
+        let (agent_ref, session, boundary) = upload_route(&req)?;
         let (target, _) = self.resolve_request_agent(&req, &agent_ref).await?;
         let attachments_dir = Config::agent_data_dir(target.agent())
             .join("attachments")
             .join(&session);
         let attachment_session = SessionRef::new(Some(target.agent().to_string()), session.clone())
             .context("build attachment session identity")?;
-
-        // Stream body with size limit to prevent OOM
-        let body = req.into_body();
-        let mut cumulative: usize = 0;
-        let mut chunks: Vec<Bytes> = Vec::new();
-        let mut body_stream = body.into_data_stream();
-
-        while let Some(chunk_result) = body_stream.next().await {
-            let chunk = chunk_result.map_err(|e| anyhow!("Failed to read body: {}", e))?;
-            cumulative += chunk.len();
-            if cumulative > MAX_UPLOAD_BYTES {
-                return json_response_with_status(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
-                );
+        // With access rules on, the guard already proved this session exists;
+        // pin that proof before the body buffers so a session deleted during
+        // the upload is a 404 instead of a never-created (D7) upload that no
+        // recheck guards (M2). Rules off keeps D7: no proof, no extra read.
+        let proven_incarnation = match self
+            .upload_session_incarnation_proof(&req, &target, &session)
+            .await
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                let (status, body) = attachment_store_error(error);
+                return json_response_with_status(status, body);
             }
-            chunks.push(chunk);
-        }
+        };
+        let proven_incarnation = match upload_proven_incarnation(proven_incarnation) {
+            Ok(proven) => proven,
+            Err((status, body)) => return json_response_with_status(status, body),
+        };
+        // JetStream is taken lazily on the first accepted part, so validation
+        // failures below never need a broker and keep their 4xx — until a
+        // part is accepted, the broker stays untouched, but a stored part has
+        // used it and later parts' validation errors may follow a store
+        // failure.
+        let mut object_store =
+            AttachmentObjectStore::new(self, &target, &attachment_session, proven_incarnation);
 
-        let body_bytes = chunks.into_iter().flatten().collect::<Vec<u8>>();
+        // The headers must outlive the body, which consumes the request.
+        let headers = http::HeaderMap::clone(req.headers());
+        let body_bytes = match read_upload_body(&headers, req.into_body()).await {
+            Ok(bytes) => bytes,
+            Err((status, body)) => return json_response_with_status(status, body),
+        };
+
         let refs = match process_multipart_upload(
             body_bytes,
             boundary,
             &attachments_dir,
             &attachment_session,
+            &mut object_store,
         )
         .await?
         {
@@ -1168,6 +1484,90 @@ impl Server {
         json_response(
             json!({"attachment_refs": refs, "attachments": refs.iter().map(|cid| json!({"cid": cid})).collect::<Vec<_>>() }),
         )
+    }
+
+    /// The session-incarnation proof an upload starts from. Access rules off
+    /// proves nothing (`None`): the upload captures with D7 semantics. Rules
+    /// on re-reads the session's `created_at` before the request's body
+    /// buffers, so the upload can tell "deleted mid-upload" from "never
+    /// created". `Some(None)` means the rules-on path found nothing this
+    /// caller may upload to: the record is already absent, or the record
+    /// now under this session id has an owner the caller cannot access —
+    /// the session was replaced between the guard's authorization and this
+    /// read, and pinning that incarnation would let the upload store for a
+    /// session the guard never approved. Either way the upload answers 404
+    /// before storing anything. Read failures propagate to the caller and
+    /// classify like any other store failure (503/500, no refs).
+    ///
+    /// The rules-on proof opens a second, short-lived connection (D9): the
+    /// upload store's per-cluster cached client is private to the storage
+    /// lock and only holds the attachments bucket, not the session-metadata
+    /// store this proof needs. Reusing it would widen that lock's reach
+    /// across two unrelated stores; one extra connection per rules-on
+    /// upload is the cheaper trade.
+    async fn upload_session_incarnation_proof<B>(
+        &self,
+        req: &hyper::Request<B>,
+        target: &ResolvedAgentTarget,
+        session: &str,
+    ) -> Result<Option<Option<DateTime<Utc>>>> {
+        let Some((rules, identities)) = self.access(req) else {
+            return Ok(None);
+        };
+        let Some(store) =
+            crate::session_access::open_session_metadata_readonly(&self.config, target.cluster())
+                .await?
+        else {
+            // No metadata bucket: with rules on no session can exist, so the
+            // session this upload addresses is gone.
+            return Ok(Some(None));
+        };
+        let caller = identities.caller();
+        let display_ref = self.display_ref(target);
+        let pinned = match store.get_for_agent(session, target.agent()).await {
+            Ok(Some(record)) => {
+                Self::proof_from_record(rules, &display_ref, caller.view(), &record)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                return Err(error.context("read the session's metadata for the upload proof"))
+            }
+        };
+        Ok(Some(pinned))
+    }
+
+    /// The proof's guard-equivalent authorization: the caller must still be
+    /// able to access the record about to be pinned, judged by that record's
+    /// own owner — the same check the guard ran on its own read, with the
+    /// rules and caller snapshot resolved from this request. `None` means
+    /// the caller cannot access this record, so nothing is pinned. An
+    /// undecodable record cannot prove anyone's authorization and denies
+    /// the same way (fail closed, 404) instead of surfacing a 500.
+    // qual:allow(iosp) reason: "The proof must decode the record, say why an undecodable one is denied, and apply the caller's authorization against the same record's owner in one pass; splitting the deny from the authorize scatters which read decided the 404."
+    fn proof_from_record(
+        rules: &harnx_core::access_rules::AccessRules,
+        display_ref: &str,
+        caller: harnx_core::access_rules::CallerView<'_>,
+        record: &harnx_runtime::nats_session_metadata::MetadataRecord,
+    ) -> Option<DateTime<Utc>> {
+        let properties =
+            match harnx_runtime::nats_session_metadata::session_properties(&record.metadata) {
+                Ok(properties) => properties,
+                Err(error) => {
+                    // Fail closed, but say why in the log: a corrupted
+                    // record should be visible, not indistinguishable from
+                    // a normal 404. Sanitized — the record is untrusted.
+                    warn!(
+                        "undecodable session record in the upload proof; failing closed: {}",
+                        crate::nats_access::sanitized_error_chain(&error)
+                    );
+                    return None;
+                }
+            };
+        let owner = properties.text("user_id");
+        rules
+            .can_access_session(display_ref, caller, owner)
+            .then_some(record.metadata.created_at)
     }
 
     async fn session_history_json(
@@ -1205,11 +1605,13 @@ impl Server {
         let user_id = RequestIdentity::user_id(&req);
         let user_principals = RequestIdentity::of(&req).stampable_principals();
         let web_base_url = web_url::inferred_base_url(req.headers(), req.uri());
+        let snapshot_features = transcript_snapshot::SnapshotFeatures::from_headers(req.headers());
         let body = req.collect().await?.to_bytes();
         let request = ag_ui::AgUiRunRequest {
             target,
             session,
             body: &body,
+            snapshot_features,
             web_base_url,
             user_id,
             user_principals,
@@ -1421,6 +1823,87 @@ struct RerankReqBody {
     top_n: Option<usize>,
 }
 
+/// Reduce the upload's session-incarnation proof to the incarnation the
+/// store should pin, or the 404 a rules-on upload owes a session whose
+/// record is already absent at request start: the guard path would have
+/// answered 404, so the upload does too, before reading or storing anything.
+fn upload_proven_incarnation(
+    proof: Option<Option<DateTime<Utc>>>,
+) -> std::result::Result<Option<DateTime<Utc>>, AttachmentUploadError> {
+    match proof {
+        // No proof (rules off): the upload captures with D7 semantics.
+        None => Ok(None),
+        // The session vanished between the guard and the route's read.
+        Some(None) => Err((
+            StatusCode::NOT_FOUND,
+            json!({"error": "session no longer exists"}),
+        )),
+        Some(proven) => Ok(proven),
+    }
+}
+
+/// Method, path and multipart-boundary checks for the upload route. Body-size
+/// enforcement happens in `read_upload_body`, before the body is read.
+fn upload_route<B>(req: &hyper::Request<B>) -> Result<(String, String, String)> {
+    if req.method() != Method::POST {
+        bail!("Method Not Allowed");
+    }
+    let path = req.uri().path().to_string();
+    let (agent_ref, session) =
+        parse_session_attachments_path(&path).ok_or_else(|| anyhow!("Not Found"))?;
+    let boundary = multipart_boundary(req.headers())?;
+    Ok((agent_ref, session, boundary))
+}
+
+/// The multipart boundary of the request's Content-Type header.
+fn multipart_boundary(headers: &http::HeaderMap) -> Result<String> {
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow!("Bad Request"))?;
+    multer::parse_boundary(content_type).map_err(|_| anyhow!("Bad Request"))
+}
+
+/// Read the whole upload body, refusing anything over the size cap with the
+/// route's 413 response before any multipart parsing.
+async fn read_upload_body<B>(
+    headers: &http::HeaderMap,
+    body: B,
+) -> std::result::Result<Vec<u8>, AttachmentUploadError>
+where
+    B: Body<Data = Bytes> + Send + Unpin,
+    <B as Body>::Error: std::fmt::Display,
+{
+    if request_is_oversized(headers) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
+        ));
+    }
+    // Stream chunks with a running size limit to prevent OOM.
+    let mut cumulative: usize = 0;
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut body_stream = body.into_data_stream();
+
+    while let Some(chunk_result) = body_stream.next().await {
+        let chunk = chunk_result.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("Failed to read body: {e}")}),
+            )
+        })?;
+        cumulative += chunk.len();
+        if cumulative > MAX_UPLOAD_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
+            ));
+        }
+        chunks.push(chunk);
+    }
+    Ok(chunks.into_iter().flatten().collect())
+}
+
 fn set_cors_header(res: &mut AppResponse) {
     res.headers_mut().insert(
         hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -1432,7 +1915,9 @@ fn set_cors_header(res: &mut AppResponse) {
     );
     res.headers_mut().insert(
         hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
-        hyper::header::HeaderValue::from_static("Content-Type,Authorization"),
+        hyper::header::HeaderValue::from_static(
+            "Content-Type,Authorization,x-harnx-snapshot-features",
+        ),
     );
 }
 
@@ -2198,6 +2683,22 @@ fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
     let (_, status) = message.split_once(ERROR_STATUS_MARKER)?;
     let code = status.parse::<u16>().ok()?;
     StatusCode::from_u16(code).ok()
+}
+
+/// A guard failure otherwise surfaces as the generic 400: the error reaches
+/// `finalize_err_status` with no status of its own. Broker-unavailability
+/// failures get the 503 the guarded route would answer itself; guard
+/// denials keep the 404 their message already carries. The original chain
+/// stays intact for the dispatch log line.
+pub(crate) fn guard_error_status(err: anyhow::Error) -> anyhow::Error {
+    if crate::nats_access::is_nats_unavailable(&err) {
+        let message = format!(
+            "{err}{ERROR_STATUS_MARKER}{}",
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        );
+        return err.context(message);
+    }
+    err
 }
 
 /// Final HTTP status for a failed dispatch. An explicit dispatch status wins;
@@ -3327,6 +3828,33 @@ mod tests {
         body
     }
 
+    const UPLOAD_BOUNDARY: &str = "boundary123";
+
+    /// The multipart Content-Type every test upload posts.
+    fn multipart_content_type(boundary: &str) -> String {
+        format!("multipart/form-data; boundary={boundary}")
+    }
+
+    /// PNG magic bytes, the fixture every positive upload test posts.
+    fn png_magic_bytes() -> Vec<u8> {
+        vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    }
+
+    /// A ready-to-post single-part multipart body and its boundary.
+    fn single_part_upload_body(
+        filename: &str,
+        content_type: &str,
+        data: &[u8],
+    ) -> (&'static str, Vec<u8>) {
+        (
+            UPLOAD_BOUNDARY,
+            build_multipart_body(
+                UPLOAD_BOUNDARY,
+                &[("attachment", filename, content_type, data)],
+            ),
+        )
+    }
+
     #[test]
     fn session_route_accepts_rpc_named_session_without_special_rpc_suffix_routing() {
         let sandbox = TestConfigSandbox::new();
@@ -3389,7 +3917,7 @@ mod tests {
             ))
             .header(
                 reqwest::header::CONTENT_TYPE,
-                format!("multipart/form-data; boundary={boundary}"),
+                multipart_content_type(boundary),
             )
             .body(body)
             .send()
@@ -3483,7 +4011,7 @@ mod tests {
 
     fn assert_snapshot_attachment_event(content: &MessageContent, cid: &str) {
         let history = [Message::new(MessageRole::User, content.clone()).with_id("user-msg-1")];
-        let snapshot = crate::ag_ui::history_messages_for_snapshot(&history);
+        let snapshot = crate::transcript_snapshot::history_messages_for_snapshot(&history);
         let durable_entries = vec![(
             1,
             SessionLogEntry::Message {
@@ -3784,34 +4312,36 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn upload_attachments_success_returns_cid_refs() {
+    #[tokio::test]
+    async fn upload_attachments_success_returns_cid_refs() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
-        let config = Arc::new(ConfigLock::new(sandbox.config()));
-        let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
+        let config = sandbox.config();
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
+        let server = Arc::new(Server::new(
+            &Arc::new(ConfigLock::new(config.clone())),
+            std::path::PathBuf::from("web-assets"),
+        ));
 
-        let boundary = "boundary123";
-        let image_data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]; // PNG magic bytes
-        let body = build_multipart_body(
+        let image_data = png_magic_bytes();
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &image_data);
+
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
             boundary,
-            &[("attachment", "test.png", "image/png", &image_data)],
-        );
-
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                None,
-            ))
-            .expect("handler response");
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body_bytes = rt
-            .block_on(http_body_util::BodyExt::collect(response.into_body()))
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
             .expect("collect body")
             .to_bytes();
         let json: Value = serde_json::from_slice(&body_bytes).expect("parse json");
@@ -3824,10 +4354,8 @@ mod tests {
             .as_array()
             .expect("refs array");
         assert_eq!(refs.len(), 1);
-        assert!(refs[0]
-            .as_str()
-            .unwrap()
-            .starts_with("cid:media:plain/test-session/"));
+        let ref_string = refs[0].as_str().expect("ref string");
+        assert!(ref_string.starts_with("cid:media:plain/test-session/"));
 
         // Verify the uploaded blob was stored in the attachment directory.
         let attachments_dir = Config::agent_data_dir("plain")
@@ -3838,10 +4366,25 @@ mod tests {
             "attachments dir should exist at {:?}",
             attachments_dir
         );
+
+        // The same blob must exist in the NATS object store with the exact
+        // bytes and MIME type, so any replica can serve the returned ref.
+        let url = CidUrl::parse(ref_string).expect("parse returned ref");
+        let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+        let bucket = harnx_blob_store::media::optional_attachments_bucket(&jetstream)
+            .await?
+            .context("attachments bucket exists")?;
+        let (bytes, mime) = harnx_blob_store::media::get_media(&bucket, &url)
+            .await?
+            .context("uploaded object exists in the object store")?;
+        assert_eq!(bytes, image_data);
+        assert_eq!(mime, "image/png");
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_malformed_multipart_returns_400() {
+    #[tokio::test]
+    async fn upload_attachments_malformed_multipart_returns_400() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(ConfigLock::new(sandbox.config()));
@@ -3851,14 +4394,14 @@ mod tests {
         let boundary = "boundary123";
         let invalid_body = b"--boundary123\r\nnot-a-valid-part\r\n--boundary123--\r\n".to_vec();
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt.block_on(call_upload_handler(
+        let response = call_upload_handler(
             server,
             "/v1/agents/plain/sessions/test-session/attachments",
             boundary,
             invalid_body,
             None,
-        ));
+        )
+        .await;
 
         // Handler returns Err for malformed multipart, which gets converted to BAD_REQUEST
         match response {
@@ -3869,10 +4412,12 @@ mod tests {
                 // Error case is acceptable - handler bubbles up "Bad Request" error
             }
         }
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_no_parts_returns_400() {
+    #[tokio::test]
+    async fn upload_attachments_no_parts_returns_400() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(ConfigLock::new(sandbox.config()));
@@ -3892,101 +4437,1840 @@ mod tests {
             b
         };
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                None,
-            ))
-            .expect("handler response");
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_oversized_returns_413() {
+    #[tokio::test]
+    async fn upload_attachments_oversized_returns_413() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a multipart body that exceeds MAX_UPLOAD_BYTES
-        let boundary = "boundary123";
         let oversized_data = vec![0u8; MAX_UPLOAD_BYTES + 1024];
-        let body = build_multipart_body(
-            boundary,
-            &[("attachment", "test.png", "image/png", &oversized_data)],
-        );
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &oversized_data);
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                None,
-            ))
-            .expect("handler response");
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_oversized_content_length_header_returns_413_early() {
+    #[tokio::test]
+    async fn upload_attachments_oversized_content_length_header_returns_413_early() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a request with a Content-Length header that exceeds MAX_UPLOAD_BYTES
-        let boundary = "boundary123";
+        let boundary = UPLOAD_BOUNDARY;
         let body = vec![0u8; 100]; // Small body, but Content-Length header says it's huge
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                Some(MAX_UPLOAD_BYTES + 1), // Oversized Content-Length header
-            ))
-            .expect("handler response");
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
+            boundary,
+            body,
+            Some(MAX_UPLOAD_BYTES + 1), // Oversized Content-Length header
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        Ok(())
     }
 
-    #[test]
-    fn upload_attachments_unsupported_content_type_returns_415() {
+    #[tokio::test]
+    async fn upload_attachments_unsupported_content_type_returns_415() -> Result<()> {
+        harnx_core::require_nextest();
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(ConfigLock::new(sandbox.config()));
         let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a multipart with an unsupported MIME type
-        let boundary = "boundary123";
         let data = b"some binary data".to_vec();
-        let body = build_multipart_body(
-            boundary,
-            &[("attachment", "test.exe", "application/octet-stream", &data)],
-        );
+        let (boundary, body) =
+            single_part_upload_body("test.exe", "application/octet-stream", &data);
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let response = rt
-            .block_on(call_upload_handler(
-                server,
-                "/v1/agents/plain/sessions/test-session/attachments",
-                boundary,
-                body,
-                None,
-            ))
-            .expect("handler response");
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        Ok(())
+    }
+
+    // ===== Upload object-store persistence tests (#2841) =====
+
+    const SEALED_ATTACHMENTS_CLUSTER: &str = "sealed-attachments";
+
+    /// A sandbox and upload server routing uploads to one named isolated
+    /// cluster. The sandbox must outlive every use of the server.
+    async fn upload_server_for_cluster(
+        cluster: &str,
+        url: &str,
+    ) -> Result<(TestConfigSandbox, Arc<Server>)> {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        sandbox.write_nats_server(cluster, &format!("url: {url}\n"));
+        let mut config = sandbox.config();
+        config.nats_routing = harnx_runtime::config::NatsRouting::Cluster(cluster.to_string());
+        let server = Arc::new(Server::new(
+            &Arc::new(ConfigLock::new(config)),
+            std::path::PathBuf::from("web-assets"),
+        ));
+        Ok((sandbox, server))
+    }
+
+    struct SealedBucketFixture {
+        _sandbox: TestConfigSandbox,
+        _nats: harnx_test_bins::NatsServerHandle,
+        server: Arc<Server>,
+    }
+
+    /// An isolated broker whose `harnx_attachments` bucket is sealed: bucket
+    /// lookup succeeds, every object put fails deterministically (nats-server
+    /// rejects publishes to a sealed stream with a 400 error).
+    async fn sealed_bucket_server() -> Result<Option<SealedBucketFixture>> {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(None);
+        };
+        let jetstream = async_nats::jetstream::new(async_nats::connect(nats.url()).await?);
+        harnx_blob_store::media::ensure_attachments_bucket(&jetstream, 1).await?;
+        let mut raw_bucket = jetstream
+            .get_object_store(harnx_blob_store::media::ATTACHMENTS_BUCKET)
+            .await?;
+        raw_bucket.seal().await?;
+
+        let (sandbox, server) =
+            upload_server_for_cluster(SEALED_ATTACHMENTS_CLUSTER, nats.url()).await?;
+        Ok(Some(SealedBucketFixture {
+            _sandbox: sandbox,
+            _nats: nats,
+            server,
+        }))
+    }
+
+    async fn upload_response_json(response: AppResponse) -> Result<Value> {
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        Ok(serde_json::from_slice(&body).expect("parse json"))
+    }
+
+    fn assert_no_upload_refs(body: &Value) {
+        assert!(
+            body.get("attachment_refs").is_none(),
+            "failed upload response must not include refs: {body}"
+        );
+        assert!(
+            body.get("attachments").is_none(),
+            "failed upload response must not include attachments: {body}"
+        );
+        assert!(body.get("error").is_some(), "error body: {body}");
+    }
+
+    #[tokio::test]
+    async fn upload_attachments_object_store_failure_returns_500_without_refs() -> Result<()> {
+        let Some(fixture) = sealed_bucket_server().await? else {
+            return Ok(());
+        };
+        let image_data = png_magic_bytes();
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &image_data);
+
+        let response = call_upload_handler(
+            fixture.server,
+            "/v1/agents/plain/sessions/upload-store-fail/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        // A failing object store is a server-side fault, not a bad request.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = upload_response_json(response).await?;
+        assert_no_upload_refs(&body);
+        // The 500 body is a fixed message: no object key, no session id, no
+        // JetStream error codes, no internal chain. The full failure chain is
+        // server-side log output.
+        assert_eq!(
+            body["error"],
+            "failed to store attachment in the object store"
+        );
+        let raw = body.to_string();
+        assert!(
+            !raw.contains("upload-store-fail"),
+            "session id must not leak: {raw}"
+        );
+        assert!(
+            !raw.contains("harnx_attachments"),
+            "bucket name must not leak: {raw}"
+        );
+        assert!(
+            !raw.contains("10109"),
+            "JetStream error codes must not leak: {raw}"
+        );
+        Ok(())
+    }
+
+    /// The first part is rejected by validation before any broker I/O, so its
+    /// 415 wins even though storing the second part would fail.
+    #[tokio::test]
+    async fn upload_attachments_invalid_first_part_returns_415_when_object_store_fails(
+    ) -> Result<()> {
+        let Some(fixture) = sealed_bucket_server().await? else {
+            return Ok(());
+        };
+        let image_data = png_magic_bytes();
+        let boundary = UPLOAD_BOUNDARY;
+        let body = build_multipart_body(
+            boundary,
+            &[
+                (
+                    "attachment",
+                    "test.exe",
+                    "application/octet-stream",
+                    b"not a png",
+                ),
+                ("attachment", "test.png", "image/png", &image_data),
+            ],
+        );
+
+        let response = call_upload_handler(
+            fixture.server,
+            "/v1/agents/plain/sessions/upload-order-invalid-first/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body = upload_response_json(response).await?;
+        assert_no_upload_refs(&body);
+        Ok(())
+    }
+
+    /// Parts are processed in order with the first error winning: a broker
+    /// failure while storing the first part wins over the later part's
+    /// unsupported MIME type.
+    #[tokio::test]
+    async fn upload_attachments_object_store_failure_precedes_later_invalid_part() -> Result<()> {
+        let Some(fixture) = sealed_bucket_server().await? else {
+            return Ok(());
+        };
+        let image_data = png_magic_bytes();
+        let boundary = UPLOAD_BOUNDARY;
+        let body = build_multipart_body(
+            boundary,
+            &[
+                ("attachment", "test.png", "image/png", &image_data),
+                (
+                    "attachment",
+                    "test.exe",
+                    "application/octet-stream",
+                    b"not a png",
+                ),
+            ],
+        );
+
+        let response = call_upload_handler(
+            fixture.server,
+            "/v1/agents/plain/sessions/upload-order-store-fail/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = upload_response_json(response).await?;
+        assert_no_upload_refs(&body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_attachments_writes_object_to_existing_bucket() -> Result<()> {
+        harnx_core::require_nextest();
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        if !crate::test_support::ensure_test_nats().await {
+            return Ok(());
+        }
+        // Pre-create the bucket so the upload exercises the open-existing path
+        // of the bucket ensure, not stream creation.
+        let jetstream = config.nats_jetstream(LOCAL_CLUSTER_KEY).await?;
+        harnx_blob_store::media::ensure_attachments_bucket(&jetstream, 1).await?;
+        let server = Arc::new(Server::new(
+            &Arc::new(ConfigLock::new(config.clone())),
+            std::path::PathBuf::from("web-assets"),
+        ));
+
+        let image_data = b"existing bucket png bytes".to_vec();
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &image_data);
+
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/upload-existing-bucket/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = upload_response_json(response).await?;
+        let ref_string = json["attachment_refs"][0]
+            .as_str()
+            .expect("one ref")
+            .to_string();
+        let url = CidUrl::parse(&ref_string).expect("parse returned ref");
+        let bucket = harnx_blob_store::media::optional_attachments_bucket(&jetstream)
+            .await?
+            .context("attachments bucket exists")?;
+        let (bytes, mime) = harnx_blob_store::media::get_media(&bucket, &url)
+            .await?
+            .context("uploaded object exists in the object store")?;
+        assert_eq!(bytes, image_data);
+        assert_eq!(mime, "image/png");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_attachments_unreachable_cluster_returns_503_without_refs() -> Result<()> {
+        harnx_core::require_nextest();
+        let (_sandbox, server) = upload_server_for_cluster("down", "nats://127.0.0.1:1").await?;
+
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &png_magic_bytes());
+
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/upload-unreachable/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        // An unreachable broker is the store being unavailable, not a server
+        // fault and not a bad request.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = upload_response_json(response).await?;
+        assert_no_upload_refs(&body);
+        assert_eq!(body["error"], "attachment object store is unavailable");
+        Ok(())
+    }
+
+    /// A broker that completes the NATS protocol handshake (INFO on connect,
+    /// PONG for every PING) and then stays silent for every JetStream API
+    /// request. Deterministically reproduces "connected, but the broker
+    /// stopped answering": the TCP connection is live while the JetStream
+    /// round trips of the bucket ensure time out.
+    async fn spawn_stalled_broker() -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let info = concat!(
+                        "INFO {\"server_id\":\"stalled\",\"server_name\":\"stalled\"",
+                        ",\"version\":\"2.10.0\",\"proto\":1,\"go\":\"go\",\"host\":\"127.0.0.1\"",
+                        ",\"port\":1,\"max_payload\":1048576,\"client_id\":1,\"headers\":true}\r\n"
+                    );
+                    if socket.write_all(info.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    // Answer every PING so the client keeps the connection
+                    // open; ignore everything else (CONNECT, subscriptions,
+                    // JetStream API requests) so the requests time out.
+                    let mut buffer = [0u8; 4096];
+                    let mut pending = Vec::new();
+                    loop {
+                        let read = match socket.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => read,
+                        };
+                        pending.extend_from_slice(&buffer[..read]);
+                        while let Some(at) = pending.windows(6).position(|w| w == b"PING\r\n") {
+                            pending.drain(..at + 6);
+                            if socket.write_all(b"PONG\r\n").await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Ok((address, task))
+    }
+
+    /// The broker accepts the upload's connection, then stops answering the
+    /// JetStream API: post-connect unavailability, classified as 503 instead
+    /// of a connect error or a store 500.
+    #[tokio::test]
+    async fn upload_attachments_post_connect_unresponsive_broker_returns_503_without_refs(
+    ) -> Result<()> {
+        harnx_core::require_nextest();
+        let (address, broker) = spawn_stalled_broker().await?;
+        let (_sandbox, server) =
+            upload_server_for_cluster("stalled", &format!("nats://{address}")).await?;
+
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &png_magic_bytes());
+        let response = call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/upload-stalled/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = upload_response_json(response).await?;
+        assert_no_upload_refs(&body);
+        assert_eq!(body["error"], "attachment object store is unavailable");
+        broker.abort();
+        Ok(())
+    }
+
+    /// The typed-evidence halves of the put-failure classification, through a
+    /// connected client. The dedup probe's leader-read subject is remapped
+    /// to one with no responders, so the probe exhausts the leader-read
+    /// recovery budget and fails with the typed recovery marker. The put
+    /// then fails with only a stringified cause: an object-store metadata
+    /// publish is a rollup, which a stream without `allow_rollup` rejects
+    /// (`ObjectStore::put` stringifies that publish ack error). The client
+    /// stays connected the whole time, so only the probe's chained typed
+    /// evidence keeps this a 503: without the probe-error chaining in
+    /// `put_media_chunked` the put's failure carries no typed cause and
+    /// the upload answers 500. This pins that chaining; the upload error
+    /// mapper also re-checks the chain for typed unavailability, so this
+    /// test does not by itself pin that arm.
+    #[tokio::test]
+    async fn upload_attachments_probe_chain_failure_is_classified_unavailable() -> Result<()> {
+        harnx_core::require_nextest();
+        const BUCKET: &str = harnx_blob_store::media::ATTACHMENTS_BUCKET;
+        let config = format!(
+            r#"mappings = {{
+  "$JS.API.STREAM.MSG.GET.OBJ_{BUCKET}": "harnx.test.unanswered"
+}}"#
+        );
+        let Some(nats) = harnx_test_bins::spawn_configured_nats_server(&config).await? else {
+            return Ok(());
+        };
+
+        // Create the bucket as this test's client, then make the next put's
+        // metadata publish fail with a stringified cause: with `allow_rollup`
+        // off, the server rejects the metadata publish's rollup.
+        let jetstream = async_nats::jetstream::new(async_nats::connect(nats.url()).await?);
+        harnx_blob_store::media::ensure_attachments_bucket(&jetstream, 1).await?;
+        let mut stream_config = jetstream
+            .get_stream(format!("OBJ_{BUCKET}"))
+            .await?
+            .info()
+            .await?
+            .config
+            .clone();
+        stream_config.allow_rollup = false;
+        jetstream.update_stream(&stream_config).await?;
+
+        let (_sandbox, server) = upload_server_for_cluster("probechain", nats.url()).await?;
+        let (status, json) = post_upload(
+            std::sync::Arc::clone(&server),
+            "/v1/agents/plain/sessions/probechain-1/attachments",
+            &png_magic_bytes(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_no_upload_refs(&json);
+        assert_eq!(
+            json["error"], "attachment object store is unavailable",
+            "the typed probe evidence classifies this, not the live connection state: {json}"
+        );
+        Ok(())
+    }
+
+    /// A put failure after the broker connection died must classify as
+    /// unavailability even though the bucket was already ensured: that is the
+    /// state a multi-part upload is in when the broker goes down between
+    /// parts, reusing the request's bucket handle.
+    #[tokio::test]
+    async fn upload_attachments_put_failure_after_broker_death_is_classified_unavailable(
+    ) -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(mut nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let (_sandbox, server) = upload_server_for_cluster("dying", nats.url()).await?;
+        let target = crate::session_actor::ResolvedAgentTarget::new("plain", "dying");
+        let session =
+            SessionRef::new(Some("plain".to_string()), "put-death".to_string()).expect("session");
+        let mut object_store =
+            crate::attachments::AttachmentObjectStore::new(&server, &target, &session, None);
+
+        let live = CidUrl::Media {
+            session: session.clone(),
+            hash: "d".repeat(64),
+        };
+        object_store
+            .put(&live, &png_magic_bytes(), "image/png")
+            .await
+            .expect("first put succeeds while the broker is up");
+
+        nats.kill().expect("kill broker");
+        nats.wait().expect("reap broker");
+
+        let dead = CidUrl::Media {
+            session: session.clone(),
+            hash: "e".repeat(64),
+        };
+        let error = object_store
+            .put(&dead, &png_magic_bytes(), "image/png")
+            .await
+            .expect_err("second put must fail with the broker down");
+        let error = match error {
+            crate::attachments::UploadPutError::Store(error) => error,
+            crate::attachments::UploadPutError::SessionGone => {
+                panic!("broker loss must classify as unavailability, not session absence")
+            }
+        };
+        assert!(
+            crate::nats_access::is_nats_unavailable(&error),
+            "post-connect broker loss must classify as unavailability: {error:#}"
+        );
+        Ok(())
+    }
+
+    // ===== Upload committing after session delete (F6) =====
+
+    /// Session metadata store on an isolated broker, opened exactly like
+    /// the initializer does: ensure + create, never provisioning on read.
+    async fn f6_metadata_store(
+        nats_url: &str,
+    ) -> Result<harnx_runtime::nats_session_metadata::SessionMetadataStore> {
+        let jetstream = async_nats::jetstream::new(async_nats::connect(nats_url).await?);
+        harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1).await
+    }
+
+    async fn f6_create_session_metadata(nats_url: &str, session_id: &str) -> Result<()> {
+        f6_create_session_metadata_as(nats_url, session_id, None).await
+    }
+
+    /// As `f6_create_session_metadata`, with the record's `user_id` set:
+    /// rules-on uploads authorize the caller against the record's owner.
+    async fn f6_create_session_metadata_as(
+        nats_url: &str,
+        session_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<()> {
+        let store = f6_metadata_store(nats_url).await?;
+        let mut initializer = harnx_runtime::SessionInitializer::named("plain", Default::default());
+        if let Some(user_id) = user_id {
+            initializer = initializer.with_user_id(user_id);
+        }
+        let metadata = harnx_runtime::nats_session_metadata::SessionMetadata::new(
+            session_id.to_string(),
+            initializer,
+        );
+        store.create(&metadata).await?;
+        Ok(())
+    }
+
+    /// The real delete path for session metadata: purge the session's keys,
+    /// as `nats_admin` does when a session is deleted.
+    async fn f6_delete_session_metadata(nats_url: &str, session_id: &str) -> Result<()> {
+        let store = f6_metadata_store(nats_url).await?;
+        let owner_key = harnx_core::session_identity::session_key(Some("plain"), session_id);
+        store.purge_session_prefix(&owner_key).await?;
+        Ok(())
+    }
+
+    /// The media URL `data` uploads under for one session, computed the way
+    /// `save_attachment_file` computes it.
+    fn f6_media_url(session_id: &str, data: &[u8]) -> Result<CidUrl> {
+        let dir = std::env::temp_dir().join("harnx-f6-upload-cid");
+        std::fs::create_dir_all(&dir)?;
+        let cid = harnx_core::attachments::store_attachment_bytes(&dir, data, "image/png")?;
+        let hash = cid
+            .strip_prefix(harnx_core::attachments::CID_PREFIX)
+            .context("stored cid is missing its prefix")?;
+        let session = SessionRef::new(Some("plain".to_string()), session_id.to_string())
+            .context("session")?;
+        Ok(CidUrl::Media {
+            session,
+            hash: hash.to_string(),
+        })
+    }
+
+    async fn f6_attachments_bucket(
+        nats_url: &str,
+    ) -> Result<harnx_blob_store::media::AttachmentsBucket> {
+        let jetstream = async_nats::jetstream::new(async_nats::connect(nats_url).await?);
+        harnx_blob_store::media::ensure_attachments_bucket(&jetstream, 1).await
+    }
+
+    /// Block until `expected` upload parts have parked at the armed recheck
+    /// gate, with a hard timeout so a broken upload fails instead of hangs.
+    async fn f6_wait_for_arrivals(
+        arrivals: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        expected: usize,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while arrivals.load(std::sync::atomic::Ordering::Relaxed) < expected {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "upload part never reached the recheck gate"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// Arm the recheck gate, start one single-part PNG upload through the
+    /// real handler, and park until its part sits between the acknowledged
+    /// put and the session recheck — the deterministic delete-during-upload
+    /// race position. The caller then mutates the session (delete, recreate,
+    /// kill the broker) and releases the gate.
+    async fn f6_start_gated_upload(
+        server: &std::sync::Arc<Server>,
+        session_id: &str,
+    ) -> Result<(
+        tokio::task::JoinHandle<Result<(StatusCode, Value)>>,
+        tokio::sync::watch::Sender<bool>,
+    )> {
+        let (arrivals, release) = server.upload_recheck_gate.arm().await;
+        let upload = {
+            let server = std::sync::Arc::clone(server);
+            let path = format!("/v1/agents/plain/sessions/{session_id}/attachments");
+            tokio::spawn(async move { post_upload(server, &path, &png_magic_bytes()).await })
+        };
+        f6_wait_for_arrivals(&arrivals, 1).await?;
+        Ok((upload, release))
+    }
+
+    /// Isolated broker + upload server + one created session: the shared
+    /// preamble of the F6 race tests. `None` skips the test the same way
+    /// `spawn_nats_server` does when the broker binary is unavailable.
+    async fn f6_upload_fixture(
+        cluster: &str,
+        session_id: &str,
+    ) -> Result<
+        Option<(
+            harnx_test_bins::NatsServerHandle,
+            TestConfigSandbox,
+            std::sync::Arc<Server>,
+        )>,
+    > {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(None);
+        };
+        let (sandbox, server) = upload_server_for_cluster(cluster, nats.url()).await?;
+        f6_create_session_metadata(nats.url(), session_id).await?;
+        Ok(Some((nats, sandbox, server)))
+    }
+
+    /// The response of an upload whose session was confirmed gone: 404, no
+    /// refs, the `{"error"}` body shape. Returns the body for extra asserts.
+    async fn f6_assert_session_gone_response(
+        upload: tokio::task::JoinHandle<Result<(StatusCode, Value)>>,
+    ) -> Result<Value> {
+        let (status, json) = upload.await.expect("upload completes")?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+        assert_no_upload_refs(&json);
+        Ok(json)
+    }
+
+    /// Start the gated upload for a live session, run `mutation` while the
+    /// part parks between its acknowledged put and the recheck (delete the
+    /// session, recreate it, kill the broker), then release the gate.
+    async fn f6_mutate_during_gated_upload<Fut>(
+        server: &std::sync::Arc<Server>,
+        session_id: &str,
+        mutation: Fut,
+    ) -> Result<tokio::task::JoinHandle<Result<(StatusCode, Value)>>>
+    where
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let (upload, release) = f6_start_gated_upload(server, session_id).await?;
+        mutation.await?;
+        release.send(true).expect("release the recheck gate");
+        Ok(upload)
+    }
+
+    /// The delete-during-upload race: the session's metadata is purged
+    /// after the part's put was acknowledged but before its recheck. The
+    /// upload must answer 404 with no refs, and the object version the
+    /// upload created must be gone.
+    #[tokio::test]
+    async fn upload_attachments_delete_race_returns_no_refs_and_removes_new_object() -> Result<()> {
+        let Some((nats, _sandbox, server)) = f6_upload_fixture("f6race", "f6race1").await? else {
+            return Ok(());
+        };
+
+        let upload = f6_mutate_during_gated_upload(
+            &server,
+            "f6race1",
+            f6_delete_session_metadata(nats.url(), "f6race1"),
+        )
+        .await?;
+
+        let json = f6_assert_session_gone_response(upload).await?;
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("session no longer exists"),
+            "{json}"
+        );
+
+        let data = png_magic_bytes();
+        let url = f6_media_url("f6race1", &data)?;
+        let bucket = f6_attachments_bucket(nats.url()).await?;
+        let info = harnx_blob_store::media::leader_media_info(&bucket, &url.kv_key()).await?;
+        assert!(
+            info.is_none(),
+            "the version the upload wrote must be removed"
+        );
+        Ok(())
+    }
+
+    /// A dedup hit after deletion must not remove the object: this upload
+    /// never created a version, so it owns nothing to clean up.
+    #[tokio::test]
+    async fn upload_attachments_dedup_hit_after_session_delete_keeps_existing_object() -> Result<()>
+    {
+        let Some((nats, _sandbox, server)) = f6_upload_fixture("f6dup", "f6dupx1").await? else {
+            return Ok(());
+        };
+        let data = png_magic_bytes();
+
+        // The object already exists, written while the session was alive.
+        let url = f6_media_url("f6dupx1", &data)?;
+        let bucket = f6_attachments_bucket(nats.url()).await?;
+        let existing = harnx_blob_store::media::put_media_versioned(
+            &bucket,
+            harnx_blob_store::media::MediaBlob {
+                url: &url,
+                bytes: &data,
+                mime_type: "image/png",
+            },
+        )
+        .await?;
+        let existing_nuid = match existing {
+            harnx_blob_store::media::MediaPut::Written { nuid } => nuid,
+            harnx_blob_store::media::MediaPut::DedupHit => {
+                panic!("fresh broker must not dedup the first put")
+            }
+        };
+
+        let upload = f6_mutate_during_gated_upload(
+            &server,
+            "f6dupx1",
+            f6_delete_session_metadata(nats.url(), "f6dupx1"),
+        )
+        .await?;
+
+        f6_assert_session_gone_response(upload).await?;
+
+        let info = harnx_blob_store::media::leader_media_info(&bucket, &url.kv_key())
+            .await?
+            .expect("a dedup hit must not purge the existing object");
+        assert_eq!(
+            info.nuid, existing_nuid,
+            "the surviving object is the one the live upload wrote"
+        );
+        let stored = harnx_blob_store::media::read_media_from_leader(&bucket, &info).await?;
+        assert_eq!(stored, data, "the surviving object's chunks are intact");
+        // The surviving version is still addressable as the object's current
+        // version: a new put of the same content dedup-hits it instead of
+        // writing a replacement.
+        let re_put = harnx_blob_store::media::put_media_versioned(
+            &bucket,
+            harnx_blob_store::media::MediaBlob {
+                url: &url,
+                bytes: &data,
+                mime_type: "image/png",
+            },
+        )
+        .await?;
+        assert!(
+            matches!(re_put, harnx_blob_store::media::MediaPut::DedupHit),
+            "the surviving version must still dedup new puts of the same content: {re_put:?}"
+        );
+        Ok(())
+    }
+
+    /// A session recreated with a new incarnation (different `created_at`)
+    /// is a replacement, not the session this upload addressed: same
+    /// 404-and-cleanup outcome, and the new incarnation's metadata survives.
+    #[tokio::test]
+    async fn upload_attachments_recreation_is_treated_as_replaced() -> Result<()> {
+        let Some((nats, _sandbox, server)) = f6_upload_fixture("f6recr", "f6recr1").await? else {
+            return Ok(());
+        };
+
+        // Delete, then recreate the same id: a new incarnation. Both run
+        // while the part parks, before the recheck gate releases.
+        let recreate = async {
+            f6_delete_session_metadata(nats.url(), "f6recr1").await?;
+            f6_create_session_metadata(nats.url(), "f6recr1").await
+        };
+        let upload = f6_mutate_during_gated_upload(&server, "f6recr1", recreate).await?;
+
+        f6_assert_session_gone_response(upload).await?;
+
+        let data = png_magic_bytes();
+        let url = f6_media_url("f6recr1", &data)?;
+        let bucket = f6_attachments_bucket(nats.url()).await?;
+        let info = harnx_blob_store::media::leader_media_info(&bucket, &url.kv_key()).await?;
+        assert!(
+            info.is_none(),
+            "the replaced session's upload must be removed"
+        );
+
+        let store = f6_metadata_store(nats.url()).await?;
+        let record = store
+            .get_for_agent("f6recr1", "plain")
+            .await?
+            .expect("the recreated session's metadata must survive");
+        assert_eq!(record.metadata.session_id, "f6recr1");
+        Ok(())
+    }
+
+    /// A session with no metadata record (never created, D7) still uploads
+    /// successfully even when the metadata bucket itself exists.
+    #[tokio::test]
+    async fn upload_attachments_never_created_session_still_succeeds() -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let (_sandbox, server) = upload_server_for_cluster("f6new", nats.url()).await?;
+        // Provision the metadata bucket but create no record: the upload's
+        // capture must read absence as "never created", not as an error.
+        let _ = f6_metadata_store(nats.url()).await?;
+        let data = png_magic_bytes();
+
+        let (status, json) = post_upload(
+            server,
+            "/v1/agents/plain/sessions/f6newc1/attachments",
+            &data,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let refs = json
+            .get("attachment_refs")
+            .and_then(Value::as_array)
+            .context("successful upload must return refs")?;
+        assert_eq!(refs.len(), 1, "{json}");
+        Ok(())
+    }
+
+    /// A recheck that fails on transport (broker dies between the
+    /// acknowledged put and the recheck) is not absence: the upload fails
+    /// with 503 per the F3 classification and nothing is purged.
+    #[tokio::test]
+    async fn upload_attachments_recheck_transport_failure_is_5xx_and_no_purge() -> Result<()> {
+        let Some((mut nats, _sandbox, server)) = f6_upload_fixture("f6down", "f6down1").await?
+        else {
+            return Ok(());
+        };
+
+        let kill_broker = async {
+            nats.kill().expect("kill broker");
+            nats.wait().expect("reap broker");
+            Ok(())
+        };
+        let upload = f6_mutate_during_gated_upload(&server, "f6down1", kill_broker).await?;
+
+        let (status, json) = upload.await.expect("upload completes")?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("attachment object store is unavailable"),
+            "{json}"
+        );
+        assert_no_upload_refs(&json);
+        Ok(())
+    }
+
+    // ===== Upload connection and bucket reuse (F4) =====
+
+    /// One single-part PNG upload through the real handler, with its
+    /// response status and JSON body.
+    async fn post_upload(
+        server: Arc<Server>,
+        path: &str,
+        data: &[u8],
+    ) -> Result<(StatusCode, Value)> {
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", data);
+        let response = call_upload_handler(server, path, boundary, body, None).await?;
+        let status = response.status();
+        let json = upload_response_json(response).await?;
+        Ok((status, json))
+    }
+
+    /// Repeated and concurrent uploads to one cluster share a single
+    /// connection and a single bucket ensure.
+    #[tokio::test]
+    async fn upload_attachments_reuse_one_connection_and_bucket_across_uploads() -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let (_sandbox, server) = upload_server_for_cluster("reuse", nats.url()).await?;
+
+        for index in 0..3 {
+            let data = [
+                png_magic_bytes(),
+                format!("sequential {index}").into_bytes(),
+            ]
+            .concat();
+            let (status, json) = post_upload(
+                server.clone(),
+                &format!("/v1/agents/plain/sessions/reuse-seq-{index}/attachments"),
+                &data,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{json}");
+        }
+
+        let mut concurrent = Vec::new();
+        for index in 0..8 {
+            let server = Arc::clone(&server);
+            let data = [
+                png_magic_bytes(),
+                format!("concurrent {index}").into_bytes(),
+            ]
+            .concat();
+            concurrent.push(async move {
+                post_upload(
+                    server,
+                    &format!("/v1/agents/plain/sessions/reuse-conc-{index}/attachments"),
+                    &data,
+                )
+                .await
+            });
+        }
+        for result in futures_util::future::join_all(concurrent).await {
+            let (status, json) = result?;
+            assert_eq!(status, StatusCode::OK, "{json}");
+        }
+
+        // One connect, one ensure, for three sequential plus eight
+        // concurrent uploads; the default recheck interval keeps the memo.
+        assert_eq!(
+            server.upload_storage_counts("reuse").await,
+            (1, 1),
+            "uploads must share one connection and one bucket ensure"
+        );
+
+        // A concurrent upload's object is really stored.
+        let jetstream = async_nats::jetstream::new(async_nats::connect(nats.url()).await?);
+        let bucket = harnx_blob_store::media::ensure_attachments_bucket(&jetstream, 1).await?;
+        let (status, json) = post_upload(
+            server,
+            "/v1/agents/plain/sessions/reuse-verify/attachments",
+            b"reuse verify png bytes",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let url = CidUrl::parse(json["attachment_refs"][0].as_str().expect("ref"))
+            .expect("parse returned ref");
+        let (bytes, mime) = harnx_blob_store::media::get_media(&bucket, &url)
+            .await?
+            .expect("uploaded object exists");
+        assert_eq!(bytes, b"reuse verify png bytes");
+        assert_eq!(mime, "image/png");
+        Ok(())
+    }
+
+    /// Two clusters keep separate connections and separate bucket ensures.
+    #[tokio::test]
+    async fn upload_attachments_two_clusters_stay_isolated() -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(nats_a) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let Some(nats_b) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        sandbox.write_nats_server("iso-a", &format!("url: {}\n", nats_a.url()));
+        sandbox.write_nats_server("iso-b", &format!("url: {}\n", nats_b.url()));
+        let config = sandbox.config();
+        let server = Arc::new(Server::new(
+            &Arc::new(ConfigLock::new(config)),
+            std::path::PathBuf::from("web-assets"),
+        ));
+
+        for (index, cluster) in ["iso-a", "iso-a", "iso-b"].into_iter().enumerate() {
+            let data = [png_magic_bytes(), format!("iso {index}").into_bytes()].concat();
+            let (status, json) = post_upload(
+                Arc::clone(&server),
+                &format!("/v1/agents/plain@{cluster}/sessions/isolated-{index}/attachments"),
+                &data,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{json}");
+        }
+
+        assert_eq!(server.upload_storage_counts("iso-a").await, (1, 1));
+        assert_eq!(server.upload_storage_counts("iso-b").await, (1, 1));
+
+        // The object of cluster A's upload is on A's broker only.
+        let ref_a: String = {
+            let (status, json) = post_upload(
+                Arc::clone(&server),
+                "/v1/agents/plain@iso-a/sessions/iso-lookup/attachments",
+                b"cluster a lookup bytes",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            json["attachment_refs"][0]
+                .as_str()
+                .expect("ref")
+                .to_string()
+        };
+        let url = CidUrl::parse(&ref_a).expect("parse returned ref");
+        let on_a = harnx_blob_store::media::ensure_attachments_bucket(
+            &async_nats::jetstream::new(async_nats::connect(nats_a.url()).await?),
+            1,
+        )
+        .await?;
+        let on_b = harnx_blob_store::media::ensure_attachments_bucket(
+            &async_nats::jetstream::new(async_nats::connect(nats_b.url()).await?),
+            1,
+        )
+        .await?;
+        assert!(harnx_blob_store::media::get_media(&on_a, &url)
+            .await?
+            .is_some());
+        assert!(harnx_blob_store::media::get_media(&on_b, &url)
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    /// A request rejected by part validation never touches upload storage.
+    #[tokio::test]
+    async fn upload_attachments_invalid_first_part_leaves_storage_uninitialized() -> Result<()> {
+        harnx_core::require_nextest();
+        let (_sandbox, server) = upload_server_for_cluster("uninit", "nats://127.0.0.1:1").await?;
+        let boundary = UPLOAD_BOUNDARY;
+        let body = build_multipart_body(
+            boundary,
+            &[(
+                "attachment",
+                "test.exe",
+                "application/octet-stream",
+                b"not a png",
+            )],
+        );
+
+        let response = call_upload_handler(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/uninit/attachments",
+            boundary,
+            body,
+            None,
+        )
+        .await
+        .expect("handler response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(server.upload_storage_counts("uninit").await, (0, 0));
+        Ok(())
+    }
+
+    /// A deleted object store makes the in-flight upload fail as a store
+    /// error, and the reset memo makes the next upload re-ensure and recover.
+    #[tokio::test]
+    async fn upload_attachments_deleted_bucket_recovers_on_next_upload() -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let (_sandbox, server) = upload_server_for_cluster("deleted-bucket", nats.url()).await?;
+
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/deleted-1/attachments",
+            b"before deletion png bytes",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        let jetstream = async_nats::jetstream::new(async_nats::connect(nats.url()).await?);
+        jetstream
+            .delete_stream(harnx_blob_store::media::attachments_stream_name())
+            .await
+            .expect("delete the object-store stream");
+
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/deleted-2/attachments",
+            b"after deletion png bytes",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert_no_upload_refs(&json);
+        assert_eq!(
+            json["error"], "failed to store attachment in the object store",
+            "{json}"
+        );
+
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/deleted-3/attachments",
+            b"recovered png bytes",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        assert_eq!(server.upload_storage_counts("deleted-bucket").await, (1, 2));
+        jetstream
+            .get_stream(harnx_blob_store::media::attachments_stream_name())
+            .await
+            .expect("the next upload re-created the object-store stream");
+        Ok(())
+    }
+
+    /// A cluster that was unreachable when the first upload ran is connected
+    /// and ensured by the first later upload that finds it up.
+    #[tokio::test]
+    async fn upload_attachments_initial_connect_failure_recovers_on_next_upload() -> Result<()> {
+        harnx_core::require_nextest();
+        // Reserve a port now so the cluster can point at a fixed address the
+        // test controls: no broker there for the first upload.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let (_sandbox, server) =
+            upload_server_for_cluster("late", &format!("nats://127.0.0.1:{port}")).await?;
+
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/late-1/attachments",
+            b"too early png bytes",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_no_upload_refs(&json);
+        assert_eq!(server.upload_storage_counts("late").await, (0, 0));
+
+        let Some(_nats) = harnx_test_bins::spawn_nats_server_on_port(port).await? else {
+            return Ok(());
+        };
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/late-2/attachments",
+            b"on time png bytes",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(server.upload_storage_counts("late").await, (1, 1));
+        Ok(())
+    }
+
+    /// Once the recheck interval has passed, the next upload re-ensures the
+    /// bucket on the kept connection. This is the mechanism that keeps a
+    /// failed best-effort replica raise from being sticky forever.
+    #[tokio::test]
+    async fn upload_attachments_bucket_recheck_re_ensures_on_the_kept_connection() -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let (_sandbox, mut server) = upload_server_for_cluster("recheck", nats.url()).await?;
+        Arc::get_mut(&mut server)
+            .expect("server not shared yet")
+            .set_upload_bucket_recheck_interval(Duration::ZERO);
+
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/recheck-1/attachments",
+            b"first recheck png bytes",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/recheck-2/attachments",
+            b"second recheck png bytes",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        // One connection across both uploads; the expired memo forced the
+        // second ensure.
+        assert_eq!(server.upload_storage_counts("recheck").await, (1, 2));
+        Ok(())
+    }
+
+    async fn upload_server_for_cluster_yaml(
+        cluster: &str,
+        nats_yaml: &str,
+    ) -> Result<(TestConfigSandbox, Arc<Server>)> {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        sandbox.write_nats_server(cluster, nats_yaml);
+        let mut config = sandbox.config();
+        config.nats_routing = harnx_runtime::config::NatsRouting::Cluster(cluster.to_string());
+        let server = Arc::new(Server::new(
+            &Arc::new(ConfigLock::new(config)),
+            std::path::PathBuf::from("web-assets"),
+        ));
+        Ok((sandbox, server))
+    }
+
+    /// An upload server with access rules on: the guard and the route's
+    /// session-incarnation proof both run for its uploads.
+    async fn upload_server_with_access_rules(
+        cluster: &str,
+        url: &str,
+    ) -> Result<(TestConfigSandbox, Arc<Server>)> {
+        upload_server_with_access_rules_for(cluster, url, "alice").await
+    }
+
+    /// Same as [`Self::upload_server_with_access_rules`], with a custom
+    /// rule users list: `users: [<users>]` joined by commas.
+    async fn upload_server_with_access_rules_for(
+        cluster: &str,
+        url: &str,
+        users: &str,
+    ) -> Result<(TestConfigSandbox, Arc<Server>)> {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        sandbox.write_nats_server(cluster, &format!("url: {url}\n"));
+        let mut config = sandbox.config();
+        config.nats_routing = harnx_runtime::config::NatsRouting::Cluster(cluster.to_string());
+        config.serve_user_id_sources = vec!["x-user".to_string()];
+        let rules = std::sync::Arc::new(
+            harnx_core::access_rules::AccessRules::from_yaml(&format!(
+                "rules:\n  - agents: ['*']\n    users: [{users}]\n"
+            ))
+            .context("parse test access rules")?,
+        );
+        let server = Arc::new(
+            Server::new_with_access_rules(
+                &Arc::new(ConfigLock::new(config)),
+                std::path::PathBuf::from("web-assets"),
+                Some(rules),
+            )
+            .context("build rules-on upload server")?,
+        );
+        Ok((sandbox, server))
+    }
+
+    /// One PNG upload through a rules-on server, by session id.
+    async fn rules_on_png_upload(
+        server: &std::sync::Arc<Server>,
+        session_id: &str,
+    ) -> Result<(StatusCode, Value)> {
+        rules_on_png_upload_as(server, session_id, "alice").await
+    }
+
+    /// One PNG upload through the upload route with a rules-on server, as
+    /// one caller (the `x-user` identity source). The route's proof
+    /// authorizes the caller against the record it pins, exactly as the
+    /// guard does, so this exercises the guard-equivalent check without
+    /// having to run the guard first.
+    async fn rules_on_png_upload_as(
+        server: &std::sync::Arc<Server>,
+        session_id: &str,
+        user: &str,
+    ) -> Result<(StatusCode, Value)> {
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &png_magic_bytes());
+        // Direct route calls skip `prepare_request`, but the proof reads the
+        // caller from the request identity extension, so stamp it exactly
+        // as the preflight does for the `x-user` identity source.
+        let identity = crate::request_identity::RequestIdentity {
+            user_id: Some(user.to_string()),
+            groups: Vec::new(),
+            roles: Vec::new(),
+            expanded_users: None,
+        };
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/v1/agents/plain/sessions/{session_id}/attachments"
+            ))
+            .header("Content-Type", multipart_content_type(boundary))
+            .header("x-user", user)
+            .extension(identity)
+            .body(Full::new(Bytes::from(body)).boxed())?;
+        let response = server.upload_session_attachments(request).await?;
+        let status = response.status();
+        let json = upload_response_json(response).await?;
+        Ok((status, json))
+    }
+
+    /// One PNG upload over real HTTP, through the guard and dispatch, as
+    /// production serves it. `user` is the `x-user` identity; `None` sends
+    /// no identity header.
+    async fn rules_on_upload_via_http(
+        server: &std::sync::Arc<Server>,
+        session_id: &str,
+        user: Option<&str>,
+    ) -> Result<(u16, Value)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let handle = server
+            .clone()
+            .run(listener, crate::DEFAULT_DRAIN_TIMEOUT)
+            .await?;
+        let (boundary, body) = single_part_upload_body("test.png", "image/png", &png_magic_bytes());
+        let mut request = reqwest::Client::builder()
+            .no_proxy()
+            .build()?
+            .post(format!(
+                "http://{address}/v1/agents/plain/sessions/{session_id}/attachments"
+            ))
+            .header("Content-Type", multipart_content_type(boundary));
+        if let Some(user) = user {
+            request = request.header("x-user", user);
+        }
+        let response = request.body(body).send().await?;
+        let status = response.status().as_u16();
+        let json = response.json().await?;
+        handle.shutdown().await?;
+        Ok((status, json))
+    }
+
+    /// A failed bucket ensure on a connected broker keeps its per-upload
+    /// retry (D2): the deferral only applies to a down connection.
+    /// `replicas: 2` against a single-node broker makes the ensure fail
+    /// deterministically while the connection stays up.
+    #[tokio::test]
+    async fn upload_attachments_connected_ensure_failures_retry_per_upload() -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let (_sandbox, server) = upload_server_for_cluster_yaml(
+            "ensurefail",
+            &format!("url: {}\nreplicas: 2\n", nats.url()),
+        )
+        .await?;
+
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/ensurefail-1/attachments",
+            &png_magic_bytes(),
+        )
+        .await?;
+        assert!(status.is_server_error(), "first upload fails: {json}");
+        assert_no_upload_refs(&json);
+        assert_eq!(server.upload_storage_counts("ensurefail").await, (1, 1));
+
+        // A live connection is never deferred: the store-level failure
+        // fails fast, so each upload retries the ensure.
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/ensurefail-2/attachments",
+            &png_magic_bytes(),
+        )
+        .await?;
+        assert!(status.is_server_error(), "second upload fails: {json}");
+        assert_no_upload_refs(&json);
+        assert_eq!(
+            server.upload_storage_counts("ensurefail").await,
+            (1, 2),
+            "a connected broker keeps the per-upload ensure retry"
+        );
+        Ok(())
+    }
+
+    /// A failed bucket ensure defers its retry only while the connection is
+    /// down (D2): during an outage no upload re-ensures under the
+    /// single-flight lock (C7), and once the broker is back the next upload
+    /// retries immediately — no recheck interval can hold recovery back.
+    #[tokio::test]
+    async fn upload_attachments_ensure_failure_defers_during_outage_and_recovers() -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(mut nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let (_sandbox, server) = upload_server_for_cluster("ensureout", nats.url()).await?;
+
+        // Warm the cache: the first upload connects and ensures.
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/ensureout-1/attachments",
+            &png_magic_bytes(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(server.upload_storage_counts("ensureout").await, (1, 1));
+
+        // Delete the object-store stream: the next upload's put fails, and
+        // the missing-stream probe resets the bucket memo — the memo-unset
+        // state the down-connection deferral governs.
+        let port = nats
+            .url()
+            .rsplit(':')
+            .next()
+            .context("parse broker port")?
+            .parse::<u16>()
+            .context("parse broker port")?;
+        let jetstream = async_nats::jetstream::new(async_nats::connect(nats.url()).await?);
+        jetstream
+            .delete_stream(harnx_blob_store::media::attachments_stream_name())
+            .await?;
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/ensureout-2/attachments",
+            &png_magic_bytes(),
+        )
+        .await?;
+        assert!(
+            status.is_server_error(),
+            "the deleted stream fails the put: {json}"
+        );
+        assert_eq!(
+            server.upload_storage_counts("ensureout").await,
+            (1, 1),
+            "the failed put resets the memo without a new ensure"
+        );
+
+        // Outage: the broker dies. While the connection is down, uploads
+        // defer the ensure retry instead of stampeding the single-flight
+        // lock with attempts that can only queue until the request timeout
+        // (C7) — both fail instantly, without a new ensure attempt.
+        nats.kill().expect("kill broker");
+        nats.wait().expect("reap broker");
+        // The cached connection notices the dead broker asynchronously;
+        // poll it (bounded) so the deferral check below is deterministic
+        // instead of racing a blind settle delay.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while server.upload_connection_state("ensureout").await
+            == Some(async_nats::connection::State::Connected)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cached connection must notice the dead broker"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for session in ["ensureout-3", "ensureout-4"] {
+            let (status, json) = post_upload(
+                Arc::clone(&server),
+                &format!("/v1/agents/plain/sessions/{session}/attachments"),
+                &png_magic_bytes(),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+            assert_no_upload_refs(&json);
+            assert_eq!(
+                server.upload_storage_counts("ensureout").await,
+                (1, 1),
+                "a down connection must defer the ensure retry, not attempt it"
+            );
+        }
+
+        // Recovery: the broker returns on the same port. The next upload
+        // must succeed as soon as the connection is back — the 10-minute
+        // success-side recheck interval never governs the retry. Poll with a
+        // hard deadline so a broken recovery fails instead of hanging.
+        let Some(_revived) = harnx_test_bins::spawn_nats_server_on_port(port).await? else {
+            return Ok(());
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut recovered = None;
+        while std::time::Instant::now() < deadline {
+            let (status, json) = post_upload(
+                Arc::clone(&server),
+                "/v1/agents/plain/sessions/ensureout-5/attachments",
+                &png_magic_bytes(),
+            )
+            .await?;
+            if status == StatusCode::OK {
+                recovered = Some(json);
+                break;
+            }
+            assert!(
+                status.is_server_error(),
+                "interim failure must be 5xx: {json}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let json = recovered.context("the upload must recover once the broker returns")?;
+        assert!(
+            json.get("attachment_refs").is_some(),
+            "the recovered upload returns refs: {json}"
+        );
+        assert_eq!(
+            server.upload_storage_counts("ensureout").await,
+            (1, 2),
+            "the recovery re-ensured the bucket exactly once"
+        );
+        Ok(())
+    }
+
+    /// The session-metadata reads on the upload path never provision the
+    /// metadata bucket (D7's read-only invariant): a never-created session
+    /// still uploads, and the bucket is still absent afterwards.
+    #[tokio::test]
+    async fn upload_attachments_never_provisions_the_metadata_bucket() -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let (_sandbox, server) = upload_server_for_cluster("noprov", nats.url()).await?;
+
+        let (status, json) = post_upload(
+            Arc::clone(&server),
+            "/v1/agents/plain/sessions/noprov-1/attachments",
+            &png_magic_bytes(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "D7 session uploads: {json}");
+
+        let jetstream = async_nats::jetstream::new(async_nats::connect(nats.url()).await?);
+        let error = jetstream
+            .get_key_value(harnx_runtime::nats_session_metadata::SESSION_METADATA_BUCKET)
+            .await
+            .err()
+            .context("the metadata bucket must not exist after an upload")?;
+        assert!(
+            harnx_runtime::nats_admin::kv_bucket_missing(&error),
+            "the read-only capture must not create the bucket: {error:#}"
+        );
+        Ok(())
+    }
+
+    /// The connection-state classification of a failed bucket ensure,
+    /// without a broker: every non-connected state is unavailability.
+    #[test]
+    fn upload_ensure_failure_classifies_by_connection_state() {
+        use async_nats::connection::State;
+        for state in [State::Pending, State::Disconnected] {
+            let name = format!("{state:?}");
+            let classified = Server::classify_upload_ensure_failure(
+                state,
+                "cluster",
+                anyhow::anyhow!("create the attachments bucket"),
+            );
+            assert!(
+                crate::nats_access::is_nats_unavailable(&classified),
+                "{name} must classify as unavailability"
+            );
+        }
+        // A live connection keeps the store-level failure for the wrapper
+        // kinds to classify: 500 when the broker answered.
+        let connected = Server::classify_upload_ensure_failure(
+            State::Connected,
+            "cluster",
+            anyhow::anyhow!("create the attachments bucket"),
+        );
+        assert!(
+            !crate::nats_access::is_nats_unavailable(&connected),
+            "a connected broker's failure stays a store failure"
+        );
+        assert_eq!(
+            connected.to_string(),
+            "create the attachments bucket",
+            "the original chain is preserved for a connected broker"
+        );
+    }
+
+    /// Isolated broker + rules-on upload server: the preamble the M2 rules-on
+    /// tests share. `None` skips the test the same way `spawn_nats_server`
+    /// does when the broker binary is unavailable. The sandbox stays alive:
+    /// the cluster's NATS yaml is read at request time, not at startup.
+    async fn m2_rules_on_fixture(
+        cluster: &str,
+    ) -> Result<
+        Option<(
+            harnx_test_bins::NatsServerHandle,
+            TestConfigSandbox,
+            std::sync::Arc<Server>,
+        )>,
+    > {
+        m2_rules_on_fixture_for(cluster, "alice").await
+    }
+
+    /// As [`m2_rules_on_fixture`], with a custom rule users list, so a
+    /// test can admit several callers and separate them by session
+    /// ownership rather than agent visibility.
+    async fn m2_rules_on_fixture_for(
+        cluster: &str,
+        users: &str,
+    ) -> Result<
+        Option<(
+            harnx_test_bins::NatsServerHandle,
+            TestConfigSandbox,
+            std::sync::Arc<Server>,
+        )>,
+    > {
+        harnx_core::require_nextest();
+        let Some(nats) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(None);
+        };
+        let (sandbox, server) =
+            upload_server_with_access_rules_for(cluster, nats.url(), users).await?;
+        Ok(Some((nats, sandbox, server)))
+    }
+
+    /// A record whose properties do not decode cannot prove anyone's
+    /// authorization: the proof answers None (404), never a 500, and the
+    /// decode failure is logged.
+    #[test]
+    fn proof_from_record_fails_closed_on_undecodable_properties() -> Result<()> {
+        let rules = harnx_core::access_rules::AccessRules::from_yaml(
+            "rules:\n  - agents: ['*']\n    users: [alice]\n",
+        )
+        .context("parse test access rules")?;
+        let mut record = harnx_runtime::nats_session_metadata::MetadataRecord {
+            metadata: harnx_runtime::nats_session_metadata::SessionMetadata::new(
+                "undecodable1",
+                harnx_runtime::nats_session_metadata::SessionInitializer::named(
+                    "plain",
+                    Default::default(),
+                ),
+            ),
+            revision: 1,
+        };
+        // Properties that cannot deserialize: the namespace extension holds
+        // a plain string.
+        record.metadata.extensions.insert(
+            harnx_runtime::nats_session_metadata::SESSION_PROPERTIES_NAMESPACE.to_string(),
+            Value::String("not session properties".to_string()),
+        );
+        let caller = harnx_core::access_rules::CallerView::from_users(&["alice"]);
+        assert!(
+            Server::proof_from_record(&rules, "plain", caller, &record).is_none(),
+            "an undecodable record denies rather than 500ing"
+        );
+        Ok(())
+    }
+
+    /// With access rules on, a session that was deleted after the guard
+    /// proved it and before the first part is a 404, not a D7-style 200:
+    /// the route's incarnation proof turns absence into "gone" (M2), and
+    /// nothing is stored.
+    /// Direct route call, no guard: the route's own incarnation proof must
+    /// answer 404 for a session whose record is already gone. (Through
+    /// dispatch the guard answers that case itself — see the dispatch guard
+    /// test, which deletes the record before the request. A deletion
+    /// between the guard's authorization and this proof has no
+    /// deterministic seam; this test pins the route's own absence check.)
+    #[tokio::test]
+    async fn upload_route_proof_404s_deleted_session_direct_handler() -> Result<()> {
+        let Some((nats, _sandbox, server)) = m2_rules_on_fixture("m2gone").await? else {
+            return Ok(());
+        };
+        f6_create_session_metadata_as(nats.url(), "m2gone1", Some("alice")).await?;
+        f6_delete_session_metadata(nats.url(), "m2gone1").await?;
+
+        let (status, json) = rules_on_png_upload(&server, "m2gone1").await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("session no longer exists"),
+            "{json}"
+        );
+        assert_no_upload_refs(&json);
+
+        // Nothing was stored: the 404 fires before the first part.
+        let data = png_magic_bytes();
+        let url = f6_media_url("m2gone1", &data)?;
+        let bucket = f6_attachments_bucket(nats.url()).await?;
+        let info = harnx_blob_store::media::leader_media_info(&bucket, &url.kv_key()).await?;
+        assert!(info.is_none(), "no object version for the deleted session");
+        Ok(())
+    }
+
+    /// The rules-on incarnation proof must not break the live-session
+    /// happy path: a session that still exists uploads normally.
+    #[tokio::test]
+    async fn upload_attachments_live_session_succeeds_with_access_rules_on() -> Result<()> {
+        let Some((nats, _sandbox, server)) = m2_rules_on_fixture("m2live").await? else {
+            return Ok(());
+        };
+        f6_create_session_metadata_as(nats.url(), "m2live1", Some("alice")).await?;
+
+        let (status, json) = rules_on_png_upload(&server, "m2live1").await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let refs = json
+            .get("attachment_refs")
+            .and_then(Value::as_array)
+            .context("successful upload must return refs")?;
+        assert_eq!(refs.len(), 1, "{json}");
+        Ok(())
+    }
+
+    /// A session replaced between the guard's authorization and the route's
+    /// proof must not be uploadable by the caller the guard approved: the
+    /// proof pins the incarnation only of a record the caller can still
+    /// access (the guard's own policy), so a replacement owned by another
+    /// user answers 404 before anything is stored. The replacement's own
+    /// owner still uploads normally.
+    /// Direct route call, no guard: the proof's own authorization check
+    /// must reject a record the guard never saw. Through dispatch the guard
+    /// rejects this caller first (see the dispatch guard test); this pins
+    /// the route's defense independently.
+    #[tokio::test]
+    async fn upload_route_proof_404s_replacement_other_owner_direct_handler() -> Result<()> {
+        // Both alice and bob appear in the rules: the swap's whole point is
+        // that bob is a legitimate caller for the replacement record.
+        let Some((nats, _sandbox, server)) =
+            m2_rules_on_fixture_for("m2swap", "alice, bob").await?
+        else {
+            return Ok(());
+        };
+        f6_create_session_metadata_as(nats.url(), "m2swap1", Some("alice")).await?;
+        f6_delete_session_metadata(nats.url(), "m2swap1").await?;
+        // Recreated under the same id with a different owner.
+        f6_create_session_metadata_as(nats.url(), "m2swap1", Some("bob")).await?;
+
+        let (status, json) = rules_on_png_upload_as(&server, "m2swap1", "alice").await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("session no longer exists"),
+            "{json}"
+        );
+        assert_no_upload_refs(&json);
+        let data = png_magic_bytes();
+        let url = f6_media_url("m2swap1", &data)?;
+        let bucket = f6_attachments_bucket(nats.url()).await?;
+        let info = harnx_blob_store::media::leader_media_info(&bucket, &url.kv_key()).await?;
+        assert!(
+            info.is_none(),
+            "nothing is stored for a session the caller cannot access"
+        );
+
+        // The replacement's own owner uploads to it as usual.
+        let (status, json) = rules_on_png_upload_as(&server, "m2swap1", "bob").await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(
+            json.get("attachment_refs").is_some(),
+            "the authorized owner's upload returns refs: {json}"
+        );
+        Ok(())
+    }
+
+    /// Through the real HTTP path the guard runs before the upload route:
+    /// the session's owner uploads successfully, a caller who can see the
+    /// agent but does not own the session is denied by the guard's
+    /// session-ownership check, and so is an anonymous caller.
+    #[tokio::test]
+    async fn upload_attachments_dispatch_guard_authorizes_owner_and_denies_others() -> Result<()> {
+        // Both alice and bob are in the rules, so both pass the guard's
+        // agent-visibility check; ownership is what separates them below.
+        let Some((nats, _sandbox, server)) =
+            m2_rules_on_fixture_for("m2guard", "alice, bob").await?
+        else {
+            return Ok(());
+        };
+        f6_create_session_metadata_as(nats.url(), "m2guard1", Some("alice")).await?;
+
+        let (status, json) = rules_on_upload_via_http(&server, "m2guard1", Some("alice")).await?;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{json}");
+        assert!(
+            json.get("attachment_refs").is_some(),
+            "the owner's guarded upload returns refs: {json}"
+        );
+
+        // Bob passes agent visibility (his own session below uploads fine),
+        // so the 404 on alice's session comes from the guard's
+        // session-ownership check, not agent invisibility.
+        f6_create_session_metadata_as(nats.url(), "m2guard2", Some("bob")).await?;
+        let (status, json) = rules_on_upload_via_http(&server, "m2guard2", Some("bob")).await?;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{json}");
+        assert!(
+            json.get("attachment_refs").is_some(),
+            "bob's own session proves he sees the agent: {json}"
+        );
+
+        let (status, json) = rules_on_upload_via_http(&server, "m2guard1", Some("bob")).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND.as_u16(), "{json}");
+        assert_no_upload_refs(&json);
+        assert_eq!(
+            json.get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str),
+            Some("Not Found"),
+            "the guard's own denial answers, not the route's proof fallback: {json}"
+        );
+
+        // An anonymous request never reaches the guard: with rules on, the
+        // preflight identity gate rejects protected routes outright (401).
+        let (status, json) = rules_on_upload_via_http(&server, "m2guard1", None).await?;
+        assert_eq!(status, StatusCode::UNAUTHORIZED.as_u16(), "{json}");
+        assert_no_upload_refs(&json);
+
+        // A session deleted before the request is the guard's own 404: the
+        // owner never reaches the route's proof. The stored object from the
+        // first upload stays — its content-addressed key is not this
+        // request's to purge — so only the response is asserted here.
+        f6_delete_session_metadata(nats.url(), "m2guard1").await?;
+        let (status, json) = rules_on_upload_via_http(&server, "m2guard1", Some("alice")).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND.as_u16(), "{json}");
+        assert_no_upload_refs(&json);
+        Ok(())
+    }
+
+    /// The guard's broker-unavailability failures surface as 503, not the
+    /// generic 400: with rules on, a rules-authorized upload to an
+    /// unreachable cluster fails the guard's metadata open before the
+    /// upload route's own classification runs.
+    #[tokio::test]
+    async fn upload_attachments_guard_unreachable_cluster_is_503() -> Result<()> {
+        harnx_core::require_nextest();
+        let (_sandbox, server) =
+            upload_server_with_access_rules("downguard", "nats://127.0.0.1:1").await?;
+
+        let (status, json) = rules_on_upload_via_http(&server, "downguard1", Some("alice")).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE.as_u16(), "{json}");
+        assert_no_upload_refs(&json);
+        Ok(())
     }
 
     // ===== Web-ui static asset serving tests (#1006) =====
@@ -4000,6 +6284,38 @@ mod tests {
         Server::new(&config, assets_dir)
     }
 
+    #[tokio::test]
+    async fn html_pages_escape_request_derived_agent_and_session_values() {
+        let server = asset_server(PathBuf::from("web-assets"));
+        let markup = "<img src=x onerror=alert(1)>";
+
+        let session = server
+            .session_html_page("plain", markup)
+            .expect("render session page");
+        assert_eq!(
+            asset_body(session).await,
+            b"<h1>session: &lt;img src=x onerror=alert(1)&gt;</h1>"
+        );
+
+        let agent = server.agent_html_page(markup).expect("render agent page");
+        assert_eq!(
+            asset_body(agent).await,
+            b"<h1>agent: &lt;img src=x onerror=alert(1)&gt;</h1>"
+        );
+
+        // Review D5: the C2 regression guard covers all five
+        // HTML-significant characters, not only the angle brackets.
+        let quotes = "&\"'";
+        let session = server
+            .session_html_page("plain", quotes)
+            .expect("render session page");
+        assert_eq!(
+            asset_body(session).await,
+            b"<h1>session: &amp;&quot;&#39;</h1>"
+        );
+        let agent = server.agent_html_page(quotes).expect("render agent page");
+        assert_eq!(asset_body(agent).await, b"<h1>agent: &amp;&quot;&#39;</h1>");
+    }
     async fn asset_body(response: AppResponse) -> Vec<u8> {
         response
             .into_body()

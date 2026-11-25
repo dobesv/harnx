@@ -161,19 +161,46 @@ async fn round_may_request_input(
     agent_name: &str,
     calls: &[ToolCall],
 ) -> bool {
-    if calls.is_empty() || !crate::tool_context::has_broker_address() {
-        return false;
-    }
-    let package = harnx_core::package_namespace::pkg_from_qualified(agent_name).map(str::to_string);
-    let config = config.read().clone();
-    let Some(provider) =
-        discover_nats_tool_provider_cached(&config, instance_id, package.as_deref()).await
-    else {
+    let Some(provider) = round_nats_provider(config, instance_id, agent_name, calls).await else {
         return false;
     };
     calls
         .iter()
         .any(|call| provider.may_request_input(&call.name))
+}
+
+/// The round's cached NATS provider when the round may consult one. A round
+/// with no calls has nothing to look up, and a process without a broker
+/// address must not start one just to check for input-capable tools.
+// Type-erased box, not a plain `Box::pin`: auto-trait evaluation still
+// descends through `Pin<Box<impl Future>>`, and discovery reaches the deep
+// async-nats connect chain, so a concrete box here overflows dependent
+// crates' trait-solver recursion budget. Erasing the future type cuts the
+// chain.
+fn round_nats_provider<'a>(
+    config: &'a GlobalConfig,
+    instance_id: &'a harnx_core::instance::ServerScope,
+    agent_name: &'a str,
+    calls: &'a [ToolCall],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<NatsToolProvider>>> + Send + 'a>>
+{
+    Box::pin(async move {
+        match round_can_consult_nats_tools(calls, crate::tool_context::has_broker_address()) {
+            true => {
+                let package = harnx_core::package_namespace::pkg_from_qualified(agent_name)
+                    .map(str::to_string);
+                let config = config.read().clone();
+                discover_nats_tool_provider_cached(&config, instance_id, package.as_deref()).await
+            }
+            false => None,
+        }
+    })
+}
+
+/// A round with no calls has nothing to look up, and a process without a
+/// broker address must not start one just to check for input-capable tools.
+fn round_can_consult_nats_tools(calls: &[ToolCall], has_broker: bool) -> bool {
+    !calls.is_empty() && has_broker
 }
 
 async fn screen_round_with_saved_denials(
@@ -219,6 +246,7 @@ async fn build_round_eval_context(
         pending_async_context: params.pending_async_context.clone(),
         bash_context_slot: Some(slot.clone()),
         command_bash: None,
+        extra_base_providers: Vec::new(),
     })
     .await;
     ctx.tool_round = tool_round;
@@ -474,19 +502,24 @@ async fn resolve_nats_provider(
     active_package: Option<&str>,
     injected: Option<Arc<NatsToolProvider>>,
 ) -> Option<Arc<NatsToolProvider>> {
-    if injected.is_some() {
-        return injected;
+    match should_discover_nats_provider(
+        injected.is_some(),
+        crate::tool_context::has_broker_address(),
+    ) {
+        true => discover_nats_tool_provider_cached(config, instance_id, active_package).await,
+        false => injected,
     }
-    // In-process tests without a broker must not start the developer's broker.
-    if !crate::tool_context::has_broker_address() {
-        return None;
-    }
-    discover_nats_tool_provider_cached(config, instance_id, active_package).await
+}
+
+/// In-process tests without a broker must not start the developer's broker,
+/// and an explicitly injected provider wins over discovery.
+fn should_discover_nats_provider(injected: bool, has_broker: bool) -> bool {
+    !injected && has_broker
 }
 
 /// Build tool providers, middleware, and rendering state for one tool round.
 pub async fn build_tool_eval_context(params: BuildToolEvalContextParams<'_>) -> ToolEvalContext {
-    build_tool_eval_context_inner(params, None).await
+    Box::pin(build_tool_eval_context_inner(params, None)).await
 }
 
 /// Build against an admitted discovery snapshot, without consulting the cache.
@@ -494,25 +527,37 @@ pub async fn build_tool_eval_context_with_provider(
     params: BuildToolEvalContextParams<'_>,
     provider: Arc<crate::nats_tool_provider::NatsToolProvider>,
 ) -> ToolEvalContext {
-    build_tool_eval_context_inner(params, Some(provider)).await
+    Box::pin(build_tool_eval_context_inner(params, Some(provider))).await
 }
 
 async fn build_tool_eval_context_inner(
     params: BuildToolEvalContextParams<'_>,
     provider: Option<Arc<NatsToolProvider>>,
 ) -> ToolEvalContext {
-    let snapshot = snapshot_tool_round(
-        params.config,
-        params.agent_use_tools,
-        params.current_agent_package.as_deref(),
-    );
+    // N1: without a round context slot, script tool bodies could never run, so
+    // don't advertise them to contexts without one (lifecycle hooks, operator
+    // `.call`, non-Bash reservation calls, orphan repair). Operator and reserved
+    // Bash contexts install a slot.
+    let script_tools_enabled = params.bash_context_slot.is_some();
+    // 4659980786: resolve the round's NATS provider before snapshotting, so
+    // the accepted view can exclude every name the provider actually serves;
+    // resolving after the snapshot would leave the view blind to tools only
+    // the provider knows about.
+    let config = params.config.read().clone();
     let provider = resolve_nats_provider(
-        &snapshot.config,
+        &config,
         params.instance_id,
         params.current_agent_package.as_deref(),
         provider,
     )
     .await;
+    let snapshot = snapshot_tool_round(
+        &config,
+        provider.as_deref(),
+        params.agent_use_tools,
+        params.current_agent_package.as_deref(),
+        script_tools_enabled,
+    );
     assemble_tool_eval_context(params, snapshot, provider)
 }
 
@@ -523,13 +568,13 @@ fn assemble_tool_eval_context(
 ) -> ToolEvalContext {
     let decl_map = Arc::new(build_context_decl_map(
         snapshot.declarations,
-        provider.as_deref(),
-        params.agent_use_tools,
+        &snapshot.provider_declarations,
         params.command_bash.as_ref(),
     ));
     let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn, emit_tool_update_fn) =
         build_emit_fns(&decl_map);
     let mut ctx = ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,
@@ -540,12 +585,15 @@ fn assemble_tool_eval_context(
             decl_map: Arc::clone(&decl_map),
         }),
         allowed_tool_names: decl_map.keys().cloned().collect(),
-        providers: build_tool_providers(
-            params.config,
-            provider,
-            params.bash_context_slot,
-            params.command_bash,
-        ),
+        providers: build_tool_providers(BuildToolProvidersParams {
+            config: params.config,
+            nats_provider: provider,
+            bash_context_slot: params.bash_context_slot,
+            command_bash: params.command_bash,
+            extra_base_providers: params.extra_base_providers,
+            script_tools: snapshot.script_tools,
+            nats_declarations: snapshot.nats_declarations,
+        }),
         current_agent_package: params.current_agent_package,
         handoff_targets: snapshot.handoff_targets,
         emit_tool_call_fn,
@@ -564,32 +612,107 @@ struct ToolRoundSnapshot {
     handoff_targets: HashMap<String, String>,
     confirmation: Arc<ConfirmToolUseFn>,
     config: Config,
+    /// The round's accepted script-tool view (decision 12): computed once from
+    /// the same captured base-declaration set as the declarations and threaded
+    /// to the script provider and the bash inner catalog, so dispatch serves
+    /// exactly what the round advertised even if discovery refreshes in
+    /// between. Empty when the round has no script evaluation slot.
+    script_tools: Vec<Arc<crate::config::script_tools::ResolvedScriptTool>>,
+    /// The round provider's declarations for the agent's `use_tools`, merged
+    /// into the advertised declaration map after the config declarations.
+    /// Captured once with the view, so the map and the dispatch cannot
+    /// disagree across a discovery refresh.
+    provider_declarations: Vec<ToolDeclaration>,
+    /// The config's NATS declarations at round start, the same capture the
+    /// accepted view and the declarations were built from. The bash inner
+    /// catalog derives from it too.
+    nats_declarations: Vec<ToolDeclaration>,
 }
 
+/// Snapshot one tool round. `script_tools_enabled` is false for contexts
+/// without a round context slot; those rounds carry no script tools at all —
+/// neither declarations nor a dispatchable provider view.
 fn snapshot_tool_round(
-    config: &GlobalConfig,
+    config: &Config,
+    provider: Option<&NatsToolProvider>,
     selectors: Option<&str>,
     package: Option<&str>,
+    script_tools_enabled: bool,
 ) -> ToolRoundSnapshot {
-    let guard = config.read();
-    let (declarations, handoff_targets) = guard.tool_declarations_for_use_tools(selectors, package);
+    // One captured set of base declarations for the whole round (decision 12,
+    // 4659980770/4659980786): the accepted script-tool view, the advertised
+    // declarations, the declaration map, and the bash inner catalog all
+    // derive from `nats_declarations` plus the resolved provider's
+    // declarations, so a discovery refresh between two reads cannot make the
+    // round advertise one tool and dispatch another under the same name.
+    // The view is additionally filtered by the provider's `has_tool`, which
+    // covers names the declarations cannot carry: raw aliases and names the
+    // agent's `use_tools` does not select are served but never declared, and
+    // the script provider precedes the NATS provider in dispatch order.
+    let nats_declarations = config.nats_tool_declarations_snapshot();
+    let provider_declarations = match provider {
+        Some(provider) => provider.declarations_for_use_tools(selectors),
+        None => Vec::new(),
+    };
+    let script_tools = if script_tools_enabled {
+        let base_names = config.base_tool_names_with(&nats_declarations, &provider_declarations);
+        exclude_provider_served(config.accepted_script_tools_against(&base_names), provider)
+    } else {
+        Vec::new()
+    };
+    let (declarations, handoff_targets) = config.tool_declarations_for_use_tools_with_script_tools(
+        selectors,
+        package,
+        &nats_declarations,
+        &script_tools,
+    );
     ToolRoundSnapshot {
         declarations,
         handoff_targets,
-        confirmation: build_confirm_tool_use_fn(&guard),
-        config: guard.clone(),
+        confirmation: build_confirm_tool_use_fn(config),
+        config: config.clone(),
+        script_tools,
+        provider_declarations,
+        nats_declarations,
     }
+}
+
+/// The accepted view minus every script tool whose name the round's
+/// resolved provider *serves* (`has_tool`). The provider's declarations —
+/// the names the config-level exclusion sees — are `use_tools`-filtered
+/// and never contain raw aliases, but dispatch routes both, and the script
+/// provider precedes the NATS provider in the round's provider order: a
+/// script tool with either kind of name would shadow a live tool. Same
+/// single snapshot: `provider` is the round's resolved provider, captured
+/// with the declarations above.
+fn exclude_provider_served(
+    view: Vec<Arc<crate::config::script_tools::ResolvedScriptTool>>,
+    provider: Option<&NatsToolProvider>,
+) -> Vec<Arc<crate::config::script_tools::ResolvedScriptTool>> {
+    let Some(provider) = provider else {
+        return view;
+    };
+    view.into_iter()
+        .filter(|tool| {
+            let name = tool.definition().name.as_str();
+            if provider.has_tool(name) {
+                crate::config::script_tools::warn_collision(tool);
+                return false;
+            }
+            true
+        })
+        .collect()
 }
 
 fn build_context_decl_map(
     mut declarations: Vec<ToolDeclaration>,
-    provider: Option<&NatsToolProvider>,
-    agent_use_tools: Option<&str>,
+    provider_declarations: &[ToolDeclaration],
     command_bash: Option<&crate::bash_provider::CommandBashInputs>,
 ) -> HashMap<String, ToolDeclaration> {
-    if let Some(provider) = provider {
-        declarations.extend(provider.declarations_for_use_tools(agent_use_tools));
-    }
+    // Provider declarations follow the config declarations, so a base tool
+    // named like a script tool wins the map — consistent with the accepted
+    // view, which excludes any script tool the provider serves.
+    declarations.extend(provider_declarations.iter().cloned());
     if let Some(inputs) = command_bash {
         // The synthetic outer `bash` wins against raw aliases, matching dispatch order.
         declarations.push(inputs.bash_declaration());
@@ -615,32 +738,156 @@ fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
 /// Assemble normal providers, with an optional command-scoped Bash catalog.
 /// An override keeps Bash active even for pure shell and limits the inner
 /// catalog to that command. Base providers never contain Bash, preventing recursion.
-fn build_tool_providers(
-    config: &GlobalConfig,
+///
+/// Script tools wrap the base providers and sit between `bash` and them
+/// (decision 1), giving the call graph `bash -> script tool -> base` with no
+/// reverse edges: the script provider's inner executor only ever holds base
+/// providers, and the bash provider's inner set additionally contains the
+/// script provider.
+/// The base stack and the round's script-tool provider are assembled by the
+/// helpers below; this function only decides the provider order.
+/// Inputs for [`build_tool_providers`], one field per source of providers so
+/// the assembler stays a pure function of its inputs. `nats_declarations`
+/// and `script_tools` come from the round snapshot: the bash inner catalog
+/// derives from the same captured sets as the round's advertisements.
+struct BuildToolProvidersParams<'a> {
+    config: &'a GlobalConfig,
     nats_provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
     bash_context_slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
     command_bash: Option<crate::bash_provider::CommandBashInputs>,
-) -> Vec<Arc<dyn ToolProvider>> {
+    extra_base_providers: Vec<Arc<dyn ToolProvider>>,
+    script_tools: Vec<Arc<crate::config::script_tools::ResolvedScriptTool>>,
+    nats_declarations: Vec<ToolDeclaration>,
+}
+
+fn build_tool_providers(params: BuildToolProvidersParams<'_>) -> Vec<Arc<dyn ToolProvider>> {
+    let BuildToolProvidersParams {
+        config,
+        nats_provider,
+        bash_context_slot,
+        command_bash,
+        extra_base_providers,
+        script_tools,
+        nats_declarations,
+    } = params;
+    let operator_command = command_bash.is_some();
     let (bash_active, bash_inner_declarations) = match command_bash {
         Some(inputs) => (true, inputs.inner_declarations),
-        None => (
-            config.read().bash_tools_active(),
-            config.read().bash_inner_tool_declarations(),
-        ),
+        None => {
+            let guard = config.read();
+            (
+                guard.bash_tools_active(),
+                guard.bash_inner_tool_declarations_with(&nats_declarations, &script_tools),
+            )
+        }
     };
-    let mut base_providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
-    // NATS is the runtime provider for configured sub-agent and tool-server tools.
-    // Its broker `max_payload` also feeds the script-mode pre-flight check.
+    // N1: a context without a round slot cannot run script tool bodies, so
+    // the script provider below holds none; the `bash` inner catalog must
+    // not offer them as commands either — their dispatch could only fail.
+    let bash_inner_declarations =
+        bash_catalog_for_slot(config, &bash_context_slot, bash_inner_declarations);
+    let stack = base_provider_stack(config, nats_provider, extra_base_providers);
+    // Script tools wrap only base providers, so they can never dispatch to
+    // `bash` or to each other (decision 1, R10). The round snapshot's script
+    // tools are threaded in (decision 12): the same accepted view that
+    // served this round's declarations, read once before the NATS discovery
+    // await, is the one the provider serves.
+    let script_provider =
+        script_provider_for_round(script_tools, config, &stack, bash_context_slot.clone());
+
+    // The script-mode `bash` provider must come before the NATS provider so
+    // it wins `has_tool("bash")` against raw-name aliases registered from
+    // tool servers (script mode, #2537); see [`script_mode_bash_provider`].
+    let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
+    providers.push(script_mode_bash_provider(ScriptModeBashParams {
+        bash_active,
+        bash_inner_declarations,
+        stack: &stack,
+        script_provider: &script_provider,
+        slot: bash_context_slot,
+        full_payload: operator_command,
+    }));
+    providers.push(script_provider);
+    providers.extend(stack.base_providers.iter().cloned());
+    providers
+}
+
+struct ScriptModeBashParams<'a> {
+    bash_active: bool,
+    bash_inner_declarations: Vec<ToolDeclaration>,
+    stack: &'a BaseProviderStack,
+    script_provider: &'a Arc<dyn ToolProvider>,
+    slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
+    full_payload: bool,
+}
+
+/// The script-mode `bash` provider. Its inner-call executor dispatches
+/// through the script provider plus the base provider list, which
+/// structurally excludes itself, so recursive `bash` dispatch is impossible
+/// and `bash_tools` can admit script tools.
+fn script_mode_bash_provider(params: ScriptModeBashParams<'_>) -> Arc<dyn ToolProvider> {
+    let ScriptModeBashParams {
+        bash_active,
+        bash_inner_declarations,
+        stack,
+        script_provider,
+        slot,
+        full_payload,
+    } = params;
+    let base_providers: Vec<Arc<dyn ToolProvider>> = std::iter::once(script_provider.clone())
+        .chain(stack.base_providers.iter().cloned())
+        .collect();
+    Arc::new(
+        crate::bash_provider::BashProvider::new(crate::bash_provider::BashProviderConfig {
+            active: bash_active,
+            inner_declarations: bash_inner_declarations,
+            base_providers,
+            slot,
+            payload_limit: stack.payload_limit.clone(),
+            full_payload,
+            script_outputs: stack.script_outputs.clone(),
+        })
+        .with_attachment_fetcher(stack.attachment_fetcher.clone())
+        .with_media_store(stack.media_store.clone()),
+    )
+}
+
+/// The base provider stack shared by the script-tool and `bash` providers:
+/// every provider except `bash` and the round's script-tool provider, plus
+/// the NATS-derived inputs both of them need.
+struct BaseProviderStack {
+    base_providers: Vec<Arc<dyn ToolProvider>>,
+    payload_limit: Option<crate::bash_inner::PayloadLimit>,
+    /// Output mappings by tool name, for the shell commands of the `bash`
+    /// tool and of Bash-bodied script tools.
+    script_outputs: std::collections::BTreeMap<String, harnx_toolset::ScriptOutput>,
+    attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
+    media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
+}
+
+/// NATS is the runtime provider for configured sub-agent and tool-server
+/// tools. Its broker `max_payload` also feeds the script-mode pre-flight
+/// check, and its stores feed the BashKit mounts of both script runners.
+fn base_provider_stack(
+    config: &GlobalConfig,
+    nats_provider: Option<Arc<crate::nats_tool_provider::NatsToolProvider>>,
+    extra_base_providers: Vec<Arc<dyn ToolProvider>>,
+) -> BaseProviderStack {
     let payload_limit = nats_provider
         .as_ref()
         .map(|nats| nats.script_payload_limit());
+    let script_outputs = nats_provider
+        .as_ref()
+        .map(|nats| nats.script_outputs())
+        .unwrap_or_default();
     let attachment_fetcher = nats_provider
         .as_ref()
         .map(|nats| nats.script_attachment_fetcher());
     let media_store = nats_provider.as_ref().map(|nats| nats.script_media_store());
-    if let Some(nats) = nats_provider {
-        base_providers.push(nats as Arc<dyn ToolProvider>);
-    }
+    let mut base_providers: Vec<Arc<dyn ToolProvider>> = nats_provider
+        .map(|nats| nats as Arc<dyn ToolProvider>)
+        .into_iter()
+        .collect();
     base_providers.push(
         Arc::new(crate::session_history::SessionHistoryProvider::new(
             config.clone(),
@@ -649,26 +896,66 @@ fn build_tool_providers(
     base_providers.push(Arc::new(crate::session_meta_tool::SessionMetaProvider::new(
         config.clone(),
     )) as Arc<dyn ToolProvider>);
+    base_providers.extend(extra_base_providers);
+    BaseProviderStack {
+        base_providers,
+        payload_limit,
+        script_outputs,
+        attachment_fetcher,
+        media_store,
+    }
+}
 
-    // The script-mode `bash` provider must come before the NATS provider so
-    // it wins `has_tool("bash")` against raw-name aliases registered from
-    // tool servers (script mode, #2537). Its inner-call executor dispatches
-    // through the base provider list, which structurally excludes itself,
-    // so recursive `bash` dispatch is impossible.
-    let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
-    providers.push(Arc::new(
-        crate::bash_provider::BashProvider::new(crate::bash_provider::BashProviderConfig {
-            active: bash_active,
-            inner_declarations: bash_inner_declarations,
-            base_providers: base_providers.clone(),
+/// Drop declarations whose names belong to script tools, for contexts whose
+/// script provider holds no tools (N1).
+fn filter_script_tools(
+    config: &GlobalConfig,
+    declarations: Vec<ToolDeclaration>,
+) -> Vec<ToolDeclaration> {
+    let guard = config.read();
+    let catalog = guard.script_tool_catalog();
+    declarations
+        .into_iter()
+        .filter(|declaration| catalog.get(&declaration.name).is_none())
+        .collect()
+}
+
+/// The `bash` inner catalog for this round: contexts without a round slot
+/// cannot run script tool bodies, so the catalog drops script-tool
+/// declarations there (N1); a slotted context keeps them so `bash` can call
+/// the round's script tools.
+fn bash_catalog_for_slot(
+    config: &GlobalConfig,
+    bash_context_slot: &Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
+    declarations: Vec<ToolDeclaration>,
+) -> Vec<ToolDeclaration> {
+    match bash_context_slot {
+        Some(_) => declarations,
+        None => filter_script_tools(config, declarations),
+    }
+}
+
+/// The round's script-tool provider over the snapshot's accepted view,
+/// wrapping the base providers (decision 12's shared snapshot). `config`
+/// stays reachable for call-time inner-selector resolution (decision 5).
+fn script_provider_for_round(
+    script_tools: Vec<Arc<crate::config::script_tools::ResolvedScriptTool>>,
+    config: &GlobalConfig,
+    stack: &BaseProviderStack,
+    bash_context_slot: Option<Arc<crate::bash_provider::BashEvalContextSlot>>,
+) -> Arc<dyn ToolProvider> {
+    Arc::new(crate::script_tool_provider::ScriptToolProvider::new(
+        crate::script_tool_provider::ScriptToolProviderConfig {
+            tools: script_tools,
+            base_providers: stack.base_providers.clone(),
+            config: config.clone(),
             slot: bash_context_slot,
-            payload_limit,
-        })
-        .with_attachment_fetcher(attachment_fetcher)
-        .with_media_store(media_store),
-    ) as Arc<dyn ToolProvider>);
-    providers.extend(base_providers);
-    providers
+            payload_limit: stack.payload_limit.clone(),
+            attachment_fetcher: stack.attachment_fetcher.clone(),
+            media_store: stack.media_store.clone(),
+            script_outputs: stack.script_outputs.clone(),
+        },
+    )) as Arc<dyn ToolProvider>
 }
 
 pub(crate) fn populate_result_markdown(
@@ -963,12 +1250,28 @@ mod tests {
         };
         let config = Arc::new(ConfigLock::new(config));
 
-        let providers = build_tool_providers(&config, None, None, None);
+        let providers = build_tool_providers(BuildToolProvidersParams {
+            config: &config,
+            nats_provider: None,
+            bash_context_slot: None,
+            command_bash: None,
+            extra_base_providers: Vec::new(),
+            script_tools: Vec::new(),
+            nats_declarations: Vec::new(),
+        });
         assert_eq!(providers[0].name(), "bash-script");
         assert!(providers[0].has_tool("bash"));
 
         let bare = Arc::new(ConfigLock::new(Config::default()));
-        let providers = build_tool_providers(&bare, None, None, None);
+        let providers = build_tool_providers(BuildToolProvidersParams {
+            config: &bare,
+            nats_provider: None,
+            bash_context_slot: None,
+            command_bash: None,
+            extra_base_providers: Vec::new(),
+            script_tools: Vec::new(),
+            nats_declarations: Vec::new(),
+        });
         assert_eq!(providers[0].name(), "bash-script");
         assert!(
             !providers[0].has_tool("bash"),
@@ -982,14 +1285,17 @@ mod tests {
     #[test]
     fn command_bash_provider_stays_active_with_empty_catalog() {
         let config = Arc::new(ConfigLock::new(Config::default()));
-        let providers = build_tool_providers(
-            &config,
-            None,
-            None,
-            Some(crate::bash_provider::CommandBashInputs {
+        let providers = build_tool_providers(BuildToolProvidersParams {
+            config: &config,
+            nats_provider: None,
+            bash_context_slot: None,
+            command_bash: Some(crate::bash_provider::CommandBashInputs {
                 inner_declarations: Vec::new(),
             }),
-        );
+            extra_base_providers: Vec::new(),
+            script_tools: Vec::new(),
+            nats_declarations: Vec::new(),
+        });
         assert_eq!(providers[0].name(), "bash-script");
         assert!(
             providers[0].has_tool("bash"),
@@ -1512,6 +1818,7 @@ mod tests {
             make_decl_with_templates("bash_exec", None, Some("OK: {{ result.content[0].text }}")),
         );
         let eval_ctx = ToolEvalContext {
+            structured_results: false,
             on_tool_call_completed: None,
             on_interaction: None,
             middleware_fn: None,
@@ -1620,5 +1927,340 @@ mod tests {
                 other => panic!("expected Completed event, got {other:?}"),
             }
         });
+    }
+
+    fn script_tool_definition(name: &str) -> harnx_core::script_tool::ScriptToolDefinition {
+        serde_json::from_value(json!({
+            "name": name,
+            "description": "Wrapper.",
+            "parameters": {
+                "type": "object",
+                "properties": {"number": {"type": "integer"}},
+                "required": ["number"],
+                "additionalProperties": false
+            },
+            "bash": "true"
+        }))
+        .unwrap()
+    }
+
+    fn config_with_script_tool(name: &str) -> Arc<ConfigLock> {
+        config_with_script_tools(&[name])
+    }
+
+    fn config_with_script_tools(names: &[&str]) -> Arc<ConfigLock> {
+        let definitions: Vec<_> = names
+            .iter()
+            .map(|name| script_tool_definition(name))
+            .collect();
+        let mut config = Config::default();
+        config
+            .set_script_tool_definitions(&definitions)
+            .expect("test script tool resolves");
+        Arc::new(ConfigLock::new(config))
+    }
+
+    /// C6/decision 12: the round snapshots the accepted view once, and the
+    /// provider serves exactly that snapshot. A NATS/MCP refresh landing
+    /// after the snapshot (here: a base tool registering the script tool's
+    /// name) cannot make the round advertise a script tool it will not
+    /// serve — or serve one it did not advertise.
+    #[test]
+    fn round_snapshot_keeps_declarations_and_provider_on_one_view() {
+        let config = config_with_script_tool("wrap_probe");
+        let snapshot = snapshot_tool_round(&config.read(), None, None, None, true);
+        assert!(
+            snapshot
+                .declarations
+                .iter()
+                .any(|declaration| declaration.name == "wrap_probe"),
+            "the snapshot must advertise the script tool"
+        );
+
+        // The mid-round refresh: a base tool takes the name. The current
+        // accepted view drops the script tool, but this round's snapshot and
+        // its provider stay the pair they were.
+        config
+            .write()
+            .nats_tool_declarations
+            .write()
+            .push(make_decl_with_templates("wrap_probe", None, None));
+        assert!(
+            config
+                .read()
+                .accepted_script_tools()
+                .iter()
+                .all(|tool| tool.definition().name != "wrap_probe"),
+            "a fresh view must drop the colliding script tool"
+        );
+
+        let stack = base_provider_stack(&config, None, Vec::new());
+        let provider =
+            script_provider_for_round(snapshot.script_tools.clone(), &config, &stack, None);
+        assert!(
+            provider.has_tool("wrap_probe"),
+            "the provider must serve the view the round advertised"
+        );
+    }
+
+    /// N1: a context without a round slot (hooks, operator `.call`,
+    /// reservations) must not advertise script tools it could never run.
+    #[test]
+    fn round_snapshot_without_slot_carries_no_script_tools() {
+        let config = config_with_script_tool("wrap_probe");
+        let snapshot = snapshot_tool_round(&config.read(), None, Some("*"), None, false);
+        assert!(
+            snapshot.script_tools.is_empty(),
+            "no slot means no script tools"
+        );
+        assert!(
+            !snapshot
+                .declarations
+                .iter()
+                .any(|declaration| declaration.name == "wrap_probe"),
+            "the wildcard catalog must not advertise the script tool"
+        );
+    }
+
+    /// 4659980786: a script tool whose name the round's NATS provider serves
+    /// is excluded from the accepted view, exactly like a config-declared
+    /// base tool — the round cannot advertise a base schema and then
+    /// dispatch the script body under the same name.
+    #[test]
+    fn accepted_view_excludes_provider_served_names() {
+        let config = config_with_script_tool("wrap_probe");
+        let guard = config.read();
+        let provider_declarations = vec![make_decl_with_templates("wrap_probe", None, None)];
+        let base_names = guard.base_tool_names_with(&[], &provider_declarations);
+        let view = guard.accepted_script_tools_against(&base_names);
+        assert!(
+            view.iter()
+                .all(|tool| tool.definition().name != "wrap_probe"),
+            "a provider-served name must drop the colliding script tool"
+        );
+    }
+
+    /// 4659980786 follow-up: `has_tool` keeps raw aliases routable through
+    /// the naming transition, but they never appear in the provider's
+    /// `use_tools`-filtered declarations. A script tool named after a raw
+    /// alias must still leave the accepted view: the script provider
+    /// precedes the NATS provider in dispatch order, so it would shadow
+    /// the alias. The non-colliding sibling must survive the exclusion.
+    #[tokio::test]
+    async fn script_tool_view_excludes_provider_raw_aliases() -> anyhow::Result<()> {
+        let server = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(server.url()).await?;
+        // `fs` serves `read` with the agent-visible name `fs_read`; the raw
+        // alias `read` routes but is not a declaration name.
+        let provider = NatsToolProvider::snapshot_test_provider(
+            &client,
+            vec![("read", "fs", "read")],
+            vec![make_decl_with_templates("fs_read", None, None)],
+            Vec::new(),
+        )
+        .await?;
+        assert!(provider.has_tool("read"), "raw alias must be routable");
+        assert!(
+            provider
+                .declarations_for_use_tools(Some("*"))
+                .iter()
+                .all(|declaration| declaration.name != "read"),
+            "the raw alias never appears in the filtered declarations"
+        );
+
+        let config = config_with_script_tools(&["read", "probe_read"]);
+        // The model-visible tool list comes from `select_tools`, whose
+        // collision view is the config-level route-name cache — populate it
+        // the way `refresh_nats_tool_declarations` would.
+        *config.read().nats_served_tool_names.write() = provider.route_names().collect();
+        let mut agent_config = harnx_core::agent_config::AgentConfig::from_prompt("test");
+        agent_config.set_use_tools(Some(vec!["*".to_string()]));
+        let functions = config.read().select_tools(&agent_config);
+        assert!(
+            functions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .all(|declaration| declaration.name != "read"),
+            "the model-visible list must not advertise the raw-alias collision"
+        );
+        assert!(
+            functions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|declaration| declaration.name == "probe_read"),
+            "the model-visible list must keep the non-colliding sibling"
+        );
+
+        let snapshot = snapshot_tool_round(&config.read(), Some(&provider), Some("*"), None, true);
+        assert!(
+            snapshot
+                .script_tools
+                .iter()
+                .all(|tool| tool.definition().name != "read"),
+            "a raw-alias collision must drop the script tool"
+        );
+        assert!(
+            snapshot
+                .script_tools
+                .iter()
+                .any(|tool| tool.definition().name == "probe_read"),
+            "the round view must keep the non-colliding sibling"
+        );
+        assert!(
+            !snapshot
+                .declarations
+                .iter()
+                .any(|declaration| declaration.name == "read"),
+            "the round must not advertise the shadowed name"
+        );
+        assert!(
+            snapshot
+                .declarations
+                .iter()
+                .any(|declaration| declaration.name == "probe_read"),
+            "the round must advertise the non-colliding sibling"
+        );
+        Ok(())
+    }
+
+    /// 4659980786 follow-up: a script tool selected only through
+    /// `bash_tools` — the `use_tools` selectors don't name it, and the
+    /// config's NATS declarations are stale — would reach the inner bash
+    /// catalog under a name the provider serves, and the script provider
+    /// would win dispatch over it. The provider-`has_tool` exclusion catches
+    /// what the declaration-based check cannot. The non-colliding sibling
+    /// (selected by both `use_tools` and `bash_tools`) must survive.
+    #[tokio::test]
+    async fn script_tool_view_excludes_provider_names_behind_bash_only_selector(
+    ) -> anyhow::Result<()> {
+        let server = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(server.url()).await?;
+        // The provider serves `wrap`; the config's NATS declarations are stale
+        // and `use_tools` selects nothing, so no declaration-based exclusion
+        // can see the collision.
+        let provider = NatsToolProvider::snapshot_test_provider(
+            &client,
+            vec![("wrap", "fs", "wrap")],
+            vec![make_decl_with_templates("wrap", None, None)],
+            Vec::new(),
+        )
+        .await?;
+        assert!(provider.has_tool("wrap"));
+
+        let config = config_with_script_tools(&["wrap", "wrap_report"]);
+        {
+            let mut guard = config.write();
+            let mut agent_config = harnx_core::agent_config::AgentConfig::from_prompt("test");
+            // `wrap` is bash-only and provider-shadowed; the sibling is
+            // selected by both `use_tools` and `bash_tools`.
+            agent_config.set_use_tools(Some(vec!["wrap_report".to_string()]));
+            agent_config.set_bash_tools(Some(vec!["wrap".to_string(), "wrap_report".to_string()]));
+            guard.agent = Some(crate::config::agent::Agent::new(agent_config));
+        }
+        let guard = config.read();
+        assert!(
+            guard.bash_tools_active(),
+            "the script tool must resolve as bash-only"
+        );
+
+        let snapshot =
+            snapshot_tool_round(&guard, Some(&provider), Some("wrap_report"), None, true);
+        assert!(
+            snapshot
+                .script_tools
+                .iter()
+                .all(|tool| tool.definition().name != "wrap"),
+            "a provider-served name must drop the script tool even when it is only bash-selected"
+        );
+        assert!(
+            snapshot
+                .script_tools
+                .iter()
+                .any(|tool| tool.definition().name == "wrap_report"),
+            "the round view must keep the non-colliding sibling"
+        );
+        // The inner bash catalog derives from the same snapshot, so the
+        // shadowed name cannot come back as a shell command — and the
+        // sibling stays available both as a command and as a declaration.
+        let inner = guard
+            .bash_inner_tool_declarations_with(&snapshot.nats_declarations, &snapshot.script_tools);
+        assert!(
+            inner.iter().all(|declaration| declaration.name != "wrap"),
+            "the bash inner catalog must not offer the shadowed name"
+        );
+        assert!(
+            inner
+                .iter()
+                .any(|declaration| declaration.name == "wrap_report"),
+            "the bash inner catalog must keep the non-colliding sibling"
+        );
+        assert!(
+            snapshot
+                .declarations
+                .iter()
+                .any(|declaration| declaration.name == "wrap_report"),
+            "the round must advertise the non-colliding sibling"
+        );
+        Ok(())
+    }
+
+    /// 4659980786 follow-up: `route_names` must cover everything `has_tool`
+    /// accepts. A cross-package registration resolves under its
+    /// per-registration agent-visible name through the bare-name fallback
+    /// (`server_identity.rs`) without being a route-map key, so the shared
+    /// collision view must yield that name as well as the map's raw aliases
+    /// and visible names.
+    #[tokio::test]
+    async fn script_tool_view_route_names_cover_visible_names_and_raw_aliases() -> anyhow::Result<()>
+    {
+        let server = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
+        let client = async_nats::connect(server.url()).await?;
+        // A registration from package `q`, server `fs`, tool `read`. The
+        // route map keys the qualified name `q__fs_read` and the raw alias
+        // `read`; the bare name `fs_read` routes only through the fallback.
+        let registration: harnx_toolset::Registration = serde_json::from_value(json!({
+            "package": "q",
+            "config": "default",
+            "server": "fs",
+            "tools": [{
+                "name": "read",
+                "description": "fs read",
+                "input_schema": {"type": "object"},
+                "idempotent_hint": false,
+                "read_only_hint": true
+            }],
+            "schema_version": 1,
+            "proto_version": 1
+        }))?;
+        let provider = NatsToolProvider::snapshot_test_provider(
+            &client,
+            vec![("q__fs_read", "q__fs", "read"), ("read", "fs", "read")],
+            Vec::new(),
+            vec![registration],
+        )
+        .await?;
+        assert!(provider.has_tool("read"), "the raw alias must route");
+        assert!(
+            provider.has_tool("fs_read"),
+            "the bare name must route through the fallback"
+        );
+        let names: std::collections::HashSet<String> = provider.route_names().collect();
+        assert!(
+            names.contains("read") && names.contains("q__fs_read"),
+            "route names must include the raw alias and the visible name"
+        );
+        assert!(
+            names.contains("fs_read"),
+            "route names must include the per-registration visible name"
+        );
+        Ok(())
     }
 }

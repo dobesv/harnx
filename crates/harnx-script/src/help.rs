@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 
+use crate::commands::OutputMapping;
 use crate::schema::{flag_table, properties, FlagKind, Property, Scalar};
 
 /// One line of command syntax followed by the description's first sentence.
@@ -18,7 +19,12 @@ pub fn synopsis(name: &str, schema: &Value, description: &str) -> String {
 
 /// Man-page style help. Defaults are shown, not inserted by the argument parser.
 /// Reference/union/nullable properties are labeled JSON, matching parse_args.
-pub fn help(name: &str, schema: &Value, description: &str) -> String {
+pub fn help(
+    name: &str,
+    schema: &Value,
+    description: &str,
+    output: Option<&OutputMapping>,
+) -> String {
     let properties = properties(schema);
     let mut text = format!(
         "NAME\n    {}\n\nSYNOPSIS\n    {}\n\nDESCRIPTION\n",
@@ -51,9 +57,9 @@ pub fn help(name: &str, schema: &Value, description: &str) -> String {
         if matches!(property.kind, FlagKind::Repeated(_)) {
             text.push_str("; repeat flag for each item");
         }
-        metadata(&mut text, property.schema);
+        metadata(&mut text, property.schema, property.value);
         if let Some(items) = property
-            .schema
+            .value
             .get("items")
             .and_then(|items| items.get("enum"))
         {
@@ -68,7 +74,36 @@ pub fn help(name: &str, schema: &Value, description: &str) -> String {
     text.push_str("    -o json|text\n        Output rendering (handled by the command wrapper, not sent to the tool).\n");
     text.push_str("    --help\n        Show tool help (handled by the command wrapper).\n");
     text.push_str("    --\n        End options. Positional arguments aren't supported.\n");
+    if let Some(mapping) = output {
+        output_section(&mut text, mapping);
+    }
     text
+}
+
+/// What the command prints where, for a tool with an output mapping.
+fn output_section(text: &mut String, mapping: &OutputMapping) {
+    text.push_str("\nOUTPUT\n");
+    if let Some(summary) = &mapping.summary {
+        indent(text, summary.trim(), 2);
+    }
+    let stderr = match (&mapping.stderr_text, &mapping.stderr) {
+        (Some(text), Some(notes)) => Some(format!("the `{text}` field, then notes from `{notes}`")),
+        (Some(field), None) | (None, Some(field)) => Some(format!("the `{field}` field")),
+        (None, None) => None,
+    };
+    let field = |field: &Option<String>| field.as_ref().map(|f| format!("the `{f}` field"));
+    let parts: Vec<String> = [
+        ("stdout", field(&mapping.stdout)),
+        ("stderr", stderr),
+        ("exit status", field(&mapping.exit_code)),
+    ]
+    .into_iter()
+    .filter_map(|(stream, text)| text.map(|text| format!("{stream}: {text}")))
+    .collect();
+    if !parts.is_empty() {
+        text.push_str(&format!("  {}\n", parts.join("    ")));
+    }
+    text.push_str("  -o json prints every field.\n");
 }
 
 fn property_uses_json(property: &Property<'_>, conflict: bool) -> bool {
@@ -149,11 +184,14 @@ fn synopsis_name(name: &str, description: &str) -> String {
     }
 }
 
-fn metadata(text: &mut String, schema: &Value) {
-    for key in ["default", "enum"] {
-        if let Some(value) = schema.get(key) {
-            text.push_str(&format!("; {key}: {value}"));
-        }
+/// `default` lives on the declared schema; `enum` usually sits on the
+/// non-null branch of a nullable union, so it is read from there first.
+fn metadata(text: &mut String, declared: &Value, value: &Value) {
+    if let Some(default) = declared.get("default") {
+        text.push_str(&format!("; default: {default}"));
+    }
+    if let Some(choices) = value.get("enum").or_else(|| declared.get("enum")) {
+        text.push_str(&format!("; enum: {choices}"));
     }
 }
 

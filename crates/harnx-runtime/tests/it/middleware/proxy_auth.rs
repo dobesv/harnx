@@ -88,13 +88,7 @@ fn shipped_config(root: &Path, package: &str) -> Result<Config> {
 }
 
 pub(super) fn binary(name: &str) -> std::path::PathBuf {
-    let path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(name);
+    let path = harnx_core::bin_dir_of_exe(&std::env::current_exe().unwrap()).join(name);
     assert!(
         path.is_file(),
         "build {name} before running proxy middleware tests: {}",

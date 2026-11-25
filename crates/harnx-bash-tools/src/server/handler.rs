@@ -138,7 +138,11 @@ impl BashServer {
             }
             "read_exec_log" => {
                 let params = parse_arguments::<ReadExecLogParams>(arguments)?;
-                self.read_exec_log_impl(params).await
+                if crate::toolset::invocation_wants_structured_result() {
+                    self.script_read_exec_log(params).await
+                } else {
+                    self.read_exec_log_impl(params).await
+                }
             }
             "spawn" => {
                 let params = parse_arguments::<SpawnCommandParams>(arguments)?;

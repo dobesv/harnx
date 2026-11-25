@@ -194,6 +194,61 @@ pending interactions for visibility but does not support interactive answering
   child session approvals. Answer pending requests through the Web UI, TUI, or by
   submitting an exact decision to the child session's JSON-RPC endpoint.
 
+## URL interactions (`harnx.kind: url`)
+
+Tools that need the user to complete something out of band — starting with
+credential-connect flows such as `jira_connect` — challenge with kind `url`
+instead of `confirm` or `a2ui` (A2UI has no link component). The challenge
+payload is:
+
+```json
+{
+  "url": "https://example.com/connect/abc",
+  "message": "Connect Jira",
+  "summary": "Connect Jira",
+  "request_state": { "challenge_id": "abc" }
+}
+```
+
+Only `https:` and loopback `http:` URLs are valid. Anything else fails
+validation, and the challenge degrades to a recoverable tool error instead of
+suspending the call — a tool can never get a plain-`http` link in front of a
+user. Allowed response actions are `continue` and `cancel`; the stored
+response carries nothing beyond the action (the session stream is cleartext,
+so `data` is rejected for this kind, exactly like the `confirm` shape).
+
+Rendering by frontend:
+
+- **Web** shows the message, a link opening in a new tab
+  (`target="_blank"`, `rel="noopener noreferrer"`), and Continue/Cancel
+  buttons.
+- **TUI** shows the message and the URL as an OSC 8 hyperlink where the
+  terminal supports it, with the plain-text URL as the always-present
+  fallback. `Enter` continues (same two-second idle gate as approvals) and
+  `Ctrl+D` cancels. URL modals have no note field: the response is the
+  action alone.
+- **CLI** (`harnx interact list`) prints the URL and how to answer:
+
+  ```
+  Pending interaction <id> (kind url, request sequence 3)
+  Connect Jira
+
+  https://example.com/connect/abc
+
+  Open the link to proceed, then answer `continue`. Answer `cancel` to abort.
+  ```
+
+  Answer with `harnx interact answer <agent> <session> --id <id>
+  --action continue` (or `cancel`).
+
+- **Operator calls** normally reject interactions ("interactions are not
+  supported here"), with one narrow exception: an operator call that
+  challenges with `url` succeeds with `{url, message, request_state}` in its
+  result, so `harnx credentials connect` can print the link and re-call with
+  the returned `request_state`. `confirm` and `a2ui` from operator calls
+  still fail exactly as before.
+
+
 ## Direct child sub-agent confirmations
 
 When a sub-agent pauses awaiting human approval (either legacy hook approvals or

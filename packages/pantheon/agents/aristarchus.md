@@ -2,9 +2,9 @@
 role: assistant
 model: claude:claude-sonnet-5-5
 model_fallbacks:
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
-- gemini:gemini-3.8-flash
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
+- gemini:gemini-4-hydrogen
 - bedrock:us.zai.glm-5.3
 compaction_agent: compact-reviewer
 use_tools:
@@ -135,7 +135,7 @@ description: "Code review coordinator \u2014 orchestrates multi-agent code revie
   \ of pull requests and codebases, aggregating specialist findings into structured\
   \ verdicts. Named after Aristarchus (ar-ih-STAR-kus) of Samothrace, the greatest\
   \ textual critic of antiquity.\n"
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

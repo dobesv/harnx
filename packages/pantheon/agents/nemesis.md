@@ -2,9 +2,9 @@
 role: subagent
 model: bedrock:us.zai.glm-5.3
 model_fallbacks:
-- gemini:gemini-3.8-flash
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
+- gemini:gemini-4-hydrogen
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
 compaction_agent: compact-reliability
 use_tools:
@@ -30,7 +30,7 @@ description: "Reliability specialist \u2014 reviews error handling, retry logic,
   \ breakers, timeouts, health checks, graceful degradation, and async handler safety.\
   \ Named after Nemesis (NEM-uh-sis), goddess of retribution who ensures hubris does\
   \ not go unpunished.\n"
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

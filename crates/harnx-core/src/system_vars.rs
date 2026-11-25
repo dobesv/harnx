@@ -9,6 +9,7 @@
 use crate::agent_config::AgentConfig;
 use crate::tool::ToolDeclaration;
 use anyhow::Result;
+use minijinja::value::Serde;
 use minijinja::{Environment, UndefinedBehavior, Value};
 use std::collections::BTreeMap;
 use std::env;
@@ -150,10 +151,10 @@ pub fn render_template(
     ctx.insert("__now__".to_string(), Value::from(current_time));
     ctx.insert("__cwd__".to_string(), Value::from(current_dir));
     ctx.insert("__os_distro__".to_string(), Value::from(os_distro));
-    ctx.insert("agent".to_string(), Value::from_serialize(&agent_ctx));
+    ctx.insert("agent".to_string(), Value::from(Serde(&agent_ctx)));
     ctx.insert(
         "tools".to_string(),
-        Value::from_serialize(tools.unwrap_or_default()),
+        Value::from(Serde(tools.unwrap_or_default())),
     );
 
     for (k, v) in agent.variables() {
@@ -163,7 +164,7 @@ pub fn render_template(
     let anonymous = crate::user_principals::anonymous();
     ctx.insert(
         "__user__".to_string(),
-        Value::from_serialize(agent.user_principals().unwrap_or(&anonymous)),
+        Value::from(Serde(agent.user_principals().unwrap_or(&anonymous))),
     );
 
     env.render_str(template, ctx)

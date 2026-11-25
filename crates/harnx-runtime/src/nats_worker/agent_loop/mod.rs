@@ -19,7 +19,7 @@ use crate::nats_metrics;
 use crate::nats_session::PendingHitlApproval;
 use crate::nats_session_metadata::{SessionMetadata, SessionMetadataStore};
 use crate::nats_tool_provider::NatsInFlightCalls;
-use crate::tool_context::discover_nats_tool_provider_fresh;
+use crate::tool_context::discover_nats_tool_provider_fresh_forced;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
 use async_nats::jetstream;
@@ -788,7 +788,10 @@ async fn build_agent_loop_context(
     // Activation has already waited for this session's on-demand tool
     // servers to register. Replace any snapshot captured while startup was
     // still in flight before the first model request reuses the tool cache.
-    discover_nats_tool_provider_fresh(
+    // Forced: it bypasses the failure window even for this scope's own
+    // recent failure — these registrations must be visible now (decision
+    // 5b), not after the retry interval.
+    discover_nats_tool_provider_fresh_forced(
         &config_snapshot,
         &params.instance_id,
         active_package.as_deref(),
@@ -1473,6 +1476,7 @@ async fn build_orphan_tool_eval_context(
         // mode's `bash` must fail closed there rather than redispatch.
         bash_context_slot: None,
         command_bash: None,
+        extra_base_providers: Vec::new(),
     })
     .await
 }

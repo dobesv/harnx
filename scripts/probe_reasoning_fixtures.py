@@ -31,6 +31,38 @@ def openai_exchange():
     ]
 
 
+def claude_turn(stop_reason, thinking, second):
+    """One Messages stream, in the shapes of a traced Fable 5.2 turn."""
+    events = [
+        {"type": "message_start", "message": {"model": "claude-fable-5-2", "id": "msg_fixture",
+            "usage": {"input_tokens": 4}}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+        {"type": "ping"},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}},
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "answer"}},
+        {"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 9}},
+        {"type": "message_stop"},
+    ]
+    return [stream(event, "claude", second=second) for event in events]
+
+
+def claude_exchange():
+    tools = [{"name": probe.TOOL, "input_schema": {}}]
+    thinking = {"type": "adaptive", "display": "summarized"}
+    initial = request({"model": "claude-fable-5-2", "tools": tools, "thinking": thinking,
+        "messages": [{"role": "user", "content": "probe"}]})
+    replay = request({"model": "claude-fable-5-2", "tools": tools, "thinking": thinking, "messages": [
+        {"role": "user", "content": "probe"},
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "plan"},
+            {"type": "tool_use", "id": "toolu_fixture", "name": probe.TOOL, "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fixture", "content": "{}"}]},
+    ]}, second=2)
+    for entry in (initial, replay):
+        entry["url"] = "https://api.anthropic.com/v1/messages"
+    return [initial, *claude_turn("tool_use", "Check session", 1), replay, *claude_turn("end_turn", "continuing", 4)]
+
+
 def cargo_output(bins):
     records = [None, [], {"reason": "build-finished"},
                {"reason": "compiler-artifact", "target": {"name": {}}, "executable": "/invalid"},

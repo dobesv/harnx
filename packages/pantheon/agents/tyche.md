@@ -2,9 +2,9 @@
 role: subagent
 model: bedrock:us.zai.glm-5.3
 model_fallbacks:
-- gemini:gemini-3.8-flash
-- codex:gpt-6.1-sol
-- openai:gpt-6.1-sol
+- gemini:gemini-4-hydrogen
+- codex:gpt-6.2-sol
+- openai:gpt-6.2-sol
 - claude:claude-sonnet-5-5
 compaction_agent: compact-deploy
 use_tools:
@@ -30,7 +30,7 @@ description: "Deployment verification specialist \u2014 produces Go/No-Go deploy
   \ checklists with pre-deployment checks, migration verification, rollback procedures,\
   \ and monitoring plans. Named after Tyche (TY-kee), goddess of fortune who determines\
   \ whether chance favors the prepared.\n"
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

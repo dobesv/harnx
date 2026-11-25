@@ -25,8 +25,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::bash_inner::{
-    InnerCallExecutor, InnerCallExecutorConfig, InnerProgressAggregator, InnerTraceStatus,
-    PayloadLimit, ScriptInnerExecutor,
+    InnerCallExecutor, InnerCallExecutorConfig, InnerProgressAggregator, InnerTraceEntry,
+    InnerTraceStatus, PayloadLimit, ScriptInnerExecutor,
 };
 use crate::config::BASH_TOOL_NAME;
 
@@ -67,7 +67,7 @@ impl BashEvalContextSlot {
         context
     }
 
-    fn get(&self) -> Option<Arc<ToolEvalContext>> {
+    pub(crate) fn get(&self) -> Option<Arc<ToolEvalContext>> {
         self.0
             .lock()
             .expect("bash context slot lock")
@@ -90,6 +90,9 @@ pub struct BashProvider {
     backend: BashKitBackend,
     attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
+    /// Operator commands read `stdout`, `stderr` and `trace` as fields; a
+    /// model round gets them once, in the rendered report.
+    full_payload: bool,
 }
 
 /// Inputs resolved before a round's evaluation context exists.
@@ -99,6 +102,11 @@ pub struct BashProviderConfig {
     pub base_providers: Vec<Arc<dyn ToolProvider>>,
     pub slot: Option<Arc<BashEvalContextSlot>>,
     pub payload_limit: Option<PayloadLimit>,
+    /// Output mappings declared by tool servers, by agent-visible tool name.
+    pub script_outputs: std::collections::BTreeMap<String, harnx_toolset::ScriptOutput>,
+    /// Operator commands read `stdout`, `stderr` and `trace` as fields; a
+    /// model round gets them once, in the rendered report.
+    pub full_payload: bool,
 }
 
 /// Command-scoped inputs for one operator Bash script call (#2630).
@@ -122,6 +130,13 @@ impl CommandBashInputs {
     }
 }
 
+/// A mapping the script layer cannot read is treated as no mapping.
+pub(crate) fn output_mapping(
+    output: &harnx_toolset::ScriptOutput,
+) -> Option<harnx_script::commands::OutputMapping> {
+    serde_json::from_value(serde_json::to_value(output).ok()?).ok()
+}
+
 struct ScriptInvocation<'a> {
     tool_round: Option<u64>,
     abort: &'a AbortSignal,
@@ -136,12 +151,15 @@ impl BashProvider {
             base_providers,
             slot,
             payload_limit,
+            script_outputs,
+            full_payload,
         } = config;
         let allowed = inner_declarations
             .iter()
             .map(|declaration| declaration.name.clone())
             .collect();
         let mut config = InnerCallExecutorConfig::new(allowed, base_providers);
+        config.structured_results = true;
         if let Some(payload_limit) = payload_limit {
             config = config.with_payload_limit(payload_limit);
         }
@@ -151,6 +169,9 @@ impl BashProvider {
                 name: declaration.name.clone(),
                 description: declaration.description.clone(),
                 schema: declaration.parameters.as_value().clone(),
+                output: script_outputs
+                    .get(&declaration.name)
+                    .and_then(output_mapping),
             })
             .collect();
         Self {
@@ -161,6 +182,7 @@ impl BashProvider {
             backend: BashKitBackend,
             attachment_fetcher: None,
             media_store: None,
+            full_payload,
         }
     }
 
@@ -246,7 +268,7 @@ impl BashProvider {
             }
         };
 
-        let outcome = BashOutcome::new(result, abort, &run, params);
+        let outcome = BashOutcome::new(result, abort, &run, params, self.full_payload);
         outcome.into_provider_result()
     }
 }
@@ -269,6 +291,7 @@ struct BashOutcome {
     first_failed: Option<crate::bash_inner::InnerTraceEntry>,
     params: BashToolParams,
     aborted: bool,
+    full_payload: bool,
 }
 
 struct RenderedStream<'a> {
@@ -282,6 +305,7 @@ impl BashOutcome {
         abort: &AbortSignal,
         run: &crate::bash_inner::InnerCallRun,
         params: BashToolParams,
+        full_payload: bool,
     ) -> Self {
         let trace = run.trace();
         let trace_dropped = run.dropped_trace_entries();
@@ -312,6 +336,7 @@ impl BashOutcome {
             first_failed,
             params,
             aborted,
+            full_payload,
         }
     }
 
@@ -427,6 +452,7 @@ impl BashOutcome {
             // display markdown falls back to the rendered report.
             "content": [{"type": "text", "text": rendered}],
         });
+        self.drop_raw_output_fields(&mut payload);
         if let Some(error) = &self.error {
             payload["error"] = json!(error);
         }
@@ -439,6 +465,20 @@ impl BashOutcome {
             payload["failed_call"] = failed_call;
         }
         payload
+    }
+
+    /// The raw streams and trace repeat what the rendered report already
+    /// says, so only operator commands keep them. Removal keeps the other
+    /// keys in order.
+    fn drop_raw_output_fields(&self, payload: &mut Value) {
+        if self.full_payload {
+            return;
+        }
+        if let Some(object) = payload.as_object_mut() {
+            for key in ["stdout", "stderr", "trace"] {
+                object.shift_remove(key);
+            }
+        }
     }
 
     /// YAML front matter + fenced stdout/stderr + trace lines, in the
@@ -485,8 +525,9 @@ impl BashOutcome {
         ));
         if !self.trace.is_empty() {
             out.push_str("\n## inner call trace\n");
-            for entry in &self.trace {
-                out.push_str(&format!("- {}\n", entry.to_progress_line()));
+            for line in trace_lines(&self.trace, self.first_failed.as_ref()) {
+                out.push_str(&line);
+                out.push('\n');
             }
             if self.trace_dropped > 0 {
                 out.push_str(&format!(
@@ -518,6 +559,69 @@ impl BashOutcome {
             ))),
         }
     }
+}
+
+/// Past this many inner calls the report stops listing each call: a loop over
+/// hundreds of files would otherwise spend most of the report on rows that
+/// all say `ok`.
+const TRACE_DETAIL_LIMIT: usize = 10;
+
+/// All inner calls of one tool that ended in one status.
+struct TraceGroup<'a> {
+    name: &'a str,
+    status: InnerTraceStatus,
+    count: u64,
+    bytes: u64,
+    duration_ms: u64,
+}
+
+/// Lines for the `## inner call trace` section: one per call up to the
+/// limit, otherwise one per distinct `(name, status)` in first-appearance
+/// order plus the first failure, which is the row worth reading.
+fn trace_lines(trace: &[InnerTraceEntry], first_failed: Option<&InnerTraceEntry>) -> Vec<String> {
+    if trace.len() <= TRACE_DETAIL_LIMIT {
+        return trace
+            .iter()
+            .map(|entry| format!("- {}", entry.to_progress_line()))
+            .collect();
+    }
+    let mut groups: Vec<TraceGroup> = Vec::new();
+    for entry in trace {
+        let known = groups
+            .iter_mut()
+            .find(|g| g.name == entry.name && g.status == entry.status);
+        match known {
+            Some(g) => {
+                g.count += 1;
+                g.bytes = g.bytes.saturating_add(entry.bytes);
+                g.duration_ms = g.duration_ms.saturating_add(entry.duration_ms);
+            }
+            None => groups.push(TraceGroup {
+                name: &entry.name,
+                status: entry.status,
+                count: 1,
+                bytes: entry.bytes,
+                duration_ms: entry.duration_ms,
+            }),
+        }
+    }
+    let mut lines: Vec<String> = groups
+        .into_iter()
+        .map(|g| {
+            format!(
+                "- {} ×{} {} {}B {}ms",
+                g.name,
+                g.count,
+                g.status.as_str(),
+                g.bytes,
+                g.duration_ms
+            )
+        })
+        .collect();
+    if let Some(entry) = first_failed {
+        lines.push(format!("first failure: {}", entry.to_progress_line()));
+    }
+    lines
 }
 
 /// One stream's fenced block with HTML markers, mirroring

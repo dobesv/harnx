@@ -1,9 +1,9 @@
 ---
 role: subagent
-model: codex:gpt-6.1-sol
+model: codex:gpt-6.2-sol
 model_fallbacks:
-- openai:gpt-6.1-sol
-- gemini:gemini-4-argon
+- openai:gpt-6.2-sol
+- gemini:gemini-4-neon
 - claude:claude-opus-5-5:xhigh
 - bedrock:us.moonshotai.kimi-k3
 compaction_agent: compact-reviewer
@@ -28,7 +28,7 @@ use_tools:
 - attachments_attachment_read
 - attachments_attachment_create
 description: "Dependency change auditor — checks published artifacts, upstream API changes, vulnerabilities and supply-chain risks. Named after Laocoön, the Trojan priest who distrusted the wooden horse."
-version: '0.4.21'
+version: '0.4.23'
 variables:
 - name: shell_execution
   description: Shared shell execution guidance for commands, tests, and diagnostics

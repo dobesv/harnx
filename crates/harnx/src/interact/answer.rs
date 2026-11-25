@@ -130,7 +130,7 @@ pub(super) fn build_response(
     action: &str,
     data: &[String],
     data_json: Option<&str>,
-    note: Option<String>,
+    mut note: Option<String>,
 ) -> Result<InteractionResponse> {
     let payload = &target.request.payload;
     let data = match target.request.kind.as_str() {
@@ -139,6 +139,20 @@ pub(super) fn build_response(
                 action == "approve" || action == "deny",
                 "confirm interactions accept only 'approve' or 'deny', not '{action}'"
             );
+            Map::new()
+        }
+        "url" => {
+            anyhow::ensure!(
+                action == "continue" || action == "cancel",
+                "url interactions accept only 'continue' or 'cancel', not '{action}'"
+            );
+            // Nothing beyond the action ever reaches the stored response —
+            // no data, no note (decision 6).
+            anyhow::ensure!(
+                note.as_deref().is_none_or(|n| n.trim().is_empty()),
+                "url interactions carry no note; the response is the action alone"
+            );
+            note = None;
             Map::new()
         }
         "a2ui" => {

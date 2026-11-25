@@ -5,12 +5,11 @@ type: openai
 # Use patches to apply jq expressions per API type.
 # Each expression receives {url, headers, body} and returns the modified version.
 # patches:
-#   chat_completions:
-#     - 'if (.body.model | startswith("gpt-5")) then .body.reasoning_effort = "high" else . end'
 #   responses:
+#     - 'if (.body.model | startswith("gpt-6.2-")) then .body.reasoning = {"effort":"high","summary":"auto"} else . end'
 #     - '.body.store = true'  # Override default store:false; re-enables dashboard logging
 
-# Note: reasoning-effort aliases (gpt-5.6-*:high/:max, gpt-6-astra:high/:max)
+# Note: reasoning-effort aliases (gpt-6.2-sol:high/:max, gpt-6.2-astra:high/:max)
 # route to /v1/responses with
 # store:false default. store:false prevents dashboard logging, but OpenAI
 # retains payloads ~30 days for abuse monitoring unless the account has ZDR

@@ -36,36 +36,41 @@ unsafe impl lock_api::RawRwLock for YieldingRawRwLock {
         inner: parking_lot::RawRwLock::INIT,
     };
 
-    type GuardMarker = <parking_lot::RawRwLock as lock_api::RawRwLock>::GuardMarker;
+    type SharedGuard = <parking_lot::RawRwLock as lock_api::RawRwLock>::SharedGuard;
+    type ExclusiveGuard = <parking_lot::RawRwLock as lock_api::RawRwLock>::ExclusiveGuard;
 
-    fn lock_shared(&self) {
-        if !self.inner.try_lock_shared() {
-            wait_off_worker(|| self.inner.lock_shared());
+    fn lock_shared(&self) -> Self::SharedGuard {
+        match self.inner.try_lock_shared() {
+            Some(guard) => guard,
+            None => wait_off_worker(|| self.inner.lock_shared()),
         }
     }
 
-    fn try_lock_shared(&self) -> bool {
+    fn try_lock_shared(&self) -> Option<Self::SharedGuard> {
         self.inner.try_lock_shared()
     }
 
-    unsafe fn unlock_shared(&self) {
-        // SAFETY: the caller holds a shared lock, as the trait requires.
-        unsafe { self.inner.unlock_shared() }
+    unsafe fn unlock_shared(&self, guard: Self::SharedGuard) {
+        // SAFETY: the caller holds a shared lock, as the trait requires, and
+        // `guard` is the state the inner lock handed out for it.
+        unsafe { self.inner.unlock_shared(guard) }
     }
 
-    fn lock_exclusive(&self) {
-        if !self.inner.try_lock_exclusive() {
-            wait_off_worker(|| self.inner.lock_exclusive());
+    fn lock_exclusive(&self) -> Self::ExclusiveGuard {
+        match self.inner.try_lock_exclusive() {
+            Some(guard) => guard,
+            None => wait_off_worker(|| self.inner.lock_exclusive()),
         }
     }
 
-    fn try_lock_exclusive(&self) -> bool {
+    fn try_lock_exclusive(&self) -> Option<Self::ExclusiveGuard> {
         self.inner.try_lock_exclusive()
     }
 
-    unsafe fn unlock_exclusive(&self) {
-        // SAFETY: the caller holds the exclusive lock, as the trait requires.
-        unsafe { self.inner.unlock_exclusive() }
+    unsafe fn unlock_exclusive(&self, guard: Self::ExclusiveGuard) {
+        // SAFETY: the caller holds the exclusive lock, as the trait requires,
+        // and `guard` is the state the inner lock handed out for it.
+        unsafe { self.inner.unlock_exclusive(guard) }
     }
 
     fn is_locked(&self) -> bool {
@@ -82,13 +87,13 @@ unsafe impl lock_api::RawRwLock for YieldingRawRwLock {
 /// `block_in_place` panics on a current-thread runtime, where there is no
 /// other worker to hand the core to, so those callers (and threads outside
 /// any runtime) block in place as before.
-fn wait_off_worker(wait: impl FnOnce()) {
+fn wait_off_worker<T>(wait: impl FnOnce() -> T) -> T {
     let multi_thread = tokio::runtime::Handle::try_current()
         .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
     if multi_thread {
-        tokio::task::block_in_place(wait);
+        tokio::task::block_in_place(wait)
     } else {
-        wait();
+        wait()
     }
 }
 

@@ -113,6 +113,7 @@ impl ToolProgress for NoProgress {
 
 fn context(provider: Arc<Provider>) -> ToolEvalContext {
     ToolEvalContext {
+        structured_results: false,
         on_tool_call_completed: None,
         on_interaction: None,
         middleware_fn: None,
@@ -168,6 +169,7 @@ async fn script(script: &str, executor: Arc<ScriptInnerExecutor>) -> ScriptRun {
     let tools = ["a", "b", "approval", "fatal", "broken", "domain", "fs_read"]
         .into_iter()
         .map(|name| ToolSpec {
+            output: None,
             name: name.into(),
             description: format!("Call {name}."),
             schema: if name == "fs_read" {
@@ -274,7 +276,7 @@ async fn approval_and_blocked_commands_stop_without_provider_dispatch() {
     });
     let (run, adapter) = adapter_with_middleware(provider.clone(), Some(middleware), 2, 100);
     let result = script("a; echo unreachable", adapter).await;
-    assert_eq!(result.exit_code, 4, "{result:?}");
+    assert_eq!(result.exit_code, 126, "{result:?}");
     assert!(result.stderr.contains("blocked by policy"));
     assert!(result.stdout.is_empty());
     assert!(provider.calls.lock().unwrap().is_empty());
@@ -285,7 +287,7 @@ async fn approval_and_blocked_commands_stop_without_provider_dispatch() {
 async fn adapter_uses_typed_rejection_kinds_and_shared_call_budget() {
     let (run, adapter) = adapter(Arc::default(), 1, 1);
     let result = script("a; b; echo unreachable", adapter.clone()).await;
-    assert_eq!(result.exit_code, 5, "{result:?}");
+    assert_eq!(result.exit_code, 126, "{result:?}");
     assert!(!result.stdout.contains("unreachable"));
     let outcome = adapter
         .call("not_allowed", json!({}), CancellationToken::new())

@@ -208,6 +208,45 @@ async fn pod_ip_missing_claim_is_not_reported_as_a_timeout() {
         .unwrap_err();
 
     assert_eq!(error.to_string(), "sandbox not found: deleted");
+    assert!(is_sandbox_not_found(&error));
+}
+
+#[tokio::test]
+async fn ensure_active_reports_missing_sandboxes_as_a_typed_not_found() {
+    let api = Arc::new(MockApi::default());
+    let error = test_manager(api.clone())
+        .ensure_active("deleted", &CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "sandbox not found: deleted");
+    assert!(is_sandbox_not_found(&error));
+    // Ok(None) from the API passes straight through retry_api, so the
+    // missing-claim lookup is a single get.
+    assert_eq!(api.state.lock().get_calls, 1);
+}
+
+/// A claim deleted while its sandbox is waking must surface from the
+/// readiness poll (`wait_until_ready`) as the typed not-found error, so an
+/// ambient connect can still recover (#2840).
+#[tokio::test]
+async fn a_claim_deleted_mid_wake_reports_a_typed_not_found() {
+    let api = Arc::new(MockApi::default());
+    api.state
+        .lock()
+        .scripted_gets
+        .push_back(Some(pending_record("claim-wake")));
+
+    let error = test_manager(api.clone())
+        .ensure_active("claim-wake", &CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "sandbox not found: claim-wake");
+    assert!(is_sandbox_not_found(&error));
+    // First get returned the pending record; the readiness poll's second get
+    // found no claim.
+    assert_eq!(api.state.lock().get_calls, 2);
 }
 
 fn missing_ip_record(id: &str) -> SandboxRecord {

@@ -22,5 +22,5 @@ region: us-east-1
 
 # Optional: Custom model list (if not using built-in catalog)
 # models:
-#   - name: "anthropic.claude-3-sonnet-20240229-v1:0"
+#   - name: "us.anthropic.claude-sonnet-5-5"
 #     type: chat

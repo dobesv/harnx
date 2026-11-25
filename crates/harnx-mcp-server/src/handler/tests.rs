@@ -37,6 +37,7 @@ fn input_required_fails_closed_with_the_compatibility_error() {
             kind: "confirm".into(),
             message: Some("Proceed?".into()),
             surface: None,
+            url: None,
             summary: String::new(),
             request_state: serde_json::Value::Null,
         }),

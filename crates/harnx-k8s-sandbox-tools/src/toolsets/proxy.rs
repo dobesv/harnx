@@ -196,7 +196,8 @@ pub(super) fn proxy_spec(mut spec: ToolSpec) -> ToolSpec {
     );
     spec.timeout_secs = Some(0);
     // The sandbox's tools are reached over MCP, which has no way to deliver a
-    // new-message signal, so a proxied wait cannot stop on one.
+    // new-message signal, so a proxied wait cannot stop on one. The request
+    // for a script-shaped result does travel, so its mapping stays.
     if let Some(meta) = spec.meta.as_mut() {
         meta.remove(harnx_toolset::STOP_ON_NEW_MESSAGE_META_KEY);
     }

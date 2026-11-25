@@ -19,6 +19,7 @@ mod persistence_split;
 mod rag_split;
 pub mod remote_session_ops;
 mod run_limits_resolver;
+pub mod script_tools;
 mod servers_split;
 pub mod session;
 pub(crate) mod session_externalize;
@@ -368,6 +369,8 @@ pub struct Config {
     pub clients: Vec<ClientConfig>,
     pub nats_servers: Vec<NatsServerConfig>,
     pub tool_servers: Vec<ToolServerConfig>,
+    /// Immutable definitions and compiled validators from global config and packages.
+    pub script_tool_catalog: script_tools::ScriptToolCatalog,
 
     // Runtime state — unchanged from pre-A2:
     pub model_cooldowns: std::sync::Arc<parking_lot::Mutex<crate::client::retry::ModelCooldownMap>>,
@@ -381,6 +384,14 @@ pub struct Config {
     pub tools: Tools,
     #[doc(hidden)]
     pub nats_tool_declarations: Arc<parking_lot::RwLock<Vec<ToolDeclaration>>>,
+    /// Every name the last refreshed NATS provider routes — agent-visible
+    /// names and the raw aliases kept through the naming transition. The
+    /// config-level script-tool collision view uses these names: raw
+    /// aliases never appear in a declaration list, but the model-visible
+    /// tool list must not advertise a script tool whose name the provider
+    /// serves. Not an advertisement set — collision exclusion only.
+    #[doc(hidden)]
+    pub nats_served_tool_names: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
     pub working_mode: WorkingMode,
     pub last_message: Option<LastMessage>,
 
@@ -452,6 +463,7 @@ impl Clone for Config {
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
             tool_servers: self.tool_servers.clone(),
+            script_tool_catalog: self.script_tool_catalog.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
             info_flag: self.info_flag,
@@ -461,6 +473,7 @@ impl Clone for Config {
             model: self.model.clone(),
             tools: self.tools.clone(),
             nats_tool_declarations: Arc::clone(&self.nats_tool_declarations),
+            nats_served_tool_names: Arc::clone(&self.nats_served_tool_names),
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: self.session.clone(),
@@ -500,6 +513,7 @@ impl Config {
             clients: self.clients.clone(),
             nats_servers: self.nats_servers.clone(),
             tool_servers: self.tool_servers.clone(),
+            script_tool_catalog: self.script_tool_catalog.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
             info_flag: self.info_flag,
@@ -509,6 +523,7 @@ impl Config {
             model: self.model.clone(),
             tools: self.tools.clone(),
             nats_tool_declarations: Arc::clone(&self.nats_tool_declarations),
+            nats_served_tool_names: Arc::clone(&self.nats_served_tool_names),
             working_mode: self.working_mode.clone(),
             last_message: self.last_message.clone(),
             session: None,
@@ -538,6 +553,7 @@ impl Default for Config {
             clients: vec![],
             nats_servers: vec![],
             tool_servers: vec![],
+            script_tool_catalog: Default::default(),
 
             model_cooldowns: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
             macro_flag: false,
@@ -549,6 +565,7 @@ impl Default for Config {
             model: Default::default(),
             tools: Default::default(),
             nats_tool_declarations: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            nats_served_tool_names: Arc::new(parking_lot::RwLock::new(Default::default())),
             working_mode: WorkingMode::Cmd,
             last_message: None,
 
@@ -1228,8 +1245,51 @@ impl Config {
         use_tools: Option<&str>,
         active_pkg: Option<&str>,
     ) -> (Vec<ToolDeclaration>, HashMap<String, String>) {
+        let script_tools = self.accepted_script_tools();
+        let nats_declarations = self.nats_tool_declarations_snapshot();
+        self.tool_declarations_for_use_tools_with_script_tools(
+            use_tools,
+            active_pkg,
+            &nats_declarations,
+            &script_tools,
+        )
+    }
+
+    /// The config's current NATS tool declarations, captured once. A tool
+    /// round threads this set through every derivation (accepted view,
+    /// declarations, bash inner catalog) so a discovery refresh between two
+    /// reads cannot desynchronize them.
+    pub(crate) fn nats_tool_declarations_snapshot(&self) -> Vec<ToolDeclaration> {
+        self.nats_tool_declarations.read().clone()
+    }
+
+    /// Same selection with a precomputed accepted script-tool view (decision
+    /// 12): a tool round snapshots the view once and serves both declarations
+    /// and the script provider from that snapshot, so a discovery refresh
+    /// between the two cannot make the round advertise a script tool it will
+    /// not serve. An empty `script_tools` is not just an optimization: it is
+    /// how contexts without a script evaluation slot (lifecycle hooks, operator
+    /// `.call`, non-Bash reservation calls, orphan repair) and inner-selector
+    /// resolution exclude script tools. Operator and reserved Bash contexts
+    /// install a slot. `nats_declarations` must come from the same round
+    /// capture as `script_tools`.
+    pub(crate) fn tool_declarations_for_use_tools_with_script_tools(
+        &self,
+        use_tools: Option<&str>,
+        active_pkg: Option<&str>,
+        nats_declarations: &[ToolDeclaration],
+        script_tools: &[Arc<script_tools::ResolvedScriptTool>],
+    ) -> (Vec<ToolDeclaration>, HashMap<String, String>) {
         let mut declarations = self.tools.declarations();
-        declarations.extend(self.nats_tool_declarations.read().iter().cloned());
+        declarations.extend(nats_declarations.iter().cloned());
+        // Script tools join the same selectable catalog (R3): literal names,
+        // globs and toolsets resolve them exactly like base tools, and the
+        // caller's snapshot already removed base-name collisions.
+        declarations.extend(
+            script_tools
+                .iter()
+                .map(|tool| script_tools::script_tool_declaration(tool.definition())),
+        );
         let mut handoff_targets = HashMap::new();
         if let Some(use_tools) = use_tools {
             let selectors = self.expanded_tool_selectors(use_tools);

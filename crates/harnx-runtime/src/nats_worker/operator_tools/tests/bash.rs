@@ -474,6 +474,7 @@ async fn assert_request_disabled_call_and_shell_parity(
         OperatorToolCommand::Call {
             name: "fixture_echo".into(),
             args_json: "{}".into(),
+            tool_input: None,
         },
     )
     .await;

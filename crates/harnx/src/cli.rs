@@ -1,4 +1,3 @@
-// qual:allow(srp, file_length=306) reason: "the clap command surface already splits subcommand arg structs into modules; registering the interact and surface commands leaves it a few lines over the module limit"
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use harnx_runtime::config::SessionFormat;
@@ -8,8 +7,12 @@ use std::path::PathBuf;
 
 mod compaction_selector;
 pub use compaction_selector::CompactionSelector;
+mod credentials_args;
+mod delete_args;
 mod interact_args;
 mod surface_args;
+pub use credentials_args::{CredentialsArgs, CredentialsSubcommands};
+pub use delete_args::{DeleteArgs, DeleteOrphanStreamsArgs, DeleteSessionArgs, DeleteSubcommands};
 pub use interact_args::*;
 pub use surface_args::*;
 
@@ -129,6 +132,11 @@ pub enum Commands {
     Interact(InteractArgs),
     /// Inspect a session's published surfaces or act on one
     Surface(SurfaceArgs),
+    /// List, connect or disconnect your tool-server credentials
+    ///
+    /// Secrets are never entered here: `connect` prints a link you complete
+    /// in a browser.
+    Credentials(CredentialsArgs),
     /// Compact session logs to reduce history size.
     ///
     /// Blocks until compaction finishes and streams progress. A "nothing to compact"
@@ -183,68 +191,6 @@ pub struct PromptArgs {
     /// Input text
     #[arg(trailing_var_arg = true)]
     text: Vec<String>,
-}
-
-#[derive(Args, Debug, PartialEq, Eq)]
-pub struct DeleteArgs {
-    #[command(subcommand)]
-    pub command: DeleteSubcommands,
-}
-
-#[derive(Subcommand, Debug, PartialEq, Eq)]
-pub enum DeleteSubcommands {
-    /// Delete a remote NATS session log stream + lease key
-    Session(DeleteSessionArgs),
-    /// Delete remote NATS sessions whose stream has no session metadata and
-    /// has not been written for the grace period, after re-checking every
-    /// guard (last write, leases, metadata)
-    OrphanStreams(DeleteOrphanStreamsArgs),
-}
-
-#[derive(Args, Debug, PartialEq, Eq)]
-pub struct DeleteSessionArgs {
-    /// Agent that owns the session
-    #[arg(long)]
-    pub agent: String,
-    pub session_id: String,
-    /// Cluster key from nats_servers/<name>.yaml
-    #[arg(long)]
-    pub cluster: String,
-}
-
-/// Guarded orphan-stream cleanup options for the CLI delete mode.
-#[derive(Args, Debug, PartialEq, Eq)]
-pub struct DeleteOrphanStreamsArgs {
-    /// Cluster key from nats_servers/<name>.yaml
-    #[arg(long)]
-    pub cluster: String,
-    /// A stream must have gone this many hours without a write (since its
-    /// creation, if it holds no messages) to be deleted. Defaults to the
-    /// configured session retention (cleanup_remote_sessions_days); pass it
-    /// explicitly when no retention is configured.
-    #[arg(long)]
-    pub grace_hours: Option<u64>,
-    /// Maximum number of orphan streams deleted in one run
-    #[arg(
-        long,
-        default_value_t = harnx_runtime::session_stream_gc::DEFAULT_MAX_ORPHAN_DELETIONS_PER_RUN
-    )]
-    pub max: usize,
-}
-
-impl DeleteSessionArgs {
-    /// An embedded cluster must agree with the explicitly selected deletion cluster.
-    pub fn agent_name(&self) -> anyhow::Result<String> {
-        let (agent, cluster) = harnx_runtime::config::resolve_session_agent(&self.agent)?;
-        if self.agent.contains('@') {
-            anyhow::ensure!(
-                cluster == self.cluster,
-                "Agent cluster '{cluster}' conflicts with --cluster '{}'",
-                self.cluster
-            );
-        }
-        Ok(agent)
-    }
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]

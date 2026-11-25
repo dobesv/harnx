@@ -117,12 +117,32 @@ tmux/interrupt e2e and other timing-sensitive tests; a pure unit test needs no
 stress run. Some flakes only appear under full-suite load, so when a new test
 is timing-sensitive, also run it once alongside the rest of its crate.
 
-CI uses the same selection on pull requests and runs the whole suite in the
-merge queue and on `main`, so a missing edge is caught before merge rather than
-after. CI skips the build and tests entirely when every changed file is on the
+An exact filter (`-E 'test(=name)'`) needs the test's full module path, e.g.
+`nats_session_claim_tests::claim_race_...`, not the bare function name. A bare
+name matches zero tests, and a `--stress-count` run over that empty selection
+still reports `20/20 iterations passed` — a false green. Check the
+`Starting N tests across M binaries` line before trusting a filtered run.
+
+CI uses the same selection on pull requests and runs the whole suite on
+`main`. Mergify's merge queue tests its batches as ordinary pull requests, so
+it uses the selection too: a missing edge, or a test only the whole suite
+runs, first fails on `main`. CI skips the build and tests entirely when every changed file is on the
 exclusion list in `.github/workflows/ci.yaml` (web, changesets, READMEs,
 release workflows), which the first path rule in `.config/affected.toml`
 mirrors. A test that starts reading one of those paths must take it off both.
+
+CI compiles each OS once, with `cargo nextest archive --workspace`, and
+splits the selected tests between several jobs that run them from the archive
+without a compiler (`.github/workflows/ci-rust.yaml`; a failure shows under
+`<OS> / Test (k/N)`). The test jobs unpack the test binaries and the
+workspace bins into the checkout's own `target/debug`, so the usual ways of
+finding a sibling binary still work: next to the test's own executable,
+through `env!("CARGO_BIN_EXE_...")`, or in `target/debug` under the workspace
+root, and `CARGO_TARGET_TMPDIR` (`target/tmp`) exists, empty. Nothing else
+from the build directory is there, so a test that reads another file under
+`target/` or runs cargo to build something passes locally and fails in CI. Only xtask's tests may run cargo, and the test jobs
+fetch crates for them alone; a new test that runs `cargo metadata` needs its
+package added to that step's condition.
 
 **Use `cargo nextest`, never `cargo test`.** Tests rely on nextest's per-test
 process isolation; `cargo test` shares one process and produces spurious
@@ -149,6 +169,12 @@ category and function rather than by line, and follow a renamed file. "Worse"
 means a bigger number on a finding both sides have: a longer function, higher
 complexity, deeper nesting, more parameters or more `unwrap`s. A file already
 over the length limit may grow; only crossing the limit counts.
+
+On a multi-commit branch, a per-task run with `--base HEAD` measures only the
+last commit's delta and misses findings earlier commits added — a branch
+whose tasks each ran the gate that way reached pre-submit with 120 unmeasured
+findings. Measure the whole branch the way CI will, against the merge base
+(`cargo xtask quality --base origin/main`).
 
 rustqual is pinned in `xtask/rustqual/Cargo.toml` and its lockfile, so nothing
 needs installing; the first run builds it, which takes about a minute. Its
@@ -179,6 +205,16 @@ member once a group reaches three. A new `A => 0, B => 2, _ => 1` match on one
 enum joined two such matches on unrelated enums in test files, and all three
 were reported.
 
+The duplicate-fragment check (`dry, fragment`) clusters similar code across
+files the same way. A third e2e file repeating the standard
+broker/binary/env-guard preamble grew clusters whose other members sat in
+`bash_script_mode.rs` and `tool_supervisor.rs`, and the gate reported those
+pre-existing pairs as made worse. Suppressing your new copy changes nothing —
+the findings live at the other locations. Deduplicate the shared shape into a
+helper (the `start_time_server` helper in
+`crates/harnx-runtime/tests/it/bash_script_mode.rs` now serves three e2es), or
+`qual:allow(dry, fragment)` the pre-existing fragment with a written reason.
+
 The `Code quality` CI job runs the gate on pull requests and annotates the diff
 with what it finds. It is advisory: `.mergify.yml` doesn't require it.
 
@@ -200,7 +236,11 @@ top-level `/tmp` entry that holds the checkout, the target directory or
 `HOME` is shared with the host. No DNS server is reachable inside, so a name
 resolves only through `/etc/hosts` and NSS modules: RFC 6761 `*.localhost`
 names need `myhostname` in `/etc/nsswitch.conf` (`libnss-myhostname` on
-Debian and Ubuntu, which CI installs). On macOS the test
+Debian and Ubuntu, which CI installs). Cargo runs offline there
+(`CARGO_NET_OFFLINE`), so a test that runs `cargo metadata`, as xtask's
+`affected` tests do, needs every target platform's crates in the registry,
+not just the host's that a build downloads; run `cargo fetch` first, as CI
+does for them. On macOS the test
 runs in its own process group, which is killed when the test ends, along with
 any process whose command line names the test's private home, such as its
 broker. A process that moved to its own group without naming the home, such
@@ -299,6 +339,8 @@ args:
 
 Use `--no-sandbox` when the test scope is bash behavior, not sandbox isolation. Hosts that block unprivileged user namespaces (some containers) fail `harnx-sandbox-exec` with exit 127 before the command runs. Precedent: `proxy_auth_hook_injects_env_vars_into_bash_exec` in `crates/harnx/tests/it/tmux_e2e.rs`; `write_with_wait_tool` in `crates/harnx/src/test_utils/interrupt.rs` bridges the time server the same way.
 
+Such a test says nothing about what `harnx-sandbox-exec` does to a result, and the shipped bash servers run every command through it. The tool sees the wrapper's exit code, not the command's status: the wrapper reported a command killed by a signal as exit 1 while every `--no-sandbox` test saw the signal. A change to how the bash tools read a command's status needs a check of the wrapper too (`exit_code` in `crates/harnx-sandbox-common/src/bin/sandbox_exec.rs` has unit tests that need no namespaces).
+
 ### MCP bridge result limits
 
 Bridged MCP tool results are capped at 128 KiB serialized JSON by default
@@ -348,6 +390,24 @@ A probe must not skip on its own mistakes either. `harnx-sandbox-run`'s integrat
 
 ### Broker-backed tests and wall-clock margins
 
+Group membership is by test name, not by what the test does: the `broker-e2e` override in
+`.config/nextest.toml` filters names (a broad `test(/nats/)` plus explicit filters such as
+`^tests::upload_attachments_` and `^access_prompt_attachments::`), in both the default and
+`ci` profiles. A test that spawns a `nats-server` but matches no filter runs in the
+default group and can destabilize the rest of the run — give it a matching name or add
+the filter to both profiles. Verify with `cargo nextest show-config test-groups`.
+
+When a test hands `nats-server` a config file, note 2.11 rejects the
+block-style `mappings` list shown in its docs (`"src": ["dst"]` fails with
+"Expected an entry for the mapping destination"); use a plain string
+destination (`mappings: { "src": "dst" }`). Subject mappings are also the
+deterministic way to simulate a post-connect write outage: reroute exactly one
+subject so no stream listens on it (see
+`claim_row_i_kv_write_failure_after_connect_is_503` in
+`crates/harnx-serve/src/nats_session_claim_tests.rs`). The same `mappings`
+trick simulates lagging followers and leaderless streams; see "NATS/GC tests:
+CI coverage and isolation" for those setups.
+
 Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
 (`.config/nextest.toml`; local runs use `-local` copies with higher caps). On
 a contended GitHub runner that whole block has been measured running 6 to 40
@@ -367,6 +427,14 @@ than a SIGKILL would.
 
 When one of these tests fails, check a passing run's timings for the same block
 before blaming the test. If the whole block is slow, the margin is the bug.
+
+rmcp's Streamable HTTP session idle timer (`SessionConfig::keep_alive`)
+restarts only when the session receives a message, not while it is still
+handling a request. A test that shortens it to watch a session expire has to
+keep the session busy until the moment it wants the timer to run, as
+`keep_session_active` in `crates/harnx-mcp-server/tests/it/transports.rs`
+does. Otherwise a slow `list_tools` loses its session mid-request, and the
+rmcp client waits forever for the reply.
 
 ### CLI binaries need an 8 MiB stack on Windows
 
@@ -388,7 +456,7 @@ tests verify the same bootstrap path that Windows executes unchanged.
 ### Error classification through typed causes, not strings
 
 When classifying broker/JetStream errors (such as size limits), use typed downcasts
-against async-nats 0.50 error causes rather than string matching. String matching on
+against async-nats 0.51 error causes rather than string matching. String matching on
 error messages creates false positives: permission-denied or connection errors may
 contain words like "size" or "exceeded" without actually being size limits.
 
@@ -423,6 +491,35 @@ source error: `config/session_persistence/append_status.rs` keeps the first appe
 across a batch, and `require_authoritative_appends` adds operation context with
 `.with_context`, never `bail!`. Regression coverage:
 `tests/it/nats_worker/activation_size_failure.rs`.
+
+async-nats 0.51's own wrappers sometimes destroy the typed cause before it reaches you.
+`ObjectStore::put` stringifies its chunk and metadata publish errors (`PutError` carries
+the message as its source, no inner `jetstream::Error` to downcast), so for a publish
+failure the surviving fallback signal is the client's `connection_state() != Connected`.
+`PutErrorKind::PurgeOldChunks` is the exception: it keeps a typed `PurgeError` source, and
+it only fires after the new version's metadata has been acknowledged — treat it as a
+committed version with a failed old-chunk cleanup, not as a publish failure (see
+`committed_after_failed_cleanup` in `crates/harnx-blob-store/src/media.rs`).
+Bucket-ensure round trips after connect surface the
+inner error wrapped in an outer typed kind instead (`context::RequestError` with
+`TimedOut`/`NoResponders`, or `GetStreamError`/`CreateStreamError`/`LastRawMessageError`
+kinds such as JetStream `CLUSTER_NOT_AVAILABLE`/`STREAM_OFFLINE`). Classify on those
+outer kinds, never on the message text: `is_nats_unavailable` in
+`crates/harnx-serve/src/nats_access.rs` is the reference implementation, and
+`nats_access_tests.rs` builds its fixtures from real error values (deserialized API
+payloads wrapped in async-nats's own constructors, live no-responders chains) rather than
+hand-built strings. Post-connect KV writes surface the same way: `kv::Store::create`
+and `update` wrap a stalled or dying broker in typed `CreateError`/`UpdateError`/
+`PublishError` kinds (plus the direct-get `NO_RESPONDERS` fallback, whose conversion drops
+its source), so callers of `is_nats_unavailable` answer 503 for them while store answers
+(`AlreadyExists`, `InvalidKey`, `WrongLastRevision`, `MaxPayloadExceeded`) stay non-outage.
+A missing kind made a post-connect reservation outage answer HTTP 400 instead of the
+retriable 503 (#2855). Besides `guard_error_status` and the claim path's `claim_read_error`,
+the 503 mappers include `crates/harnx-serve/src/attachments/upload_store.rs` and the
+`ag_ui_rpc.rs` attachment preflight (through `SourceCheck`'s `read_failure` in
+`session_access.rs`). CID authorization deliberately does not map outages to 503: an
+unavailable source reads as absent and gets the blob route's own 404
+(`cid.rs::can_access_cid`).
 
 ### Telling a flake from a regression
 
@@ -609,6 +706,14 @@ reasoning patch, usually because the registry doesn't mark it
 `supports_reasoning`: give it a curated patch if it reasons, or add it to the
 guard's `openai_model_without_reasoning` if it doesn't.
 
+Those two patches are all a new model gets. Effort aliases, the removal of
+sampling parameters and Gemini 4's per-request output limit are lists of model
+names in `scripts/model_variants.py` (`OPENAI_EFFORT_VARIANTS`,
+`apply_openai_base_patches`, `GEMINI_4_REQUEST_PATCHES`), and no guard fails
+for a model missing from them. GPT-6.2 arrived without `:high` and `:max`
+aliases, and Gemini 4 Carbon with its whole 1,048,576-token window as its
+output limit. Read a new model's catalog entry before an agent selects it.
+
 Claude thinking aliases come from the registry's flags rather than model
 names. `ThinkingSupport.from_registry` (`scripts/model_variants.py`) reads
 `supports_adaptive_thinking`, `supports_legacy_thinking` (a fixed
@@ -649,6 +754,15 @@ refresh one provider also imports every other provider's current upstream
 drift, which does not belong in a scoped changeset. After a scoped refresh,
 take `HEAD:crates/harnx/models.yaml`, splice in only the `provider:` block
 you meant to change, and confirm `git diff` touches that block alone.
+
+To apply a new rule in `scripts/model_variants.py` without the registry, load
+the catalog with `load_existing_data`, pass a provider's own models (minus
+those `is_generated_variant_name` matches) to `regenerate_provider_models` as
+the fetched set, and write the result with `render_models_yaml`. Rendering
+every provider unchanged reproduces the file byte for byte, so the diff shows
+only what the rule changed. This works for OpenAI and Gemini. Claude's thinking
+aliases need the registry's flags, which the catalog doesn't store, so a Claude
+provider regenerated this way loses them.
 
 ## Key Patterns
 
@@ -858,23 +972,28 @@ of failure, and a probe on one client type says nothing about the other.
 To verify reasoning summaries, streaming, and tool replay across providers,
 run the live probe script (`scripts/probe_reasoning_summaries.*`).
 
-### Think-tag rendering contract (issues #2437, #2488)
+### Think-tag rendering contract (issues #2437, #2488, #2858)
 
 Thinking text is persisted and streamed wrapped in literal `<think>\n…\n</think>`
-tags: session persistence (`harnx-runtime/src/config/session.rs` ~L860 and
-`harnx-serve/src/lib.rs` ~L1953 for tool-call turns), the streaming bracket
+tags: session persistence (`harnx-runtime/src/config/session.rs::add_assistant_text`;
+the legacy REST view `harnx-serve/src/lib.rs::history_message_content` folds
+tool-call thoughts the same way), the streaming bracket
 helpers in `harnx-client` (`SseHandler::thought`, `claude_transition_reasoning`,
 `openai_transition_reasoning`), the non-streaming `format!`s in `claude.rs`,
 `openai.rs`, and `bedrock.rs`, and inline-thinking models emitting tags inside
-normal text. The tags are the wire format; frontends split them out for display
-rather than persistence changing what it writes.
+normal text. Persistence and the live stream keep the tags as the wire format
+(issue #2858 changed only what history snapshots emit): the server strips
+leading wrappers from snapshot assistant content and returns the reasoning in
+a side-channel `history_reasoning` map; frontends split live inline tags for
+display.
 
 - Display splitting uses `harnx_core::text::THINK_TAG_PAIRS` (`<think>` and
   `<thinking>`; case-sensitive, no nesting, no code-fence special-casing).
   Consumers: the TUI (`assistant_render.rs`), the CLI
   (`streaming_think_segmenter.rs`, which must run at the `cli_event_sink`
   boundary because the sink's partial-line raw writes bypass `MarkdownRender`),
-  and the web port `web/src/lib/thinkBlocks.ts`. The TS port must stay
+  and the web port `web/src/lib/thinkBlocks.ts` (legacy fallback only — see the
+  history-snapshot bullet below). The TS port must stay
   semantically identical to `split_think_blocks` — its vitest cases mirror the
   Rust unit tests, including the single-newline trim at tag boundaries.
 - `strip_think_tag` (`harnx-core/src/text.rs`) is LLM-facing: it removes a
@@ -887,7 +1006,31 @@ rather than persistence changing what it writes.
   authoritative — only `None` (failed/timed-out read) may fall back to the raw
   live sink (`sanitized_empty_durable_progress_does_not_expose_later_live_reasoning`).
   `split_think_blocks` is display-facing (any position, ordered
-  segments). Keep the two contracts separate.
+  segments). Keep the contracts separate.
+- History snapshots strip thinking server-side (issue #2858).
+  `crates/harnx-serve/src/history_projection.rs::split_history_reasoning` is
+  snapshot-facing and has its own semantics: it removes only *leading,
+  writer-shaped* wrappers — `<think>\n…\n</think>` followed by `\n\n` (model
+  adapters), one `\n` (session storage) or end-of-string — looping over
+  consecutive wrappers and coalescing adjacent duplicates. Mid-text, fenced,
+  `<thinking>` and unclosed tags stay verbatim, and the answer is never
+  trimmed. It runs on assistant `Text` and `ToolCalls.text` (tool-call turns
+  can be stored with role `Tool`) only; user/system/tool-result rows are
+  untouched and a reasoning-only row keeps `content: ""`. Callers:
+  `history_projection::project_message`, which feeds `HistorySnapshot`
+  (`transcript_snapshot.rs`: the MESSAGES_SNAPSHOT payload and `session/get`)
+  and `session_history/{groups,projection}.rs` (`session/history` and HTTP
+  history pages). The `ModelEvent::Final` fallback
+  `ag_ui.rs::emit_final_content` calls `split_history_reasoning` directly
+  (thoughts re-emitted only when none were streamed as THINKING events). Stripped reasoning is returned as a
+  `history_reasoning` map keyed by the emitted assistant row ID: a sibling of
+  `history_snapshot` in RPC/HTTP responses, and — only when an SSE request
+  opts in via `x-harnx-snapshot-features: history-reasoning` — a
+  `CUSTOM history_reasoning` event immediately after each MESSAGES_SNAPSHOT
+  (`transcript_snapshot.rs::SnapshotFeatures`). The web client consumes the
+  structured map (`ChatProvider.tsx` injects synthetic `role: "reasoning"`
+  rows; `historyReasoningSupport.ts` flags support), so `thinkBlocks.ts`
+  inline splitting is an assistant-only legacy fallback for older servers.
 - CLI raw/non-TTY output keeps literal tags byte-for-byte — scripts may parse it
   (`raw_and_non_tty_output_remain_byte_identical` in `cli_thought_tests.rs`).
   TTY output instead prints a dim `Thinking` label plus DarkGray DIM+ITALIC
@@ -1005,6 +1148,70 @@ meaningful `null` must declare the property nullable (`Option<T>` in schemars
 does). A new native toolset with a map-typed parameter loses strict mode for
 that whole tool, so prefer a list of name/value objects when strictness
 matters.
+
+### What script mode reads from a tool
+
+Inside a `bash` script every tool is a command (`crates/harnx-script`), and
+three things a tool declares decide how well it works there.
+
+- **Parameter types.** A scalar, or an array of scalars, becomes a plain
+  flag, and so does its nullable form (`Option<T>`: `type: [T, "null"]`,
+  `nullable: true`, or `anyOf` of one type and null). Anything else, including
+  a union of two non-null types, a `$ref` that survived inlining or a map,
+  takes one quoted JSON argument, which models get wrong more often.
+- **Audience annotations.** A command's text output is the result's text
+  blocks minus those whose `annotations.audience` doesn't include
+  `assistant`. Put the data a script should pipe in an assistant-audience or
+  unannotated block, and the one-line summary for the person watching in a
+  user-audience block. A tool that annotates its data `user` prints nothing
+  in a script.
+- **Structured results.** The `bash` tool's inner calls send the request
+  capability `harnx:structured_result`
+  (`InnerCallExecutorConfig::structured_results`), and so does a custom
+  script tool's Bash body; direct model calls, a script tool's Python body
+  and a middleware's or hook's own `call_tool` don't. A native tool that
+  wants a shell form returns script-style fields when
+  `ToolInvocationContext::wants_structured_result()`
+  (`text` for a file, `paths` or `matches` for a search), declares with
+  `ToolSpec::with_script_output` which field is stdout, stderr and the exit
+  status, and leaves its direct-call output byte-identical. It bounds the
+  result itself, and puts a note about cut-off data in the field the mapping
+  names as `stderr`, never in the data. A note that says where to continue
+  (`--offset K`, `start_index=K`) is computed from what was printed after
+  every cap, not from the window the tool selected before the byte cap cut
+  it: a script that follows K otherwise skips the dropped part. Paths it
+  prints have to be usable as arguments to the next command. Scripts run with `set -e`, so a non-zero
+  status for "nothing found" (`fs_grep` exits 1) ends a script that doesn't
+  guard the call. `harnx-fs-tools` is the reference (`script_result.rs`,
+  `script_search.rs`); `harnx-bash-tools` is the reference for a tool that
+  behaves like a command (`server/script_result.rs`): its mapping sets
+  `stderr_text` for the command's own stderr, printed as stored before the
+  notes, and `exit_code` for its status (a value outside 0 to 255 is reported
+  as 255).
+
+  The request rides on the call context (`ToolCallOrigin::structured_result`,
+  set only by the fork the `bash` tool's inner calls use), not on a
+  task-local: a
+  script middleware runs on harnx-script's worker thread, and its `call_next`
+  dispatch would lose one. A middleware or hook that wraps a script's inner
+  call sees the script-shaped result, so one that scans `content` text misses
+  the data. Over MCP the capability travels in the request `_meta`
+  (`"harnx:structured_result": true`), so a tool behind `harnx-mcp-bridge` or
+  in the k8s sandbox gets its shell form; a server older than this answers in
+  model style and the command prints that text. A bridged script-style result
+  over the bridge's result limit is an error that says how to page.
+
+The `bash` tool's own result has two shapes, chosen by
+`BashProviderConfig::full_payload`. A model round gets `status`, `exit_code`,
+the truncation flags and the rendered report in `content`. An operator
+command (`harnx call bash`, `.call bash`) also gets `stdout`, `stderr` and
+`trace` as fields. Code that renders or inspects a model round's `bash` result
+has to read `content`.
+
+A script that runs to a non-zero `exit` comes back as status `error` with no
+`error` text; status `ok` always means exit code 0. Only a failure of the run
+itself (a resource limit, a timeout, a cancel, a fatal inner call) carries
+`error` text (`crates/harnx-script/src/bashkit_backend/outcome.rs`).
 
 ### Loop protection
 
@@ -1433,6 +1640,47 @@ opening a control handle; without metadata they return idle/not-found rather
 than creating one. Creating it there would stamp only the defaults, and the
 next prompt's request identity could never replace them.
 
+Under access rules, the session guard
+(`crates/harnx-serve/src/session_access.rs::guard_session_request`) renders
+the same 404 for a missing and a foreign ID once the owner lookup succeeds
+and decodes. A lookup or decode error never becomes that 404 and never
+defers: it propagates through `guard_error_status` — 503 for a recognized
+broker outage, 400 otherwise. Only a confirmed absence (`Ok(None)`) can
+defer, and only for a claim-candidate item POST. The `/v1/cid/*` blob route
+returns its own 404 for missing, foreign, undecodable and broker-unavailable
+source records (`crates/harnx-serve/src/cid.rs::can_access_cid`). The
+deferral is a `POST` to exactly `/v1/agents/{agent}/sessions/{session}` with
+a claimable ID, which the guard hands to the claim path: classification rows
+a–g are inline comments in
+`crates/harnx-serve/src/session_claim.rs`, and rows h–i — a live registered
+actor forces a leader reread of the canonical record, otherwise the ID is
+reserved via `create_or_read_session_metadata` — live in
+`crates/harnx-serve/src/session_claim_reservation.rs`. Pinned by
+`crates/harnx-serve/tests/it/access_sessions/claim_matrix.rs` and
+`crates/harnx-serve/src/nats_session_claim_tests.rs`:
+
+- A request that doesn't qualify as a creating prompt never reaches actor or
+  stream code on an unseen ID.
+- Refused outcomes are identical for missing and foreign IDs: same 404
+  status, body and application headers, and — for claim-candidate item
+  POSTs after a successful owner lookup — the same bounded body read (with
+  its cap and deadline) before any owner-dependent answer. That is
+  final-response parity, not a no-oracle guarantee — processing time can
+  still differ for prompt-scope callers, and the 403 for an admin-only
+  creating prompt and the 503 for a broker outage are intentional
+  exceptions.
+- An owner denial on the claim path is the guard's 404, never the actor's 409
+  `Rejected`.
+- Owner decoding is strict on the claim path
+  (`session_claim_reservation.rs::claim_record_owner`): undecodable
+  properties and a present non-string `user_id` fail closed, admins
+  included. The guard's own owner read (`read_session_owner`) is more
+  lenient — it treats a present non-string `user_id` as a legacy owner.
+- Owners are matched only through `rules.can_access_session`, never raw
+  `user_id` equality: prompt scope requires the stored owner to be among the
+  caller's `CallerView::users` (aliases included), admin scope reaches any
+  existing session, and groups/roles grant scope — never ownership.
+
 A `SESSION_` JetStream stream must never exist before canonical metadata does
 (`sessions/<storage_key>/meta` in `harnx_sessions`). The stream name is
 `SESSION_<sha256(storage_key)>` and cannot be reversed, and the remote GC
@@ -1467,6 +1715,20 @@ physically with a stream purge plus subject filter (like
 of per-key KV purge: a per-key PURGE marker leaves the subject listed forever,
 which "keys gone" checks and listings then misreport.
 
+`delete_session_leftovers` never touches the canonical record: the final
+revision-conditional purge of `sessions/<key>/meta` runs in `delete_session_state`
+(`harnx-runtime/src/nats_admin.rs`), after the leftovers cascade and the A2A
+cleanup, conditioned on the KV revision captured when deletion started (#2855).
+While the canonical record remains — any earlier failure leaves it in place,
+with the session still owned by its old owner — other prompt-scope callers
+cannot claim a partially deleted ID, and re-running `harnx delete session` or
+retention GC can finish the job. A deletion that saw no canonical record at
+start skips the final purge, so it never removes a record a later creator
+wrote. The reorder protects the canonical key only while the owner record
+remains; it does not fence later incarnations of a reused ID — media, plans,
+live actors and streams from the previous session are not
+incarnation-checked.
+
 ### Crate layering for NATS tool servers
 
 Tool servers that need NATS object/KV storage must depend on `harnx-blob-store`,
@@ -1498,6 +1760,17 @@ key; it cannot prove exclusive ownership when replicas share the same instance I
 A departing replica holding the latest revision will delete the key, leaving survivors
 undiscoverable until their next refresh (up to 30s). Only use `DeleteIfCurrent` for
 singletons that are guaranteed never to share their registration identity.
+
+User-scoped (`…{identity}.u.{user}`) and ownerless-only (`…{identity}.anon`)
+registrations — the per-principal additions credentialed tool servers publish
+(`harnx_toolset_server::RegistrationHandle`) — follow a stricter rule than either
+policy: no blind puts and no unconditional deletes. Every refresh is a CAS on the
+KV revision the writer last read, and every delete additionally checks the stored
+`connection_id` (`ConditionalDelete::ConnectionMismatch` leaves a newer connection's
+registration alone), so a stale instance can keep a removed principal's registration
+alive for at most one refresh interval and can never clobber or recreate a newer
+connection's. See `crates/harnx-toolset-server/src/registration_handle.rs` and
+`docs/tool-credentials.md`.
 
 
 ### Canonical `cid:` URL scheme
@@ -1667,6 +1940,19 @@ after the limit is raised, and lowering the limit below a message's delivery
 count drops it without the max-deliveries advisory. See "Delivery limits" in
 `docs/nats-ha.md`.
 
+### `kv::Store::status()` serves cached stream info
+
+`kv::Store::status()` clones the stream's cached info, so a `max_message_size`
+or other limit changed after the handle was opened stays invisible to it.
+When a size-rejection retry must plan against the limit that actually rejected
+the write, read the config fresh with `jetstream.get_stream(...).info()`.
+`InvocationJournal::complete_bounded` hit this: its typed-size retry re-planned
+an image offload against a stale ~1 MiB budget, and the real 8192-byte row cap
+turned the single retry into a fatal completion
+(`crates/harnx-toolset-server/src/invocation_journal/completion.rs`).
+Reading a config just to modify and update it in one step is fine with
+`status()`, which is why several test helpers still use it.
+
 ### Interrupt acceptance
 
 Interruption is established by one durable `Cancel` entry in the session log and
@@ -1720,6 +2006,40 @@ arms.
 Build the workspace before cross-process tests after changing tool wire
 types. Those tests launch workspace sidecars as well as linked test code; a stale
 tool binary can fail decoding even when a per-crate build succeeds.
+
+### Future size and type erasure in harnx-runtime
+
+harnx-runtime's async chains are deep enough that large futures fail in three
+distinct ways, and the three need different fixes:
+
+- **Test stack overflows.** Nextest's test processes use the default 8 MiB
+  stack, and a large inline future (tool discovery, tool-context construction)
+  counts toward the *caller's* stack frame while it is awaited. Growth anywhere
+  in the chain can tip razor-edge tests into SIGSEGV before any of the new code
+  runs (`nats_worker::operator_tools::admission_tests::real_subagent_operator_roots_and_inherited_deadlines`
+  failed this way; commit `361687041` fixed it). Fix: `Box::pin` the big future
+  at its builder entry point so its state lives on the heap while the caller
+  waits on network I/O — `execute_tool_round`,
+  `build_tool_eval_context`/`build_tool_eval_context_with_provider` and
+  `run_reserved_tool_command`'s `reserved_eval_context` all do this.
+- **E0275 in dependent crates.** rustc's auto-trait evaluation recurses through
+  the concrete future *type*, and `Pin<Box<impl Future>>` doesn't shorten that
+  chain: the compiler still walks every nested future inside the box. A concrete
+  future reaching the async-nats/rustls connect chain overflows the trait-solver
+  recursion budget in crates that merely call harnx-runtime (harnx-serve).
+  Fix: type-erase to `Pin<Box<dyn Future<Output = …> + Send>>`, as
+  `Config::nats_client` (`config/nats_split.rs`),
+  `NatsToolProvider::open_discovery_transport` and `round_nats_provider`
+  (`tool.rs`) do. A plain `Box::pin` there is not enough.
+- **Query-depth overflow on layout (harnx-tui).** rustc lays out one `async fn`'s
+  future as a single cumulative walk through every nested future across its
+  `.await` chains, so one wide event loop can overflow even when auto-trait
+  evaluation is fine — harnx-tui's `run_loop_inner` failed Windows CI with
+  `queries overflow the depth limit` (PR #2835) while Linux still built.
+  Fix: `Pin<Box<dyn Future>>` seams between the loop and its deep subchains
+  (`*_erased` wrappers; no `Send` — the futures borrow `!Sync` `Tui` state),
+  documented on `run_loop_inner` (`harnx-tui/src/lifecycle.rs`). Not a
+  `recursion_limit` bump.
 
 ### TUI transcript items are TUI-local
 
@@ -1870,7 +2190,7 @@ Qualify non-`__local__` agent names with their cluster. Never call
 
 CI runs integration tests against an isolated `nats-server` per test via
 `spawn_nats_server` in `crates/harnx-runtime/tests/it/common/mod.rs`. The CI
-workflow installs `nats-server` on all platforms (`.github/workflows/ci.yaml`);
+workflow installs `nats-server` on all platforms (`.github/workflows/ci-rust.yaml`);
 tests that skip when the binary is absent still pass, but real coverage requires
 the installed binary.
 
