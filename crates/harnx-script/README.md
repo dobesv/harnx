@@ -37,10 +37,10 @@ async fn example() {
   plus `limit_hit`. Timeout reports `timed_out`/124; cancellation reports
   `cancelled`/130. Streaming capture retains emitted partial output on errors.
   Fatal command messages and errors returned by BashKit also appear in
-  `ScriptRun.error`, independent of stream caps. BashKit 0.20.2 reports late
+  `ScriptRun.error`, independent of stream caps. BashKit 0.21.1 reports late
   syntax errors as ordinary stderr with exit 2; if its own stderr cap has
   discarded that diagnostic, the backend can't recover it.
-- BashKit is pinned to `=0.20.2`, with `jq` and `python` enabled. HTTP, SSH,
+- BashKit is pinned to `=0.21.1`, with `jq` and `python` enabled. HTTP, SSH,
   git and host filesystems aren't enabled. `http`/`curl`/`wget` are also filtered out at
   construction. Builtins operate on virtual files, including BashKit's synthetic
   `/etc` and `/proc`, not host files.
@@ -63,9 +63,10 @@ EOF
 
 `open()` and `pathlib.Path` use the same VFS as Bash, including lazy reads from
 full-CID `/attachments` paths. The attachment mount stays read-only. Monty's
-stdlib is a subset; network, subprocesses and `re` aren't available. Monty 0.0.19
-supports simple classes, but not inheritance or metaclasses. BashKit's older
-"no classes" hint doesn't describe this version.
+stdlib is a subset; network and subprocesses aren't available. `re` is bundled in
+the VM, with a linear-time engine for plain patterns and a backtracking cap for
+backreferences and lookaround. Monty supports simple classes, but not inheritance
+or metaclasses. BashKit's older "no classes" hint doesn't describe this version.
 
 **Python has no host functions by default.** With `python_functions: None`, the
 backend keeps `python_with_limits` behavior: Bash command registrations don't
@@ -101,7 +102,7 @@ batch per-item processing into a single Python invocation.
 ### Python host functions
 
 Set `ScriptRequest.python_functions` to `Some(ScriptPythonFunctions { names,
-handler })`. Both `python` and `python3` then use BashKit 0.20.2's
+handler })`. Both `python` and `python3` then use BashKit 0.21.1's
 `python_with_external_handler` with the same Python resource limits. Names are an
 allowlist; an unregistered name raises `NameError` without calling the handler.
 The adapter also checks dispatch names so returned callable values can't bypass
@@ -167,37 +168,32 @@ Host handlers should still enforce their own I/O limits.
 
 The 64 MiB Python limit and the run timeout (86,400 seconds by default) are
 cooperative VM checks, not hard OS-level process or memory isolation guarantees.
-Certain Python operations allocate directly on the host heap outside Monty's
-resource tracker. These allocations can exhaust host memory or trigger an
-unrecoverable process abort (`SIGABRT`), taking down the entire host worker process
-that runs script mode.
 
-Tested through `harnx-script`'s `BashKitBackend` with a 64 MiB Python memory ceiling,
-a 1-second test harness timeout, and BashKit 0.20.2 / Monty 0.0.19. Confirmed failure
-examples include (non-exhaustive):
+**The process must install `bashkit::MeteredAllocator`.** BashKit meters the VM's
+heap through the global allocator, so a binary that runs scripts installs
+[`VM_ALLOCATOR`](src/lib.rs) (or an allocator that wraps it, as `harnx` and
+`harnx-worker` do with `HeapGuard`). Without it `python3` fails closed with
+`Monty memory limits need bashkit::MeteredAllocator as the global allocator`
+instead of running unmetered. A test binary that runs `python3` in-process
+installs it too.
 
-1. **Large JSON indent:** `json.dumps(0, indent=10**9)` attempts an untracked string
-   allocation in native code and aborts the entire worker process (`SIGABRT`). An indent
-   of `134217728` allocated ~159 MiB RSS, well past the 64 MiB limit.
-2. **Exponential result export:** Returning a deeply shared list graph (`x = [x, x]`
-   repeated 30 times as the final expression) expands to ~500 MiB RSS during result bridge
-   conversion. Timeout and cancellation signals do not stop this native export in time,
-   resulting in an allocation failure and `SIGABRT`.
-3. **Import gate bypass:** BashKit filters `import re` with a line-prefix check. Prefixing
-   the statement (for example `pass; import re`) bypasses the gate. Running
-   `re.split('', 'a' * 4194304)` allocated ~302 MiB RSS and failed to stop cleanly at the
-   1-second test timeout.
-4. **Parser recursion:** Very long left-associative expression chains (such as `1+1+...`,
-   `x.x.x...`, `f()()...`, or `a[0][0]...`) cause a parser stack overflow during AST
-   construction before execution limits can apply.
-5. **Untracked string/bytes join and split:** Native preallocations in `str.join`, `bytes.join`,
-   `str.split`, and `bytes.split` allocate directly on the host heap outside Monty's memory
-   tracker and abort on host allocation failure.
+Under BashKit 0.21.1 the memory-exhaustion crashes found against 0.20.2 no longer
+reproduce. Each was re-run through `BashKitBackend` with a 64 MiB Python limit and
+a 1-second timeout: `json.dumps(0, indent=10**9)`, a deeply shared list graph
+(`x = [x, x]` repeated 30 times), `re.split('', 'a' * 4194304)`, and
+`str`/`bytes` `join` and `split` over tens of millions of items now end in a
+`MemoryError` or an ordinary result, and the process stays under 80 MiB. `re` is a
+supported module, so there is no import gate to bypass.
 
-No newer compatible BashKit release is known to resolve these issues.
+One crash remains:
 
-**What is affected:** An allocation failure or abort crashes the entire host worker or
-host process running script mode, not just the Python invocation or subshell.
+- **Parser recursion:** Very long left-associative expression chains (such as
+  `1+1+...` with 100,000 terms, `x.x.x...`, `f()()...`, or `a[0][0]...`) overflow
+  the stack during AST construction, before execution limits can apply, and abort
+  the process.
+
+**What is affected:** A stack overflow aborts the entire host worker or host process
+running script mode, not just the Python invocation or subshell.
 
 **Configuration and guidance:** Python cannot be disabled separately in this version;
 no builder- or configuration-level setting exists to toggle Monty off while script mode is active.

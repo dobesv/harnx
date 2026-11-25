@@ -436,6 +436,22 @@ keep the session busy until the moment it wants the timer to run, as
 does. Otherwise a slow `list_tools` loses its session mid-request, and the
 rmcp client waits forever for the reply.
 
+### Binaries that run scripts install the script VM's allocator
+
+`python3` in script mode refuses to run unless `bashkit::MeteredAllocator` is the
+process's global allocator, because that is how BashKit enforces the VM's memory
+limit. A process has one global allocator, and `harnx` and `harnx-worker` already
+install `harnx_core::alloc_guard::HeapGuard`, so `HeapGuard` wraps another
+allocator and both binaries hand it `harnx_script::VM_ALLOCATOR`:
+`HeapGuard::wrapping(harnx_script::VM_ALLOCATOR)`. A new binary that runs scripts
+in its own process does the same. A test binary that runs `python3` in-process
+installs `VM_ALLOCATOR` directly, under `#[cfg(test)]` in a library's unit tests
+(`harnx-script`, `harnx-runtime`) or in `tests/it/main.rs`. Frontends such as
+`harnx-serve` hand turns to `harnx-worker` instead of running them.
+`python_scripts_run_under_the_workers_global_allocator` in `harnx-worker` and the
+`python3` case in `call_bash_e2e_selection_purity_and_failures` fail if either
+binary stops installing it.
+
 ### CLI binaries need an 8 MiB stack on Windows
 
 Windows executables start with a 1 MiB stack. Deep debug-build async dispatch frames

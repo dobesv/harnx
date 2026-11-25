@@ -52,7 +52,7 @@ impl Completed {
         if self.result.exit_code == 0 || self.result.error.is_some() {
             return false;
         }
-        // BashKit 0.20.2 exposes Monty's VM timeout only as stderr/exit 1.
+        // BashKit 0.21.1 exposes Monty's VM timeout only as stderr/exit 1.
         self.result
             .stderr
             .lines()
