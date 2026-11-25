@@ -6,7 +6,7 @@ pub(crate) use legacy::LegacyProbe;
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
     RequestPermissionRequest, TextContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
@@ -253,7 +253,7 @@ async fn attach_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         PermissionOptionId, SelectedPermissionOutcome, ToolCallContent,
     };
     use harnx_core::interaction::InteractionRequest;

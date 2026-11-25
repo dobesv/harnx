@@ -1,6 +1,6 @@
 //! Mapping from harnx's canonical event stream to ACP session updates.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock as AcpContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall,
     ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind as AcpToolKind,

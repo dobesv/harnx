@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
+use agent_client_protocol::v1::schema::{SessionUpdate, ToolCallStatus};
 use harnx_acp_server::event_map::agent_event_to_session_update;
 use harnx_acp_server::HARNX_USAGE_META;
 use harnx_core::api_types::CompletionTokenUsage;

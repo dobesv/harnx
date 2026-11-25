@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::SessionUpdate;
+use agent_client_protocol::v1::schema::SessionUpdate;
 use harnx_core::event::{AgentEvent, AgentEventSink};
 use tokio::sync::mpsc;
 
@@ -269,7 +269,7 @@ mod tests {
         sink: &AcpEventSink,
         rx: &mut mpsc::UnboundedReceiver<AcpMessage>,
         event: AgentEvent,
-    ) -> agent_client_protocol::schema::v1::ToolCallUpdate {
+    ) -> agent_client_protocol::v1::schema::ToolCallUpdate {
         sink.emit(event);
         let AcpMessage::Update { update, .. } = rx.try_recv().expect("tool call update") else {
             panic!("expected update message");
@@ -292,7 +292,7 @@ mod tests {
                     output: serde_json::json!("done"),
                     markdown: None,
                 },
-                agent_client_protocol::schema::v1::ToolCallStatus::Completed,
+                agent_client_protocol::v1::schema::ToolCallStatus::Completed,
             ),
             (
                 "failed-call",
@@ -300,7 +300,7 @@ mod tests {
                     id: "failed-call".into(),
                     error: "failed".into(),
                 },
-                agent_client_protocol::schema::v1::ToolCallStatus::Failed,
+                agent_client_protocol::v1::schema::ToolCallStatus::Failed,
             ),
         ];
 
@@ -359,20 +359,20 @@ mod tests {
         );
         assert_eq!(
             terminal.fields.status,
-            Some(agent_client_protocol::schema::v1::ToolCallStatus::Completed),
+            Some(agent_client_protocol::v1::schema::ToolCallStatus::Completed),
         );
 
         assert_eq!(
             emit_tool_call_update(&sink, &mut rx, progress_event("live-call"))
                 .fields
                 .status,
-            Some(agent_client_protocol::schema::v1::ToolCallStatus::InProgress),
+            Some(agent_client_protocol::v1::schema::ToolCallStatus::InProgress),
         );
         assert_eq!(
             emit_tool_call_update(&sink, &mut rx, progress_event("unrelated-call"))
                 .fields
                 .status,
-            Some(agent_client_protocol::schema::v1::ToolCallStatus::InProgress),
+            Some(agent_client_protocol::v1::schema::ToolCallStatus::InProgress),
         );
     }
 
@@ -391,7 +391,7 @@ mod tests {
                 let SessionUpdate::AgentMessageChunk(chunk) = *update else {
                     panic!("expected agent message chunk");
                 };
-                let agent_client_protocol::schema::v1::ContentBlock::Text(text) = chunk.content
+                let agent_client_protocol::v1::schema::ContentBlock::Text(text) = chunk.content
                 else {
                     panic!("expected text content");
                 };

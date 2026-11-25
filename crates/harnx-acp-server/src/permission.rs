@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
     SessionId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
@@ -115,7 +115,7 @@ fn outcome_approved(outcome: RequestPermissionOutcome) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{PermissionOptionId, SelectedPermissionOutcome};
+    use agent_client_protocol::v1::schema::{PermissionOptionId, SelectedPermissionOutcome};
     use tokio::sync::oneshot;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -195,7 +195,7 @@ mod tests {
         let (connection_tx, connection_rx) = oneshot::channel();
         let agent_task = tokio::spawn(async move {
             let _ = agent_client_protocol::Agent
-                .builder()
+                .v1()
                 .connect_with(agent_transport, async move |connection| {
                     let _ = connection_tx.send(connection);
                     std::future::pending::<()>().await;
@@ -206,7 +206,7 @@ mod tests {
         });
         let client_task = tokio::spawn(async move {
             let _ = agent_client_protocol::Client
-                .builder()
+                .v1()
                 .connect_with(client_transport, async move |_connection| {
                     std::future::pending::<()>().await;
                     #[allow(unreachable_code)]

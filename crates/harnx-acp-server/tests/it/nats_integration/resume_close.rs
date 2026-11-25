@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{CloseSessionRequest, ResumeSessionRequest, SessionId};
+use agent_client_protocol::v1::schema::{CloseSessionRequest, ResumeSessionRequest, SessionId};
 use anyhow::{Context, Result};
 use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
 use harnx_core::message::MessageRole;
@@ -122,7 +122,7 @@ async fn session_resume_establishes_context_without_replay() -> Result<()> {
         .await?;
     assert_eq!(
         prompt_response.stop_reason,
-        agent_client_protocol::schema::v1::StopReason::EndTurn
+        agent_client_protocol::v1::schema::StopReason::EndTurn
     );
 
     worker.abort();
@@ -212,7 +212,7 @@ async fn session_close_cancels_active_turn_and_removes_context() -> Result<()> {
         .context("prompt task crashed")??;
     assert_eq!(
         prompt_result.stop_reason,
-        agent_client_protocol::schema::v1::StopReason::Cancelled
+        agent_client_protocol::v1::schema::StopReason::Cancelled
     );
 
     // Context should be removed

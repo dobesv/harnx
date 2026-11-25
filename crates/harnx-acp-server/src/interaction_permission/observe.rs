@@ -126,7 +126,7 @@ impl Observer {
         &self,
         pending: &PendingInteraction,
         reply: agent_client_protocol::Result<
-            agent_client_protocol::schema::v1::RequestPermissionResponse,
+            agent_client_protocol::v1::schema::RequestPermissionResponse,
         >,
     ) -> Result<()> {
         // Only an explicit Cancelled outcome is a denial. Transport failure isn't consent

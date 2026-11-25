@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock as AcpContentBlock, SessionId, SessionUpdate,
 };
 use anyhow::{Context, Result};
@@ -91,7 +91,7 @@ async fn session_load_replays_history_and_establishes_session_context() -> Resul
     // Verify the session responded
     assert_eq!(
         response.stop_reason,
-        agent_client_protocol::schema::v1::StopReason::EndTurn
+        agent_client_protocol::v1::schema::StopReason::EndTurn
     );
 
     // Receive the prompt response chunks
@@ -339,7 +339,7 @@ async fn session_cancel_works_on_loaded_session() -> Result<()> {
 
     // Cancel should work on a loaded session (not return "session not found")
     agent
-        .cancel(agent_client_protocol::schema::v1::CancelNotification::new(
+        .cancel(agent_client_protocol::v1::schema::CancelNotification::new(
             SessionId::new("cancel-test-session".to_string()),
         ))
         .await
@@ -370,8 +370,8 @@ async fn load_updates(
         .start_session()
         .await?;
     assert_eq!(
-        restored.response(),
-        &acp::schema::v1::LoadSessionResponse::new()
+        &restored.response,
+        &acp::v1::schema::LoadSessionResponse::new()
     );
     drop(restored);
 
@@ -413,7 +413,7 @@ fn replay_summary(update: SessionUpdate) -> String {
                 .content
                 .and_then(|content| content.into_iter().next())
                 .and_then(|content| match content {
-                    acp::schema::v1::ToolCallContent::Content(content) => {
+                    acp::v1::schema::ToolCallContent::Content(content) => {
                         Some(chunk_text(content.content))
                     }
                     _ => None,
