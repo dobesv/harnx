@@ -895,6 +895,8 @@ async fn metadata_creation_failure_leaves_the_transcript_empty() -> Result<()> {
     Ok(())
 }
 
+mod metadata_claim;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transcript_without_metadata_is_rejected_without_an_append() -> Result<()> {
     require_nextest();

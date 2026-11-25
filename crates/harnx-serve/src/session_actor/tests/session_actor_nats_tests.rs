@@ -1,4 +1,5 @@
 use super::*;
+use ag_ui_core::types::message::Message as AgUiMessage;
 use futures_util::StreamExt;
 use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 
@@ -100,7 +101,7 @@ async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
         &active_calls.tool_results[0]
     ));
     assert_eq!(
-        crate::ag_ui::history_messages_for_snapshot(&active.messages).len(),
+        crate::transcript_snapshot::history_messages_for_snapshot(&active.messages).len(),
         2,
         "active snapshot should contain user + assistant tool call, without a result"
     );
@@ -125,7 +126,7 @@ async fn history_load_uses_worker_lease_to_keep_tool_call_pending() {
         &interrupted_calls.tool_results[0]
     ));
     assert_eq!(
-        crate::ag_ui::history_messages_for_snapshot(&interrupted.messages).len(),
+        crate::transcript_snapshot::history_messages_for_snapshot(&interrupted.messages).len(),
         3,
         "interrupted snapshot should include the synthetic lost result"
     );
@@ -341,10 +342,15 @@ async fn serve_replays_prompt_queued_during_active_run() {
         } => id,
         other => panic!("expected an enqueued prompt with a durable message ID, got {other:?}"),
     };
-    assert!(subscribe(&handle).await.snapshot.iter().any(|message| {
-        matches!(message, AgUiMessage::User { id, content, .. }
+    assert!(subscribe(&handle)
+        .await
+        .snapshot
+        .messages
+        .iter()
+        .any(|message| {
+            matches!(message, AgUiMessage::User { id, content, .. }
             if id.to_string() == queued_id && content == "queued follow-up")
-    }));
+        }));
     assert!(
         tokio::time::timeout(Duration::from_millis(250), &mut mock.second_request)
             .await

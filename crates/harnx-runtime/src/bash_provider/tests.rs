@@ -948,6 +948,7 @@ fn script_output_converts_with_every_field() {
     let output = harnx_toolset::ScriptOutput {
         stdout: Some("out".into()),
         row: Some("{a}:{b}".into()),
+        stderr_text: Some("err".into()),
         stderr: Some("notes".into()),
         exit_code: Some("status".into()),
         error_exit_code: Some(7),
@@ -956,6 +957,7 @@ fn script_output_converts_with_every_field() {
     let harnx_toolset::ScriptOutput {
         stdout,
         row,
+        stderr_text,
         stderr,
         exit_code,
         error_exit_code,
@@ -964,6 +966,7 @@ fn script_output_converts_with_every_field() {
     let expected = harnx_script::commands::OutputMapping {
         stdout,
         row,
+        stderr_text,
         stderr,
         exit_code,
         error_exit_code,

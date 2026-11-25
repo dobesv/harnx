@@ -74,9 +74,10 @@ harnx-serve --web-assets ./web/dist
 The AG-UI surface allows modern web interfaces to interact with `harnx` agents using a real-time event stream and a JSON-RPC control plane.
 
 Harnx session identity and AG-UI thread identity are deliberately separate.
-The `:session` path segment is the canonical short Harnx ID used by URLs, the
-NATS stream, and canonical session metadata. AG-UI's `ThreadId` type requires a UUID, so
-`ag_ui::derive_thread_id` deterministically maps a short ID to UUID v5 at the
+The `:session` path segment is the canonical Harnx session ID (either
+server-generated or client-chosen) used by URLs, the NATS stream, and canonical
+session metadata. AG-UI's `ThreadId` type requires a UUID, so
+`ag_ui::derive_thread_id` deterministically maps a session ID to UUID v5 at the
 wire boundary (and passes legacy UUID session IDs through). The derived UUID is
 never used as a persistence or routing key.
 
@@ -87,7 +88,7 @@ never used as a persistence or routing key.
 | `GET` | `/v1/agents` | `application/json` | List all configured agents. |
 | `GET` | `/v1/agents/:agent` | `application/json` | Agent details (name, description, active sessions). |
 | `GET` | `/v1/agents/:agent/sessions` | `application/json` | List sessions for the agent. |
-| `POST` | `/v1/agents/:agent/sessions` | `application/json` | Reserve a canonical short session ID. |
+| `POST` | `/v1/agents/:agent/sessions` | `application/json` | Reserve a server-generated short session ID. |
 | `GET` | `/v1/agents/:agent/sessions/:session` | `application/json` | Legacy active-history message array. Use JSON-RPC `session/get` for the compaction-aware default snapshot. |
 | `GET` | `/v1/agents/:agent/sessions/:session/history` | `application/json` | Read-only transcript page, selected by compaction or inclusive sequence range. |
 | `GET` | `/v1/agents/:agent/sessions/:session/metadata` | `application/json` | Read redacted canonical session metadata. |
@@ -134,6 +135,7 @@ Errors: 400 for malformed CIDs, 404 if blob not found or caller is unauthorized.
 ### Attachment Upload
 
 `POST /v1/agents/:agent/sessions/:session/attachments` accepts a `multipart/form-data` body of `attachment` parts (filename plus part `Content-Type`):
+- Session ID requirement: because uploaded attachments embed a `SessionRef`, `:session` must match `[A-Za-z0-9_-]+` and be at least 6 characters long.
 - Accepted part types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `application/pdf`, `text/plain`; anything else is `415 Unsupported Media Type`. The whole request is capped at 20 MiB (`413 Payload Too Large`).
 - Success returns `200` with `{"attachment_refs": ["cid:media:...", ...], "attachments": [{"cid": "..."}, ...]}`.
 - Each accepted part is written to the shared `harnx_attachments` NATS object store before its ref is returned; the serving pod's local copy is only that pod's warm cache. Refs are usable on any replica and survive pod restarts.
@@ -261,7 +263,9 @@ Same canonical session URL, negotiated into programmatic control.
   ```json
   { "jsonrpc": "2.0", "id": 1, "method": "session/get" }
   ```
-  **Result:** `{ "state": { … }, "history_snapshot": [...], "compaction": { … }, "last_turn": { … }, "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }`
+  **Result:** `{ "state": { … }, "history_snapshot": [...], "history_reasoning": { … }, "compaction": { … }, "last_turn": { … }, "history_warnings": [], "capabilities": { "multiClient": true, "persistence": "nats" } }`
+  `history_reasoning` maps assistant row IDs to the reasoning removed from their
+  `content`, or is `{}`. See [Snapshot reasoning](#snapshot-reasoning).
   `compaction` is optional and omitted until the session has been compacted. See
   [Compacted history snapshots](#compacted-history-snapshots) for its shape.
 
@@ -334,7 +338,8 @@ Same canonical session URL, negotiated into programmatic control.
   ```
 
   Optional `attachment_refs` parameter supplies `cid:media:` attachment refs
-  (as returned by the upload endpoint) with the prompt:
+  (as returned by the upload endpoint) with the prompt (attachment-only prompts
+  still require a `text` field, which may be `""`):
   ```json
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "what is this?", "attachment_refs": ["cid:media:..."] } }
   ```
@@ -344,19 +349,25 @@ Same canonical session URL, negotiated into programmatic control.
   that the session routes require — matching owner (including alias
   expansion) or admin scope on the source agent, with the source agent
   normalized for the destination cluster (bare for the default cluster,
-  `agent@cluster` otherwise). At most 32 `cid:media` refs are accepted per
-  prompt; a longer list is rejected as `-32602` (HTTP 400) before any broker
-  work, and prompts without `cid:media` refs do no broker work at this layer
-  at all. An unauthorized or unattributable source (no record, no named agent,
-  or a record that cannot be decoded) returns the generic `-32005` error
-  below for the whole list, before the session log gains any entry or a turn
-  is activated. If the source session's metadata cannot be read because the
-  broker is unavailable — the open, or a read classified as broker
-  unavailability — the prompt fails closed with `-32003` (HTTP 503), logged
-  server-side at `warn`, so an outage is not mistaken for a denial.
-  Admitting an authorized ref lets the destination session use its content.
-  Same-session refs, a caller's own cross-session refs, and admin callers
-  keep working; without access rules a ref remains a bearer capability.
+  `agent@cluster` otherwise). For an existing, accessible session, at most 32
+  `cid:media` refs are accepted per prompt; a longer list is rejected as
+  `-32602` (HTTP 400) before any broker work, and prompts without `cid:media`
+  refs do no broker work at this layer at all. An unauthorized or
+  unattributable source (no record, no named agent, or a record that cannot be
+  decoded) returns the generic `-32005` error below for the whole list, before
+  the session log gains any entry or a turn is activated. If the source
+  session's metadata cannot be read because the broker is unavailable — the
+  open, or a read classified as broker unavailability — the prompt fails
+  closed with `-32003` (HTTP 503), logged server-side at `warn`, so an outage
+  is not mistaken for a denial. Admitting an authorized ref lets the
+  destination session use its content. Same-session refs, a caller's own
+  cross-session refs, and admin callers keep working; without access rules a
+  ref remains a bearer capability. When access rules are enabled and the target
+  session does not exist yet, attachment validation runs before metadata
+  creation: unauthorized, malformed, or `>32` `cid:media` refs all return the
+  guard's HTTP `404 Not Found` (not `400` / `-32602` or `-32005`), and broker
+  unavailability returns HTTP `503 Service Unavailable`, leaving no session
+  created.
 - **`session/cancel`**: Interrupts the session's current turn by appending one
   durable `Cancel` to its session log. Takes no parameters — an interrupt always
   targets whatever turn is running. It returns as soon as that append is
@@ -385,11 +396,11 @@ Same canonical session URL, negotiated into programmatic control.
 
 **Error Codes:**
 - `-32001`: Unknown session (HTTP 404) for operations that require an existing session, such as `session/get`, `session/history`, `session/cancel`, `session/compact`, and read-state updates. `session/prompt` creates the session if absent.
-- `-32003`: Session actor or history storage unavailable (HTTP 503). Transient: retry the call. Also returned by `session/prompt` when attachment source metadata cannot be read because the broker is unavailable (the store open or an unavailable-classified read): the prompt is rejected before admission, fail closed.
-- `-32004`: Prompt rejected (HTTP 409), including a prompt whose attachment refs cannot be resolved or parsed.
-- `-32005`: Attachment not found (HTTP 404): with access rules configured, a `session/prompt` attachment ref whose source session the caller cannot access, or that has no readable, decodable owner record. Generic by design; it does not reveal whether the referenced object exists.
+- `-32003`: Session actor or history storage unavailable (HTTP 503). Transient: retry the call. For existing sessions, broker outages during attachment source checks also return `-32003` (HTTP 503). On unseen IDs, broker outages during metadata read/reservation or pre-reservation attachment checks instead return HTTP `503` with the guard's JSON error body, not JSON-RPC `-32003`.
+- `-32004`: Prompt rejected (HTTP 409), including a prompt on an existing session whose attachment refs cannot be resolved or parsed (on an unseen ID under access rules, pre-reservation attachment rejections return the guard's HTTP 404 instead).
+- `-32005`: Attachment not found (HTTP 404): with access rules configured, a `session/prompt` attachment ref on an existing session whose source session the caller cannot access, or that has no readable, decodable owner record. Generic by design; it does not reveal whether the referenced object exists. (On an unseen ID, unauthorized, malformed, or `>32` `cid:media` refs return the guard's HTTP 404.)
 - `-32601`: Method not found
-- Standard JSON-RPC 2.0 codes (-32700, -32600, -32602); with access rules configured, `session/prompt` also returns `-32602` (HTTP 400) for more than 32 `cid:media` refs.
+- Standard JSON-RPC 2.0 codes (-32700, -32600, -32602); with access rules configured on an existing session, `session/prompt` also returns `-32602` (HTTP 400) for more than 32 `cid:media` refs (on an unseen ID, `>32` `cid:media` refs return the guard's HTTP 404 instead).
 
 `session/cancel` on an idle session is not an error; it returns
 `{ "outcome": "idle" }`.
@@ -426,6 +437,7 @@ Example result for `before_compaction: 15, limit: 2` using the shared fixture:
   "jsonrpc": "2.0",
   "id": 8,
   "result": {
+    "history_reasoning": {},
     "history_snapshot": [
       {
         "role": "assistant",
@@ -493,11 +505,52 @@ and unavailable history storage uses `-32003` (HTTP 503). Access rules can hide
 unauthorized or missing sessions behind the existing HTTP 404 response before
 RPC dispatch. Unauthenticated requests retain the server's HTTP 401 behavior.
 
+### Snapshot reasoning
+
+`session/get`, `session/history`, and `GET /v1/agents/{agent}/sessions/{session}/history`
+return `history_reasoning` beside `history_snapshot`. It maps IDs of assistant
+rows in that response to arrays of reasoning strings, in transcript order.
+`session/history` only includes entries for the requested page. A response
+with no reasoning includes `"history_reasoning": {}`.
+
+Example result (other fields omitted):
+
+```json
+{
+  "history_snapshot": [
+    {"role":"assistant","id":"d951259d-1bb5-4ea1-824f-85d5dfd28d13","content":"The tests passed."}
+  ],
+  "history_reasoning": {"d951259d-1bb5-4ea1-824f-85d5dfd28d13":["Check the test results."]}
+}
+```
+
+On an AG-UI SSE `POST` to the session URL, send
+`x-harnx-snapshot-features: history-reasoning` to opt in. The header accepts
+comma-separated feature tokens. An opted-in stream sends this companion
+immediately after each `MESSAGES_SNAPSHOT`:
+
+```text
+data: {"type":"CUSTOM","name":"history_reasoning","value":{"d951259d-1bb5-4ea1-824f-85d5dfd28d13":["Check the test results."]}}
+
+```
+
+`value` is the map itself. Replace prior snapshot reasoning with the new map,
+including `value: {}` when the snapshot has no reasoning. Match keys to IDs in
+the immediately preceding snapshot, not to IDs from another request or page.
+The companion is omitted without the header.
+
+In both cases, assistant snapshot `content` contains the answer without leading
+reasoning wrappers written by the server or model adapters. An assistant row
+with only reasoning keeps `content: ""`. Reasoning does not add snapshot rows
+or affect cursors. Live `THINKING_*` events remain separate.
+
 ### Client Implementation Flow
 
-1. **Create**: `POST` the session collection (`POST /v1/agents/{agent}/sessions`) and use the returned `session_id` as the URL, NATS stream, and persistence identity.
-   - When access control rules are active, callers **must** reserve a session ID via this `POST` endpoint before prompting.
-   - When access rules are disabled, clients that choose their own session IDs can skip this POST: send `session/prompt` to the chosen session URL to create the session and admit its first prompt.
+1. **Create**: Clients can either reserve a server-generated short ID via `POST /v1/agents/{agent}/sessions` or choose their own session ID and create it by sending the first prompt to `POST /v1/agents/{agent}/sessions/{session}` (with or without access rules):
+   - **JSON-RPC (`Content-Type: application/json`)**: send `session/prompt` with nonblank `text` or non-empty `attachment_refs`, and no `resume` entries. Attachment-only prompts still require the `text` field, which may be `""`.
+   - **SSE (`Accept: text/event-stream`)**: send an AG-UI run body with no `resume` decisions whose last supported message (after dropping unknown roles) is a nonblank `user` message.
+   - **Session ID format**: Under access rules, client-chosen `:session` IDs must be a safe path segment with no leading or trailing whitespace and satisfy the runtime's `SessionRef` format (`[A-Za-z0-9_-]+`, at least 6 characters); refused IDs (such as `demo` or `pr.12`) receive the guard's HTTP `404`. Without access rules, `:session` on the session prompt route is not checked by `claimable_session_id`, while uploading attachments (`POST /v1/agents/{agent}/sessions/{session}/attachments`) always requires the `SessionRef` format `[A-Za-z0-9_-]+` of at least 6 characters.
+   - **Access rules**: Creating a session requires `prompt` scope (`admin` alone returns HTTP `403`, `session creation requires prompt scope`) and stamps the caller as the session's immutable owner. Any non-creating request on an unseen ID returns HTTP `404 Not Found`.
 2. **Connect**: Open the session event feed and use promptless AG-UI runs to hydrate or join an active run. An attach after prompt admission waits for a worker or durable completion even before the worker claims the lease. If no worker claims it within `nats_lease_acquisition_timeout_secs` (default 60 seconds), the stream closes with `RUN_ERROR`, not a false `RUN_FINISHED`. This observation timeout doesn't cancel the prompt. Restore the worker and attach again, or explicitly cancel the pending turn; unanswered durable input remains `running` until completed, failed, cancelled, or retracted.
 3. **Drive**: Use JSON-RPC on the same canonical session URL to send prompts
    (`session/prompt`) and interrupt runs (`session/cancel`).
@@ -619,8 +672,9 @@ are omitted.
 
 | harnx `AgentEvent` | AG-UI event(s) | Notes |
 | :--- | :--- | :--- |
-| `Model::MessageChunk` / `Model::Final` | `TEXT_MESSAGE_CONTENT` | `TEXT_MESSAGE_START` / `TEXT_MESSAGE_END` still come from session actor lifecycle. |
-| `Model::ThoughtChunk` | `THINKING_START`, `THINKING_TEXT_MESSAGE_START`, `THINKING_TEXT_MESSAGE_CONTENT`, `THINKING_TEXT_MESSAGE_END`, `THINKING_END` | Sink keeps per-run thinking state so multi-chunk reasoning stays one segment. |
+| `Model::MessageChunk` | `TEXT_MESSAGE_CONTENT` | `TEXT_MESSAGE_START` / `TEXT_MESSAGE_END` follow the assistant message lifecycle. |
+| `Model::Final` | `THINKING_*` (when needed), then `TEXT_MESSAGE_CONTENT` | If no text streamed for this model call, split leading writer-shaped `<think>` wrappers from the answer. Emit their reasoning only if no thought chunks streamed for that call. |
+| `Model::ThoughtChunk` | `THINKING_START`, `THINKING_TEXT_MESSAGE_START`, `THINKING_TEXT_MESSAGE_CONTENT`, `THINKING_TEXT_MESSAGE_END`, `THINKING_END` | Consecutive thought chunks share a segment. |
 | `Tool::*` | `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END`, `TOOL_CALL_RESULT` | Progress/update still dropped as too noisy. |
 | `Turn::Started` / `Turn::Ended` | `STEP_STARTED` / `STEP_FINISHED` | Step names use `turn-N`. |
 | `Turn::SubAgentProgress` | `CUSTOM` | Name: `sub_agent_progress`. The invocation ID correlates reused child sessions, and `tool_call_id`, when present, names the parent tool call that started the child; progress carries running/done/failed status, elapsed milliseconds, direct token usage, direct tool-call count, and optional `title` (present when the sub-agent reported a session title). |
@@ -945,7 +999,7 @@ The group values are `CN=admins,OU=eng,O=Acme`, `CN=ops,O=Acme`, and `plain-grou
 - **Startup loading**: Loaded once at startup via `config_paths::local_path("users.yaml")`. Missing `users.yaml` preserves default singleton identity behavior. An invalid present file fails startup immediately with path context. Modifying the file requires a server restart; there is no live reload.
 - **Caller authorization expansion**: An authenticated caller's identity expands into the first matching entry's `identities` list for agent access checks and session visibility under access rules. Overlapping entries do not merge (no transitive union).
 - **Configured groups and roles**: Entries can declare optional `groups` and `roles`. When a caller matches an entry, its configured memberships are merged into the request memberships (appended after header values and deduped) for matching against `access.yaml` rules. Configured values apply even when no membership headers are configured.
-- **Session ownership preserved**: Session creation (`POST /v1/agents/{agent}/sessions`) stores the incoming caller's raw `user_id` in session metadata, never an alias entry name or other group identities. Configured groups and roles never grant session ownership. (For prompt and tool tailoring, resolved caller principals are snapshotted into the read-only `user_principals` property, but access control never uses that snapshot to grant ownership). Stored session owners are never expanded.
+- **Session ownership preserved**: Session creation (via `POST /v1/agents/{agent}/sessions` or a first prompt to `/v1/agents/{agent}/sessions/{session}`) stores the incoming caller's raw `user_id` in session metadata, never an alias entry name or other group identities. Configured groups and roles never grant session ownership. (For prompt and tool tailoring, resolved caller principals are snapshotted into the read-only `user_principals` property, but access control never uses that snapshot to grant ownership). Stored session owners are never expanded.
 - **Behavior without access rules**: When `access.yaml` is absent, `harnx-serve` operates without access restrictions; `users.yaml` alone does not restrict endpoints or session access.
 - **Security notice**: Because alias mappings expand caller permissions, `users.yaml` should be modified only by trusted operators.
 
@@ -967,9 +1021,23 @@ The group values are `CN=admins,OU=eng,O=Acme`, `CN=ops,O=Acme`, and `plain-grou
   - `prompt`: Authorizes creating sessions on the agent and accessing sessions owned by the caller.
   - `admin`: Authorizes viewing, operating, compacting, and cancelling sessions owned by any user (and legacy unowned sessions). Does not grant creation permission.
   - Callers holding only `admin` scope receive HTTP `403 Forbidden` (`session creation requires prompt scope`) when attempting to create a session.
-- **Pre-allocation Requirement**: Callers must reserve a session ID via `POST /v1/agents/{agent}/sessions` before prompting. Implicit session creation on unreserved session IDs returns HTTP `404 Not Found`.
+- **Client-Chosen Session IDs and First-Prompt Creation**: Callers with `prompt` scope can create a session with a client-chosen ID by sending a first prompt to `POST /v1/agents/{agent}/sessions/{session}`, or reserve a server-generated short ID via `POST /v1/agents/{agent}/sessions`:
+  - **Qualifying first prompts**: For JSON-RPC (`Content-Type: application/json`), a `session/prompt` with nonblank `text` or non-empty `attachment_refs` and no `resume` entries (attachment-only prompts still need a `text` field, which may be `""`). Attachment ref checks run before reservation, so unauthorized, malformed, or `>32` `cid:media` refs (guard HTTP `404`) and preflight broker outages (HTTP `503`) leave the ID unclaimed. A broker outage during metadata reservation also returns HTTP `503` (including post-connect KV write timeouts, broken pipes, or no responders) without admitting the prompt, though it can occur after canonical KV creation committed before the ack arrived, leaving the ID claimed by the caller; retrying as the same caller resolves it as owned. For SSE (`Accept: text/event-stream`), a valid AG-UI run input with no `resume` decisions whose last supported message (after dropping unknown roles) is a nonblank `user` message.
+  - **Scope check**: Callers without `prompt` scope (such as `admin`-only callers) receive HTTP `403 Forbidden` (`session creation requires prompt scope`) on a qualifying creating prompt to an unseen ID, with nothing created.
+  - **Non-creating requests stay hidden**: All other requests on an unseen ID return HTTP `404 Not Found` like an inaccessible session for refused (404) outcomes; this parity doesn't cover every partial-outage outcome. No metadata, session actors, or transcript streams are created. This includes every non-prompt JSON-RPC method (`session/get`, `session/history`, `session/cancel`, `session/compact`, HITL, interaction, and surface-action RPCs), blank or `resume`-bearing `session/prompt` calls, promptless or `resume`-bearing SSE runs, malformed bodies, non-`POST` methods, and deeper subroutes (`/history`, `/events`, `/attachments`, `/metadata`). For `POST /v1/agents/{agent}/sessions/{session}` (with a claimable ID and no deeper segments), both unseen and foreign-owned IDs reject a declared `Content-Length` over 20 MiB immediately with the guard's `404` before reading any body bytes, and otherwise run the same bounded body read (20 MiB cap, 30-second deadline) before deciding; bodies over the cap or unfinished at the deadline return HTTP `404` either way (never `413`). Any ingress or reverse proxy in front of `harnx-serve` must allow request bodies of at least 20 MiB and at least a 30-second upload time for claim-candidate `POST` requests.
+  - **Session ID format**: `:session` must be a safe path segment (non-empty, no `/`, `\`, `.`, or `..`) with no leading or trailing whitespace and satisfy the runtime's `SessionRef` format (`[A-Za-z0-9_-]+`, at least 6 characters, matching attachment uploads). Refused IDs — such as `demo`, `pr.12`, or whitespace-only/whitespace-padded IDs — receive the same opaque guard HTTP `404` without claiming or falling back to a generated ID.
+  - **Race safety and orphan refusal**: Concurrent first prompts on the same ID race atomically in NATS KV (`SessionMetadataStore::create`). One creator wins and owns the session; competing callers are authorized against the winning record and get HTTP `404` if unauthorized. Creating prompts also return `404` without claiming the ID if a `SESSION_` transcript stream already exists without canonical metadata (orphan), or if the server already has a live session actor for that key with no canonical metadata on leader reread.
+  - **Deletion and ID reuse**: Session deletion purges the canonical metadata record (`sessions/<storage_key>/meta`) last. If deletion fails mid-cascade, the canonical record remains with its old owner so other prompt-only callers continue to get `404` until `harnx delete session` is re-run or retention GC collects it on a later pass. If the final purge is skipped because the record revision changed, `harnx delete session` prints `Incomplete deletion of remote session` to stderr and exits `1`. Retrying deletion also rewrites the invocation journal's one-hour tombstone, which refuses journaled tool calls on the reused ID for another hour (it does not block claiming the ID). Once fully deleted, anyone with `prompt` scope can reuse the ID.
+  - **Limitations**:
+    - For refused `404` outcomes, the final response (status, body, and application headers) is identical between unseen and foreign IDs, and both run the same bounded body read; this parity doesn't cover every partial-outage outcome. Processing time can still differ slightly for callers with `prompt` scope because only the unseen-ID path parses the buffered body and checks `cid:media` refs. This is an accepted limitation because `prompt`-scope callers already learn whether an ID exists from create versus `404`.
+    - Deletions that failed before canonical-last ordering may have left media or plans without a canonical metadata record. After upgrading, another user could claim that ID and read those leftovers through `/v1/cid/*`, and a later retry could delete the new claimant's session. Operators should finish retrying any such incomplete deletions with `harnx delete session <session_id> --agent <agent> --cluster <cluster>` before enabling or upgrading to a `harnx-serve` with client-chosen claims.
+    - A client still holding an SSE stream on another `harnx-serve` process during an operator delete can observe events from a later claimant of the same ID, because actors are not incarnation-aware.
+    - A worker still running at deletion time can write into a later claimant's session.
+    - Reusing an ID within an hour of deletion can make journaled tool calls fail because the invocation journal retains a one-hour deletion tombstone, and retrying deletion rewrites that tombstone for another hour.
+    - A prompt sent while deletion is already in flight keeps the existing race and may append to a session being torn down.
+  - **Upgrade order**: On clusters that use access rules, upgrade every component that deletes sessions (`harnx` CLI, and `harnx-worker` instances running retention or orphan GC) and let any in-flight old cleanup runs finish **before** upgrading `harnx-serve`. Older deleters purge the canonical metadata record first and can leave new claimable partial deletions. When rolling back, roll back `harnx-serve` **before** rolling back the deleters. There is no feature flag.
 - **Session Listings**: `GET /v1/agents/{agent}/sessions` filters results before pagination, showing only sessions the caller is authorized to access.
-- **Prompt Attachment Refs**: `cid:media:` refs supplied to the JSON-RPC `session/prompt` are authorized against the session that uploaded them before the prompt is admitted — the caller needs the same access to that source session that the session routes require (matching owner, alias expansion, or admin scope on the source agent, normalized for the destination cluster). At most 32 `cid:media` refs are accepted per prompt (HTTP 400 / `-32602` over the cap). An unauthorized, unattributed, or otherwise unreadable source returns the generic `-32005` `attachment not found` (HTTP 404) for the whole list, before any log append or turn activation; only confirmed broker unavailability during the check returns `-32003` (HTTP 503). Prompts without `cid:media` refs do no extra broker work.
+- **Prompt Attachment Refs**: On existing, accessible sessions, `cid:media:` refs supplied to the JSON-RPC `session/prompt` are authorized against the session that uploaded them before the prompt is admitted — the caller needs the same access to that source session that the session routes require (matching owner, alias expansion, or admin scope on the source agent, normalized for the destination cluster). At most 32 `cid:media` refs are accepted per prompt (HTTP 400 / `-32602` over the cap). An unauthorized, unattributed, or otherwise unreadable source returns the generic `-32005` `attachment not found` (HTTP 404) for the whole list, before any log append or turn activation; only confirmed broker outage during the check returns `-32003` (HTTP 503). Prompts without `cid:media` refs do no extra broker work. For creating prompts on unseen session IDs, pre-reservation attachment validation maps unauthorized, malformed, and `>32` `cid:media` refs to the guard's HTTP `404 Not Found` (not `400` / `-32602` or `-32005`), and broker outage to HTTP `503`.
 - **CID Attachments**: `/v1/cid/*` validates caller access against the owning session embedded in the CID. Protected responses emit `Cache-Control: private, no-store`. Shared proxy caches should be purged when enabling rules.
 ## Quickstart
 

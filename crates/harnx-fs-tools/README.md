@@ -47,9 +47,9 @@ Path lists can also come from `HARNX_TOOLS_ALLOW_READ`, `HARNX_TOOLS_ALLOW_WRITE
 
 ### Output in `bash` scripts
 
-This applies when the `bash` tool calls a natively registered `harnx-fs-tools`, which is the default NATS mode. Reached through `--mcp-stdio` behind a bridge, or through the k8s sandbox gateway, the tools print the same text a direct call gets, because MCP does not carry the request for the script form.
+This applies when the `bash` tool calls `harnx-fs-tools` natively, behind `harnx-mcp-bridge` with `--mcp-stdio`, or through the k8s sandbox gateway. A server built before the request travelled over MCP answers in the direct-call style, and the command then prints that text.
 
-When a `bash` script calls these tools in that mode, they behave like the shell commands of the same name. Data goes to stdout, notes go to stderr as `fs_<tool>: <note>`, and the exit status says whether anything was found.
+When a `bash` script calls these tools, they behave like the shell commands of the same name. Data goes to stdout, notes go to stderr as `fs_<tool>: <note>`, and the exit status says whether anything was found.
 
 - `fs_read` prints the selected lines as they are in the file, with no line-number prefix unless you pass `--line-numbers`, and adds no final newline to a file that has none, so `fs_read --path f > copy` matches `f` byte for byte when `f` is valid UTF-8 text and no limit cuts the output. Invalid UTF-8 bytes are printed as U+FFFD, and a binary file is refused. A line cap or byte cap truncates the output and prints a note on stderr naming the `offset` to continue from, and a single line longer than the byte cap is cut with a note.
 - `fs_ls` prints one entry name per line. `fs_find` prints one path per line, and `fs_grep` prints `path:line:text` rows; their paths start with the `--path` you gave, so they can be passed straight to `fs_read --path`. `fs_grep --path` accepts a file as well as a directory; for a file the printed path is the argument itself.

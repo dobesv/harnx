@@ -143,17 +143,16 @@ impl SessionActor {
     ) -> anyhow::Result<NatsSession> {
         let abort = create_abort_signal();
         let config = self.prompt_config().await;
-        let initializer = harnx_runtime::SessionInitializer::named_from_config(
-            self.key.agent().to_string(),
-            &config.read(),
-        );
-        let initializer = match user_id {
-            Some(user_id) => initializer.with_user_id(user_id),
-            None => initializer,
-        };
-        let initializer = match user_principals {
-            Some(principals) => initializer.with_user_principals(principals),
-            None => initializer,
+        // The shared serve-side identity stamp (review C13): the claim path
+        // reserves metadata with the same precedence admission stamps here.
+        let initializer = {
+            let config_snapshot = config.read();
+            identity_stamped_initializer(
+                self.key.agent(),
+                &config_snapshot,
+                user_id,
+                user_principals,
+            )
         };
         let cluster = self.key.cluster().to_string();
         NatsSession::from_global_config(

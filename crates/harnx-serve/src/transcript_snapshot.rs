@@ -1,10 +1,12 @@
 //! AG-UI projection of the shared default transcript view.
 
+use crate::history_projection::{project_message, HistoryReasoning};
 use ag_ui_core::{
     event::{BaseEvent, CustomEvent, Event},
     types::message::Message as AgUiMessage,
 };
 use harnx_core::{
+    message::Message,
     session::{Session, SessionLogEntry},
     transcript_view::{default_view, CompactionMarker},
 };
@@ -68,6 +70,7 @@ impl SessionCompaction {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct HistorySnapshot {
     pub messages: Vec<AgUiMessage>,
+    pub reasoning: HistoryReasoning,
     pub compaction: Option<SessionCompaction>,
 }
 
@@ -75,36 +78,123 @@ impl From<Vec<AgUiMessage>> for HistorySnapshot {
     fn from(messages: Vec<AgUiMessage>) -> Self {
         Self {
             messages,
-            compaction: None,
+            ..Self::default()
         }
     }
 }
 
 impl HistorySnapshot {
+    pub(crate) fn from_messages(history: &[Message]) -> Self {
+        let mut snapshot = Self::from(Vec::with_capacity(history.len()));
+        for (ordinal, message) in history.iter().enumerate() {
+            let projected = project_message(message, ordinal);
+            snapshot.messages.extend(projected.rows);
+            snapshot.reasoning.extend(projected.reasoning);
+        }
+        snapshot
+    }
+
     pub(crate) fn from_entries(
         entries: &[(u64, SessionLogEntry)],
         base: &Session,
         preserve_pending: bool,
     ) -> anyhow::Result<Self> {
         let view = default_view(entries)?;
-        let replay = if preserve_pending {
-            harnx_runtime::nats_session_log::load_session_from_entries_with_metadata_preserving_pending
-        } else {
-            harnx_runtime::nats_session_log::load_session_from_entries_with_metadata
-        };
-        let session = replay(&view.entries, base.id(), base.clone())?;
-        let mut snapshot = Self::from(crate::ag_ui::history_messages_for_snapshot(
-            &session.messages,
-        ));
-        snapshot.compaction = view.compaction.map(SessionCompaction::from);
-        if let Some(compaction) = &snapshot.compaction {
-            snapshot.messages.insert(0, compaction.message());
-        }
-        Ok(snapshot)
+        let session = replay_history(&view.entries, base, preserve_pending)?;
+        Ok(Self::from_messages(&session.messages).with_compaction(view.compaction))
     }
 
-    pub(crate) fn events(self) -> Vec<Event> {
-        snapshot_events(self.messages, self.compaction.as_ref())
+    fn with_compaction(mut self, marker: Option<CompactionMarker>) -> Self {
+        self.compaction = marker.map(SessionCompaction::from);
+        if let Some(compaction) = &self.compaction {
+            self.messages.insert(0, compaction.message());
+        }
+        self
+    }
+
+    /// Keep rows and reasoning in one queued event. A broadcast lag or remote
+    /// sequence fence can drop an event; it must not separate these two frames.
+    /// `SnapshotFeatures::expand_live_event` consumes the internal `raw_event`
+    /// before framing the snapshot for a subscriber.
+    pub(crate) fn live_events(self) -> [Event; 2] {
+        let mut snapshot = crate::ag_ui_attach::messages_snapshot(self.messages);
+        snapshot.base.raw_event = Some(json!(self.reasoning));
+        [
+            compaction_event(self.compaction.as_ref()),
+            Event::MessagesSnapshot(snapshot),
+        ]
+    }
+
+    pub(crate) fn events_for(self, features: SnapshotFeatures) -> Vec<Event> {
+        let mut events = vec![
+            compaction_event(self.compaction.as_ref()),
+            crate::ag_ui_attach::snapshot_event(self.messages),
+        ];
+        if features.history_reasoning {
+            events.push(history_reasoning_event(json!(self.reasoning)));
+        }
+        events
+    }
+}
+
+fn replay_history(
+    entries: &[(u64, SessionLogEntry)],
+    base: &Session,
+    preserve_pending: bool,
+) -> anyhow::Result<Session> {
+    use harnx_runtime::nats_session_log::{
+        load_session_from_entries_with_metadata as replay,
+        load_session_from_entries_with_metadata_preserving_pending as replay_active,
+    };
+    let replay = if preserve_pending {
+        replay_active
+    } else {
+        replay
+    };
+    replay(entries, base.id(), base.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn history_messages_for_snapshot(history: &[Message]) -> Vec<AgUiMessage> {
+    HistorySnapshot::from_messages(history).messages
+}
+
+const HISTORY_REASONING: &str = "history_reasoning";
+
+/// `x-harnx-snapshot-features: history-reasoning` opts an SSE request into a
+/// companion CUSTOM event immediately after each MESSAGES_SNAPSHOT.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SnapshotFeatures {
+    history_reasoning: bool,
+}
+
+impl SnapshotFeatures {
+    #[cfg(test)]
+    pub(crate) const WITH_HISTORY_REASONING: Self = Self {
+        history_reasoning: true,
+    };
+
+    pub(crate) fn from_headers(headers: &http::HeaderMap) -> Self {
+        Self {
+            history_reasoning: headers
+                .get_all("x-harnx-snapshot-features")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .any(|token| token.trim() == "history-reasoning"),
+        }
+    }
+
+    pub(crate) fn expand_live_event(self, mut event: Event) -> impl Iterator<Item = Event> {
+        let reasoning = match &mut event {
+            Event::MessagesSnapshot(snapshot) => snapshot.base.raw_event.take(),
+            _ => None,
+        };
+        std::iter::once(event).chain(
+            reasoning
+                .filter(|_| self.history_reasoning)
+                .map(history_reasoning_event),
+        )
     }
 }
 
@@ -119,14 +209,15 @@ pub(crate) fn compaction_event(compaction: Option<&SessionCompaction>) -> Event 
     })
 }
 
-pub(crate) fn snapshot_events(
-    messages: Vec<AgUiMessage>,
-    compaction: Option<&SessionCompaction>,
-) -> Vec<Event> {
-    vec![
-        compaction_event(compaction),
-        crate::ag_ui_attach::snapshot_event(messages),
-    ]
+fn history_reasoning_event(reasoning: Value) -> Event {
+    Event::Custom(CustomEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        name: HISTORY_REASONING.to_owned(),
+        value: reasoning,
+    })
 }
 
 #[cfg(test)]

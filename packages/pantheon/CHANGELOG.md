@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.4.23 (2026-11-24)
+
+### Features
+
+- file tools behave like shell commands in bash scripts (#2847)
+- script tools' Bash bodies get the tools' shell forms (#2853)
+- commands and fetches behave like shell commands in bash… (#2856)
+
+### Fixes
+
+- update dependency @radix-ui/react-dropdown-menu to v2.2.1 (#2884)
+- update rust crate lru to 0.19 (#2892)
+- give the claim continuation's run request its snapshot features (#2905)
+
 ## 0.4.22 (2026-11-23)
 
 ### Features

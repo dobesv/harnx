@@ -40,9 +40,7 @@ struct BashCliFixture {
 
 impl BashCliFixture {
     fn configure(nats_url: &str) -> anyhow::Result<Self> {
-        let fs_tools = std::env::current_exe()?
-            .parent()
-            .and_then(|dir| dir.parent())
+        let fs_tools = Some(harnx_core::bin_dir_of_exe(&std::env::current_exe()?))
             .map(|dir| dir.join(format!("harnx-fs-tools{}", std::env::consts::EXE_SUFFIX)))
             .filter(|path| path.is_file())
             .ok_or_else(|| anyhow::anyhow!("build harnx-fs-tools before this test"))?;

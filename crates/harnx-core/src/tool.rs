@@ -10,6 +10,7 @@ use crate::abort::AbortSignal;
 use crate::execution_context::ExecutionContextObservation;
 use crate::message::MessageContentPart;
 use async_trait::async_trait;
+use minijinja::value::Serde;
 use minijinja::{Environment, Error, UndefinedBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -605,7 +606,7 @@ pub fn render_tool_call_template(
     let mut env = make_template_env();
     env.add_function("raw", move || Ok(raw.clone()));
     let ctx = serde_json::json!({ "args": args });
-    env.render_str(template, ctx)
+    env.render_str(template, Serde(ctx))
 }
 
 /// Render a MiniJinja result template.
@@ -620,7 +621,7 @@ pub fn render_tool_result_template(
     let mut env = make_template_env();
     env.add_function("raw", move || Ok(raw.clone()));
     let ctx = serde_json::json!({ "result": result });
-    env.render_str(template, ctx)
+    env.render_str(template, Serde(ctx))
 }
 
 pub use crate::json_schema::JsonSchema;

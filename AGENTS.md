@@ -117,6 +117,12 @@ tmux/interrupt e2e and other timing-sensitive tests; a pure unit test needs no
 stress run. Some flakes only appear under full-suite load, so when a new test
 is timing-sensitive, also run it once alongside the rest of its crate.
 
+An exact filter (`-E 'test(=name)'`) needs the test's full module path, e.g.
+`nats_session_claim_tests::claim_race_...`, not the bare function name. A bare
+name matches zero tests, and a `--stress-count` run over that empty selection
+still reports `20/20 iterations passed` — a false green. Check the
+`Starting N tests across M binaries` line before trusting a filtered run.
+
 CI uses the same selection on pull requests and runs the whole suite on
 `main`. Mergify's merge queue tests its batches as ordinary pull requests, so
 it uses the selection too: a missing edge, or a test only the whole suite
@@ -333,6 +339,8 @@ args:
 
 Use `--no-sandbox` when the test scope is bash behavior, not sandbox isolation. Hosts that block unprivileged user namespaces (some containers) fail `harnx-sandbox-exec` with exit 127 before the command runs. Precedent: `proxy_auth_hook_injects_env_vars_into_bash_exec` in `crates/harnx/tests/it/tmux_e2e.rs`; `write_with_wait_tool` in `crates/harnx/src/test_utils/interrupt.rs` bridges the time server the same way.
 
+Such a test says nothing about what `harnx-sandbox-exec` does to a result, and the shipped bash servers run every command through it. The tool sees the wrapper's exit code, not the command's status: the wrapper reported a command killed by a signal as exit 1 while every `--no-sandbox` test saw the signal. A change to how the bash tools read a command's status needs a check of the wrapper too (`exit_code` in `crates/harnx-sandbox-common/src/bin/sandbox_exec.rs` has unit tests that need no namespaces).
+
 ### MCP bridge result limits
 
 Bridged MCP tool results are capped at 128 KiB serialized JSON by default
@@ -389,6 +397,17 @@ Group membership is by test name, not by what the test does: the `broker-e2e` ov
 default group and can destabilize the rest of the run — give it a matching name or add
 the filter to both profiles. Verify with `cargo nextest show-config test-groups`.
 
+When a test hands `nats-server` a config file, note 2.11 rejects the
+block-style `mappings` list shown in its docs (`"src": ["dst"]` fails with
+"Expected an entry for the mapping destination"); use a plain string
+destination (`mappings: { "src": "dst" }`). Subject mappings are also the
+deterministic way to simulate a post-connect write outage: reroute exactly one
+subject so no stream listens on it (see
+`claim_row_i_kv_write_failure_after_connect_is_503` in
+`crates/harnx-serve/src/nats_session_claim_tests.rs`). The same `mappings`
+trick simulates lagging followers and leaderless streams; see "NATS/GC tests:
+CI coverage and isolation" for those setups.
+
 Tests that spawn a `nats-server` run in the `broker-e2e` / `heavy-e2e` groups
 (`.config/nextest.toml`; local runs use `-local` copies with higher caps). On
 a contended GitHub runner that whole block has been measured running 6 to 40
@@ -408,6 +427,14 @@ than a SIGKILL would.
 
 When one of these tests fails, check a passing run's timings for the same block
 before blaming the test. If the whole block is slow, the margin is the bug.
+
+rmcp's Streamable HTTP session idle timer (`SessionConfig::keep_alive`)
+restarts only when the session receives a message, not while it is still
+handling a request. A test that shortens it to watch a session expire has to
+keep the session busy until the moment it wants the timer to run, as
+`keep_session_active` in `crates/harnx-mcp-server/tests/it/transports.rs`
+does. Otherwise a slow `list_tools` loses its session mid-request, and the
+rmcp client waits forever for the reply.
 
 ### CLI binaries need an 8 MiB stack on Windows
 
@@ -481,7 +508,18 @@ outer kinds, never on the message text: `is_nats_unavailable` in
 `crates/harnx-serve/src/nats_access.rs` is the reference implementation, and
 `nats_access_tests.rs` builds its fixtures from real error values (deserialized API
 payloads wrapped in async-nats's own constructors, live no-responders chains) rather than
-hand-built strings.
+hand-built strings. Post-connect KV writes surface the same way: `kv::Store::create`
+and `update` wrap a stalled or dying broker in typed `CreateError`/`UpdateError`/
+`PublishError` kinds (plus the direct-get `NO_RESPONDERS` fallback, whose conversion drops
+its source), so callers of `is_nats_unavailable` answer 503 for them while store answers
+(`AlreadyExists`, `InvalidKey`, `WrongLastRevision`, `MaxPayloadExceeded`) stay non-outage.
+A missing kind made a post-connect reservation outage answer HTTP 400 instead of the
+retriable 503 (#2855). Besides `guard_error_status` and the claim path's `claim_read_error`,
+the 503 mappers include `crates/harnx-serve/src/attachments/upload_store.rs` and the
+`ag_ui_rpc.rs` attachment preflight (through `SourceCheck`'s `read_failure` in
+`session_access.rs`). CID authorization deliberately does not map outages to 503: an
+unavailable source reads as absent and gets the blob route's own 404
+(`cid.rs::can_access_cid`).
 
 ### Telling a flake from a regression
 
@@ -934,23 +972,28 @@ of failure, and a probe on one client type says nothing about the other.
 To verify reasoning summaries, streaming, and tool replay across providers,
 run the live probe script (`scripts/probe_reasoning_summaries.*`).
 
-### Think-tag rendering contract (issues #2437, #2488)
+### Think-tag rendering contract (issues #2437, #2488, #2858)
 
 Thinking text is persisted and streamed wrapped in literal `<think>\n…\n</think>`
-tags: session persistence (`harnx-runtime/src/config/session.rs` ~L860 and
-`harnx-serve/src/lib.rs` ~L1953 for tool-call turns), the streaming bracket
+tags: session persistence (`harnx-runtime/src/config/session.rs::add_assistant_text`;
+the legacy REST view `harnx-serve/src/lib.rs::history_message_content` folds
+tool-call thoughts the same way), the streaming bracket
 helpers in `harnx-client` (`SseHandler::thought`, `claude_transition_reasoning`,
 `openai_transition_reasoning`), the non-streaming `format!`s in `claude.rs`,
 `openai.rs`, and `bedrock.rs`, and inline-thinking models emitting tags inside
-normal text. The tags are the wire format; frontends split them out for display
-rather than persistence changing what it writes.
+normal text. Persistence and the live stream keep the tags as the wire format
+(issue #2858 changed only what history snapshots emit): the server strips
+leading wrappers from snapshot assistant content and returns the reasoning in
+a side-channel `history_reasoning` map; frontends split live inline tags for
+display.
 
 - Display splitting uses `harnx_core::text::THINK_TAG_PAIRS` (`<think>` and
   `<thinking>`; case-sensitive, no nesting, no code-fence special-casing).
   Consumers: the TUI (`assistant_render.rs`), the CLI
   (`streaming_think_segmenter.rs`, which must run at the `cli_event_sink`
   boundary because the sink's partial-line raw writes bypass `MarkdownRender`),
-  and the web port `web/src/lib/thinkBlocks.ts`. The TS port must stay
+  and the web port `web/src/lib/thinkBlocks.ts` (legacy fallback only — see the
+  history-snapshot bullet below). The TS port must stay
   semantically identical to `split_think_blocks` — its vitest cases mirror the
   Rust unit tests, including the single-newline trim at tag boundaries.
 - `strip_think_tag` (`harnx-core/src/text.rs`) is LLM-facing: it removes a
@@ -963,7 +1006,31 @@ rather than persistence changing what it writes.
   authoritative — only `None` (failed/timed-out read) may fall back to the raw
   live sink (`sanitized_empty_durable_progress_does_not_expose_later_live_reasoning`).
   `split_think_blocks` is display-facing (any position, ordered
-  segments). Keep the two contracts separate.
+  segments). Keep the contracts separate.
+- History snapshots strip thinking server-side (issue #2858).
+  `crates/harnx-serve/src/history_projection.rs::split_history_reasoning` is
+  snapshot-facing and has its own semantics: it removes only *leading,
+  writer-shaped* wrappers — `<think>\n…\n</think>` followed by `\n\n` (model
+  adapters), one `\n` (session storage) or end-of-string — looping over
+  consecutive wrappers and coalescing adjacent duplicates. Mid-text, fenced,
+  `<thinking>` and unclosed tags stay verbatim, and the answer is never
+  trimmed. It runs on assistant `Text` and `ToolCalls.text` (tool-call turns
+  can be stored with role `Tool`) only; user/system/tool-result rows are
+  untouched and a reasoning-only row keeps `content: ""`. Callers:
+  `history_projection::project_message`, which feeds `HistorySnapshot`
+  (`transcript_snapshot.rs`: the MESSAGES_SNAPSHOT payload and `session/get`)
+  and `session_history/{groups,projection}.rs` (`session/history` and HTTP
+  history pages). The `ModelEvent::Final` fallback
+  `ag_ui.rs::emit_final_content` calls `split_history_reasoning` directly
+  (thoughts re-emitted only when none were streamed as THINKING events). Stripped reasoning is returned as a
+  `history_reasoning` map keyed by the emitted assistant row ID: a sibling of
+  `history_snapshot` in RPC/HTTP responses, and — only when an SSE request
+  opts in via `x-harnx-snapshot-features: history-reasoning` — a
+  `CUSTOM history_reasoning` event immediately after each MESSAGES_SNAPSHOT
+  (`transcript_snapshot.rs::SnapshotFeatures`). The web client consumes the
+  structured map (`ChatProvider.tsx` injects synthetic `role: "reasoning"`
+  rows; `historyReasoningSupport.ts` flags support), so `thinkBlocks.ts`
+  inline splitting is an assistant-only legacy fallback for older servers.
 - CLI raw/non-TTY output keeps literal tags byte-for-byte — scripts may parse it
   (`raw_and_non_tty_output_remain_byte_identical` in `cli_thought_tests.rs`).
   TTY output instead prints a dim `Thinking` label plus DarkGray DIM+ITALIC
@@ -1109,11 +1176,18 @@ three things a tool declares decide how well it works there.
   `ToolSpec::with_script_output` which field is stdout, stderr and the exit
   status, and leaves its direct-call output byte-identical. It bounds the
   result itself, and puts a note about cut-off data in the field the mapping
-  names as `stderr`, never in the data. Paths it prints have to be usable as
-  arguments to the next command. Scripts run with `set -e`, so a non-zero
+  names as `stderr`, never in the data. A note that says where to continue
+  (`--offset K`, `start_index=K`) is computed from what was printed after
+  every cap, not from the window the tool selected before the byte cap cut
+  it: a script that follows K otherwise skips the dropped part. Paths it
+  prints have to be usable as arguments to the next command. Scripts run with `set -e`, so a non-zero
   status for "nothing found" (`fs_grep` exits 1) ends a script that doesn't
   guard the call. `harnx-fs-tools` is the reference (`script_result.rs`,
-  `script_search.rs`).
+  `script_search.rs`); `harnx-bash-tools` is the reference for a tool that
+  behaves like a command (`server/script_result.rs`): its mapping sets
+  `stderr_text` for the command's own stderr, printed as stored before the
+  notes, and `exit_code` for its status (a value outside 0 to 255 is reported
+  as 255).
 
   The request rides on the call context (`ToolCallOrigin::structured_result`,
   set only by the fork the `bash` tool's inner calls use), not on a
@@ -1121,10 +1195,11 @@ three things a tool declares decide how well it works there.
   script middleware runs on harnx-script's worker thread, and its `call_next`
   dispatch would lose one. A middleware or hook that wraps a script's inner
   call sees the script-shaped result, so one that scans `content` text misses
-  the data. MCP doesn't carry the request, so the mapping is stripped from
-  MCP listings (`harnx-toolset-server/src/mcp.rs`) and from the sandbox
-  gateway's proxied specs: a tool reached that way answers in model style
-  and advertises no shell form.
+  the data. Over MCP the capability travels in the request `_meta`
+  (`"harnx:structured_result": true`), so a tool behind `harnx-mcp-bridge` or
+  in the k8s sandbox gets its shell form; a server older than this answers in
+  model style and the command prints that text. A bridged script-style result
+  over the bridge's result limit is an error that says how to page.
 
 The `bash` tool's own result has two shapes, chosen by
 `BashProviderConfig::full_payload`. A model round gets `status`, `exit_code`,
@@ -1565,6 +1640,47 @@ opening a control handle; without metadata they return idle/not-found rather
 than creating one. Creating it there would stamp only the defaults, and the
 next prompt's request identity could never replace them.
 
+Under access rules, the session guard
+(`crates/harnx-serve/src/session_access.rs::guard_session_request`) renders
+the same 404 for a missing and a foreign ID once the owner lookup succeeds
+and decodes. A lookup or decode error never becomes that 404 and never
+defers: it propagates through `guard_error_status` — 503 for a recognized
+broker outage, 400 otherwise. Only a confirmed absence (`Ok(None)`) can
+defer, and only for a claim-candidate item POST. The `/v1/cid/*` blob route
+returns its own 404 for missing, foreign, undecodable and broker-unavailable
+source records (`crates/harnx-serve/src/cid.rs::can_access_cid`). The
+deferral is a `POST` to exactly `/v1/agents/{agent}/sessions/{session}` with
+a claimable ID, which the guard hands to the claim path: classification rows
+a–g are inline comments in
+`crates/harnx-serve/src/session_claim.rs`, and rows h–i — a live registered
+actor forces a leader reread of the canonical record, otherwise the ID is
+reserved via `create_or_read_session_metadata` — live in
+`crates/harnx-serve/src/session_claim_reservation.rs`. Pinned by
+`crates/harnx-serve/tests/it/access_sessions/claim_matrix.rs` and
+`crates/harnx-serve/src/nats_session_claim_tests.rs`:
+
+- A request that doesn't qualify as a creating prompt never reaches actor or
+  stream code on an unseen ID.
+- Refused outcomes are identical for missing and foreign IDs: same 404
+  status, body and application headers, and — for claim-candidate item
+  POSTs after a successful owner lookup — the same bounded body read (with
+  its cap and deadline) before any owner-dependent answer. That is
+  final-response parity, not a no-oracle guarantee — processing time can
+  still differ for prompt-scope callers, and the 403 for an admin-only
+  creating prompt and the 503 for a broker outage are intentional
+  exceptions.
+- An owner denial on the claim path is the guard's 404, never the actor's 409
+  `Rejected`.
+- Owner decoding is strict on the claim path
+  (`session_claim_reservation.rs::claim_record_owner`): undecodable
+  properties and a present non-string `user_id` fail closed, admins
+  included. The guard's own owner read (`read_session_owner`) is more
+  lenient — it treats a present non-string `user_id` as a legacy owner.
+- Owners are matched only through `rules.can_access_session`, never raw
+  `user_id` equality: prompt scope requires the stored owner to be among the
+  caller's `CallerView::users` (aliases included), admin scope reaches any
+  existing session, and groups/roles grant scope — never ownership.
+
 A `SESSION_` JetStream stream must never exist before canonical metadata does
 (`sessions/<storage_key>/meta` in `harnx_sessions`). The stream name is
 `SESSION_<sha256(storage_key)>` and cannot be reversed, and the remote GC
@@ -1598,6 +1714,20 @@ physically with a stream purge plus subject filter (like
 `CheckpointStore::purge_session` for `harnx_interaction_checkpoints`) instead
 of per-key KV purge: a per-key PURGE marker leaves the subject listed forever,
 which "keys gone" checks and listings then misreport.
+
+`delete_session_leftovers` never touches the canonical record: the final
+revision-conditional purge of `sessions/<key>/meta` runs in `delete_session_state`
+(`harnx-runtime/src/nats_admin.rs`), after the leftovers cascade and the A2A
+cleanup, conditioned on the KV revision captured when deletion started (#2855).
+While the canonical record remains — any earlier failure leaves it in place,
+with the session still owned by its old owner — other prompt-scope callers
+cannot claim a partially deleted ID, and re-running `harnx delete session` or
+retention GC can finish the job. A deletion that saw no canonical record at
+start skips the final purge, so it never removes a record a later creator
+wrote. The reorder protects the canonical key only while the owner record
+remains; it does not fence later incarnations of a reused ID — media, plans,
+live actors and streams from the previous session are not
+incarnation-checked.
 
 ### Crate layering for NATS tool servers
 

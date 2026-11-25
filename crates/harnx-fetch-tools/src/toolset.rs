@@ -1,12 +1,14 @@
 use async_trait::async_trait;
-use harnx_toolset::{ToolInvokeError, ToolProgressKind, ToolSpec, Toolset};
+use harnx_toolset::{
+    ScriptOutput, ToolInvocation, ToolInvokeError, ToolProgressKind, ToolSpec, Toolset,
+};
 use rmcp::model::{CallToolResult, ErrorData};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::{
-    tool_schema, FetchParams, FetchServer, YoutubeTranscriptParams, TOOL_DESCRIPTIONS,
+    tool_schema, FetchParams, FetchServer, ResultStyle, YoutubeTranscriptParams, TOOL_DESCRIPTIONS,
 };
 
 #[derive(Clone)]
@@ -42,6 +44,21 @@ fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, ToolInvokeError> {
         .map_err(|error| ToolInvokeError::Recoverable(format!("invalid tool arguments: {error}")))
 }
 
+fn fetch_params(args: Value, style: ResultStyle) -> Result<FetchParams, ToolInvokeError> {
+    let mut params: FetchParams = parse_args(args)?;
+    params.style = style;
+    Ok(params)
+}
+
+fn youtube_params(
+    args: Value,
+    style: ResultStyle,
+) -> Result<YoutubeTranscriptParams, ToolInvokeError> {
+    let mut params: YoutubeTranscriptParams = parse_args(args)?;
+    params.fetch.style = style;
+    Ok(params)
+}
+
 fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolInvokeError> {
     match result {
         Ok(result) => serde_json::to_value(result).map_err(|error| {
@@ -63,6 +80,12 @@ fn tool_spec(name: &str, description: &str) -> ToolSpec {
         meta: None,
     }
     .with_kind(ToolProgressKind::Fetch)
+    .with_script_output(ScriptOutput {
+        stdout: Some("text".to_string()),
+        stderr: Some("notes".to_string()),
+        summary: Some("the page text; notes about cut-off output on stderr".to_string()),
+        ..Default::default()
+    })
 }
 
 #[async_trait]
@@ -88,35 +111,55 @@ impl Toolset for FetchToolset {
         args: Value,
         _cancel: CancellationToken,
     ) -> Result<Value, ToolInvokeError> {
+        self.invoke_styled(tool, args, ResultStyle::Model).await
+    }
+
+    async fn invoke_with_context(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Value, ToolInvokeError> {
+        let style = if invocation.context.wants_structured_result() {
+            ResultStyle::Script
+        } else {
+            ResultStyle::Model
+        };
+        self.invoke_styled(&invocation.tool, invocation.args, style)
+            .await
+    }
+}
+
+impl FetchToolset {
+    async fn invoke_styled(
+        &self,
+        tool: &str,
+        args: Value,
+        style: ResultStyle,
+    ) -> Result<Value, ToolInvokeError> {
         match tool {
             "fetch_html" => map_result(
                 self.server
-                    .fetch_html_impl(parse_args::<FetchParams>(args)?)
+                    .fetch_html_impl(fetch_params(args, style)?)
                     .await,
             ),
             "fetch_markdown" => map_result(
                 self.server
-                    .fetch_markdown_impl(parse_args::<FetchParams>(args)?)
+                    .fetch_markdown_impl(fetch_params(args, style)?)
                     .await,
             ),
-            "fetch_txt" => map_result(
-                self.server
-                    .fetch_txt_impl(parse_args::<FetchParams>(args)?)
-                    .await,
-            ),
+            "fetch_txt" => map_result(self.server.fetch_txt_impl(fetch_params(args, style)?).await),
             "fetch_json" => map_result(
                 self.server
-                    .fetch_json_impl(parse_args::<FetchParams>(args)?)
+                    .fetch_json_impl(fetch_params(args, style)?)
                     .await,
             ),
             "fetch_readable" => map_result(
                 self.server
-                    .fetch_readable_impl(parse_args::<FetchParams>(args)?)
+                    .fetch_readable_impl(fetch_params(args, style)?)
                     .await,
             ),
             "fetch_youtube_transcript" => map_result(
                 self.server
-                    .fetch_youtube_transcript_impl(parse_args::<YoutubeTranscriptParams>(args)?)
+                    .fetch_youtube_transcript_impl(youtube_params(args, style)?)
                     .await,
             ),
             _ => Err(ToolInvokeError::Recoverable(format!(

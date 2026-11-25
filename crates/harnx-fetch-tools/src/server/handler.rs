@@ -14,6 +14,7 @@ use crate::{client::FetchedPage, format};
 use super::image::try_image_result;
 use super::model::PlayerResponse;
 use super::params::DEFAULT_MAX_LENGTH;
+use super::script_result::{script_page, ResultStyle};
 use super::{FetchParams, FetchServer, YoutubeTranscriptParams, TOOL_DESCRIPTIONS};
 
 fn domain_error(message: impl Into<String>) -> ErrorData {
@@ -61,6 +62,15 @@ fn json_output(value: &str, params: &FetchParams) -> String {
     truncate_output(&preview, &params.truncation_opts())
 }
 
+/// Render a page's transformed text for the caller the params name.
+fn finish(full: &str, page: &FetchedPage, params: &FetchParams, json: bool) -> CallToolResult {
+    match params.style {
+        ResultStyle::Script => script_page(full, page, params, json),
+        ResultStyle::Model if json => text_result(json_output(full, params)),
+        ResultStyle::Model => text_result(output(full, params)),
+    }
+}
+
 impl FetchServer {
     async fn fetch_page(&self, params: &FetchParams) -> Result<FetchedPage, ErrorData> {
         params.validate().map_err(domain_error)?;
@@ -73,6 +83,7 @@ impl FetchServer {
     async fn fetch_page_result(
         &self,
         params: &FetchParams,
+        json: bool,
         render_text: impl FnOnce(&str, &str) -> Result<String, ErrorData>,
     ) -> Result<CallToolResult, ErrorData> {
         let page = self.fetch_page(params).await?;
@@ -80,11 +91,11 @@ impl FetchServer {
             return Ok(image);
         }
         let body = String::from_utf8_lossy(&page.body);
-        render_text(&body, page.final_url.as_str()).map(text_result)
+        render_text(&body, page.final_url.as_str()).map(|full| finish(&full, &page, params, json))
     }
 
     pub async fn fetch_html_impl(&self, params: FetchParams) -> Result<CallToolResult, ErrorData> {
-        self.fetch_page_result(&params, |body, _| Ok(output(body, &params)))
+        self.fetch_page_result(&params, false, |body, _| Ok(body.to_owned()))
             .await
     }
 
@@ -92,27 +103,24 @@ impl FetchServer {
         &self,
         params: FetchParams,
     ) -> Result<CallToolResult, ErrorData> {
-        self.fetch_page_result(&params, |body, _| {
-            Ok(output(&format::html_to_md(body), &params))
-        })
-        .await
+        self.fetch_page_result(&params, false, |body, _| Ok(format::html_to_md(body)))
+            .await
     }
 
     pub async fn fetch_txt_impl(&self, params: FetchParams) -> Result<CallToolResult, ErrorData> {
-        self.fetch_page_result(&params, |body, _| {
-            let text = format::html_to_text(body).map_err(domain_error)?;
-            Ok(output(&text, &params))
+        self.fetch_page_result(&params, false, |body, _| {
+            format::html_to_text(body).map_err(domain_error)
         })
         .await
     }
 
     pub async fn fetch_json_impl(&self, params: FetchParams) -> Result<CallToolResult, ErrorData> {
-        self.fetch_page_result(&params, |body, _| {
+        self.fetch_page_result(&params, true, |body, _| {
             let parsed: Value = serde_json::from_str(body)
                 .map_err(|error| domain_error(format!("response is not valid JSON: {error}")))?;
             let pretty = serde_json::to_string_pretty(&parsed)
                 .map_err(|error| domain_error(format!("failed to serialize JSON: {error}")))?;
-            Ok(json_output(&pretty, &params))
+            Ok(pretty)
         })
         .await
     }
@@ -121,9 +129,8 @@ impl FetchServer {
         &self,
         params: FetchParams,
     ) -> Result<CallToolResult, ErrorData> {
-        self.fetch_page_result(&params, |body, url| {
-            let markdown = format::readable_markdown(body, url).map_err(domain_error)?;
-            Ok(output(&markdown, &params))
+        self.fetch_page_result(&params, false, |body, url| {
+            format::readable_markdown(body, url).map_err(domain_error)
         })
         .await
     }
@@ -176,7 +183,7 @@ impl FetchServer {
             .map_err(domain_error)?;
         let transcript = format::transcript_lines(&String::from_utf8_lossy(&captions.body))
             .map_err(domain_error)?;
-        Ok(text_result(output(&transcript, &params.fetch)))
+        Ok(finish(&transcript, &watch_page, &params.fetch, false))
     }
 }
 

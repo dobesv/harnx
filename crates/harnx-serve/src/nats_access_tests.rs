@@ -230,6 +230,92 @@ fn jetstream_offline_error_codes_in_wrappers_are_unavailable() {
     assert!(is_nats_unavailable(&timed_out));
 }
 
+/// The typed KV write and direct-get kinds the first-prompt reservation
+/// surfaces after connect (review D1): a `kv::Store::create` whose broker
+/// stalled or died mid-write — the ack timeout, whose `From<UpdateError>`
+/// conversion re-labels the kind as `CreateErrorKind::Publish` while
+/// keeping the `UpdateError` source, and the bare update one level down —
+/// the publish round trip's timed-out ack, broken pipe and lost stream,
+/// and a direct get with no responders whose conversion drops its source
+/// so the status is the only carrier. Built from async-nats's own public
+/// wrapper constructors; no error text is matched.
+#[test]
+fn kv_write_and_direct_get_outage_kinds_are_unavailable() {
+    use async_nats::jetstream::kv::{CreateError, CreateErrorKind, UpdateError, UpdateErrorKind};
+
+    // `kv::Store::create` on a broker stalled after connect: the put's ack
+    // wait times out. The From conversion both keeps the UpdateError in
+    // the chain and re-labels its kind — the classifier must catch either.
+    let stalled = CreateError::with_source(
+        CreateErrorKind::Publish,
+        UpdateError::new(UpdateErrorKind::TimedOut),
+    );
+    let error = anyhow::Error::new(stalled).context("reserve session metadata");
+    assert!(is_nats_unavailable(&error), "kv create ack timeout");
+
+    let bare_update = anyhow::Error::new(UpdateError::new(UpdateErrorKind::TimedOut));
+    assert!(is_nats_unavailable(&bare_update), "kv update ack timeout");
+
+    for kind in [
+        async_nats::jetstream::context::PublishErrorKind::TimedOut,
+        async_nats::jetstream::context::PublishErrorKind::BrokenPipe,
+        async_nats::jetstream::context::PublishErrorKind::StreamNotFound,
+    ] {
+        let publish = anyhow::Error::new(async_nats::jetstream::context::PublishError::new(kind))
+            .context("publish the reservation put");
+        assert!(is_nats_unavailable(&publish), "{kind:?} publish");
+    }
+
+    let no_responders = anyhow::Error::new(async_nats::jetstream::stream::DirectGetError::new(
+        async_nats::jetstream::stream::DirectGetErrorKind::ErrorResponse(
+            async_nats::StatusCode::NO_RESPONDERS,
+            "no responders".to_string(),
+        ),
+    ));
+    assert!(
+        is_nats_unavailable(&no_responders),
+        "direct get no responders"
+    );
+}
+
+/// The KV and direct-get kinds that are broker answers, not outages
+/// (review D1): an existing key, an invalid key, a racing revision, a
+/// client-side payload rejection and an answered-but-negative direct get
+/// must stay non-503 — no blanket unavailability.
+#[test]
+fn kv_store_answers_and_direct_get_responses_stay_not_unavailable() {
+    use async_nats::jetstream::kv::{CreateErrorKind, UpdateErrorKind};
+    use async_nats::jetstream::stream::DirectGetErrorKind;
+
+    let already_exists = anyhow::Error::new(async_nats::jetstream::kv::CreateError::new(
+        CreateErrorKind::AlreadyExists,
+    ))
+    .context("reserve session metadata");
+    assert!(!is_nats_unavailable(&already_exists));
+
+    let wrong_revision = anyhow::Error::new(async_nats::jetstream::kv::UpdateError::new(
+        UpdateErrorKind::WrongLastRevision,
+    ))
+    .context("reserve session metadata");
+    assert!(!is_nats_unavailable(&wrong_revision));
+
+    let max_payload = anyhow::Error::new(async_nats::jetstream::context::PublishError::new(
+        async_nats::jetstream::context::PublishErrorKind::MaxPayloadExceeded,
+    ))
+    .context("publish the reservation put");
+    assert!(!is_nats_unavailable(&max_payload));
+
+    // A direct get the broker answered with an ordinary status: not found,
+    // not an outage.
+    let not_found = anyhow::Error::new(async_nats::jetstream::stream::DirectGetError::new(
+        DirectGetErrorKind::ErrorResponse(
+            async_nats::StatusCode::NOT_FOUND,
+            "message not found".to_string(),
+        ),
+    ));
+    assert!(!is_nats_unavailable(&not_found));
+}
+
 #[test]
 fn store_failures_are_not_unavailable() {
     // A client-side payload rejection, request errors without an

@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::ag_ui::frame_event;
 use crate::ag_ui_sync::history_warning_event;
+use crate::transcript_snapshot::{HistorySnapshot, SnapshotFeatures};
 
 pub(crate) fn session_attach_boundary_event(attached_seq: u64) -> Event {
     Event::Custom(CustomEvent {
@@ -27,22 +28,27 @@ pub(crate) fn session_attach_boundary_frame(attached_seq: u64) -> Bytes {
 }
 
 pub(crate) fn snapshot_event(messages: Vec<AgUiMessage>) -> Event {
-    Event::MessagesSnapshot(MessagesSnapshotEvent {
+    Event::MessagesSnapshot(messages_snapshot(messages))
+}
+
+pub(crate) fn messages_snapshot(messages: Vec<AgUiMessage>) -> MessagesSnapshotEvent {
+    MessagesSnapshotEvent {
         base: BaseEvent {
             timestamp: None,
             raw_event: None,
         },
         messages,
-    })
+    }
 }
 
 pub(crate) fn initial_attach_frame(
-    snapshot: crate::transcript_snapshot::HistorySnapshot,
+    snapshot: HistorySnapshot,
     history_warnings: Vec<String>,
     include_snapshot: bool,
+    features: SnapshotFeatures,
 ) -> Option<Bytes> {
     let frames = include_snapshot
-        .then(|| snapshot.events())
+        .then(|| snapshot.events_for(features))
         .into_iter()
         .flatten()
         .chain(history_warnings.into_iter().map(history_warning_event))

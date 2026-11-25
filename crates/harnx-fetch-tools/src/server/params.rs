@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use harnx_core::safety::{TruncateOpts, DEFAULT_MAX_BYTES};
 use serde::Deserialize;
 
+use super::ResultStyle;
+
 /// Character window deliberately equal in number to the shared byte budget.
 pub const DEFAULT_MAX_LENGTH: usize = DEFAULT_MAX_BYTES;
 
@@ -23,6 +25,9 @@ pub struct FetchParams {
     pub tail_lines: Option<usize>,
     #[serde(default)]
     pub max_output_bytes: Option<usize>,
+    /// Chosen by the caller from the invocation, never read from arguments.
+    #[serde(skip)]
+    pub style: ResultStyle,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

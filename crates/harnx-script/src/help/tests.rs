@@ -154,6 +154,26 @@ fn help_shows_output_section_for_a_mapped_tool() {
 }
 
 #[test]
+fn help_lists_stderr_text_before_notes() {
+    let mapping = OutputMapping {
+        stderr_text: Some("err".into()),
+        stderr: Some("notes".into()),
+        ..Default::default()
+    };
+    let text = help("t", &schema(), "d", Some(&mapping));
+    assert!(
+        text.contains("stderr: the `err` field, then notes from `notes`\n"),
+        "{text}"
+    );
+    let only_text = OutputMapping {
+        stderr_text: Some("err".into()),
+        ..Default::default()
+    };
+    let text = help("t", &schema(), "d", Some(&only_text));
+    assert!(text.contains("  stderr: the `err` field\n"), "{text}");
+}
+
+#[test]
 fn help_leaves_out_output_lines_for_absent_parts() {
     let mapping = OutputMapping {
         stdout: Some("text".into()),

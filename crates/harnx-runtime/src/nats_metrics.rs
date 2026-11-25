@@ -25,7 +25,7 @@ pub fn active_session_started() {
 
 pub fn active_session_finished() {
     ACTIVE_SESSIONS_PER_WORKER
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
             Some(value.saturating_sub(1))
         })
         .ok();

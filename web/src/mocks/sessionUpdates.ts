@@ -1,5 +1,6 @@
 const subscribers = new Map<string, Set<ReadableStreamDefaultController>>();
 export const snapshots = new Map<string, any[]>();
+export const snapshotReasonings = new Map<string, Record<string, string[]>>();
 
 export const controlStates = new Map<string, any[]>();
 
@@ -22,9 +23,15 @@ export function notify(session: string) {
 }
 
 channel?.addEventListener('message', (event) => {
-  const update = event.data as { session?: string; messages?: any[]; controlStates?: any[] };
+  const update = event.data as {
+    session?: string;
+    messages?: any[];
+    controlStates?: any[];
+    reasoning?: Record<string, string[]>;
+  };
   if (!update.session || !Array.isArray(update.messages)) return;
   if (update.controlStates) controlStates.set(update.session, update.controlStates);
+  if (update.reasoning) snapshotReasonings.set(update.session, update.reasoning);
   snapshots.set(update.session, update.messages);
   notify(update.session);
 });
@@ -33,15 +40,38 @@ export function additionalSnapshot(session: string): any[] {
   return snapshots.get(session) ?? [];
 }
 
-export function persistExchange(session: string, userText: string, reply: string, userMessageId = `mock-user-${messageId++}`) {
+export function additionalReasoning(session: string): Record<string, string[]> {
+  return snapshotReasonings.get(session) ?? {};
+}
+
+export function persistExchange(
+  session: string,
+  userText: string,
+  reply: string,
+  userMessageId = `mock-user-${messageId++}`,
+  reasoning?: string[],
+) {
   const persisted = additionalSnapshot(session);
+  const assistantMessageId = `mock-assistant-${messageId++}`;
   persisted.push(
     { id: userMessageId, role: 'user', content: userText },
-    { id: `mock-assistant-${messageId++}`, role: 'assistant', content: reply },
+    { id: assistantMessageId, role: 'assistant', content: reply },
   );
   snapshots.set(session, persisted);
+  if (reasoning && reasoning.length > 0) {
+    const current = snapshotReasonings.get(session) ?? {};
+    snapshotReasonings.set(session, {
+      ...current,
+      [assistantMessageId]: reasoning,
+    });
+  }
   notify(session);
-  channel?.postMessage({ session, messages: persisted, controlStates: controlStates.get(session) });
+  channel?.postMessage({
+    session,
+    messages: persisted,
+    controlStates: controlStates.get(session),
+    reasoning: snapshotReasonings.get(session),
+  });
 }
 
 

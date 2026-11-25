@@ -144,10 +144,7 @@ pub fn harnx_worker_binary() -> Option<PathBuf> {
     }
 
     let mut path = std::env::current_exe().ok()?;
-    path.pop();
-    if path.file_name().is_some_and(|name| name == "deps") {
-        path.pop();
-    }
+    path = harnx_core::bin_dir_of_exe(&path);
     path.push(if cfg!(windows) {
         "harnx-worker.exe"
     } else {
