@@ -11,8 +11,8 @@ pub fn render_error(err: anyhow::Error) {
     eprintln!("{}", error_text(&format!("Error: {body}")));
 }
 
-/// Built-in Monokai Extended theme bytes — bincode-legacy-encoded
-/// `syntect::highlighting::Theme`. Use [`load_builtin_theme`] to decode.
+/// Built-in Monokai Extended theme bytes — a `syntect::highlighting::Theme` in
+/// syntect's uncompressed dump format. Use [`load_builtin_theme`] to decode.
 const DARK_THEME_BYTES: &[u8] = include_bytes!("../assets/monokai-extended.theme.bin");
 const LIGHT_THEME_BYTES: &[u8] = include_bytes!("../assets/monokai-extended-light.theme.bin");
 
@@ -30,12 +30,10 @@ pub fn load_builtin_theme(light: bool) -> anyhow::Result<syntect::highlighting::
     decode_bin(bytes).with_context(|| format!("Invalid builtin {label} theme"))
 }
 
-/// Inlined from `harnx::utils::decode_bin` — bincode-legacy decode for
-/// the bundled `syntaxes.bin` and any other embedded binary assets.
-/// Duplicated here to keep harnx-core free of the bincode dep.
+/// Decode one of the bundled syntect assets (`syntaxes.bin` or a theme), which
+/// are in syntect's uncompressed dump format.
 pub(crate) fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> anyhow::Result<T> {
-    let (v, _) = bincode::serde::decode_from_slice(data, bincode::config::legacy())?;
-    Ok(v)
+    Ok(syntect::dumps::from_uncompressed_data(data)?)
 }
 
 /// Inlined from `harnx::utils::error_text`. Respects `NO_COLOR` env
@@ -100,7 +98,25 @@ fn indent_text<T: ToString>(s: T, size: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::pretty_error_string;
+    use super::{decode_bin, load_builtin_theme, pretty_error_string};
+    use syntect::parsing::SyntaxSet;
+
+    #[test]
+    fn bundled_syntaxes_and_themes_decode() {
+        let syntaxes: SyntaxSet = decode_bin(include_bytes!("../assets/syntaxes.bin")).unwrap();
+        assert!(syntaxes.find_syntax_by_extension("rs").is_some());
+        assert!(syntaxes.find_syntax_by_extension("md").is_some());
+        for light in [false, true] {
+            let theme = load_builtin_theme(light).unwrap();
+            assert!(theme.settings.foreground.is_some());
+        }
+    }
+
+    #[test]
+    fn truncated_asset_is_an_error_not_a_panic() {
+        let bytes = include_bytes!("../assets/syntaxes.bin");
+        assert!(decode_bin::<SyntaxSet>(&bytes[..bytes.len() / 2]).is_err());
+    }
 
     #[test]
     fn no_causes() {
