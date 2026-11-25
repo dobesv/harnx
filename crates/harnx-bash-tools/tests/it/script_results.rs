@@ -877,7 +877,9 @@ async fn rollback_takes_the_short_id_from_a_summary_line() {
     let result = call(&repo.toolset, "rollback_file", args, false).await;
     assert!(result["isError"] != json!(true), "{result}");
     let note = std::fs::read_to_string(repo.directory.path().join("note.txt")).unwrap();
-    assert_eq!(note, "after\n");
+    // Rollback ends with a git reset, which checks files out with the
+    // machine's line-ending conversion (CRLF where `core.autocrlf` is on).
+    assert_eq!(note.replace("\r\n", "\n"), "after\n");
 }
 
 #[tokio::test]
