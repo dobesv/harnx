@@ -226,13 +226,11 @@ fn write_commit(dir: &Path, body: &[u8]) {
     assert!(child.wait().expect("wait").success());
 }
 
-#[test]
-fn an_ambiguous_prefix_is_an_error() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    pair(temp.path());
-    let tree = git(temp.path(), &["rev-parse", "HEAD^{tree}"]);
+/// Two commit bodies whose ids share their first 7 hex digits.
+fn colliding_commits(dir: &Path) -> (Vec<u8>, Vec<u8>, String) {
+    let tree = git(dir, &["rev-parse", "HEAD^{tree}"]);
     let mut seen = std::collections::HashMap::new();
-    let (first, second, prefix) = (0..)
+    (0..)
         .find_map(|n| {
             let body = commit_body(tree.trim(), n);
             let hash =
@@ -242,7 +240,14 @@ fn an_ambiguous_prefix_is_an_error() {
             seen.insert(prefix.clone(), body.clone())
                 .map(|earlier| (earlier, body, prefix))
         })
-        .expect("a collision exists");
+        .expect("a collision exists")
+}
+
+#[test]
+fn an_ambiguous_prefix_is_an_error() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    pair(temp.path());
+    let (first, second, prefix) = colliding_commits(temp.path());
     write_commit(temp.path(), &first);
     write_commit(temp.path(), &second);
     let err = resolve_commit_id(temp.path(), &prefix).expect_err("ambiguous");
@@ -286,5 +291,43 @@ fn a_branch_named_like_an_id_is_not_a_snapshot() {
         err.to_string()
             .starts_with(&format!("no snapshot {name} in ")),
         "{err}"
+    );
+}
+
+#[test]
+fn a_branch_named_like_a_prefix_does_not_hide_the_commit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (before, after) = pair(temp.path());
+    let prefix = after.to_hex().to_string()[..8].to_owned();
+    git(
+        temp.path(),
+        &["branch", &prefix, &before.to_hex().to_string()],
+    );
+    assert_eq!(
+        resolve_commit_id(temp.path(), &prefix).expect("the commit"),
+        after
+    );
+}
+
+#[test]
+fn a_branch_named_like_a_shared_prefix_is_still_ambiguous() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    pair(temp.path());
+    let (first, second, prefix) = colliding_commits(temp.path());
+    write_commit(temp.path(), &first);
+    write_commit(temp.path(), &second);
+    let first_id = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Commit, &first)
+        .expect("hash");
+    git(
+        temp.path(),
+        &["branch", &prefix, &first_id.to_hex().to_string()],
+    );
+    let err = resolve_commit_id(temp.path(), &prefix).expect_err("ambiguous");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{prefix} names more than one object in {}",
+            temp.path().display()
+        )
     );
 }

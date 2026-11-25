@@ -45,6 +45,32 @@ async fn summary_line_of_a_write(server: &FsServer, tracked: &Path) -> String {
     diff_of(&fields).unwrap().trim_end().to_owned()
 }
 
+/// The undo the docs teach, run from `cwd`: the summary line's command with
+/// `--binary` after `diff`, piped into `git -C <repo> apply -R`.
+fn run_undo(line: &str, repo: &Path, cwd: &Path, binary: bool) -> std::process::Output {
+    let command = line.split_once(": ").expect("colon").1;
+    let command = if binary {
+        command.replacen(" diff ", " diff --binary ", 1)
+    } else {
+        command.to_owned()
+    };
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{command} | git -C '{}' apply -R",
+            path_string(repo)
+        ))
+        .current_dir(cwd)
+        .output()
+        .unwrap()
+}
+
+/// A text file's contents with CRLF folded to LF, since a git apply may
+/// rewrite line endings on Windows.
+fn read_lf(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+}
+
 fn fields(result: &CallToolResult) -> Value {
     result
         .structured_content
@@ -177,26 +203,16 @@ async fn reverse_applying_a_summary_lines_diff_undoes_the_write() {
         "{line}"
     );
 
-    let command = line.split_once(": ").expect("colon").1;
-    let undo = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "{command} | git -C '{}' apply -R",
-            path_string(dir.path())
-        ))
-        .output()
-        .unwrap();
+    let outside = TestDir::new();
+    let undo = run_undo(line, dir.path(), outside.path(), true);
     assert!(
         undo.status.success(),
         "{}",
         String::from_utf8_lossy(&undo.stderr)
     );
 
-    assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "old value\n");
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("other.txt")).unwrap(),
-        "other\n"
-    );
+    assert_eq!(read_lf(&tracked), "old value\n");
+    assert_eq!(read_lf(&dir.path().join("other.txt")), "other\n");
     assert_eq!(rev_parse_head(dir.path()), head);
 }
 
@@ -347,4 +363,43 @@ fn object_count(dir: &Path) -> usize {
         .filter(|line| line.starts_with("count:") || line.starts_with("in-pack:"))
         .filter_map(|line| line.split_whitespace().nth(1)?.parse::<usize>().ok())
         .sum()
+}
+
+#[tokio::test]
+async fn a_binary_change_is_undone_with_a_binary_patch() {
+    let dir = TestDir::new();
+    init_git_repo(dir.path());
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    let original: &[u8] = b"\x00\x01original\xff\x00";
+    let binary = dir.path().join("blob.bin");
+    std::fs::write(&binary, original).unwrap();
+    git(dir.path(), &["add", "blob.bin"]);
+    git(dir.path(), &["commit", "-q", "-m", "init"]);
+    let server = make_server(dir.path());
+    let written = server
+        .write_bytes_at(
+            &path_string(&binary),
+            b"\x89PNG\x00changed\xfe",
+            Some(DiffLevel::Summary),
+            ResultStyle::Script,
+        )
+        .await
+        .unwrap();
+    let line = diff_of(&fields(&written)).unwrap().trim_end().to_owned();
+    let outside = TestDir::new();
+
+    let plain = run_undo(&line, dir.path(), outside.path(), false);
+    assert!(
+        !plain.status.success(),
+        "a diff without --binary applied: {line}"
+    );
+    assert_ne!(std::fs::read(&binary).unwrap(), original);
+
+    let undo = run_undo(&line, dir.path(), outside.path(), true);
+    assert!(
+        undo.status.success(),
+        "{}",
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    assert_eq!(std::fs::read(&binary).unwrap(), original);
 }

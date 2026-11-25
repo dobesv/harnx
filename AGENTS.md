@@ -1255,8 +1255,8 @@ three things a tool declares decide how well it works there.
   `harnx-bash-tools` (`server/diff_option.rs`) and `harnx-fs-tools`
   (`server/mutation_result.rs`) are the references. Command templates take no
   `diff` and follow the defaults. The two ids on a summary line are the
-  snapshots before and after the change, and the line's command piped into
-  `git apply -R` undoes it.
+  snapshots before and after the change, and the line's command with `--binary`
+  added, piped into `git -C <repo> apply -R`, undoes it.
 
   The request rides on the call context (`ToolCallOrigin::structured_result`,
   set only by the fork the `bash` tool's inner calls use), not on a

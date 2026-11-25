@@ -118,33 +118,53 @@ fn check_id_shape(id: &str) -> Result<()> {
     anyhow::bail!("commit id must be {MIN_ID_LEN} to {MAX_ID_LEN} hex digits: {id}")
 }
 
-/// The resolved id, only when it starts with what the caller typed. Git
-/// resolves ref names before object ids, so a branch called `deadbeef` would
-/// otherwise stand in for a commit id.
-fn named_by_prefix(stdout: &[u8], id: &str) -> Option<gix::ObjectId> {
-    let resolved =
-        gix::ObjectId::from_hex(String::from_utf8_lossy(stdout).trim().as_bytes()).ok()?;
-    let full = resolved.to_hex().to_string();
-    full.starts_with(&id.to_ascii_lowercase())
-        .then_some(resolved)
+/// Every object id in the repository that starts with `id`. `--disambiguate`
+/// reads the object store only, so a branch named like an id cannot stand in
+/// for a commit or hide one.
+fn candidate_ids(repo_workdir: &Path, id: &str) -> Result<Vec<String>> {
+    let output = run_git(
+        repo_workdir,
+        &["rev-parse", &format!("--disambiguate={id}")],
+    )?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git rev-parse --disambiguate failed in {}: {}",
+            repo_workdir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The candidates whose object is a commit, in the order git listed them.
+fn only_commits(repo_workdir: &Path, candidates: Vec<String>) -> Result<Vec<String>> {
+    let mut commits = Vec::new();
+    for candidate in candidates {
+        let output = run_git(repo_workdir, &["cat-file", "-t", &candidate])?;
+        if output.status.success() && output.stdout.trim_ascii() == b"commit" {
+            commits.push(candidate);
+        }
+    }
+    Ok(commits)
+}
+
+fn single_commit(mut commits: Vec<String>, id: &str, repo: &Path) -> Result<gix::ObjectId> {
+    let repo = repo.display();
+    match (commits.pop(), commits.is_empty()) {
+        (Some(full), true) => Ok(gix::ObjectId::from_hex(full.as_bytes())?),
+        (None, _) => anyhow::bail!("no snapshot {id} in {repo}"),
+        _ => anyhow::bail!("{id} names more than one object in {repo}"),
+    }
 }
 
 /// A snapshot commit from its full id or a unique prefix of 7 or more hex digits.
 pub fn resolve_commit_id(repo_workdir: &Path, id: &str) -> Result<gix::ObjectId> {
     check_id_shape(id)?;
-    let spec = format!("{id}^{{commit}}");
-    // No `--quiet`: it hides the "ambiguous" message that tells the two
-    // failures apart.
-    let output = run_git(repo_workdir, &["rev-parse", "--verify", &spec])?;
-    let repo = repo_workdir.display();
-    if output.status.success() {
-        return named_by_prefix(&output.stdout, id)
-            .with_context(|| format!("no snapshot {id} in {repo}"));
-    }
-    if String::from_utf8_lossy(&output.stderr).contains("ambiguous") {
-        anyhow::bail!("{id} names more than one object in {repo}");
-    }
-    anyhow::bail!("no snapshot {id} in {repo}")
+    let commits = only_commits(repo_workdir, candidate_ids(repo_workdir, id)?)?;
+    single_commit(commits, id, repo_workdir)
 }
 
 #[cfg(test)]
