@@ -26,6 +26,20 @@ pub use bashkit_backend::BashKitBackend;
 pub use host::{ScriptControl, ScriptHostContext, ScriptPythonFunctions, ScriptPythonHandler};
 pub use tokio_util::sync::CancellationToken;
 
+/// The allocator the embedded Python VM meters its memory through. A binary
+/// that runs scripts installs it, or a wrapper around it, as its global
+/// allocator: without it `python3` refuses to run, so a script's memory limit
+/// can't be enforced.
+pub type VmAllocator = bashkit::MeteredAllocator;
+
+/// The value to install for [`VmAllocator`].
+pub const VM_ALLOCATOR: VmAllocator = bashkit::MeteredAllocator;
+
+// This crate's own tests run `python3`, so their binary needs it too.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: VmAllocator = VM_ALLOCATOR;
+
 /// Maximum number of simultaneously nested interpreter runs (including the root).
 pub const MAX_SCRIPT_NESTING: usize = 16;
 

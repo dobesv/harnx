@@ -164,7 +164,6 @@ async fn python_cannot_call_registered_tools_or_host_services() {
         "import subprocess; subprocess.run(['probe'])",
         "import os; os.system('probe')",
         "import socket",
-        "import re",
     ] {
         let result = BashKitBackend
             .run(crate::ScriptRequest {
@@ -192,6 +191,14 @@ async fn python_cannot_call_registered_tools_or_host_services() {
     .await;
     assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
     assert!(result.stderr.contains("FileNotFoundError"), "{result:?}");
+}
+
+#[tokio::test]
+async fn python_bundled_re_module_runs_inside_the_vm() {
+    // `re` ships inside the VM and reaches no host service, so it is allowed.
+    let result = run("python3 - <<'EOF'\nimport re\nprint(re.sub('a', 'b', 'aaa'))\nEOF").await;
+    assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
+    assert_eq!(result.stdout, "bbb\n");
 }
 
 #[test]

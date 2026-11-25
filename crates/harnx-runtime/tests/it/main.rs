@@ -2,6 +2,10 @@
 //! binary per file links the whole dependency graph again for each, which
 //! dominated build time; nextest still runs every test in its own process.
 
+// Tests here run `python3` in-process, which needs the script VM's allocator.
+#[global_allocator]
+static ALLOCATOR: harnx_script::VmAllocator = harnx_script::VM_ALLOCATOR;
+
 #[allow(dead_code)]
 mod common;
 #[allow(dead_code)]

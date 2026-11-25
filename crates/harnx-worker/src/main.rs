@@ -18,9 +18,12 @@ use std::sync::Arc;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
 /// if live heap exceeds `HARNX_HEAP_LIMIT_MB`. Disarmed (plain passthrough to
-/// the system allocator) when that env var is unset.
+/// the underlying allocator) when that env var is unset. The underlying
+/// allocator is the script VM's memory meter, which `python3` needs as the
+/// process's global allocator (`harnx_script::VmAllocator`).
 #[global_allocator]
-static GLOBAL_ALLOC: harnx_core::alloc_guard::HeapGuard = harnx_core::alloc_guard::HeapGuard;
+static GLOBAL_ALLOC: harnx_core::alloc_guard::HeapGuard<harnx_script::VmAllocator> =
+    harnx_core::alloc_guard::HeapGuard::wrapping(harnx_script::VM_ALLOCATOR);
 
 #[derive(Parser, Debug, PartialEq, Eq)]
 #[command(
@@ -254,6 +257,31 @@ async fn run(cli: Cli, shutdown: tokio_util::sync::CancellationToken) -> Result<
 mod tests {
     use super::Cli;
     use clap::Parser;
+
+    /// The worker runs agents' scripts, and `python3` refuses to start unless
+    /// the script VM's allocator is the process's global allocator. This test
+    /// binary is built from `main.rs`, so it carries the production static.
+    #[test]
+    fn python_scripts_run_under_the_workers_global_allocator() {
+        use harnx_script::{
+            BashKitBackend, CancellationToken, ScriptBackend, ScriptLimits, ScriptRequest,
+            ScriptStatus,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(BashKitBackend.run(ScriptRequest {
+            script: "python3 -c 'print(6 * 7)'",
+            limits: ScriptLimits::default(),
+            commands: vec![],
+            python_functions: None,
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        }));
+        assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
+        assert_eq!(result.stdout, "42\n");
+    }
 
     #[test]
     fn parses_agent_variables() {

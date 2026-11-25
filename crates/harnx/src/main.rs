@@ -17,10 +17,13 @@ mod tool_cmd;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
 /// if live heap exceeds `HARNX_HEAP_LIMIT_MB`. Disarmed (plain passthrough to
-/// the system allocator) when that env var is unset. Diagnostic for the #842
-/// runaway-allocation OOM.
+/// the underlying allocator) when that env var is unset. Diagnostic for the #842
+/// runaway-allocation OOM. The underlying allocator is the script VM's memory
+/// meter, which `python3` needs as the process's global allocator
+/// (`harnx_script::VmAllocator`).
 #[global_allocator]
-static GLOBAL_ALLOC: harnx_core::alloc_guard::HeapGuard = harnx_core::alloc_guard::HeapGuard;
+static GLOBAL_ALLOC: harnx_core::alloc_guard::HeapGuard<harnx_script::VmAllocator> =
+    harnx_core::alloc_guard::HeapGuard::wrapping(harnx_script::VM_ALLOCATOR);
 
 #[cfg(test)]
 pub mod test_utils;

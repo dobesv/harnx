@@ -1190,7 +1190,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11724f856199cdc891ec4c2b5ea3359ea05f488e6b0d18769d0273bdf2113964"
 dependencies = [
  "chrono",
- "jiff",
+ "jiff 0.2.46",
  "monty-macros",
  "nix 0.32.0",
  "num-bigint",
@@ -5641,6 +5641,7 @@ dependencies = [
  "harnx-metrics",
  "harnx-nats-common",
  "harnx-runtime",
+ "harnx-script",
  "harnx-telemetry",
  "tokio",
  "tokio-util",

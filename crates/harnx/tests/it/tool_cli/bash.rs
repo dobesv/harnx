@@ -187,6 +187,21 @@ impl BashCliFixture {
         // Single valid JSON on stdout, no progress contamination.
         assert!(payload.get("content").is_some(), "{payload}");
 
+        // The worker that runs the script installs the VM's metering
+        // allocator, which `python3` needs; without it the call fails closed.
+        let (code, output) = self
+            .run(&["call", "bash", "python3 -c 'print(6 * 7)'", "--json"])
+            .await;
+        assert_eq!(code, Some(0), "python3: {output:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert!(
+            payload["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("42"),
+            "{payload}"
+        );
+
         // Unmatched explicit selectors never infer a fallback.
         let script = format!("fs_read --path {}", bash_path(sample));
         let (code, output) = self
