@@ -8,12 +8,16 @@ async fn test_edit_file_unique_match() {
     let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
-        .edit_file_impl(EditFileParams {
-            path: path_string(&file_path),
-            old_text: "beta".to_string(),
-            new_text: "gamma".to_string(),
-            replace_all: Some(false),
-        })
+        .edit_file_impl(
+            EditFileParams {
+                path: path_string(&file_path),
+                old_text: "beta".to_string(),
+                new_text: "gamma".to_string(),
+                replace_all: Some(false),
+                diff: None,
+            },
+            ResultStyle::Model,
+        )
         .await
         .unwrap();
 
@@ -32,12 +36,16 @@ async fn test_edit_file_multiple_matches() {
     let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
 
     let result = server
-        .edit_file_impl(EditFileParams {
-            path: path_string(&file_path),
-            old_text: "value".to_string(),
-            new_text: "updated".to_string(),
-            replace_all: Some(false),
-        })
+        .edit_file_impl(
+            EditFileParams {
+                path: path_string(&file_path),
+                old_text: "value".to_string(),
+                new_text: "updated".to_string(),
+                replace_all: Some(false),
+                diff: None,
+            },
+            ResultStyle::Model,
+        )
         .await
         .unwrap();
 

@@ -35,6 +35,9 @@ pub(crate) struct CommandReport<'a> {
     /// the lines.
     pub log_unfiltered: bool,
     pub notes: Vec<String>,
+    /// What the command changed in the repositories under its working
+    /// directory, as the call's `diff` level prints it.
+    pub diff: Option<String>,
 }
 
 /// Exit statuses a shell uses for a command a signal or a deadline ended.
@@ -167,15 +170,15 @@ pub(crate) fn read_log_command() -> String {
     format!("{}_read_exec_log", crate::toolset::TOOLSET_NAME)
 }
 
-/// The history diff a direct call appends is left out: a script reads the
-/// command's own output, and the diff has no cap shared with the streams.
+/// The change report travels in its own `diff` field, which the mapping
+/// prints on stderr after the notes, so `stdout` stays the command's own.
 pub(crate) fn command_result(report: CommandReport<'_>, summary: String) -> CallToolResult {
     let stdout = cut_stream(report.stdout, report.max_output_bytes);
     let stderr = cut_stream(report.stderr, report.max_output_bytes);
     let mut notes = report.notes.clone();
     notes.extend(cut_note("stdout", &stdout, &report));
     notes.extend(cut_note("stderr", &stderr, &report));
-    let fields = json!({
+    let mut fields = json!({
         "execution_id": report.execution_id,
         "status": report.status,
         "exit_code": report.exit_code,
@@ -185,6 +188,9 @@ pub(crate) fn command_result(report: CommandReport<'_>, summary: String) -> Call
         "stdout_log_path": report.stdout_log_path,
         "stderr_log_path": report.stderr_log_path,
     });
+    if let Some(diff) = &report.diff {
+        fields["diff"] = json!(diff);
+    }
     let mut result = CallToolResult::success(vec![
         ContentBlock::text(summary).with_audience(vec![Role::User])
     ]);
@@ -217,6 +223,7 @@ fn command_mapping() -> ScriptOutput {
         stdout: Some("stdout".to_string()),
         stderr_text: Some("stderr".to_string()),
         stderr: Some("notes".to_string()),
+        stderr_after: Some("diff".to_string()),
         exit_code: Some("exit_code".to_string()),
         error_exit_code: Some(125),
         ..Default::default()

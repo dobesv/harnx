@@ -29,10 +29,14 @@ async fn read_only_allowlist_reads_but_denies_writes() {
         .expect("read grant permits reads");
 
     let denied = server
-        .write_file_impl(WriteFileParams {
-            path: path_string(&file),
-            content: "changed".into(),
-        })
+        .write_file_impl(
+            WriteFileParams {
+                path: path_string(&file),
+                content: "changed".into(),
+                diff: None,
+            },
+            ResultStyle::Model,
+        )
         .await
         .unwrap_err();
     assert!(denied.message.contains("filesystem writes are denied"));
@@ -63,10 +67,14 @@ async fn rwx_allowlist_reads_and_writes() {
     let server = FsServer::new(rwx_allowlist([dir.path().to_path_buf()]));
 
     server
-        .write_file_impl(WriteFileParams {
-            path: path_string(&file),
-            content: "changed".into(),
-        })
+        .write_file_impl(
+            WriteFileParams {
+                path: path_string(&file),
+                content: "changed".into(),
+                diff: None,
+            },
+            ResultStyle::Model,
+        )
         .await
         .expect("rwx grant permits writes");
     let result = server

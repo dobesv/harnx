@@ -14,6 +14,7 @@ fn report<'a>(stdout: &'a str, stderr: &'a str, cap: usize) -> CommandReport<'a>
         log_command: Some("bash_read_exec_log".to_string()),
         log_unfiltered: true,
         notes: Vec::new(),
+        diff: None,
     }
 }
 

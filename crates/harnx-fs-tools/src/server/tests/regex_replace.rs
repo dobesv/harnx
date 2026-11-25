@@ -15,12 +15,16 @@ async fn run_replace(
     let file_path = write_fixture(temp_dir, case.file_name, case.content);
     let server = FsServer::new(rwx_allowlist([temp_dir.path().to_path_buf()]));
     let result = server
-        .re_replace_impl(ReReplaceParams {
-            path: path_string(&file_path),
-            pattern: case.pattern.to_string(),
-            replacement: case.replacement.to_string(),
-            replace_all: case.replace_all,
-        })
+        .re_replace_impl(
+            ReReplaceParams {
+                path: path_string(&file_path),
+                pattern: case.pattern.to_string(),
+                replacement: case.replacement.to_string(),
+                replace_all: case.replace_all,
+                diff: None,
+            },
+            ResultStyle::Model,
+        )
         .await;
     (file_path, result)
 }

@@ -139,18 +139,23 @@ async fn direct_exec_result_is_unchanged() {
 #[tokio::test]
 async fn plain_template_gets_the_exec_mapping_and_jsonl_template_does_not() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let write = |name: &str, extra: &str| {
+    gix::init(directory.path()).expect("git init");
+    let write = |name: &str, extra: &str, script: &str| {
         let path = directory.path().join(format!("{name}.yaml"));
         std::fs::write(
             &path,
             format!(
-                "name: {name}\ndescription: Test {name}\n{extra}sandbox:\n  enabled: false\nscript: |\n  echo hi\n"
+                "name: {name}\ndescription: Test {name}\n{extra}sandbox:\n  enabled: false\nscript: |\n  {script}\n"
             ),
         )
         .expect("write template");
         path
     };
-    let paths = vec![write("plain", ""), write("streaming", "protocol: jsonl\n")];
+    let paths = vec![
+        write("plain", "", "echo hi"),
+        write("streaming", "protocol: jsonl\n", "echo hi"),
+        write("writer", "", "echo $$ > note.txt"),
+    ];
     let templates = discover_tool_templates(None, &paths, &[]).expect("discover templates");
     let toolset = BashToolset::new(sandbox_config(directory.path()), templates)
         .await
@@ -181,6 +186,16 @@ async fn plain_template_gets_the_exec_mapping_and_jsonl_template_does_not() {
 
     let result = call(&toolset, "plain", json!({}), true).await;
     assert_eq!(result["structuredContent"]["stdout"], json!("hi\n"));
+    assert!(
+        result["structuredContent"].get("diff").is_none(),
+        "{result}"
+    );
+
+    let result = call(&toolset, "writer", json!({}), true).await;
+    let diff = result["structuredContent"]["diff"].as_str().expect("diff");
+    assert!(diff.contains(": git -C "), "{result}");
+    let direct = call(&toolset, "writer", json!({}), false).await;
+    assert!(direct.to_string().contains("```diff"), "{direct}");
 }
 
 /// A toolset in its own working directory, with the helpers the spawn tests
@@ -618,31 +633,253 @@ async fn spawned_command_past_its_own_deadline_reports_a_timeout() {
     assert!(has_note(fields, "timed out after 1s and was terminated"));
 }
 
-/// A direct call appends a diff of what the command changed. A script gets
-/// none: no shell form prints it, and it would add to a result whose size
-/// only the streams' cap bounds.
-#[tokio::test]
-async fn exec_in_a_script_carries_no_history_diff() {
-    let directory = tempfile::tempdir().expect("temp dir");
-    gix::init(directory.path()).expect("git init");
-    std::fs::write(directory.path().join("note.txt"), "before\n").expect("write note");
-    let toolset = toolset_in(directory.path()).await;
-    let write_note = |text: &str| {
-        json!({
+/// A git repository holding one tracked-looking file, with the toolset that
+/// may work in it.
+struct Repo {
+    directory: tempfile::TempDir,
+    toolset: BashToolset,
+}
+
+impl Repo {
+    async fn new() -> Self {
+        let directory = tempfile::tempdir().expect("temp dir");
+        gix::init(directory.path()).expect("git init");
+        std::fs::write(directory.path().join("note.txt"), "before\n").expect("write note");
+        let toolset = toolset_in(directory.path()).await;
+        Self { directory, toolset }
+    }
+
+    /// An `exec` call that rewrites the note, with `extra` arguments merged in.
+    fn write_note(&self, text: &str, extra: Value) -> Value {
+        let mut args = json!({
             "command": format!("printf '{text}\\n' > note.txt"),
-            "working_dir": directory.path(),
+            "working_dir": self.directory.path(),
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        args
+    }
+
+    /// The note-rewriting `exec` call, made as a script or as a model.
+    async fn exec_note(&self, text: &str, extra: Value, script: bool) -> Value {
+        call(&self.toolset, "exec", self.write_note(text, extra), script).await
+    }
+
+    /// Spawns the note-rewriting command as a script and returns its id.
+    async fn spawn_note(&self, extra: Value) -> String {
+        let args = self.write_note("after", extra);
+        let spawned = call(&self.toolset, "spawn", args, true).await;
+        spawned["structuredContent"]["execution_id"]
+            .as_str()
+            .expect("id")
+            .to_string()
+    }
+
+    fn object_count(&self) -> u64 {
+        let output = std::process::Command::new("git")
+            .args(["count-objects", "-v"])
+            .current_dir(self.directory.path())
+            .output()
+            .expect("git count-objects");
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.lines()
+            .filter_map(|line| line.strip_prefix("count: "))
+            .next()
+            .expect("count line")
+            .trim()
+            .parse()
+            .expect("count")
+    }
+}
+
+/// The `diff` field of a script-style result.
+fn diff_field(result: &Value) -> &str {
+    result["structuredContent"]["diff"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no diff field: {result}"))
+}
+
+/// The text blocks of a direct result.
+fn texts(result: &Value) -> Vec<String> {
+    result["content"]
+        .as_array()
+        .expect("content")
+        .iter()
+        .filter_map(|block| block["text"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The before and after ids on a summary line.
+fn summary_ids(line: &str) -> (String, String) {
+    let mut words = line.split_whitespace().rev();
+    let after = words.next().expect("after id");
+    let before = words.next().expect("before id");
+    assert_eq!(before.len(), 12, "{line}");
+    assert_eq!(after.len(), 12, "{line}");
+    assert!(after.chars().all(|c| c.is_ascii_hexdigit()), "{line}");
+    (before.to_string(), after.to_string())
+}
+
+/// A script's diff is a summary line by default, and the command's own
+/// output is left alone.
+#[tokio::test]
+async fn exec_in_a_script_reports_a_summary_by_default() {
+    let repo = Repo::new().await;
+    let script = repo.exec_note("after", json!({}), true).await;
+    let fields = &script["structuredContent"];
+    assert_eq!(fields["exit_code"], json!(0), "{script}");
+    assert_eq!(fields["stdout"], json!(""), "{script}");
+    let diff = diff_field(&script);
+    assert_eq!(diff.lines().count(), 1, "{diff}");
+    assert!(diff.ends_with('\n'), "{diff:?}");
+    assert!(diff.starts_with("1 file changed"), "{diff}");
+    assert!(diff.contains(": git -C "), "{diff}");
+    summary_ids(diff.trim_end());
+    assert!(!script.to_string().contains("```diff"), "{script}");
+    let names = declared_properties("exec", &repo.toolset);
+    assert_declared("exec", &names, &script);
+}
+
+#[tokio::test]
+async fn exec_in_a_script_reports_each_level() {
+    let repo = Repo::new().await;
+    let files = repo
+        .exec_note("one", json!({ "diff": "files" }), true)
+        .await;
+    let diff = diff_field(&files);
+    let mut lines = diff.lines();
+    assert!(lines.next().unwrap().contains(": git -C "), "{diff}");
+    let rest: Vec<&str> = lines.collect();
+    assert!(rest.iter().any(|line| line.contains("note.txt")), "{diff}");
+    assert!(!diff.contains("```"), "{diff}");
+
+    let full = repo.exec_note("two", json!({ "diff": "full" }), true).await;
+    let diff = diff_field(&full);
+    assert!(diff.starts_with("commit "), "{diff}");
+    assert!(diff.contains("```diff"), "{diff}");
+
+    let none = repo
+        .exec_note("three", json!({ "diff": "none" }), true)
+        .await;
+    assert!(none["structuredContent"].get("diff").is_none(), "{none}");
+}
+
+#[tokio::test]
+async fn exec_at_none_takes_no_snapshot() {
+    let repo = Repo::new().await;
+    let before = repo.object_count();
+    let result = repo
+        .exec_note("after", json!({ "diff": "none" }), false)
+        .await;
+    assert_eq!(repo.object_count(), before, "{result}");
+    assert_eq!(texts(&result).len(), 2, "{result}");
+    repo.exec_note("again", json!({ "diff": "summary" }), false)
+        .await;
+    assert!(repo.object_count() > before);
+}
+
+#[tokio::test]
+async fn a_direct_exec_reports_the_level_it_was_asked_for() {
+    let repo = Repo::new().await;
+    let default = repo.exec_note("a", json!({}), false).await;
+    let blocks = texts(&default);
+    assert_eq!(blocks.len(), 3, "{default}");
+    assert!(blocks[2].starts_with("commit "), "{}", blocks[2]);
+    assert!(blocks[2].contains("```diff"), "{}", blocks[2]);
+
+    let summary = texts(
+        &repo
+            .exec_note("b", json!({ "diff": "summary" }), false)
+            .await,
+    );
+    assert_eq!(summary.len(), 3, "{summary:?}");
+    assert!(summary[2].contains(": git -C "), "{summary:?}");
+    assert!(!summary[2].contains("```"), "{summary:?}");
+
+    let files = texts(&repo.exec_note("c", json!({ "diff": "files" }), false).await);
+    assert_eq!(files.len(), 3, "{files:?}");
+    assert!(files[2].contains("note.txt"), "{files:?}");
+
+    let none = repo.exec_note("d", json!({ "diff": "none" }), false).await;
+    assert_eq!(texts(&none).len(), 2);
+}
+
+#[tokio::test]
+async fn an_unknown_diff_level_names_the_four() {
+    let repo = Repo::new().await;
+    let args = repo.write_note("a", json!({ "diff": "loud" }));
+    let error = repo
+        .toolset
+        .invoke_with_context(ToolInvocation {
+            tool: "exec".to_string(),
+            args,
+            context: ToolInvocationContext::default(),
+            cancel: CancellationToken::new(),
         })
-    };
-    let script = call(&toolset, "exec", write_note("after"), true).await;
-    assert_eq!(
-        script["structuredContent"]["exit_code"],
-        json!(0),
+        .await
+        .expect_err("invalid level");
+    let message = format!("{error:?}");
+    for name in ["none", "summary", "files", "full"] {
+        assert!(message.contains(name), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn a_spawned_command_is_reported_at_each_callers_level() {
+    let repo = Repo::new().await;
+    let id = repo.spawn_note(json!({})).await;
+    let wait = json!({ "execution_id": id, "seconds": 20 });
+    let script = call(&repo.toolset, "wait", wait.clone(), true).await;
+    let summary = diff_field(&script);
+    let (_, after) = summary_ids(summary.trim_end());
+    let names = declared_properties("wait", &repo.toolset);
+    assert_declared("wait", &names, &script);
+
+    let status = json!({ "execution_id": id, "diff": "files" });
+    let files = call(&repo.toolset, "status", status, true).await;
+    let files = diff_field(&files);
+    assert!(files.starts_with(summary.trim_end()), "{files}");
+    assert!(files.contains("note.txt"), "{files}");
+
+    let direct = call(&repo.toolset, "wait", wait, false).await;
+    let blocks = texts(&direct);
+    let full = blocks.last().expect("diff block");
+    assert!(full.starts_with(&format!("commit {after}")), "{full}");
+}
+
+#[tokio::test]
+async fn a_command_spawned_at_none_has_nothing_to_show() {
+    let repo = Repo::new().await;
+    let before = repo.object_count();
+    let id = repo.spawn_note(json!({ "diff": "none" })).await;
+    let wait = json!({ "execution_id": id, "seconds": 20, "diff": "full" });
+    let script = call(&repo.toolset, "wait", wait.clone(), true).await;
+    assert_eq!(script["structuredContent"]["status"], json!("exited"));
+    assert!(
+        script["structuredContent"].get("diff").is_none(),
         "{script}"
     );
-    assert!(script["structuredContent"].get("diffs").is_none());
-    assert!(!script.to_string().contains("```diff"), "{script}");
-    let direct = call(&toolset, "exec", write_note("again"), false).await;
-    assert!(direct.to_string().contains("```diff"), "{direct}");
+    let direct = call(&repo.toolset, "wait", wait, false).await;
+    assert_eq!(texts(&direct).len(), 2, "{direct}");
+    assert_eq!(repo.object_count(), before);
+}
+
+#[tokio::test]
+async fn rollback_takes_the_short_id_from_a_summary_line() {
+    let repo = Repo::new().await;
+    let script = repo.exec_note("after", json!({}), true).await;
+    let summary = diff_field(&script);
+    let (_, after) = summary_ids(summary.trim_end());
+    repo.exec_note("later", json!({ "diff": "none" }), false)
+        .await;
+    let args = json!({ "commit_id": after, "repo_path": repo.directory.path() });
+    let result = call(&repo.toolset, "rollback_file", args, false).await;
+    assert!(result["isError"] != json!(true), "{result}");
+    let note = std::fs::read_to_string(repo.directory.path().join("note.txt")).unwrap();
+    // Rollback ends with a git reset, which checks files out with the
+    // machine's line-ending conversion (CRLF where `core.autocrlf` is on).
+    assert_eq!(note.replace("\r\n", "\n"), "after\n");
 }
 
 #[tokio::test]

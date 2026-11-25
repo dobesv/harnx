@@ -192,6 +192,24 @@ same CLI flags, output and exit codes as in the `bash` tool's script mode:
   not start. `bash_spawn`, `bash_wait` and `bash_status` report a finished
   command the same way. See
   [Output in `bash` scripts](../crates/harnx-bash-tools/README.md#output-in-bash-scripts).
+- A tool that changes files reports the change at the level of its `diff`
+  option: `none` takes no snapshot and prints nothing (and leaves nothing to
+  roll back to), `summary` prints one line, `files` adds git's `--stat` lines
+  for up to 50 files, and `full` prints the diff. A script defaults to
+  `summary`, where a direct call defaults to `full`. The report goes to stderr
+  after the tool's notes, so it never enters a pipe. A summary line is git's
+  shortstat and the command that shows the change, with the first 12 digits of
+  the snapshot ids. The first id is the snapshot before the change and the
+  second is the snapshot just after it:
+  `1 file changed, 1 insertion(+), 1 deletion(-): git -C /work/repo diff eb58d8a2f19a 3fd6fdcc1dcb`.
+  To undo that change, pipe the line's command into `git apply -R`:
+  `git -C /work/repo diff eb58d8a2f19a 3fd6fdcc1dcb | git -C /work/repo apply -R`.
+  That touches only the files the change touched and leaves the branch alone.
+  `fs_write`, `fs_edit`, `fs_insert` and `fs_re_replace` print a one-line
+  confirmation on stdout. `rollback_file` accepts a snapshot id in full or as a
+  prefix of at least 7 hex digits, but it restores the whole repository to that
+  snapshot and moves the branch, so it is not the way to undo one change.
+  Command templates take no `diff` option and follow the defaults.
 
 Under BashKit's default `set -e`, a non-zero exit from an inner tool will halt
 the script unless handled with `set +e` or conditional checks (`if`, `||`). For

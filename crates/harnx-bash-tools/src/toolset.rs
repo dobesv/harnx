@@ -199,7 +199,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         ),
         spec::<RollbackParams>(
             "rollback_file",
-            "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.",
+            "Restore a repository's tracked files to a harnx history snapshot and move the branch to a new commit. The commit_id is a snapshot id, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change and the second is the state after it; the 'commit' line of a full diff is the state after.",
             tool_templates::ROLLBACK_FILE_CALL,
             None,
         ),

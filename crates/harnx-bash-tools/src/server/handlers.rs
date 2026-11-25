@@ -15,6 +15,8 @@ pub(crate) struct ExecPipelineParams<'a> {
     /// Set for protocol templates: their stdout carries progress messages and
     /// only stderr is returned.
     pub(crate) protocol: Option<ToolProtocol>,
+    /// The call's `diff` argument; templates take none.
+    pub(crate) diff: Option<harnx_git_history::DiffLevel>,
 }
 
 /// Inputs for building a sandboxed child command. Groups the parameters

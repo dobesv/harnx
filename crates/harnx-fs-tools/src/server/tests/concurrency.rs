@@ -13,12 +13,16 @@ async fn test_insert_impl_serializes_concurrent_same_file_updates() {
         let path = path_string(&file_path);
         tasks.spawn(async move {
             server
-                .insert_impl(InsertParams {
-                    path,
-                    insert_line: None,
-                    insert_text: format!("task-{index}\n"),
-                    column: None,
-                })
+                .insert_impl(
+                    InsertParams {
+                        path,
+                        insert_line: None,
+                        insert_text: format!("task-{index}\n"),
+                        column: None,
+                        diff: None,
+                    },
+                    ResultStyle::Model,
+                )
                 .await
         });
     }
@@ -111,10 +115,14 @@ async fn test_rollback_excludes_concurrent_edits_in_same_repo() {
     let blocked_edit = tokio::spawn(async move {
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            edit_server.write_file_impl(WriteFileParams {
-                path: edit_path,
-                content: "blocked\n".to_string(),
-            }),
+            edit_server.write_file_impl(
+                WriteFileParams {
+                    path: edit_path,
+                    content: "blocked\n".to_string(),
+                    diff: None,
+                },
+                ResultStyle::Model,
+            ),
         )
         .await
     });
