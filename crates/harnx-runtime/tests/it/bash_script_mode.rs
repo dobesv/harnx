@@ -122,7 +122,7 @@ pub(crate) async fn start_time_server(
     instance_id: &ServerScope,
     servers: &[ToolServerConfig],
 ) -> Result<ToolServerSupervisor> {
-    start_tool_servers(server_url, token, instance_id, servers, "__time__time").await
+    start_tool_servers(server_url, token, instance_id, servers, &["__time__time"]).await
 }
 
 /// As [`start_time_server`], waiting for the registration `identity` names.
@@ -131,7 +131,7 @@ async fn start_tool_servers(
     token: &str,
     instance_id: &ServerScope,
     servers: &[ToolServerConfig],
-    identity: &str,
+    identities: &[&str],
 ) -> Result<ToolServerSupervisor> {
     let client = async_nats::ConnectOptions::new()
         .token(token.to_string())
@@ -141,7 +141,9 @@ async fn start_tool_servers(
     let supervisor =
         ToolServerSupervisor::start_local_with_timeout(start, servers, Duration::from_secs(60))
             .await?;
-    wait_for_registration(&client, instance_id, identity).await?;
+    for identity in identities {
+        wait_for_registration(&client, instance_id, identity).await?;
+    }
     Ok(supervisor)
 }
 
@@ -201,7 +203,7 @@ async fn start_script_server(
 ) -> Result<(ServerScope, ToolServerSupervisor, Arc<ConfigLock>)> {
     let instance_id = ServerScope::new();
     let supervisor =
-        start_tool_servers(server_url, TOKEN, &instance_id, &[server], identity).await?;
+        start_tool_servers(server_url, TOKEN, &instance_id, &[server], &[identity]).await?;
     let config = script_mode_config(patterns);
     harnx_runtime::tool_context::refresh_nats_tool_declarations(&config, &instance_id).await;
     Ok((instance_id, supervisor, config))
@@ -624,5 +626,160 @@ bash_exec --command 'echo hi' -o json | jq -r .exit_code"#;
     drop(supervisor);
     assert_eq!(output["status"], "ok", "{output}");
     assert_eq!(stdout_block(&output), "HI\nstatus=3\ne\n0", "{output}");
+    Ok(())
+}
+
+/// The stderr block of a `bash` result's report.
+fn stderr_block(output: &serde_json::Value) -> String {
+    let text = output["content"][0]["text"].as_str().unwrap_or_default();
+    text.split("<!-- start stderr -->")
+        .nth(1)
+        .and_then(|rest| rest.split("<!-- end stderr -->").next())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A git repository with one committed file, with an identity in its own
+/// config because the test sandbox strips the ambient one.
+fn git_repository_with(file: &str, content: &str) -> Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join(file), content)?;
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Test"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "commit.gpgsign", "false"],
+        vec!["add", file],
+        vec!["commit", "-q", "-m", "initial"],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(dir.path())
+            .status()?;
+        anyhow::ensure!(status.success(), "git {args:?} failed");
+    }
+    Ok(dir)
+}
+
+/// The file and bash tool servers over one broker, both allowed to work in
+/// `dir`, with `bash_tools` covering both toolsets.
+async fn start_file_and_bash_servers(
+    server_url: &str,
+    dir: &std::path::Path,
+) -> Result<(ServerScope, ToolServerSupervisor, Arc<ConfigLock>)> {
+    let dir = dir.to_string_lossy().into_owned();
+    let mut fs_server = time_server_config(&workspace_binary("harnx-fs-tools")?.to_string_lossy());
+    fs_server.name = "fs".to_string();
+    fs_server.args = vec!["--allow-write".into(), dir.clone()];
+    let mut bash_server =
+        time_server_config(&workspace_binary("harnx-bash-tools")?.to_string_lossy());
+    bash_server.name = "bash".to_string();
+    bash_server.args = vec!["--no-sandbox".into(), "--allow-rwx".into(), dir];
+    let instance_id = ServerScope::new();
+    let supervisor = start_tool_servers(
+        server_url,
+        TOKEN,
+        &instance_id,
+        &[fs_server, bash_server],
+        &["__fs__fs", "__bash__bash"],
+    )
+    .await?;
+    let config = script_mode_config(&["fs_*", "bash_*"]);
+    harnx_runtime::tool_context::refresh_nats_tool_declarations(&config, &instance_id).await;
+    Ok((instance_id, supervisor, config))
+}
+
+async fn assert_default_is_a_summary(
+    config: &Arc<ConfigLock>,
+    instance_id: &ServerScope,
+    tracked: &std::path::Path,
+) -> Result<()> {
+    let script = format!("fs_write --path {} --content summary", tracked.display());
+    let summary = run_bash_script(config, instance_id, &script).await?;
+    let (stdout, stderr) = (stdout_block(&summary), stderr_block(&summary));
+    assert!(stderr.contains(": git -C "), "{summary}");
+    assert!(stderr.contains("1 file changed"), "{summary}");
+    assert!(!stderr.contains("```diff"), "{summary}");
+    assert!(
+        !stdout.contains("git -C") && !stdout.is_empty(),
+        "{summary}"
+    );
+    Ok(())
+}
+
+async fn assert_full_diff_goes_to_stderr(
+    config: &Arc<ConfigLock>,
+    instance_id: &ServerScope,
+    tracked: &std::path::Path,
+) -> Result<()> {
+    let script = format!(
+        "fs_write --path {} --content full --diff full",
+        tracked.display()
+    );
+    let full = run_bash_script(config, instance_id, &script).await?;
+    let (stdout, stderr) = (stdout_block(&full), stderr_block(&full));
+    assert!(
+        stderr.contains("```diff") && stderr.contains("+full"),
+        "{full}"
+    );
+    assert!(
+        !stdout.contains("```diff") && !stdout.contains("+full"),
+        "{full}"
+    );
+    Ok(())
+}
+
+fn snapshot_recipe_script(repo: &std::path::Path, tracked: &std::path::Path) -> String {
+    format!(
+        r#"d={repo}
+base=$(bash_exec --working-dir "$d" --command 'git stash create')
+fs_write --path {tracked} --content changed --diff none
+fs_write --path {fresh} --content brand-new --diff none
+bash_exec --working-dir "$d" --command "git status --short; git diff ${{base:-HEAD}}""#,
+        repo = repo.display(),
+        tracked = tracked.display(),
+        fresh = repo.join("fresh.txt").display(),
+    )
+}
+
+/// The earlier write left `full` in the tracked file, so a diff against the
+/// snapshot removes `full`. A diff against HEAD would remove `old` instead,
+/// which is what an empty snapshot id falls back to.
+fn assert_recipe_diffs_against_the_snapshot(snapshot: &serde_json::Value) {
+    let stdout = stdout_block(snapshot);
+    assert!(stdout.contains("fresh.txt"), "{snapshot}");
+    assert!(stdout.contains("+changed"), "{snapshot}");
+    assert!(stdout.contains("-full"), "{snapshot}");
+    assert!(!stdout.contains("-old"), "{snapshot}");
+}
+
+/// In a script a file write confirms on stdout and reports the change on
+/// stderr: a one-line summary by default, the diff under `--diff full`.
+/// A snapshot taken first with `git stash create` gives one diff, with the
+/// new file listed by `git status`, across several changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn script_change_reports_and_snapshot_recipe() -> Result<()> {
+    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(TOKEN.to_string()),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let repo = git_repository_with("tracked.txt", "old\n")?;
+    let _env = EnvGuard::install(&[
+        (HARNX_NATS_URL_ENV, server.url()),
+        (HARNX_NATS_TOKEN_ENV, TOKEN),
+    ]);
+    let (instance_id, supervisor, config) =
+        start_file_and_bash_servers(server.url(), repo.path()).await?;
+    let tracked = repo.path().join("tracked.txt");
+
+    assert_default_is_a_summary(&config, &instance_id, &tracked).await?;
+    assert_full_diff_goes_to_stderr(&config, &instance_id, &tracked).await?;
+    let recipe = snapshot_recipe_script(repo.path(), &tracked);
+    let snapshot = run_bash_script(&config, &instance_id, &recipe).await?;
+    drop(supervisor);
+    assert_recipe_diffs_against_the_snapshot(&snapshot);
     Ok(())
 }

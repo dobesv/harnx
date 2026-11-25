@@ -77,7 +77,7 @@ impl ServerHandler for FsServer {
                     .with_input_schema::<FindFilesParams>()
                     .annotate(read_only.clone())
                     .with_meta(make_tool_meta(tool_templates::FIND_CALL)),
-                Tool::new("rollback_file", "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.", Map::new())
+                Tool::new("rollback_file", "Restore a repository's tracked files to a harnx history snapshot and move the branch to a new commit. The commit_id is a snapshot id, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change and the second is the state after it; the 'commit' line of a full diff is the state after. A snapshot taken by a file tool holds only the file it wrote, so rolling back to one removes the repository's other tracked files. To undo one change, reverse-apply its diff as the summary line's command shows: pipe it into git apply -R.", Map::new())
                     .with_input_schema::<RollbackParams>()
                     .with_meta(make_tool_meta(tool_templates::ROLLBACK_FILE_CALL)),
             ];
@@ -166,7 +166,7 @@ impl FsServer {
             }
             "write" => {
                 let params = parse_arguments::<WriteFileParams>(arguments)?;
-                self.write_file_impl(params).await
+                self.write_file_impl(params, style).await
             }
             "write_bytes" if self.sandbox_transport_enabled() => {
                 let params = parse_arguments::<WriteBytesParams>(arguments)?;
@@ -174,19 +174,19 @@ impl FsServer {
             }
             "write_attachment" => {
                 let params = parse_arguments::<WriteAttachmentParams>(arguments)?;
-                self.write_attachment_impl(params).await
+                self.write_attachment_impl(params, style).await
             }
             "edit" => {
                 let params = parse_arguments::<EditFileParams>(arguments)?;
-                self.edit_file_impl(params).await
+                self.edit_file_impl(params, style).await
             }
             "insert" => {
                 let params = parse_arguments::<InsertParams>(arguments)?;
-                self.insert_impl(params).await
+                self.insert_impl(params, style).await
             }
             "re_replace" => {
                 let params = parse_arguments::<ReReplaceParams>(arguments)?;
-                self.re_replace_impl(params).await
+                self.re_replace_impl(params, style).await
             }
             "ls" => {
                 let params = parse_arguments::<ListDirectoryParams>(arguments)?;

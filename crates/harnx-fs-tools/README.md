@@ -43,7 +43,7 @@ Path lists can also come from `HARNX_TOOLS_ALLOW_READ`, `HARNX_TOOLS_ALLOW_WRITE
 - `ls`: List directory contents.
 - `grep`: Search file contents with a regex.
 - `find`: Find files by glob pattern.
-- `rollback_file`: Restore a repository to a prior harnx history snapshot.
+- `rollback_file`: Restore a repository's tracked files to a harnx history snapshot and move the branch to a new commit. `commit_id` is a snapshot id, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change and the second is the state after it; the `commit` line of a full diff is the state after. A snapshot taken by a file tool holds only the file it wrote, so rolling back to one removes the repository's other tracked files. To undo one change, reverse-apply its diff instead (see below).
 
 ### Output in `bash` scripts
 
@@ -53,6 +53,12 @@ When a `bash` script calls these tools, they behave like the shell commands of t
 
 - `fs_read` prints the selected lines as they are in the file, with no line-number prefix unless you pass `--line-numbers`, and adds no final newline to a file that has none, so `fs_read --path f > copy` matches `f` byte for byte when `f` is valid UTF-8 text and no limit cuts the output. Invalid UTF-8 bytes are printed as U+FFFD, and a binary file is refused. A line cap or byte cap truncates the output and prints a note on stderr naming the `offset` to continue from, and a single line longer than the byte cap is cut with a note.
 - `fs_ls` prints one entry name per line. `fs_find` prints one path per line, and `fs_grep` prints `path:line:text` rows; their paths start with the `--path` you gave, so they can be passed straight to `fs_read --path`. `fs_grep --path` accepts a file as well as a directory; for a file the printed path is the argument itself.
+- `fs_write`, `fs_edit`, `fs_insert`, `fs_re_replace` and `fs_write_attachment` print their confirmation line on stdout and report the change on stderr, after any notes. `--diff` chooses how much, for the first four; `write_attachment` takes no `diff` and always reports a summary in a script (through the k8s sandbox it is served by the sandbox's `write_bytes`, which answers in model style, so the script prints the confirmation and the full diff on stdout there):
+  - `none` takes no snapshot and prints nothing, so there is nothing to roll back to.
+  - `summary` (the default in a script) prints one line: git's `--shortstat` text, then `git -C <repo> diff <before> <after>` with 12-digit snapshot ids, the command that shows the change.
+  - `files` adds git's `--stat` line for the changed file.
+  - `full` prints the whole diff, as a direct call does (with a `commit <sha>` header).
+  A file outside a git repository has no snapshot, so it reports nothing at any level. A direct call defaults to `full` and appends the report as a second content block. With `-o json` the confirmation is the `message` field and the report is `diff`. The two ids on a summary line are the snapshots before and after the change. To undo the change, pipe the line's command into `git apply -R`: `git -C <repo> diff <before> <after> | git -C <repo> apply -R`. That touches only the files the change touched and leaves the branch alone. `fs_rollback_file --commit-id` accepts an id of 7 or more hex digits, but it restores the whole repository to that snapshot and moves the branch.
 - `fs_grep` exits 1 when nothing matched. Scripts run with `set -e`, so a bare no-match `fs_grep` ends the script: use it in `if` or `||`, or add `|| true`. It exits 2, with the reason on stderr, when the path it was given can't be read, is not a regular file or directory, is over the search size limit or is a binary file; unreadable, oversized or binary files found inside a searched directory are skipped without a report.
 - `fs_find` and `fs_grep` stop at `max_results`, `fs_ls` at 500 entries, and all three at 128 KiB of output, each with a note on stderr.
 

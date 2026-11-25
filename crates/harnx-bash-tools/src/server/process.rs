@@ -1,4 +1,5 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
+use super::diff_option::{diff_level, ChangedRepo, SnapshotPlan};
 use super::exec::resolve_command_timeout;
 use super::script_pending::{pending_result, PendingReport, ScriptStateCtx};
 use super::*;
@@ -15,11 +16,18 @@ struct WaitRequest {
     /// `None` for a forever wait with no caller deadline.
     stop_at: Option<(tokio::time::Instant, WaitEnd)>,
     new_message: CancellationToken,
+    /// The `diff` argument of the call that waits.
+    diff: Option<DiffLevel>,
 }
 
 impl WaitRequest {
     /// A wait for the running call.
-    fn new(execution_id: String, options: WaitOptions, limit: WaitLimit) -> Self {
+    fn new(
+        execution_id: String,
+        options: WaitOptions,
+        limit: WaitLimit,
+        diff: Option<DiffLevel>,
+    ) -> Self {
         let now = tokio::time::Instant::now();
         let own = match limit {
             WaitLimit::Seconds(seconds) => Some((
@@ -39,6 +47,7 @@ impl WaitRequest {
             options,
             stop_at,
             new_message: crate::toolset::invocation_new_message(),
+            diff,
         }
     }
 
@@ -83,6 +92,8 @@ struct StateReport<'a> {
     waited: Option<WaitEnd>,
     options: &'a WaitOptions,
     grep_regex: Option<Regex>,
+    /// The `diff` argument of the call that reports.
+    diff: Option<DiffLevel>,
 }
 
 /// The one-line summary of a wait that left the process running.
@@ -154,7 +165,10 @@ impl BashServer {
                 &params.command,
                 params.working_dir.as_deref(),
                 params.env.as_ref(),
-                "before spawn",
+                SnapshotPlan {
+                    label: "before spawn",
+                    level: diff_level(params.diff),
+                },
             )
             .await?;
         let (execution_id, entry) = self
@@ -162,7 +176,7 @@ impl BashServer {
             .await?;
 
         if let (Some(options), Some((limit, grep_regex))) = (params.wait, wait) {
-            let request = WaitRequest::new(execution_id, options, limit);
+            let request = WaitRequest::new(execution_id, options, limit, params.diff);
             return self.wait_for_process(request, grep_regex).await;
         }
 
@@ -265,7 +279,7 @@ impl BashServer {
         let options = params.options();
         let limit = params.limit()?;
         let grep_regex = compile_wait_grep(&options)?;
-        let request = WaitRequest::new(params.execution_id, options, limit);
+        let request = WaitRequest::new(params.execution_id, options, limit, params.diff);
         self.wait_for_process(request, grep_regex).await
     }
 
@@ -285,6 +299,7 @@ impl BashServer {
             waited: request.end(),
             options: &request.options,
             grep_regex,
+            diff: request.diff,
         })
         .await
     }
@@ -309,6 +324,7 @@ impl BashServer {
             waited: None,
             options: &options,
             grep_regex,
+            diff: params.diff,
         })
         .await
     }
@@ -327,6 +343,7 @@ impl BashServer {
             waited,
             options,
             grep_regex,
+            diff,
         } = report;
         let output =
             Self::read_wait_output(execution_id, entry, options, grep_regex.as_ref()).await;
@@ -334,7 +351,7 @@ impl BashServer {
             Some(exit) => {
                 let kind = entry.exit_kind(&exit);
                 let ctx = entry.exit_result_ctx(execution_id, exit, output);
-                self.build_wait_exit_result(ctx, kind, &entry.exit_diff)
+                self.build_wait_exit_result(ctx, kind, &entry.exit_changes, diff_level(diff))
                     .await
             }
             None => Self::build_wait_running_result(execution_id, entry, waited, output),
@@ -462,6 +479,7 @@ impl BashServer {
             waited,
             options,
             grep_regex,
+            diff,
         } = report;
         let ctx = ScriptStateCtx {
             execution_id,
@@ -469,6 +487,7 @@ impl BashServer {
             max_output_bytes: options.max_output_bytes,
             grep: grep_regex.as_ref(),
             line_cap_notes: harnx_toolset::line_cap_notes(options.head_lines, options.tail_lines),
+            diff: diff_level(diff),
         };
         match exit {
             Some(exit) => {
@@ -532,26 +551,28 @@ impl BashServer {
         Self::build_success_result(output, summary, vec![])
     }
 
-    /// Every wait that sees the exit reports the same diff: the first one
-    /// takes the after-exit snapshot, later ones reuse it.
+    /// Every wait that sees the exit describes the same snapshot pair: the
+    /// first one takes the after-exit snapshot, later ones reuse it, each
+    /// rendering it at its own level.
     async fn build_wait_exit_result(
         &self,
         ctx: ExitResultCtx<'_>,
         kind: ExitKind,
-        exit_diff: &OnceCell<Vec<String>>,
+        exit_changes: &OnceCell<Vec<ChangedRepo>>,
+        level: DiffLevel,
     ) -> CallToolResult {
         let summary = exit_summary(ctx.execution_id, kind, ctx.exit_code);
-        let diff_parts = exit_diff
+        let changes = exit_changes
             .get_or_init(|| {
-                self.diff_snapshots(
+                self.snapshot_changes(
                     ctx.before_snaps,
                     ctx.snapshot_decision,
                     ctx.working_dir,
                     "after wait",
                 )
             })
-            .await
-            .clone();
+            .await;
+        let diff_parts = self.render_changes(changes, level).await;
         Self::exit_result_with_diff(ctx, kind, summary, diff_parts)
     }
 
@@ -607,7 +628,7 @@ impl SpawnedProcess {
             deadline_secs,
             exit,
             control,
-            exit_diff: Arc::default(),
+            exit_changes: Arc::default(),
         }
     }
 

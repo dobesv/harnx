@@ -15,12 +15,16 @@ fn insert_fixture(file_name: &str, content: &str) -> (TestDir, PathBuf, FsServer
 
 async fn run_insert(server: &FsServer, file_path: &Path, spec: InsertSpec<'_>) -> CallToolResult {
     server
-        .insert_impl(InsertParams {
-            path: path_string(file_path),
-            insert_line: spec.line,
-            insert_text: spec.text.to_string(),
-            column: spec.column,
-        })
+        .insert_impl(
+            InsertParams {
+                path: path_string(file_path),
+                insert_line: spec.line,
+                insert_text: spec.text.to_string(),
+                column: spec.column,
+                diff: None,
+            },
+            ResultStyle::Model,
+        )
         .await
         .unwrap()
 }

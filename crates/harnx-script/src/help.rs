@@ -90,11 +90,7 @@ fn output_section(text: &mut String, mapping: &OutputMapping) {
     if let Some(summary) = &mapping.summary {
         indent(text, summary.trim(), 2);
     }
-    let stderr = match (&mapping.stderr_text, &mapping.stderr) {
-        (Some(text), Some(notes)) => Some(format!("the `{text}` field, then notes from `{notes}`")),
-        (Some(field), None) | (None, Some(field)) => Some(format!("the `{field}` field")),
-        (None, None) => None,
-    };
+    let stderr = stderr_description(mapping);
     let field = |field: &Option<String>| field.as_ref().map(|f| format!("the `{f}` field"));
     let parts: Vec<String> = [
         ("stdout", field(&mapping.stdout)),
@@ -108,6 +104,30 @@ fn output_section(text: &mut String, mapping: &OutputMapping) {
         text.push_str(&format!("  {}\n", parts.join("    ")));
     }
     text.push_str("  -o json prints every field.\n");
+}
+
+/// Where stderr comes from, in print order: the text, the notes, then the
+/// after-text.
+fn stderr_description(mapping: &OutputMapping) -> Option<String> {
+    let notes_label = if mapping.stderr_text.is_some() {
+        "notes from `"
+    } else {
+        "the `"
+    };
+    let notes_end = if mapping.stderr_text.is_some() {
+        "`"
+    } else {
+        "` field"
+    };
+    let parts: Vec<String> = [
+        (&mapping.stderr_text, "the `", "` field"),
+        (&mapping.stderr, notes_label, notes_end),
+        (&mapping.stderr_after, "the `", "` field"),
+    ]
+    .into_iter()
+    .filter_map(|(name, before, after)| name.as_ref().map(|n| format!("{before}{n}{after}")))
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(", then "))
 }
 
 fn property_uses_json(property: &Property<'_>, conflict: bool) -> bool {

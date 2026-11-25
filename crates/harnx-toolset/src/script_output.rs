@@ -29,6 +29,10 @@ pub struct ScriptOutput {
     /// structuredContent field printed on stderr.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// structuredContent string field printed on stderr exactly as stored,
+    /// after the notes. For text meant for the reader, such as a diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_after: Option<String>,
     /// structuredContent integer field used as the exit status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<String>,

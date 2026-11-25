@@ -6,7 +6,7 @@ use super::script_result::{
     command_result, ended_with, read_log_command, status_of, CommandReport,
 };
 use super::supervisor::ProcessExit;
-use super::{BashServer, ExitKind, Path, Regex, SpawnedProcess, TruncateOpts};
+use super::{BashServer, DiffLevel, ExitKind, Path, Regex, SpawnedProcess, TruncateOpts};
 use harnx_toolset_server::content::WithAudience;
 use rmcp::model::{CallToolResult, ContentBlock, Role};
 use serde_json::{json, Value};
@@ -70,6 +70,8 @@ pub(super) struct ScriptStateCtx<'a> {
     pub grep: Option<&'a Regex>,
     /// Notes for the line caps the call passed and a script cannot use.
     pub line_cap_notes: Vec<String>,
+    /// The level the change report is rendered at.
+    pub diff: DiffLevel,
 }
 
 /// The log's lines that match `grep`, each keeping its newline.
@@ -102,12 +104,12 @@ impl BashServer {
         ended.notes.extend(ctx.line_cap_notes.iter().cloned());
         let stdout = matching_lines(read_lossy(&entry.stdout_log_path).await, ctx.grep);
         let stderr = matching_lines(read_lossy(&entry.stderr_log_path).await, ctx.grep);
-        // The result carries no diff, but the first report of an exit takes
-        // the after-exit snapshot, and a later direct wait reports this diff.
-        entry
-            .exit_diff
+        // The first report of an exit takes the after-exit snapshot; every
+        // later report, at whatever level, describes the same pair.
+        let changes = entry
+            .exit_changes
             .get_or_init(|| {
-                self.diff_snapshots(
+                self.snapshot_changes(
                     &entry.before_snap_ids,
                     &entry.snapshot_decision,
                     &entry.working_dir,
@@ -115,6 +117,8 @@ impl BashServer {
                 )
             })
             .await;
+        let (diff, diff_note) = self.script_diff(changes, ctx.diff).await;
+        ended.notes.extend(diff_note);
         let summary = summary(kind, ended.exit_code);
         command_result(
             CommandReport {
@@ -131,6 +135,7 @@ impl BashServer {
                 log_command: Some(read_log_command()),
                 log_unfiltered: ctx.grep.is_none(),
                 notes: ended.notes,
+                diff,
             },
             summary,
         )

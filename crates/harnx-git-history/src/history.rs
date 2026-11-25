@@ -321,12 +321,7 @@ impl HistoryManager {
         Ok(results)
     }
 
-    pub async fn diff_commits(
-        &self,
-        repo_workdir: &Path,
-        before_id: gix::ObjectId,
-        after_id: gix::ObjectId,
-    ) -> Result<String> {
+    async fn tracked_repo(&self, repo_workdir: &Path) -> Result<gix::ThreadSafeRepository> {
         // Tracked repos are stored under their canonical workdir; canonicalize
         // the caller's path so lookups still succeed when they came from a
         // non-canonical source like `gix::Repository::workdir()`.
@@ -341,6 +336,16 @@ impl HistoryManager {
                 .map(|session| session.repo.clone())
                 .context("repo not tracked for diff")?
         };
+        Ok(ts_repo)
+    }
+
+    pub async fn diff_commits(
+        &self,
+        repo_workdir: &Path,
+        before_id: gix::ObjectId,
+        after_id: gix::ObjectId,
+    ) -> Result<String> {
+        let ts_repo = self.tracked_repo(repo_workdir).await?;
 
         tokio::task::spawn_blocking(move || {
             let repo = ts_repo.to_thread_local();
@@ -348,6 +353,24 @@ impl HistoryManager {
         })
         .await
         .context("diff task join failed")?
+    }
+
+    /// The change between two snapshots as `level` prints it; empty when they
+    /// do not differ or the level is `None`.
+    pub async fn render_change(
+        &self,
+        repo_workdir: &Path,
+        before_id: gix::ObjectId,
+        after_id: gix::ObjectId,
+        level: crate::DiffLevel,
+    ) -> Result<String> {
+        let ts_repo = self.tracked_repo(repo_workdir).await?;
+        tokio::task::spawn_blocking(move || {
+            let repo = ts_repo.to_thread_local();
+            crate::change::render_change_blocking(&repo, before_id, after_id, level)
+        })
+        .await
+        .context("render change task join failed")?
     }
 
     pub async fn rollback(

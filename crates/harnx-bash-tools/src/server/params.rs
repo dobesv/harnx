@@ -1,4 +1,5 @@
 // Auto-split from server.rs for cohesion. See server/mod.rs.
+use super::diff_option::{diff_schema, DIFF_DESCRIPTION, DIFF_REPORT_DESCRIPTION};
 use super::*;
 use crate::tool_template::output::{
     HEAD_LINES_DESCRIPTION, MAX_OUTPUT_BYTES_DESCRIPTION, TAIL_LINES_DESCRIPTION,
@@ -23,6 +24,8 @@ pub(crate) struct ExecCommandParams {
     pub(crate) max_output_bytes: Option<usize>,
     #[serde(default)]
     pub(crate) env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub(crate) diff: Option<DiffLevel>,
 }
 
 impl JsonSchema for ExecCommandParams {
@@ -47,6 +50,7 @@ impl JsonSchema for ExecCommandParams {
                 ("tail_lines", TAIL_LINES_DESCRIPTION, tail_lines),
                 ("max_output_bytes", MAX_OUTPUT_BYTES_DESCRIPTION, max_output_bytes),
                 ("env", "Additional environment variables for the command. Merged on top of the server's environment; per-call overrides only.", env),
+                ("diff", DIFF_DESCRIPTION, diff_schema()),
             ],
             &["command"],
         )
@@ -138,6 +142,8 @@ pub(crate) struct SpawnCommandParams {
     pub(crate) timeout_secs: Option<u64>,
     #[serde(default)]
     pub(crate) wait: Option<WaitOptions>,
+    #[serde(default)]
+    pub(crate) diff: Option<DiffLevel>,
 }
 
 impl JsonSchema for SpawnCommandParams {
@@ -166,6 +172,7 @@ impl JsonSchema for SpawnCommandParams {
                 ),
                 ("timeout_secs", "Kill the process after this many seconds, 1 to 86400. Defaults to 86400 (24 hours). This is the process's own deadline, not a wait limit.", timeout_secs),
                 ("wait", "Wait for completion or return partial output without stopping the process. Omit for immediate spawn-only behavior; {} waits up to 240 seconds by default. Use wait.forever to wait until the process exits.", wait),
+                ("diff", DIFF_DESCRIPTION, diff_schema()),
             ],
             &["command"],
         )
@@ -287,6 +294,8 @@ pub(crate) struct WaitParams {
     pub(crate) max_output_bytes: Option<usize>,
     #[serde(default)]
     pub(crate) grep: Option<String>,
+    #[serde(default)]
+    pub(crate) diff: Option<DiffLevel>,
 }
 
 impl WaitParams {
@@ -326,6 +335,7 @@ impl JsonSchema for WaitParams {
             execution_id,
         )];
         properties.extend(WaitOptions::schema_properties(generator));
+        properties.push(("diff", DIFF_REPORT_DESCRIPTION, diff_schema()));
         object_schema_with_desc(properties, &["execution_id"])
     }
 }
@@ -343,6 +353,8 @@ pub(crate) struct StatusParams {
     pub(crate) max_output_bytes: Option<usize>,
     #[serde(default)]
     pub(crate) grep: Option<String>,
+    #[serde(default)]
+    pub(crate) diff: Option<DiffLevel>,
 }
 
 impl StatusParams {
@@ -371,6 +383,7 @@ impl JsonSchema for StatusParams {
             execution_id,
         )];
         properties.extend(WaitOptions::output_properties(generator));
+        properties.push(("diff", DIFF_REPORT_DESCRIPTION, diff_schema()));
         object_schema_with_desc(properties, &["execution_id"])
     }
 }
@@ -426,7 +439,7 @@ impl JsonSchema for RollbackParams {
             vec![
                 (
                     "commit_id",
-                    "The harnx snapshot commit SHA shown in a prior tool response diff header.",
+                    "The harnx snapshot commit to restore, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change; the second id, and the 'commit' line of a full diff, are the state after it.",
                     commit_id,
                 ),
                 (

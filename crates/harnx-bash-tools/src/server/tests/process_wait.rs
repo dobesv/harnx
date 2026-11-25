@@ -615,6 +615,7 @@ async fn spawn_wait_preserves_snapshot_diffs_on_completion_and_after_expiry() {
 
 pub(super) fn status_params(execution_id: &str) -> StatusParams {
     StatusParams {
+        diff: None,
         execution_id: execution_id.to_owned(),
         head_lines: None,
         tail_lines: None,
@@ -629,6 +630,7 @@ pub(super) fn wait_params_with(
     options: WaitOptions,
 ) -> WaitParams {
     WaitParams {
+        diff: None,
         execution_id: execution_id.into(),
         seconds: options.seconds,
         forever: options.forever,

@@ -104,12 +104,12 @@ async fn write_attachment_requires_non_null_path_and_url_on_both_dispatch_paths(
     }
 }
 
-fn assert_required_strings(schema: &Value, fields: &[&str]) {
+fn assert_required_strings(schema: &Value, fields: &[&str], optional: usize) {
     assert_eq!(schema["type"], "object");
     assert_eq!(schema["required"], json!(fields));
     assert_eq!(schema["additionalProperties"], false);
     let properties = schema["properties"].as_object().unwrap();
-    assert_eq!(properties.len(), fields.len());
+    assert_eq!(properties.len(), fields.len() + optional);
     for field in fields {
         assert_eq!(properties[*field]["type"], "string");
     }
@@ -137,7 +137,7 @@ async fn write_attachment_schema_description_and_template_match_direct_mcp() {
         .unwrap();
     let schema = mcp.schema_as_json_value();
     assert_eq!(spec.input_schema, schema);
-    assert_required_strings(&schema, &["path", "url"]);
+    assert_required_strings(&schema, &["path", "url"], 0);
     assert_eq!(spec.description, "Copy exact bytes from a cid:media: attachment, or rendered Markdown from a cid:plan: URL, to a file. Creates or overwrites destination. No text decoding.");
     assert_eq!(mcp.description.as_deref(), Some(spec.description.as_str()));
     assert_eq!(spec.kind(), Some(ToolProgressKind::Edit));
@@ -150,7 +150,7 @@ async fn write_attachment_schema_description_and_template_match_direct_mcp() {
         meta["call_template"]
     );
     let write = specs.iter().find(|tool| tool.name == "write").unwrap();
-    assert_required_strings(&write.input_schema, &["path", "content"]);
+    assert_required_strings(&write.input_schema, &["path", "content"], 1);
     assert!(write
         .description
         .ends_with("To copy attachment bytes (including binary), use write_attachment."));

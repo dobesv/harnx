@@ -569,6 +569,7 @@ fn sandbox_server(root: impl Into<PathBuf>) -> BashServer {
 
 fn exec_params(command: impl Into<String>, working_dir: &Path) -> ExecCommandParams {
     ExecCommandParams {
+        diff: None,
         command: command.into(),
         working_dir: Some(working_dir.to_string_lossy().to_string()),
         timeout_secs: Some(15),
@@ -581,6 +582,7 @@ fn exec_params(command: impl Into<String>, working_dir: &Path) -> ExecCommandPar
 
 fn spawn_params(command: impl Into<String>, working_dir: &Path) -> SpawnCommandParams {
     SpawnCommandParams {
+        diff: None,
         timeout_secs: None,
         command: command.into(),
         working_dir: Some(working_dir.to_string_lossy().to_string()),
@@ -907,6 +909,7 @@ async fn test_sandbox_exec_write_allowed() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "echo hi > out.txt".to_string(),
             working_dir: Some(root.path().to_string_lossy().to_string()),
             timeout_secs: Some(15),
@@ -942,6 +945,7 @@ async fn test_sandbox_exec_write_denied_outside_root() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "echo hi > out.txt".to_string(),
             working_dir: Some(root.path().to_string_lossy().to_string()),
             timeout_secs: Some(15),
@@ -980,6 +984,7 @@ async fn test_working_dir_rejected_outside_allowlist() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "pwd".to_string(),
             working_dir: Some(outside.path().to_string_lossy().to_string()),
             timeout_secs: Some(5),
@@ -1004,6 +1009,7 @@ async fn test_exec_rejects_empty_command() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "   ".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(5),
@@ -1027,6 +1033,7 @@ async fn test_exec_rejects_invalid_env_keys() {
     bad_env.insert("".to_string(), "value".to_string());
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "true".to_string(),
             working_dir: None,
             timeout_secs: None,
@@ -1043,6 +1050,7 @@ async fn test_exec_rejects_invalid_env_keys() {
     bad_env2.insert("FOO=BAR".to_string(), "value".to_string());
     let result2 = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "true".to_string(),
             working_dir: None,
             timeout_secs: None,
@@ -1059,6 +1067,7 @@ async fn test_exec_rejects_invalid_env_keys() {
     bad_env3.insert("FOO\0BAR".to_string(), "value".to_string());
     let result3 = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "true".to_string(),
             working_dir: None,
             timeout_secs: None,
@@ -1096,6 +1105,7 @@ async fn test_exec_basic_command() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "echo test".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(5),
@@ -1146,6 +1156,7 @@ async fn test_exec_per_call_env_vars() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "echo $MY_TEST_VAR".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(5),
@@ -1174,6 +1185,7 @@ async fn test_spawn_per_call_env_vars() {
 
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "echo $MY_SPAWN_VAR".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -1215,6 +1227,7 @@ async fn test_sandbox_exec_per_call_env_vars() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "echo $MY_SANDBOX_VAR".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(15),
@@ -1250,6 +1263,7 @@ async fn test_sandbox_spawn_per_call_env_vars() {
 
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "echo $MY_SANDBOX_SPAWN_VAR".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -1286,6 +1300,7 @@ async fn env_secret_not_leaked_to_child() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "echo ${AWS_SECRET_ACCESS_KEY:-empty}".to_string(),
             working_dir: Some(root.path().to_string_lossy().to_string()),
             timeout_secs: Some(5),
@@ -1314,6 +1329,7 @@ async fn test_exec_timeout() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "sleep 10".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(1),
@@ -1343,6 +1359,7 @@ async fn test_exec_truncation_mentions_log_paths_and_read_exec_log_works() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "printf 'out1\nout2\nout3\n'; printf 'err1\nerr2\n' >&2".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(5),
@@ -1433,6 +1450,7 @@ async fn test_read_exec_log_offset_and_tail_combined() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "printf 'l1\\nl2\\nl3\\nl4\\nl5\\nl6\\n'".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(5),
@@ -1507,6 +1525,7 @@ async fn test_cleanup_log_dir_removes_temp_logs() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "echo cleanup".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(5),
@@ -1534,6 +1553,7 @@ async fn test_spawn_and_wait() {
 
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "echo background && sleep 1".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -1578,6 +1598,7 @@ async fn test_spawn_wait_timeout() {
 
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "sleep 5".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -1721,6 +1742,7 @@ async fn test_spawn_with_output() {
 
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "for i in 1 2 3; do echo line$i; done".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -1766,6 +1788,7 @@ async fn test_exec_env_special_chars_and_override() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: command.to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(5),
@@ -1810,6 +1833,7 @@ async fn test_sandbox_exec_env_special_chars_and_override() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: command.to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(15),
@@ -1900,6 +1924,7 @@ async fn test_exec_python_shebang() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "#!/usr/bin/env python3\nprint(\"hello from python\")".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(10),
@@ -1930,6 +1955,7 @@ async fn test_exec_node_shebang() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "#!/usr/bin/env node\nconsole.log(\"hello from node\")".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(10),
@@ -1960,6 +1986,7 @@ async fn test_spawn_python_shebang() {
 
     let spawn_result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "#!/usr/bin/env python3\nprint(\"hello from spawn python\")".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -2122,6 +2149,7 @@ async fn test_sandbox_exec_python_shebang() {
 
     let result = server
         .exec_command_impl(ExecCommandParams {
+            diff: None,
             command: "#!/usr/bin/env python3\nprint(\"hello from sandboxed python\")".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             timeout_secs: Some(10),
@@ -2155,6 +2183,7 @@ async fn test_wait_grep_filters_per_stream() {
 
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "printf 'keep-out\\ndrop-out\\n'; printf 'keep-err\\ndrop-err\\n' >&2"
                 .to_string(),
@@ -2204,6 +2233,7 @@ async fn test_wait_truncation_triggers_and_mentions_log_path() {
 
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "for i in $(seq 1 200); do echo \"stdout-line-$i\"; done".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -2249,6 +2279,7 @@ async fn test_wait_max_output_bytes_truncates() {
 
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "for i in $(seq 1 200); do echo \"line-$i\"; done".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -2288,6 +2319,7 @@ async fn test_wait_stream_markers() {
     // stdout has content, stderr is empty.
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "echo only-stdout".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -2334,6 +2366,7 @@ async fn test_concurrent_execution_log_isolation() {
 
     let (res_a, res_b) = tokio::join!(
         server.spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "echo alpha-out; echo alpha-err >&2; sleep 0.3".to_string(),
             working_dir: Some(wd.clone()),
@@ -2341,6 +2374,7 @@ async fn test_concurrent_execution_log_isolation() {
             wait: None,
         }),
         server.spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "echo bravo-out; echo bravo-err >&2; sleep 0.3".to_string(),
             working_dir: Some(wd.clone()),
@@ -2403,6 +2437,7 @@ async fn test_spawn_wait_read_exec_log_returns_full_output() {
 
     let result = server
         .spawn_impl(SpawnCommandParams {
+            diff: None,
             timeout_secs: None,
             command: "printf 'out1\\nout2\\nout3\\n'; printf 'err1\\nerr2\\n' >&2".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -2455,4 +2490,43 @@ async fn test_spawn_wait_read_exec_log_returns_full_output() {
     let stderr_text = text_content(&stderr_read);
     assert!(stderr_text.contains("1: err1"));
     assert!(stderr_text.contains("2: err2"));
+}
+
+#[test]
+fn bounded_diff_keeps_whole_entries_and_counts_the_rest() {
+    use super::diff_option::bounded_diff;
+
+    assert_eq!(bounded_diff(vec![]), (None, None));
+
+    let small = vec!["one".to_string(), "two\n".to_string()];
+    assert_eq!(bounded_diff(small), (Some("one\ntwo\n".to_string()), None));
+
+    // The first entry stays even when it alone is over the bound.
+    let huge = "x".repeat(60_000);
+    let (diff, note) = bounded_diff(vec![huge.clone(), "second".to_string()]);
+    assert_eq!(diff, Some(format!("{huge}\n")));
+    assert_eq!(
+        note.as_deref(),
+        Some("1 more repository changed; diff not shown")
+    );
+
+    // Whole entries up to the bound, then none of the rest.
+    let part = "y".repeat(19_999);
+    let parts = vec![part.clone(); 4];
+    let (diff, note) = bounded_diff(parts);
+    assert_eq!(diff.map(|text| text.len()), Some(40_000));
+    assert_eq!(
+        note.as_deref(),
+        Some("2 more repositories changed; diff not shown")
+    );
+}
+
+#[test]
+fn diff_schema_offers_the_four_names_or_null() {
+    let schema = serde_json::to_value(super::diff_option::diff_schema()).unwrap();
+    assert_eq!(schema["type"], json!(["string", "null"]));
+    assert_eq!(
+        schema["enum"],
+        json!(["none", "summary", "files", "full", null])
+    );
 }

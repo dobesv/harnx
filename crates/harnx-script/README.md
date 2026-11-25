@@ -421,6 +421,7 @@ mapping in the tool's `_meta` under `harnx:script_output`. The mapping has these
 | `row` | Format for an object item of `stdout`, such as `{path}:{line}:{text}`. |
 | `stderr_text` | String field printed on stderr exactly as stored, before the notes, with no prefix. For a command's own stderr. A newline is added before the first note only when the text is non-empty, doesn't end in a newline and a note follows. |
 | `stderr` | Field holding notes (string or array of strings). Each note is printed as `<tool>: <note>`. |
+| `stderr_after` | String field printed on stderr exactly as stored, after the notes, with no prefix. For text meant for the reader, such as a diff. A newline is added before it only when what precedes it is non-empty and doesn't end in a newline. |
 | `exit_code` | Integer field used as the exit status. A value outside 0 to 255 is reported as 255. |
 | `error_exit_code` | Exit status when the tool returns an error. Default 1. |
 | `summary` | One line shown in the OUTPUT section of `help <tool>`. |

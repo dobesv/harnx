@@ -206,3 +206,75 @@ fn pipeline_with_only_a_reader_asks_for_its_text() {
         "{text}"
     );
 }
+
+fn shell_tool(name: &str, with_diff: bool) -> ToolSpec {
+    let mut properties = json!({"command": {"type": "string"}});
+    if with_diff {
+        properties["diff"] =
+            json!({"type": "string", "enum": ["none", "summary", "files", "full"]});
+    }
+    ToolSpec {
+        output: Some(crate::commands::OutputMapping::default()),
+        output_schema: None,
+        name: name.into(),
+        description: "Run a command.".into(),
+        schema: json!({"type": "object", "properties": properties, "required": ["command"]}),
+    }
+}
+
+const CHANGE_REPORT: &str = "- A tool that changes files reports the change on stderr in one line: its size and the git diff command that shows it (pipe that command into git apply -R to undo the change). --diff full prints the diff, --diff files the changed files, --diff none skips the snapshot (nothing to roll back to).";
+
+#[test]
+fn change_report_bullet_names_the_agents_own_bash_exec() {
+    let text = bash_tool_description(&[shell_tool("shell_bash_exec", true)], 8, 1000);
+    let bullet = text
+        .lines()
+        .find(|line| line.starts_with(CHANGE_REPORT))
+        .expect("change report bullet");
+    assert!(
+        bullet.ends_with("(git status lists new files, which git diff leaves out)."),
+        "{bullet}"
+    );
+    assert!(
+        bullet.contains("base=$(shell_bash_exec --command 'git stash create')"),
+        "{bullet}"
+    );
+    assert!(
+        bullet
+            .contains(r#"shell_bash_exec --command "git status --short; git diff ${base:-HEAD}""#),
+        "{bullet}"
+    );
+    // It sits right after the shell-form bullet and before the tools bullet.
+    let lines: Vec<_> = text.lines().collect();
+    let at = lines.iter().position(|line| *line == bullet).unwrap();
+    assert!(lines[at - 1].starts_with("- A tool with a shell form"));
+    assert!(lines[at + 1].starts_with("- tools [quoted-glob]"));
+}
+
+#[test]
+fn change_report_bullet_drops_the_snapshot_sentence_without_bash_exec() {
+    let mut writer = shell_tool("fs_write", true);
+    writer.schema["properties"] = json!({"path": {"type": "string"}, "diff": {"type": "string"}});
+    let text = bash_tool_description(&[writer], 8, 1000);
+    let bullet = text
+        .lines()
+        .find(|line| line.starts_with(CHANGE_REPORT))
+        .expect("bullet");
+    assert!(bullet.ends_with("(nothing to roll back to)."), "{bullet}");
+    assert!(!text.contains("For one diff across several changes"));
+}
+
+#[test]
+fn change_report_bullet_needs_a_shell_form_and_a_diff_property() {
+    for tools in [
+        vec![shell_tool("bash_exec", false)],
+        vec![ToolSpec {
+            output: None,
+            ..shell_tool("bash_exec", true)
+        }],
+        vec![],
+    ] {
+        let text = bash_tool_description(&tools, 8, 1000);
+        assert!(!text.contains("reports the change on stderr"), "{text}");
+    }
+}

@@ -245,10 +245,13 @@ async fn write_attachment_resolves_before_taking_repo_or_file_locks() {
         };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            server.write_attachment_impl(WriteAttachmentParams {
-                path: path_string(&path),
-                url: PLAN_URL.to_string(),
-            }),
+            server.write_attachment_impl(
+                WriteAttachmentParams {
+                    path: path_string(&path),
+                    url: PLAN_URL.to_string(),
+                },
+                ResultStyle::Model,
+            ),
         )
         .await
         .expect("source resolution must not wait for destination locks");
@@ -259,3 +262,25 @@ async fn write_attachment_resolves_before_taking_repo_or_file_locks() {
 }
 
 mod protocol;
+
+#[tokio::test]
+async fn a_script_write_attachment_returns_the_message_field() {
+    let root = TestDir::new();
+    let resolver = FakeResolver::new(PLAN_URL, Ok(b"# Plan\n".to_vec()));
+    let server = FsServer::new(rwx_allowlist([root.path().to_path_buf()]))
+        .with_attachment_resolver(resolver);
+    let path = path_string(&root.path().join("plan.md"));
+    let result = server
+        .invoke_tool_value(
+            "write_attachment",
+            json!({"path": path, "url": PLAN_URL}),
+            crate::script_result::ResultStyle::Script,
+        )
+        .await
+        .unwrap();
+    let fields = result.structured_content.unwrap();
+    assert_eq!(
+        fields["message"],
+        format!("Wrote {} (1 lines) to {path}\n", format_size(7))
+    );
+}
