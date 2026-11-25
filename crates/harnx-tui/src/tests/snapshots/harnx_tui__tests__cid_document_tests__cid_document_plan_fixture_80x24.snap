@@ -1,0 +1,29 @@
+---
+source: crates/harnx-tui/src/tests/cid_document_tests.rs
+assertion_line: 90
+expression: trimmed
+---
+Plan: Release Readiness─────────────────────────────────────────────────────────
+
+  Plan: Release Readiness                                                      ↑
+                                                                               █
+  Summary paragraph explaining why spacing, nested lists, wrapped              █
+  continuation text, and fullscreen margins improve plan readability across    █
+  narrow and normal viewports.                                                 █
+                                                                               █
+  Scope                                                                        █
+                                                                               █
+  - [x] Audit section spacing across headings, paragraphs, and blocks          █
+    - [ ] Verify nested wrapped continuation lines stay aligned under item     █
+          content across narrow terminal widths                                ║
+    - Tight sibling item without extra blank row                               ║
+                                                                               ║
+  Tasks                                                                        ║
+                                                                               ║
+  ┌─────────────────────────────────────────────────────────────────────────┐  ║
+  │Status      Task Dependencies                                            │  ║
+  │closed      T1   -                                                       │  ║
+  │in_progress T2   T1                                                      │  ║
+  │                                                                         │  ↓
+────────────────────────────────────────────────────────────────────────────────
+ ↑↓/Tab: select link  Enter: open  Backspace/Esc: back  PgUp/PgDn: scroll

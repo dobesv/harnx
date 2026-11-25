@@ -1476,6 +1476,9 @@ impl Tui {
         let Some(view) = &self.app.doc_view else {
             return Vec::new();
         };
+        if width == 0 {
+            return Vec::new();
+        }
         let mut entries = vec![crate::markdown_render::render_markdown(
             &view.text,
             Style::default(),
@@ -1512,19 +1515,33 @@ impl Tui {
         standard: Option<(Vec<Vec<Line<'static>>>, String)>,
     ) {
         if let Some((entries, _)) = standard {
-            self.app
-                .detail_view_scroll
-                .render(frame, area, &entries, |lines| {
-                    let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-                    let height = paragraph.line_count(area.width);
-                    (height, paragraph)
-                });
-            return;
+            self.render_standard_detail_content(frame, area, &entries);
+        } else {
+            self.render_cid_document_content(frame, area);
         }
-        let entries = self.cid_document_entries(area.width.max(1));
+    }
+
+    fn render_standard_detail_content(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        entries: &[Vec<Line<'static>>],
+    ) {
         self.app
             .detail_view_scroll
-            .render(frame, area, &entries, |entry| {
+            .render(frame, area, entries, |lines| {
+                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+                let height = paragraph.line_count(area.width);
+                (height, paragraph)
+            });
+    }
+
+    fn render_cid_document_content(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let areas = cid_document_scroll_areas(area);
+        let entries = self.cid_document_entries(areas.content.width);
+        self.app
+            .detail_view_scroll
+            .render_in_areas(frame, areas, &entries, |entry| {
                 (usize::from(entry.total_height.max(1)), entry.clone())
             });
     }
@@ -1791,6 +1808,55 @@ fn push_surface_detail_lines(
     }
 }
 
+pub(crate) fn cid_document_scroll_areas(
+    inner_area: ratatui::layout::Rect,
+) -> ratatui_widget_scrolling::ScrollAreas {
+    if inner_area.is_empty() {
+        return ratatui_widget_scrolling::ScrollAreas {
+            content: ratatui::layout::Rect::new(inner_area.x, inner_area.y, 0, 0),
+            scrollbar: None,
+        };
+    }
+
+    let top_margin = u16::from(inner_area.height >= 2);
+    let content_y = inner_area.y + top_margin;
+    let content_height = inner_area.height - top_margin;
+
+    // Reserve the rightmost column for overflow scrollbar chrome outside the
+    // blank right margin whenever at least one content column still fits.
+    let (scrollbar, usable_width) = if inner_area.width >= 2 {
+        (
+            Some(ratatui::layout::Rect::new(
+                inner_area.right() - 1,
+                content_y,
+                1,
+                content_height,
+            )),
+            inner_area.width - 1,
+        )
+    } else {
+        (None, inner_area.width)
+    };
+
+    let (left_margin, right_margin) = match usable_width {
+        0 | 1 => (0, 0),
+        2 => (1, 0),
+        3 | 4 => (1, 1),
+        _ => (2, 2),
+    };
+    let content_width = usable_width - left_margin - right_margin;
+
+    ratatui_widget_scrolling::ScrollAreas {
+        content: ratatui::layout::Rect::new(
+            inner_area.x + left_margin,
+            content_y,
+            content_width,
+            content_height,
+        ),
+        scrollbar,
+    }
+}
+
 pub(crate) fn session_picker_highlight_index(selected: usize, has_error: bool) -> usize {
     if has_error {
         selected + 1
@@ -1833,5 +1899,90 @@ mod tests {
         assert_eq!(session_picker_highlight_index(1, true), 2);
         // - error: None, selected: 0 → highlighted row is "New session" (display index 0).
         assert_eq!(session_picker_highlight_index(0, false), 0);
+    }
+
+    #[test]
+    fn cid_document_scroll_areas_margins_and_tiny_fallback() {
+        use ratatui::layout::Rect;
+        use ratatui_widget_scrolling::ScrollAreas;
+
+        // Zero-sized or height-0 inner area yields empty content and no scrollbar.
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 0, 0, 0)),
+            ScrollAreas {
+                content: Rect::new(0, 0, 0, 0),
+                scrollbar: None,
+            }
+        );
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 1, 20, 0)),
+            ScrollAreas {
+                content: Rect::new(0, 1, 0, 0),
+                scrollbar: None,
+            }
+        );
+
+        // Width 1 cannot hold content + separate scrollbar: hide chrome, keep content.
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 1, 1, 1)),
+            ScrollAreas {
+                content: Rect::new(0, 1, 1, 1),
+                scrollbar: None,
+            }
+        );
+
+        // Width 2..5 shrink margins first while retaining content >= 1 and rightmost chrome.
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 1, 2, 2)),
+            ScrollAreas {
+                content: Rect::new(0, 2, 1, 1),
+                scrollbar: Some(Rect::new(1, 2, 1, 1)),
+            }
+        );
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 1, 3, 4)),
+            ScrollAreas {
+                content: Rect::new(1, 2, 1, 3),
+                scrollbar: Some(Rect::new(2, 2, 1, 3)),
+            }
+        );
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 1, 4, 4)),
+            ScrollAreas {
+                content: Rect::new(1, 2, 1, 3),
+                scrollbar: Some(Rect::new(3, 2, 1, 3)),
+            }
+        );
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 1, 5, 4)),
+            ScrollAreas {
+                content: Rect::new(1, 2, 2, 3),
+                scrollbar: Some(Rect::new(4, 2, 1, 3)),
+            }
+        );
+
+        // Width >= 6 gets 2 left blank cols, content >= 1, 2 right blank cols, 1 outer scrollbar.
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 1, 6, 4)),
+            ScrollAreas {
+                content: Rect::new(2, 2, 1, 3),
+                scrollbar: Some(Rect::new(5, 2, 1, 3)),
+            }
+        );
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 1, 80, 21)),
+            ScrollAreas {
+                content: Rect::new(2, 2, 75, 20),
+                scrollbar: Some(Rect::new(79, 2, 1, 20)),
+            }
+        );
+        // Wide viewports do not cap width.
+        assert_eq!(
+            cid_document_scroll_areas(Rect::new(0, 1, 140, 27)),
+            ScrollAreas {
+                content: Rect::new(2, 2, 135, 26),
+                scrollbar: Some(Rect::new(139, 2, 1, 26)),
+            }
+        );
     }
 }
