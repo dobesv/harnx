@@ -1974,6 +1974,13 @@ Resource owners keep cleanup handles outside turn/reply futures. A dropped
 MCP cancellation closes only the request waiter; never restart shared
 infrastructure to cancel a call. See `docs/nats-ha.md` under "Interruption".
 
+A detached task also dies with its runtime, so cleanup a process must finish
+before it exits can't be left to one. harnx-mcp-server returns from `main` as
+soon as its aborted calls return at stdio EOF, and the tool cancel used to go
+out from a spawned task that had often not run yet. An aborted call now waits
+for its first cancel publish to be flushed (`send_cancel` in
+`nats_tool_provider/cancellation.rs`); the resends stay detached.
+
 The TUI runs broker requests as spawned tasks and only checks their join
 handles from its render loop (`pending_exit_cancel` in `harnx-tui/src/types.rs`).
 That loop blocks in the terminal poll for up to one 80 ms tick and looks at a

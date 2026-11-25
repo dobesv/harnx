@@ -280,9 +280,7 @@ impl NatsEndpoint {
             .max_reconnects(None)
             .ping_interval(Duration::from_secs(5))
             .connection_timeout(Duration::from_secs(2))
-            .reconnect_delay_callback(|attempt| {
-                Duration::from_millis((100_u64 << attempt.min(4)).min(1_000))
-            });
+            .reconnect_delay_callback(reconnect_delay);
         let transport = self.transport();
         options = self.apply_auth_options(options);
         options = self.apply_tls_options(options, transport)?;
@@ -579,9 +577,43 @@ impl NatsEndpoint {
     }
 }
 
+/// The wait before the first retry, doubled for each one after it.
+const FIRST_RECONNECT_DELAY: Duration = Duration::from_millis(100);
+/// The longest wait between attempts.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// The wait before connection attempt `attempt`. async-nats counts from 1 and
+/// sleeps for this delay before every attempt, the first one included, both
+/// when a client first connects and when it reconnects after an outage. The
+/// first attempt therefore has to be immediate: a delay there is paid by every
+/// fresh connection. Later attempts back off from 100 ms to at most 1 s, so a
+/// broker failover is noticed quickly without spinning.
+fn reconnect_delay(attempt: usize) -> Duration {
+    match attempt.checked_sub(2) {
+        None => Duration::ZERO,
+        Some(retry) => {
+            let doublings = u32::try_from(retry).unwrap_or(u32::MAX);
+            FIRST_RECONNECT_DELAY
+                .saturating_mul(2_u32.saturating_pow(doublings))
+                .min(MAX_RECONNECT_DELAY)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// async-nats calls the callback with 1 before a client's first attempt,
+    /// so a nonzero delay there would slow every fresh connection.
+    #[test]
+    fn first_connection_attempt_is_immediate_and_retries_back_off() {
+        let delays: Vec<u64> = (1..=7)
+            .map(|attempt| reconnect_delay(attempt).as_millis() as u64)
+            .collect();
+        assert_eq!(delays, [0, 100, 200, 400, 800, 1_000, 1_000]);
+        assert_eq!(reconnect_delay(usize::MAX), Duration::from_secs(1));
+    }
 
     /// async-nats assumes `nats://` for a URL with no scheme, so an operator
     /// who wrote a bare `host:port` must land on the TCP path rather than on
