@@ -49,6 +49,8 @@ async function streamHarness() {
     await act(async () => {
       await target.onEvent?.({ event });
       await target[callbacks[event.type]!]?.({ event });
+      // Content updates notify listeners from a zero-delay timer.
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
   };
   const done = async () => {

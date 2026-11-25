@@ -10,4 +10,4 @@ overrides:
   '@assistant-ui/store': 0.3.24
   assistant-stream: 0.3.58
 patchedDependencies:
-  '@assistant-ui/react-ag-ui@0.0.63': patches/@assistant-ui__react-ag-ui@0.0.63.patch
+  '@assistant-ui/react-ag-ui@0.1.11': patches/@assistant-ui__react-ag-ui@0.1.11.patch
