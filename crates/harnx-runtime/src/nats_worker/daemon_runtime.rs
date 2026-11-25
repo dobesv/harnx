@@ -463,7 +463,7 @@ impl WorkerRuntime {
         activation: &SessionActivate,
         generation: u64,
     ) -> Result<Option<Arc<NatsSessionLease>>> {
-        let lease = NatsSessionLease::acquire_for_execution(
+        let lease = NatsSessionLease::acquire_for_worker_activation(
             NatsLeaseAcquireParams {
                 jetstream: self.jetstream.clone(),
                 session_id: &activation.session_id,

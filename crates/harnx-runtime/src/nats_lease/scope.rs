@@ -25,7 +25,7 @@ impl NatsSessionLease {
     ) -> Result<Option<Self>> {
         let key = params.config.key_for_scope(params.session_id, scope)?;
         params.session_metadata = None;
-        Self::acquire_key(params, None, key).await
+        Self::acquire_key(params, None, key, AcquisitionPolicy::Generic).await
     }
 
     pub fn key(&self) -> &str {

@@ -28,20 +28,20 @@ async fn assert_immediately_deliverable(
 /// for deliveries an aborted waiter never settled.
 async fn spawn_shutdown_probe_worker(
     server_url: &str,
-    spec: FaultWorkerSpec,
+    worker_id: &'static str,
     shutdown: CancellationToken,
-) -> Result<(CancellationToken, AbortOnDropHandle<Result<()>>)> {
+) -> Result<(
+    Arc<AtomicUsize>,
+    Arc<BusyWaiterProbe>,
+    Arc<ActivationFaults>,
+    CancellationToken,
+    AbortOnDropHandle<Result<()>>,
+)> {
     use harnx_runtime::nats_worker::{run_worker_daemon_with_shutdown, DaemonRunOptions};
-    let FaultWorkerSpec {
-        worker_id,
-        call_fn,
-        probe,
-        faults,
-        per_session_capacity: _,
-    } = spec;
+    let (calls, probe, faults) = probe_parts();
     let mut daemon = WorkerDaemonConfig::managing("local", worker_id)
-        .with_busy_waiter_probe_for_test(probe)
-        .with_activation_faults_for_test(faults)
+        .with_busy_waiter_probe_for_test(Arc::clone(&probe))
+        .with_activation_faults_for_test(Arc::clone(&faults))
         .with_activation_ack_wait_for_test(Duration::from_secs(3));
     daemon.lease = fast_daemon_lease();
     let readiness = harnx_healthz::Readiness::default();
@@ -49,14 +49,14 @@ async fn spawn_shutdown_probe_worker(
         local_nats_runtime_config(server_url),
         daemon,
         DaemonRunOptions {
-            call_fn: Some(call_fn),
+            call_fn: Some(counting_stub_call_fn(Arc::clone(&calls))),
             readiness: Some(readiness.clone()),
             shutdown: shutdown.clone(),
             shutdown_timeout: harnx_runtime::nats_worker::WORKER_SHUTDOWN_TIMEOUT,
         },
     )));
     wait_until(CI_SAFE_TIMEOUT, move || readiness.is_ready()).await?;
-    Ok((shutdown, handle))
+    Ok((calls, probe, faults, shutdown, handle))
 }
 
 /// Fetch a delivery a settled (or aborted) waiter handed back. The dead
@@ -152,20 +152,12 @@ async fn aborting_the_daemon_future_settles_parked_waiters() -> Result<()> {
     };
     let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "busy-park-abort";
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let faults = Arc::new(ActivationFaults::default());
-    let worker = spawn_fault_probe_worker(
-        server.url(),
-        FaultWorkerSpec {
-            worker_id: "busy-park-abort-worker",
-            call_fn: counting_stub_call_fn(Arc::clone(&calls)),
-            probe: Arc::clone(&probe),
-            faults: Arc::clone(&faults),
-            per_session_capacity: None,
-        },
-    )
-    .await?;
+    let ProbedWorker {
+        calls: _calls,
+        probe,
+        faults: _faults,
+        worker,
+    } = ProbedWorker::spawn(server.url(), "busy-park-abort-worker", None).await?;
 
     let foreign_lease =
         publish_foreign_busy_activation(&jetstream, session_id, "foreign-holder").await?;
@@ -200,24 +192,15 @@ async fn shutdown_timeout_aborts_and_reconciles_a_stalled_waiter() -> Result<()>
     };
     let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "busy-settle-timeout";
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let faults = Arc::new(ActivationFaults::default());
     // The waiter NAKs its delivery back, then stalls forever in the shutdown
     // flush, past the two-second settle budget.
-    faults.stall_shutdown_flush.store(true, Ordering::SeqCst);
-    let (shutdown, daemon_handle) = spawn_shutdown_probe_worker(
+    let (_calls, probe, faults, shutdown, daemon_handle) = spawn_shutdown_probe_worker(
         server.url(),
-        FaultWorkerSpec {
-            worker_id: "busy-settle-timeout-worker",
-            call_fn: counting_stub_call_fn(Arc::clone(&calls)),
-            probe: Arc::clone(&probe),
-            faults: Arc::clone(&faults),
-            per_session_capacity: None,
-        },
+        "busy-settle-timeout-worker",
         CancellationToken::new(),
     )
     .await?;
+    faults.stall_shutdown_flush.store(true, Ordering::SeqCst);
 
     let foreign_lease =
         publish_foreign_busy_activation(&jetstream, session_id, "foreign-holder").await?;

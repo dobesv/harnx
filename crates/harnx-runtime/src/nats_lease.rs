@@ -1,4 +1,7 @@
+mod acquisition;
+mod broker_clock;
 mod holder_liveness;
+mod lease_ttl;
 mod scope;
 mod slot;
 use crate::config::DEFAULT_BUCKET_REPLICAS;
@@ -9,7 +12,7 @@ use async_nats::header::{NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MESSAGE_ID, N
 use async_nats::jetstream::{self, context::PublishErrorKind, kv, stream};
 pub use holder_liveness::holder_reclaim_supported;
 use serde::{Deserialize, Serialize};
-use slot::LeaseSlot;
+use slot::{CreatedLease, LeaseSlot};
 use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,8 +23,18 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time;
 
+pub(crate) use acquisition::{
+    assess_lease, AcquisitionPolicy, HeldAge, LeaseAssessment, ReclaimReason,
+};
+
 const LEASE_BUCKET: &str = "harnx_leases";
 const LEASE_KEY_PREFIX: &str = "sessions";
+
+/// The JetStream subject a lease key lives on, the one place the mapping
+/// is spelled out.
+fn kv_subject(bucket_name: &str, key: &str) -> String {
+    format!("$KV.{}.{}", bucket_name, key)
+}
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 pub const DEFAULT_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_TOMBSTONE_TTL: Duration = Duration::from_secs(3600);
@@ -48,8 +61,9 @@ pub struct LeaseRecord {
 /// Whether the holder recorded in `record` is provably dead on this host, so
 /// the lease it can no longer renew may be reclaimed. `false` on any
 /// uncertainty: missing identity (records from older binaries), a different
-/// host, or a liveness check that can't be trusted all keep the TTL as the
-/// only reclaim path.
+/// host, or a liveness check that can't be trusted all leave the holder
+/// unproven, with no liveness reclaim — worker activation has a separate
+/// broker-clock age rule (see `nats_lease::acquisition`).
 pub(crate) fn holder_is_stale(record: &LeaseRecord) -> bool {
     use holder_liveness::HolderLiveness;
     record
@@ -145,13 +159,37 @@ impl NatsSessionLease {
         execution_id: Option<String>,
     ) -> Result<Option<Self>> {
         let key = params.config.key_for_session(params.session_id);
-        Self::acquire_key(params, execution_id, key).await
+        Self::acquire_key(params, execution_id, key, AcquisitionPolicy::Generic).await
+    }
+
+    /// As [`Self::acquire_for_execution`], under the worker-activation
+    /// policy. Besides a holder provably dead on this host, a lease that is
+    /// still present on the broker past three effective TTLs of its own —
+    /// judged on the broker's clock, never the worker's — is reclaimed
+    /// through the same revision-checked CAS, which is what recovers a
+    /// session whose dead holder's lease outlived its message TTL. The
+    /// claimant's TTL must be a positive whole number of seconds, because
+    /// create and renewal encode `ttl.as_secs()` on the wire and the
+    /// confirmation deadline must equal the TTL actually sent.
+    pub async fn acquire_for_worker_activation(
+        params: NatsLeaseAcquireParams<'_>,
+        execution_id: Option<String>,
+    ) -> Result<Option<Self>> {
+        let key = params.config.key_for_session(params.session_id);
+        Self::acquire_key(
+            params,
+            execution_id,
+            key,
+            AcquisitionPolicy::WorkerActivation,
+        )
+        .await
     }
 
     async fn acquire_key(
         params: NatsLeaseAcquireParams<'_>,
         execution_id: Option<String>,
         key: String,
+        policy: AcquisitionPolicy,
     ) -> Result<Option<Self>> {
         let NatsLeaseAcquireParams {
             jetstream,
@@ -161,59 +199,51 @@ impl NatsSessionLease {
             config,
             session_metadata,
         } = params;
+        if policy == AcquisitionPolicy::WorkerActivation {
+            validate_worker_ttl(config.ttl)?;
+        }
         config.validate()?;
         let bucket = ensure_lease_bucket(&jetstream, &config).await?;
         let mut record = LeaseRecord::new(worker_id.clone(), generation);
         record.execution_id = execution_id.clone();
-        let acquired_at = time::Instant::now();
         let slot = LeaseSlot {
             jetstream: &jetstream,
             bucket: &bucket,
             key: &key,
             marker_ttl: config.tombstone_ttl,
         };
-        let Some(revision) = claim_lease(&slot, session_id, &record, config.ttl).await? else {
+        let acquired_at = time::Instant::now();
+        let Some(created) = claim_lease(&slot, session_id, &record, &config, policy).await? else {
             return Ok(None);
         };
-
-        let (status_tx, _status_rx) = watch::channel(true);
-        let state = Arc::new(LeaseState {
-            execution_id,
+        if policy == AcquisitionPolicy::WorkerActivation
+            && discard_expired_create(&slot, session_id, &worker_id, &created, config.ttl).await
+        {
+            return Ok(None);
+        }
+        // Worker confirmations anchor to the instant immediately before the
+        // successful TTL-bearing create: the clock round trips an age check
+        // can add before it must not spend the lease's renewal budget, and
+        // anchoring after the acknowledgement would overstate the remaining
+        // TTL. Every other acquirer keeps the old anchor.
+        let confirmed_from = match policy {
+            AcquisitionPolicy::WorkerActivation => created.sent_at,
+            AcquisitionPolicy::Generic => acquired_at,
+        };
+        let confirmed_until = confirmed_from + config.ttl;
+        Ok(Some(finish_acquisition(FinishAcquisition {
+            jetstream,
+            bucket,
+            key,
+            session_id,
             worker_id,
             generation,
-            ttl: config.ttl,
-            marker_ttl: config.tombstone_ttl,
-            held: AtomicBool::new(true),
-            fence_token: AtomicU64::new(revision),
-            renew_lock: Mutex::new(()),
-            status_tx,
-            confirmed_until: parking_lot::Mutex::new(acquired_at + config.ttl),
-        });
-        info!(
-            "nats lease acquired: session_id={session_id} worker_id={} generation={} revision={revision}",
-            state.worker_id,
-            state.generation
-        );
-        nats_metrics::lease_acquired();
-
-        let renew_task = spawn_renew_task(RenewTaskParams {
-            jetstream: jetstream.clone(),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            state: Arc::clone(&state),
-            renew_interval: config.renew_interval,
-            session_id: session_id.to_string(),
+            execution_id,
+            config: &config,
             session_metadata,
-        });
-
-        Ok(Some(Self {
-            bucket,
-            jetstream,
-            key,
-            acquisition_revision: revision,
-            state,
-            renew_task: Mutex::new(Some(renew_task)),
-        }))
+            created: &created,
+            confirmed_until,
+        })))
     }
 
     pub fn is_held(&self) -> bool {
@@ -222,7 +252,9 @@ impl NatsSessionLease {
 
     /// Perform a broker-authoritative ownership check by renewing with the
     /// lease's current KV revision. Failure marks the local lease lost so an
-    /// approved tool can't start after broker expiry or handoff.
+    /// approved tool isn't started once loss is observed; this does not
+    /// atomically prevent expiry or takeover after the check returns, or revoke
+    /// already in-flight tool effects.
     pub async fn revalidate_ownership(&self) -> Result<bool> {
         if !self.is_held() {
             return Ok(false);
@@ -248,9 +280,12 @@ impl NatsSessionLease {
         }
     }
 
-    /// The lease's current KV revision, which durable writes are fenced on.
-    /// Every renewal rewrites the lease and raises it, so compare against the
-    /// token a write actually carried rather than one read afterwards.
+    /// The lease's current KV revision, stamped as diagnostic metadata on
+    /// durable log entries that carry a `fence_token` field. Durable log
+    /// appends check the local `is_held()` flag and the session log's tail
+    /// sequence (`append_fenced`), not this lease revision on the broker. Every
+    /// renewal rewrites the lease and raises it, so compare against the token
+    /// a write actually carried rather than one read afterwards.
     pub fn fence_token(&self) -> u64 {
         self.state.fence_token.load(Ordering::SeqCst)
     }
@@ -466,25 +501,46 @@ pub async fn session_has_active_lease(
         .is_some())
 }
 
-/// Take the lease key for `record`, reclaiming it first from a holder that
-/// provably died on this host. `Ok(None)` means another holder keeps it.
+/// Take the lease key for `record`, reclaiming it first when the observed
+/// holder may be reclaimed under `policy`: provably dead on this host, or —
+/// for worker activation — old on the broker's clock. `Ok(None)` means
+/// another holder keeps it.
+///
+/// Read and broker-clock failures propagate: the calling stage settles them
+/// through its existing error path, and no failure ever purges. A malformed
+/// lease record stays held rather than becoming a free lease.
 async fn claim_lease(
     slot: &LeaseSlot<'_>,
     session_id: &str,
     record: &LeaseRecord,
-    ttl: Duration,
-) -> Result<Option<u64>> {
-    if let Some(revision) = create_lease(slot, record, ttl).await? {
-        return Ok(Some(revision));
+    config: &NatsLeaseConfig,
+    policy: AcquisitionPolicy,
+) -> Result<Option<CreatedLease>> {
+    if let Some(created) = create_lease(slot, record, config.ttl).await? {
+        return Ok(Some(created));
     }
-    // Another holder owns the key. When that holder provably died on this
-    // host — a SIGKILLed local worker, a crashed daemon — reclaim the stale
-    // lease now instead of waiting out its TTL. Anything less certain keeps
-    // the old back-off behaviour.
-    if !try_reclaim_stale_lease(slot, session_id).await? {
+    // Another holder owns the key. The assessment re-reads the entry from
+    // the stream leader and re-applies the same policy against this
+    // claimant's configuration, so an old observation never carries onto a
+    // revision someone else may have rewritten meanwhile.
+    let assessment =
+        acquisition::assess_lease(slot.jetstream, slot.bucket, slot.key, config, policy)
+            .await
+            .with_context(|| format!("Failed to read NATS lease for session '{session_id}'"))?;
+    let LeaseAssessment::Reclaimable {
+        revision,
+        record: held,
+        reason,
+    } = assessment
+    else {
+        // Held, gone, or undecodable: the TTL (or the next delivery) is the
+        // only reclaim path left.
+        return Ok(None);
+    };
+    if !delete_stale_lease_at_revision(slot, session_id, revision, &held, reason).await? {
         return Ok(None);
     }
-    create_lease(slot, record, ttl).await
+    create_lease(slot, record, config.ttl).await
 }
 
 /// Claim the session's lease key. A create conflict means another owner still
@@ -494,82 +550,152 @@ async fn create_lease(
     slot: &LeaseSlot<'_>,
     record: &LeaseRecord,
     ttl: Duration,
-) -> Result<Option<u64>> {
+) -> Result<Option<CreatedLease>> {
     let payload = serde_json::to_vec(record).context("Failed to serialize lease record")?;
     harnx_metrics::time_nats_operation("lease_create", slot.create(payload, ttl)).await
 }
 
-/// Delete the lease at `key` when its holder is provably dead on this host.
-///
-/// Returns `Ok(true)` when a stale lease was removed at the revision this
-/// function observed; `Ok(false)` when the lease is still legitimately held,
-/// was already released or expired, or its record can't be decoded. The
-/// delete is a CAS on the observed revision, so a holder that renewed or a
-/// worker that reclaimed first makes this a no-op, and any uncertainty keeps
-/// the TTL as the only reclaim path.
-///
-/// A failure to *read* the entry propagates as an error instead of a silent
-/// `Ok(false)`, so a contended acquire surfaces a `ClaimError`-style delayed
-/// NAK rather than a quiet defer; that is bounded and self-healing, and
-/// indistinguishable from any other broker read failure.
-async fn try_reclaim_stale_lease(slot: &LeaseSlot<'_>, session_id: &str) -> Result<bool> {
-    let Some(entry) = harnx_metrics::time_nats_operation("lease_get", slot.bucket.entry(slot.key))
-        .await
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("Failed to read NATS lease for session '{session_id}'"))?
-    else {
-        return Ok(false);
-    };
-    if entry.operation != kv::Operation::Put {
-        return Ok(false);
-    }
-    let record: LeaseRecord = match serde_json::from_slice(&entry.value) {
-        Ok(record) => record,
-        Err(_) => return Ok(false),
-    };
-    let Some(holder) = record.holder.as_ref() else {
-        return Ok(false);
-    };
-    if holder_liveness::holder_liveness(holder) != holder_liveness::HolderLiveness::Dead {
-        return Ok(false);
-    }
-    delete_stale_lease_at_revision(
-        slot,
-        session_id,
-        ObservedLease {
-            revision: entry.revision,
-            record: &record,
-        },
-    )
-    .await
+/// Inputs to [`finish_acquisition`]: everything a claimed lease needs to
+/// become a live [`NatsSessionLease`].
+struct FinishAcquisition<'a> {
+    jetstream: jetstream::Context,
+    bucket: kv::Store,
+    key: String,
+    session_id: &'a str,
+    worker_id: String,
+    generation: u64,
+    execution_id: Option<String>,
+    config: &'a NatsLeaseConfig,
+    session_metadata: Option<SessionMetadataStore>,
+    created: &'a CreatedLease,
+    confirmed_until: time::Instant,
 }
 
-/// A lease entry as read before a reclaim attempt.
-struct ObservedLease<'a> {
-    revision: u64,
-    record: &'a LeaseRecord,
+/// Everything after a successful claim: local state, the acquisition log,
+/// the renewal task, and the handle joining them.
+fn finish_acquisition(acquired: FinishAcquisition<'_>) -> NatsSessionLease {
+    let FinishAcquisition {
+        jetstream,
+        bucket,
+        key,
+        session_id,
+        worker_id,
+        generation,
+        execution_id,
+        config,
+        session_metadata,
+        created,
+        confirmed_until,
+    } = acquired;
+    let (status_tx, _status_rx) = watch::channel(true);
+    let state = Arc::new(LeaseState {
+        execution_id,
+        worker_id,
+        generation,
+        ttl: config.ttl,
+        marker_ttl: config.tombstone_ttl,
+        held: AtomicBool::new(true),
+        fence_token: AtomicU64::new(created.revision),
+        renew_lock: Mutex::new(()),
+        status_tx,
+        confirmed_until: parking_lot::Mutex::new(confirmed_until),
+    });
+    info!(
+        "nats lease acquired: session_id={session_id} worker_id={} generation={} revision={}",
+        state.worker_id, state.generation, created.revision
+    );
+    nats_metrics::lease_acquired();
+
+    let renew_task = spawn_renew_task(RenewTaskParams {
+        jetstream: jetstream.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        state: Arc::clone(&state),
+        renew_interval: config.renew_interval,
+        session_id: session_id.to_string(),
+        session_metadata,
+    });
+
+    NatsSessionLease {
+        bucket,
+        jetstream,
+        key,
+        acquisition_revision: created.revision,
+        state,
+        renew_task: Mutex::new(Some(renew_task)),
+    }
+}
+
+/// Whether the broker's acknowledgement of a TTL-bearing create arrived
+/// after the lease it confirmed had already expired. Exact equality with the
+/// deadline still leaves the lease live: expiry is strict.
+fn create_ack_expired(created: &CreatedLease, ttl: Duration) -> bool {
+    created.acked_at > created.sent_at + ttl
+}
+
+/// The worker activation path requires a positive whole-second TTL: create
+/// and renewal publish `ttl.as_secs()`, so a fractional or subsecond value
+/// would put a longer window on the wire's confirmation deadline than the
+/// expiry the broker actually enforces. Generic acquirers keep their own
+/// validation.
+fn validate_worker_ttl(ttl: Duration) -> Result<()> {
+    if ttl.is_zero() || ttl.subsec_nanos() != 0 {
+        bail!(
+            "worker activation lease TTL must be a positive whole number of seconds, got {ttl:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A worker-activation create whose acknowledgement outlived the lease it
+/// confirmed may already have expired by the time this worker learned it
+/// owns the key, so no protected session work may run under it: purge it at
+/// its own revision and report the lease unavailable so the activation
+/// defers. A renewal or another claimant that moved first makes the purge
+/// CAS lose, which is fine.
+async fn discard_expired_create(
+    slot: &LeaseSlot<'_>,
+    session_id: &str,
+    worker_id: &str,
+    created: &CreatedLease,
+    ttl: Duration,
+) -> bool {
+    if !create_ack_expired(created, ttl) {
+        return false;
+    }
+    warn!(
+        "nats lease create acknowledgement arrived after the TTL: session_id={session_id} worker_id={worker_id} revision={} ttl_secs={}",
+        created.revision,
+        ttl.as_secs()
+    );
+    if let Err(error) =
+        harnx_metrics::time_nats_operation("lease_release", slot.remove(created.revision)).await
+    {
+        if error.kind() != kv::UpdateErrorKind::WrongLastRevision {
+            log::warn!("failed to discard an expired-acquired lease: {error:#}");
+        }
+    }
+    true
 }
 
 /// CAS-delete a stale lease at the revision it was observed at. `Ok(false)`
 /// means the delete lost the CAS: another writer moved first and this
-/// attempt gives up. Split from [`try_reclaim_stale_lease`] so the CAS
-/// outcome can be tested directly against a replaced lease.
+/// attempt gives up. Split from [`claim_lease`] so the CAS outcome can be
+/// tested directly against a replaced lease.
+///
+/// A holder identity is optional evidence here: a claim from a foreign host
+/// or an older record without one can still be reclaimed by age. The holder's
+/// pid, when recorded, is logged, never required.
 async fn delete_stale_lease_at_revision(
     slot: &LeaseSlot<'_>,
     session_id: &str,
-    observed: ObservedLease<'_>,
+    revision: u64,
+    record: &LeaseRecord,
+    reason: ReclaimReason,
 ) -> Result<bool> {
-    let ObservedLease { revision, record } = observed;
-    let holder = record
-        .holder
-        .as_ref()
-        .expect("reclaim precondition: holder identity present");
     match harnx_metrics::time_nats_operation("lease_reclaim", slot.remove(revision)).await {
         Ok(()) => {
-            info!(
-                "reclaimed stale session lease from dead holder: session_id={session_id} holder_worker_id={} holder_pid={} holder_generation={}",
-                record.worker_id, holder.pid, record.generation
-            );
+            log_reclaimed_lease(session_id, revision, record, &reason);
             nats_metrics::lease_reclaimed();
             Ok(true)
         }
@@ -590,12 +716,48 @@ async fn delete_stale_lease_at_revision(
     }
 }
 
+/// Diagnostics for a successful reclaim, per reason. Proven death and old age
+/// are reported as what they are: age alone is never proof that the holder
+/// process died, and its logs must not say so.
+fn log_reclaimed_lease(
+    session_id: &str,
+    revision: u64,
+    record: &LeaseRecord,
+    reason: &ReclaimReason,
+) {
+    let holder_pid = record
+        .holder
+        .as_ref()
+        .map(|holder| holder.pid)
+        .unwrap_or_default();
+    match reason {
+        ReclaimReason::DeadHolder => {
+            info!(
+                "reclaimed stale session lease from dead holder: session_id={session_id} holder_worker_id={} holder_pid={} holder_generation={}",
+                record.worker_id, holder_pid, record.generation
+            );
+        }
+        ReclaimReason::BrokerAge { age, effective_ttl } => {
+            info!(
+                "reclaimed stale session lease by broker-clock age: session_id={session_id} holder_worker_id={} holder_pid={} holder_generation={} revision={revision} age_secs={} effective_ttl_secs={} reason=broker-age",
+                record.worker_id,
+                holder_pid,
+                record.generation,
+                age.as_secs(),
+                effective_ttl.as_secs()
+            );
+        }
+    }
+}
+
 /// Open the lease bucket, creating it at `config.replicas` if it doesn't
 /// exist yet, or raising an existing bucket's replica count to match if an
 /// operator changed cluster config after the bucket was first created. This
-/// is the split-brain guard every session write is fenced against, so a
-/// bucket stuck at R=1 on a cluster configured for R=3 defeats the point of
-/// running a cluster at all.
+/// bucket coordinates single-active-worker ownership via lease-key revision
+/// CAS (log writes themselves use local `is_held()` checks and session-log
+/// tail CAS rather than an atomic broker-side lease check), so a bucket stuck
+/// at R=1 on a cluster configured for R=3 defeats the point of running a
+/// cluster at all.
 pub async fn ensure_lease_bucket(
     jetstream: &jetstream::Context,
     config: &NatsLeaseConfig,
@@ -754,7 +916,7 @@ async fn renew_once(
     record.execution_id = state.execution_id.clone();
     let payload =
         serde_json::to_vec(&record).context("Failed to serialize renewed lease record")?;
-    let subject = format!("$KV.{}.{}", bucket.name, key);
+    let subject = kv_subject(&bucket.name, key);
     let mut headers = async_nats::HeaderMap::new();
     headers.insert(
         NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
@@ -850,6 +1012,371 @@ mod tests {
         })
     }
 
+    /// Lease timings that let an age reclaim land inside a test: the
+    /// claimant's TTL is a whole second, so the create acknowledgement
+    /// deadline is tight and renewal is fast. The seeded writer's lease is
+    /// headerless (a legacy record, or one whose TTL evidence a broker
+    /// restart stranded), so it never expires on its own and the age
+    /// threshold comes from the legacy default floor. A TTL-headed seed
+    /// cannot reproduce the stranded state against a live nats-server
+    /// (verified on 2.11.6): the broker enforces a Put's own `Nats-TTL`
+    /// inline, so the old record reads back as a marker within seconds,
+    /// never as an aged holder.
+    fn fast_age_lease_config() -> NatsLeaseConfig {
+        NatsLeaseConfig {
+            ttl: Duration::from_secs(1),
+            renew_interval: Duration::from_millis(250),
+            replicas: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Seed another worker's lease as a headerless Put: nothing on the
+    /// broker ever expires it, and a live process on this host wrote it, so
+    /// neither the TTL nor a dead-holder check can free it. Only the
+    /// broker-clock age policy can take it back.
+    async fn seed_headerless_live_lease(
+        bucket: &kv::Store,
+        config: &NatsLeaseConfig,
+        session_id: &str,
+        worker_id: &str,
+    ) -> Result<LeaseRecord> {
+        let record = LeaseRecord::new(worker_id.into(), 1);
+        // This process is alive: no dead-holder reclaim can fire.
+        assert!(!holder_is_stale(&record));
+        bucket
+            .create(
+                &config.key_for_session(session_id),
+                serde_json::to_vec(&record)?.into(),
+            )
+            .await?;
+        Ok(record)
+    }
+
+    async fn acquire_as(
+        policy_worker_activation: bool,
+        js: &jetstream::Context,
+        config: &NatsLeaseConfig,
+        session_id: &str,
+        worker_id: &str,
+    ) -> Result<Option<NatsSessionLease>> {
+        let params = NatsLeaseAcquireParams {
+            jetstream: js.clone(),
+            session_id,
+            worker_id: worker_id.into(),
+            generation: 2,
+            config: config.clone(),
+            session_metadata: None,
+        };
+        if policy_worker_activation {
+            NatsSessionLease::acquire_for_worker_activation(params, None).await
+        } else {
+            NatsSessionLease::acquire(params).await
+        }
+    }
+
+    /// A lease with no TTL evidence — the legacy/stranded record shape —
+    /// must be reclaimed by the worker-activation policy once it is past
+    /// three effective TTLs of age on the broker's own clock, where the
+    /// effective TTL is the legacy default floor.
+    #[tokio::test]
+    async fn worker_activation_reclaims_an_old_headerless_lease() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let config = fast_age_lease_config();
+        let bucket = ensure_lease_bucket(&js, &config).await?;
+
+        seed_headerless_live_lease(&bucket, &config, "age-reclaim", "stranded-worker").await?;
+        // Three effective TTLs at the 30s legacy floor is 90s, and
+        // eligibility is strictly greater: sleep past it with margin.
+        tokio::time::sleep(Duration::from_secs(92)).await;
+
+        let reclaims_before = nats_metrics::snapshot().lease_reclaims;
+        let lease = acquire_as(true, &js, &config, "age-reclaim", "new-worker")
+            .await?
+            .expect("a headerless lease past three floor TTLs must be reclaimed");
+        assert!(lease.is_held());
+        assert!(
+            nats_metrics::snapshot().lease_reclaims > reclaims_before,
+            "the age reclaim must be counted"
+        );
+        // The reclaim was by age, not a proven death: the claimant's own
+        // lease must be a TTL-bearing create over the purge marker, so the
+        // session can never strand again.
+        let latest = bucket
+            .stream
+            .get_last_raw_message_by_subject(&kv_subject(&bucket.name, lease.key()))
+            .await?;
+        assert_eq!(
+            latest
+                .headers
+                .get(async_nats::header::NATS_MESSAGE_TTL)
+                .map(|ttl| ttl.as_str().to_owned()),
+            Some(config.ttl.as_secs().to_string())
+        );
+        lease.stop_renewal_for_test().await;
+        drop(lease);
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_activation_keeps_deferring_below_the_age_threshold() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let config = fast_age_lease_config();
+        let bucket = ensure_lease_bucket(&js, &config).await?;
+
+        seed_headerless_live_lease(&bucket, &config, "age-young", "slow-worker").await?;
+        // Two seconds is under the 90s floor threshold: age eligibility
+        // is strict, and a young lease is the holder's no matter what the
+        // claimant configured.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let reclaims_before = nats_metrics::snapshot().lease_reclaims;
+        let lease = acquire_as(true, &js, &config, "age-young", "new-worker").await?;
+        assert!(
+            lease.is_none(),
+            "a lease under three effective TTLs of age must not be reclaimed"
+        );
+        assert_eq!(
+            nats_metrics::snapshot().lease_reclaims,
+            reclaims_before,
+            "no reclaim may happen below the threshold"
+        );
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generic_acquisition_never_reclaims_by_age() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let config = fast_age_lease_config();
+        let bucket = ensure_lease_bucket(&js, &config).await?;
+
+        seed_headerless_live_lease(&bucket, &config, "age-generic", "stranded-worker").await?;
+        tokio::time::sleep(Duration::from_secs(92)).await;
+
+        let reclaims_before = nats_metrics::snapshot().lease_reclaims;
+        let lease = acquire_as(false, &js, &config, "age-generic", "gc-election").await?;
+        assert!(
+            lease.is_none(),
+            "generic acquisitions must keep deferring on a stale lease"
+        );
+        assert_eq!(
+            nats_metrics::snapshot().lease_reclaims,
+            reclaims_before,
+            "generic acquisitions must not reclaim by age"
+        );
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
+    /// A TTL-bearing lease whose expiry the broker actually enforced leaves
+    /// a marker, not a holder. The claim must still succeed — over the
+    /// marker, with a TTL-bearing create — without any reclaim.
+    #[tokio::test]
+    async fn worker_activation_claims_over_an_expiry_marker() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let config = fast_age_lease_config();
+        let bucket = ensure_lease_bucket(&js, &config).await?;
+
+        let record = LeaseRecord::new("dead-worker".into(), 1);
+        assert!(!holder_is_stale(&record));
+        bucket
+            .create_with_ttl(
+                &config.key_for_session("age-marker"),
+                serde_json::to_vec(&record)?.into(),
+                config.ttl,
+            )
+            .await?;
+        // Let the broker expire the message and place its marker.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        let reclaims_before = nats_metrics::snapshot().lease_reclaims;
+        let lease = acquire_as(true, &js, &config, "age-marker", "new-worker")
+            .await?
+            .expect("a lease the broker expired must be claimable over its marker");
+        assert!(lease.is_held());
+        let latest = bucket
+            .stream
+            .get_last_raw_message_by_subject(&kv_subject(&bucket.name, lease.key()))
+            .await?;
+        assert_eq!(
+            latest
+                .headers
+                .get(async_nats::header::NATS_MESSAGE_TTL)
+                .map(|ttl| ttl.as_str().to_owned()),
+            Some(config.ttl.as_secs().to_string()),
+            "the claim must leave a TTL-bearing lease, not a marker"
+        );
+        assert_eq!(
+            nats_metrics::snapshot().lease_reclaims,
+            reclaims_before,
+            "claiming over an expiry marker is not a reclaim"
+        );
+        lease.stop_renewal_for_test().await;
+        drop(lease);
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
+    /// A healthy holder renewing faster than its TTL always looks young on
+    /// the broker's clock: age reclaim must defer to it, and once it
+    /// releases, the next activation claim must succeed normally.
+    #[tokio::test]
+    async fn a_renewing_holder_is_protected_from_age_reclaim() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let config = fast_age_lease_config();
+        // Longer than the test run, so the lease never expires on its own.
+        let holder_config = NatsLeaseConfig {
+            ttl: Duration::from_secs(1),
+            renew_interval: Duration::from_millis(200),
+            replicas: 1,
+            ..Default::default()
+        };
+        let holder = NatsSessionLease::acquire(NatsLeaseAcquireParams {
+            jetstream: js.clone(),
+            session_id: "age-renewing",
+            worker_id: "renewing-worker".into(),
+            generation: 1,
+            config: holder_config.clone(),
+            session_metadata: None,
+        })
+        .await?
+        .expect("the healthy holder takes the lease");
+        assert!(holder.is_held());
+
+        // The renewal cadence keeps the observed message young; several
+        // attempts all see a fresh lease and defer.
+        for _ in 0..3 {
+            let lease = acquire_as(true, &js, &config, "age-renewing", "new-worker").await?;
+            assert!(
+                lease.is_none(),
+                "a renewing holder's lease must never be reclaimed by age"
+            );
+        }
+        holder.release().await?;
+        let lease = acquire_as(true, &js, &config, "age-renewing", "new-worker")
+            .await?
+            .expect("the released lease is claimable");
+        lease.stop_renewal_for_test().await;
+        drop(lease);
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_activation_requires_a_positive_whole_second_ttl() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        for ttl in [
+            Duration::from_millis(1500),
+            Duration::from_millis(500),
+            Duration::ZERO,
+        ] {
+            let config = NatsLeaseConfig {
+                ttl,
+                renew_interval: Duration::from_millis(100),
+                replicas: 1,
+                ..Default::default()
+            };
+            let error = acquire_as(true, &js, &config, "age-ttl-invalid", "new-worker")
+                .await
+                .expect_err("a fractional or zero TTL must fail the worker activation claim");
+            assert!(
+                error
+                    .to_string()
+                    .contains("positive whole number of seconds"),
+                "unexpected error: {error:#}"
+            );
+        }
+        // Generic acquisitions keep their own, laxer rules: no worker
+        // validation fires, and whatever happens next is the generic
+        // path's existing behavior — here the broker's own TTL rules
+        // rejecting a subsecond TTL encoded as zero seconds.
+        let config = NatsLeaseConfig {
+            ttl: Duration::from_millis(500),
+            renew_interval: Duration::from_millis(100),
+            replicas: 1,
+            ..Default::default()
+        };
+        let error = acquire_as(false, &js, &config, "age-ttl-invalid", "new-worker")
+            .await
+            .expect_err("a subsecond TTL is rejected by the broker's own rules");
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains("positive whole number of seconds"),
+            "worker-only validation must not fire on the generic path: {rendered}"
+        );
+        assert!(
+            rendered.contains("invalid per-message TTL"),
+            "unexpected error: {rendered}"
+        );
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
+    /// A create whose acknowledgement lands after the TTL it confirmed may
+    /// already have expired: no session work may run under it. The
+    /// acquisition must purge it at its own revision and report the lease
+    /// unavailable, and the next claim must succeed cleanly.
+    #[tokio::test]
+    async fn an_expired_create_acknowledgement_never_protects_work() -> Result<()> {
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let config = fast_age_lease_config();
+
+        slot::set_create_ack_delay_for_test(Duration::from_millis(1500));
+        let lease = acquire_as(true, &js, &config, "age-ack-expired", "new-worker").await?;
+        assert!(
+            lease.is_none(),
+            "an acknowledgement past the TTL must not yield a usable lease"
+        );
+        assert!(
+            !session_has_active_lease(&js, "age-ack-expired").await?,
+            "the expired create must have been purged at its own revision"
+        );
+        slot::clear_create_ack_delay_for_test();
+
+        let lease = acquire_as(true, &js, &config, "age-ack-expired", "new-worker")
+            .await?
+            .expect("a clean claim succeeds after the delayed create was discarded");
+        assert!(lease.is_held());
+        // The confirmation deadline anchors to immediately before the
+        // successful create, so a renewal before it must still be inside
+        // the lease's window: a renewal now commits at a fresh revision.
+        assert!(lease.revalidate_ownership().await?);
+        lease.stop_renewal_for_test().await;
+        drop(lease);
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn acquire_reclaims_lease_from_dead_holder() -> Result<()> {
         let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
@@ -901,7 +1428,7 @@ mod tests {
         // The reclaim leaves a marker, and the lease taken over it still expires.
         let latest = bucket
             .stream
-            .get_last_raw_message_by_subject(&format!("$KV.{}.{}", bucket.name, lease.key()))
+            .get_last_raw_message_by_subject(&kv_subject(&bucket.name, lease.key()))
             .await?;
         assert_eq!(
             latest
@@ -910,6 +1437,78 @@ mod tests {
                 .map(|ttl| ttl.as_str().to_owned()),
             Some(config.ttl.as_secs().to_string())
         );
+        lease.stop_renewal_for_test().await;
+        drop(lease);
+        let _ = nats.kill();
+        let _ = nats.wait();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_acquisition_reclaims_a_dead_holder_on_its_own_key() -> Result<()> {
+        let config = NatsLeaseConfig::default();
+        let (url, mut nats, _store) = crate::nats_worker::tests::spawn_test_nats()
+            .await
+            .context("nats-server required")?;
+        let js = jetstream::new(async_nats::connect(&url).await?);
+        let bucket = ensure_lease_bucket(&js, &config).await?;
+
+        let Some(dead_holder) = dead_holder_on_this_host() else {
+            // Liveness is not provable on this platform or sandbox: reclaim
+            // must stay disabled there.
+            let _ = nats.kill();
+            let _ = nats.wait();
+            return Ok(());
+        };
+        // A live session lock for the same session: a scoped claim must
+        // assess its own key, and a session lock held by someone else must
+        // neither block nor be purged by it. This is the A2A context
+        // takeover shape — a killed replica's scoped lease beside a live
+        // worker's session lock.
+        let live = LeaseRecord::new("live-worker".into(), 1);
+        bucket
+            .create_with_ttl(
+                &config.key_for_session("reclaim-scope"),
+                serde_json::to_vec(&live)?.into(),
+                config.ttl,
+            )
+            .await?;
+        let mut stale = LeaseRecord::new("dead-worker".into(), 1);
+        stale.holder = Some(dead_holder);
+        assert!(
+            holder_is_stale(&stale),
+            "identity should be provably dead on a strong host"
+        );
+        let scope_key = config.key_for_scope("reclaim-scope", "a2a")?;
+        bucket
+            .create_with_ttl(&scope_key, serde_json::to_vec(&stale)?.into(), config.ttl)
+            .await?;
+
+        let reclaims_before = nats_metrics::snapshot().lease_reclaims;
+        let lease = NatsSessionLease::acquire_scoped(
+            NatsLeaseAcquireParams {
+                jetstream: js.clone(),
+                session_id: "reclaim-scope",
+                worker_id: "new-worker".into(),
+                generation: 2,
+                config: config.clone(),
+                session_metadata: None,
+            },
+            "a2a",
+        )
+        .await?
+        .expect("scoped lease acquired despite dead holder");
+        assert_eq!(lease.key(), scope_key);
+        assert!(
+            nats_metrics::snapshot().lease_reclaims > reclaims_before,
+            "scoped reclaim must be counted"
+        );
+        // The live session lock was never the scoped claim's to judge, and
+        // its holder keeps it.
+        let holder = lease_holder_in(&bucket, &config, "reclaim-scope")
+            .await?
+            .expect("session lock still held");
+        assert_eq!(holder.worker_id, "live-worker");
         lease.stop_renewal_for_test().await;
         drop(lease);
         let _ = nats.kill();
@@ -962,10 +1561,9 @@ mod tests {
         let reclaimed = delete_stale_lease_at_revision(
             &slot,
             "reclaim-cas-lost",
-            ObservedLease {
-                revision: observed,
-                record: &stale,
-            },
+            observed,
+            &stale,
+            ReclaimReason::DeadHolder,
         )
         .await?;
         assert!(!reclaimed, "a replaced lease must not be reclaimed");

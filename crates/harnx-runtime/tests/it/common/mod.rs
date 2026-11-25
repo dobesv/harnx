@@ -41,7 +41,9 @@ pub async fn spawn_nats_server_with_options(
 }
 
 /// [`spawn_nats_server`], with `config` loaded as a nats-server configuration
-/// file. The command-line options still win where the two overlap.
+/// file. The command-line options still win where the two overlap, and the
+/// readiness probe authenticates with `options.auth_token` only: auth set in
+/// `config` alone aborts startup before any client connects.
 #[allow(dead_code)]
 pub async fn spawn_configured_nats_server(config: &str) -> Result<Option<NatsServerHandle>> {
     spawn_nats_server_from(SpawnNatsServerOptions::default(), Some(config)).await

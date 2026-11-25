@@ -134,20 +134,12 @@ async fn busy_waiter_slots_do_not_leak_across_finished_sessions() -> Result<()> 
         return Ok(());
     };
     let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let faults = Arc::new(ActivationFaults::default());
-    let worker = spawn_fault_probe_worker(
-        server.url(),
-        FaultWorkerSpec {
-            worker_id: "busy-slot-leak-worker",
-            call_fn: counting_stub_call_fn(Arc::clone(&calls)),
-            probe: Arc::clone(&probe),
-            faults: Arc::clone(&faults),
-            per_session_capacity: None,
-        },
-    )
-    .await?;
+    let ProbedWorker {
+        calls,
+        probe,
+        faults: _faults,
+        worker,
+    } = ProbedWorker::spawn(server.url(), "busy-slot-leak-worker", None).await?;
 
     for index in 0..3 {
         let session_id = format!("busy-slot-leak-{index}");
@@ -192,21 +184,13 @@ async fn busy_waiter_total_capacity_overflows_across_distinct_sessions() -> Resu
         return Ok(());
     };
     let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let faults = Arc::new(ActivationFaults::default());
     // Per-session capacity one: the worker total is 1 × MAX_CONCURRENT_ADMISSIONS (8).
-    let worker = spawn_fault_probe_worker(
-        server.url(),
-        FaultWorkerSpec {
-            worker_id: "busy-total-overflow-worker",
-            call_fn: counting_stub_call_fn(Arc::clone(&calls)),
-            probe: Arc::clone(&probe),
-            faults: Arc::clone(&faults),
-            per_session_capacity: Some(1),
-        },
-    )
-    .await?;
+    let ProbedWorker {
+        calls,
+        probe,
+        faults: _faults,
+        worker,
+    } = ProbedWorker::spawn(server.url(), "busy-total-overflow-worker", Some(1)).await?;
 
     let mut foreign_leases = Vec::new();
     for index in 0..9 {
@@ -267,25 +251,17 @@ async fn busy_wait_budget_expiry_wakes_the_waiter_before_a_recheck_interval() ->
     };
     let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "busy-budget-wake";
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe = Arc::new(BusyWaiterProbe::default());
-    let mut daemon = WorkerDaemonConfig::managing("local", "busy-budget-wake-worker")
-        .with_busy_wait_limits_for_test(Duration::from_secs(2), 4)
-        .with_busy_waiter_probe_for_test(Arc::clone(&probe));
-    daemon.lease = NatsLeaseConfig {
-        ttl: Duration::from_secs(30),
-        renew_interval: Duration::from_secs(10),
-        replicas: 1,
-        ..Default::default()
-    };
-    let readiness = harnx_healthz::Readiness::default();
-    let worker = AbortOnDropHandle::new(tokio::spawn(run_worker_daemon(
-        local_nats_runtime_config(server.url()),
-        daemon,
-        Some(counting_stub_call_fn(Arc::clone(&calls))),
-        Some(readiness.clone()),
-    )));
-    wait_until(CI_SAFE_TIMEOUT, move || readiness.is_ready()).await?;
+    // The busy-wait budget is 2s with a 30s recheck interval (the lease
+    // TTL): only the budget can wake the waiter.
+    let ProbedWorker {
+        calls,
+        probe,
+        faults: _faults,
+        worker,
+    } = ProbedWorker::spawn_slow_recheck_tuned(server.url(), "busy-budget-wake-worker", |daemon| {
+        daemon.with_busy_wait_limits_for_test(Duration::from_secs(2), 4)
+    })
+    .await?;
 
     let foreign_lease =
         publish_foreign_busy_activation(&jetstream, session_id, "foreign-holder").await?;

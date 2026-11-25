@@ -1588,8 +1588,14 @@ a different process or a zombie. Anything else — missing identity fields
 (records from older binaries), a different host or pid namespace, a live pid,
 EPERM, or any platform that can't record a strong host identity (macOS and
 Windows never reclaim; Linux needs a readable boot id and pid namespace, and a
-machine id alone never suffices) — keeps the TTL as the only reclaim path.
-Never reclaim a live holder, and never let a frontend wait on a lease (see
+machine id alone never suffices) — keeps the TTL as the only reclaim path for
+generic acquisitions (GC and k8s leader election). Worker activation has a
+second path: a lease still present past three effective TTLs on the broker's
+own clock (`STREAM.INFO` `ts` minus the entry's `created`, never the worker's
+UTC; a present-but-unknown TTL or unusable time evidence disables it and parks
+the holder) is reclaimed by the same revision CAS. See the age-recovery bullets
+in `docs/nats-ha.md` under "Latency contract". Never reclaim a holder that
+keeps renewing within its TTL, and never let a frontend wait on a lease (see
 "Interrupt acceptance").
 
 Every write to a lease key must leave it expiring. A plain `delete` or

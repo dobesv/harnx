@@ -158,47 +158,148 @@ async fn spawn_local_worker(
     Ok(worker)
 }
 
-/// Helper for the fault- and probe-driven busy-waiter tests: a worker whose
-/// busy-waiter registry is observable (`BusyWaiterProbe`) and whose claim
-/// chain carries injectable faults.
-struct FaultWorkerSpec {
-    worker_id: &'static str,
-    call_fn: harnx_runtime::agent_loop::AgentCallFn,
+/// The observable worker fixture every busy-waiter test drives: a counting
+/// stub call_fn, a waiter probe, injectable faults, and the spawned worker,
+/// joined so the Arc wiring is defined once instead of per test.
+struct ProbedWorker {
+    calls: Arc<AtomicUsize>,
     probe: Arc<BusyWaiterProbe>,
     faults: Arc<ActivationFaults>,
-    per_session_capacity: Option<usize>,
+    worker: AbortOnDropHandle<Result<()>>,
 }
 
-async fn spawn_fault_probe_worker(
+/// The observable triplet every busy-waiter fixture is built from.
+fn probe_parts() -> (
+    Arc<AtomicUsize>,
+    Arc<BusyWaiterProbe>,
+    Arc<ActivationFaults>,
+) {
+    (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(BusyWaiterProbe::default()),
+        Arc::new(ActivationFaults::default()),
+    )
+}
+
+/// Spawn the daemon behind a probed fixture and wait for its readiness:
+/// the tail every probed-worker fixture shares.
+async fn spawn_ready_worker(
     server_url: &str,
-    spec: FaultWorkerSpec,
+    daemon: WorkerDaemonConfig,
+    calls: Arc<AtomicUsize>,
 ) -> Result<AbortOnDropHandle<Result<()>>> {
-    let FaultWorkerSpec {
-        worker_id,
-        call_fn,
-        probe,
-        faults,
-        per_session_capacity,
-    } = spec;
-    let mut daemon = WorkerDaemonConfig::managing("local", worker_id);
-    daemon.lease = fast_daemon_lease();
-    let daemon = daemon
-        .with_busy_waiter_probe_for_test(Arc::clone(&probe))
-        .with_activation_faults_for_test(Arc::clone(&faults));
-    let daemon = if let Some(capacity) = per_session_capacity {
-        daemon.with_busy_wait_limits_for_test(Duration::from_secs(6 * 60 * 60), capacity)
-    } else {
-        daemon
-    };
     let readiness = harnx_healthz::Readiness::default();
     let worker = AbortOnDropHandle::new(tokio::spawn(run_worker_daemon(
         local_nats_runtime_config(server_url),
         daemon,
-        Some(call_fn),
+        Some(counting_stub_call_fn(calls)),
         Some(readiness.clone()),
     )));
     wait_until(CI_SAFE_TIMEOUT, move || readiness.is_ready()).await?;
     Ok(worker)
+}
+
+/// Bring up the broker fixture a busy-waiter test needs, skipping the test
+/// when no local broker is running: the spawned broker's handle (its drop
+/// kills the server, so the test must hold it), a JetStream context, and a
+/// probed worker whose id is derived from the session.
+async fn busy_fixture(
+    session_id: &str,
+) -> Result<
+    Option<(
+        crate::common::NatsServerHandle,
+        async_nats::jetstream::Context,
+        ProbedWorker,
+    )>,
+> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(None);
+    };
+    let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let worker = ProbedWorker::spawn(server.url(), &format!("{session_id}-worker"), None).await?;
+    Ok(Some((server, jetstream, worker)))
+}
+
+/// [`busy_fixture`] on a worker whose recheck interval is a full 30s lease
+/// TTL — for tests that must tell a wake apart from a recheck.
+async fn slow_recheck_fixture(
+    session_id: &str,
+) -> Result<
+    Option<(
+        crate::common::NatsServerHandle,
+        async_nats::jetstream::Context,
+        ProbedWorker,
+    )>,
+> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(None);
+    };
+    let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let worker =
+        ProbedWorker::spawn_slow_recheck(server.url(), &format!("{session_id}-worker")).await?;
+    Ok(Some((server, jetstream, worker)))
+}
+
+impl ProbedWorker {
+    /// Spawn a probed, fault-injectable worker against the test server,
+    /// optionally with a per-session busy-waiter capacity override.
+    async fn spawn(
+        server_url: &str,
+        worker_id: &str,
+        per_session_capacity: Option<usize>,
+    ) -> Result<Self> {
+        let (calls, probe, faults) = probe_parts();
+        let mut daemon = WorkerDaemonConfig::managing("local", worker_id)
+            .with_busy_waiter_probe_for_test(Arc::clone(&probe))
+            .with_activation_faults_for_test(Arc::clone(&faults));
+        if let Some(capacity) = per_session_capacity {
+            daemon =
+                daemon.with_busy_wait_limits_for_test(Duration::from_secs(6 * 60 * 60), capacity);
+        }
+        daemon.lease = fast_daemon_lease();
+        let worker = spawn_ready_worker(server_url, daemon, Arc::clone(&calls)).await?;
+        Ok(Self {
+            calls,
+            probe,
+            faults,
+            worker,
+        })
+    }
+
+    /// As [`Self::spawn`], but on a worker whose recheck interval is a full
+    /// 30s lease TTL — for tests that must tell a wake apart from a
+    /// recheck.
+    async fn spawn_slow_recheck(server_url: &str, worker_id: &str) -> Result<Self> {
+        Self::spawn_slow_recheck_tuned(server_url, worker_id, |daemon| daemon).await
+    }
+
+    /// [`Self::spawn_slow_recheck`] with `tune` for per-test busy-wait
+    /// limits and daemon wiring.
+    async fn spawn_slow_recheck_tuned(
+        server_url: &str,
+        worker_id: &str,
+        tune: impl FnOnce(WorkerDaemonConfig) -> WorkerDaemonConfig,
+    ) -> Result<Self> {
+        let (calls, probe, faults) = probe_parts();
+        let mut daemon = tune(
+            WorkerDaemonConfig::managing("local", worker_id)
+                .with_busy_waiter_probe_for_test(Arc::clone(&probe))
+                .with_activation_faults_for_test(Arc::clone(&faults)),
+        );
+        daemon.lease = NatsLeaseConfig {
+            ttl: Duration::from_secs(30),
+            renew_interval: Duration::from_secs(10),
+            replicas: 1,
+            ..Default::default()
+        };
+        let worker = spawn_ready_worker(server_url, daemon, Arc::clone(&calls)).await?;
+        Ok(Self {
+            calls,
+            probe,
+            faults,
+            worker,
+        })
+    }
 }
 
 /// Queue a prompt behind a foreign-held lease and publish its activation, so
@@ -252,3 +353,4 @@ mod capacity;
 mod faults_settlement;
 mod parking_wake;
 mod shutdown;
+mod stale_recovery;

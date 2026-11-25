@@ -17,7 +17,7 @@ const TOKEN: &str = "nats-common-test-token";
 #[path = "registry_ttl/recovery.rs"]
 mod recovery;
 
-struct NatsServerHandle {
+pub(crate) struct NatsServerHandle {
     url: String,
     _store_dir: TempDir,
     _ports_dir: TempDir,
@@ -31,7 +31,7 @@ impl Drop for NatsServerHandle {
     }
 }
 
-async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
+pub(crate) async fn spawn_nats_server() -> Result<Option<NatsServerHandle>> {
     spawn_configured_nats_server(None).await
 }
 
@@ -138,7 +138,7 @@ fn nats_server_binary() -> Option<PathBuf> {
 
 /// Connect to `server` and wrap it as a JetStream context, the way every
 /// test in this file needs its NATS connection.
-async fn test_jetstream(server: &NatsServerHandle) -> Result<jetstream::Context> {
+pub(crate) async fn test_jetstream(server: &NatsServerHandle) -> Result<jetstream::Context> {
     let client = async_nats::ConnectOptions::new()
         .token(TOKEN.to_string())
         .connect(&server.url)
