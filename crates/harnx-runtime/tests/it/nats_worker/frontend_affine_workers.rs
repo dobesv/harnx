@@ -629,6 +629,71 @@ async fn targeted_lease_holder_read_error_settles_without_parking_or_launching()
     Ok(())
 }
 
+/// A lease key holding a live Put that is not a lease record settles exactly
+/// like the injected read error above — a delayed preflight NAK, no parking,
+/// no turn — and never frees the key. Once the corrupt record is purged, the
+/// next redelivery claims cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targeted_malformed_lease_record_settles_without_parking_or_launching() -> Result<()> {
+    let Some(fixture) = TargetedFaultFixture::start("targeted-fault-worker").await? else {
+        return Ok(());
+    };
+    let session_id = "targeted-malformed-lease";
+    let prompt = fixture
+        .seed_prompt(session_id, "run after the corrupt lease clears")
+        .await?;
+    // Garbage where the session's lease record belongs: a live Put the
+    // preflight can read but never decode.
+    let bucket = fixture.jetstream.get_key_value("harnx_leases").await?;
+    let key = format!(
+        "sessions/{}/lock",
+        harnx_core::session_identity::session_key(None, session_id)
+    );
+    bucket
+        .create(&key, b"not a lease record".to_vec().into())
+        .await?;
+    // Capture before publishing: num_redelivered counts messages already in
+    // redelivery state, so the delivered activation can affect a later baseline.
+    let before_redeliveries = fixture.redeliveries().await?;
+    fixture.publish(session_id, prompt).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        0,
+        "a settled delivery must not launch a turn"
+    );
+    assert_eq!(
+        fixture.probe.parked.load(Ordering::SeqCst),
+        0,
+        "a malformed lease must not park a busy waiter"
+    );
+    assert_eq!(
+        fixture.probe.slots.load(Ordering::SeqCst),
+        0,
+        "a malformed lease must not leave a waiter slot"
+    );
+    assert!(
+        fixture.redeliveries().await? > before_redeliveries,
+        "the settled delivery must come back through the broker"
+    );
+    // Once the corrupt record is purged, the next redelivery claims
+    // cleanly: exactly one turn ever runs for this session.
+    bucket.purge(&key).await?;
+    wait_until(CI_SAFE_TIMEOUT, || {
+        fixture.calls.load(Ordering::SeqCst) >= 1
+    })
+    .await?;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.probe.parked.load(Ordering::SeqCst),
+        0,
+        "the recovery claim must not park either"
+    );
+    fixture.worker.abort();
+    let _ = fixture.worker.await;
+    Ok(())
+}
+
 /// A targeted lease-acquisition error (after the preflights passed) must
 /// settle the delivery exactly once: NAK it back and end the claim. Treating
 /// that NAKed delivery as merely busy would park it while JetStream already

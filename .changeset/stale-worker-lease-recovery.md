@@ -1,0 +1,5 @@
+---
+harnx: patch
+---
+
+Worker activation now recovers sessions whose lease remains present past its TTL instead of parking indefinitely: alongside existing immediate CAS reclaim for a holder provably dead on the same host, activation preflight and claim now reclaim any lease whose age on the broker's `STREAM.INFO` clock is strictly past three effective TTLs (`max(claimant_ttl, observed_writer_ttl)`), which covers abandoned leases from foreign hosts and legacy headerless records. Generic lease acquisitions (GC and k8s elections) keep their prior behavior and never sample broker time. A headerless legacy record plans against the 30 s default TTL floor; a present `Nats-TTL` that is zero, `never`, overflowing, or not understood disables age reclaim for that lease; a broker response without usable time (`ts` missing/invalid or a clustered response naming no `cluster.leader`) keeps the holder protected. Worker activation also requires a positive whole-second TTL, anchors its confirmation deadline immediately before the successful create, and discards a create whose acknowledgement arrives after its TTL expires.

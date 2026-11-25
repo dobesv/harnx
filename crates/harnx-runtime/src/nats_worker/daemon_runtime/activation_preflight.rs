@@ -2,6 +2,8 @@
 //! canonical metadata, the right route, and — for a session whose last turn
 //! was interrupted — winding that turn up before anything else may run.
 use super::*;
+use crate::nats_lease::{LeaseAssessment, ReclaimReason};
+use anyhow::Context as _;
 use harnx_core::session::SessionLogEntry;
 use harnx_core::session_reconstruct::TurnStatus;
 
@@ -242,53 +244,52 @@ impl WorkerRuntime {
         delivery: &mut ActivationDelivery,
         activation: &SessionActivate,
     ) -> Result<LeaseHolderCheck> {
-        let holder = if self.activation_faults.as_ref().is_some_and(|faults| {
+        let assessment = if self.activation_faults.as_ref().is_some_and(|faults| {
             faults
                 .fail_targeted_lease_holder_read
                 .load(std::sync::atomic::Ordering::SeqCst)
         }) {
             Err(anyhow::anyhow!("injected lease-holder lookup failure"))
         } else {
-            crate::nats_lease::lease_holder_in(
+            crate::nats_lease::assess_lease(
+                &self.jetstream,
                 &self.lease_bucket,
+                &self.lease.key_for_session(&activation.session_id),
                 &self.lease,
-                &activation.session_id,
+                crate::nats_lease::AcquisitionPolicy::WorkerActivation,
             )
             .await
+            .with_context(|| {
+                format!(
+                    "Failed to read NATS lease for session '{}'",
+                    activation.session_id
+                )
+            })
         };
-        match holder {
-            Ok(Some(holder)) => {
-                if crate::nats_lease::holder_is_stale(&holder) {
-                    // The holder provably died on this host (a SIGKILLed local
-                    // worker, a crashed daemon). Skip the busy path so the
-                    // acquisition CAS reclaims the stale key instead of the
-                    // delivery waiting out the lease TTL; a live holder that
-                    // took over meanwhile wins that CAS and we defer then.
-                    log::info!(
-                        "stale lease holder is dead on this host; proceeding to reclaim: session_id={} holder_worker_id={} holder_pid={} holder_generation={}",
-                        activation.session_id,
-                        holder.worker_id,
-                        holder
-                            .holder
-                            .as_ref()
-                            .map(|identity| identity.pid)
-                            .unwrap_or_default(),
-                        holder.generation
-                    );
-                    return Ok(LeaseHolderCheck::Free);
-                }
-                log::debug!(
-                    "deferring busy activation before session preflight: session_id={} holder_worker_id={} holder_generation={}",
-                    activation.session_id,
-                    holder.worker_id,
-                    holder.generation
-                );
+        match assessment {
+            Ok(LeaseAssessment::NoHolder) => Ok(LeaseHolderCheck::Free),
+            // Preflight is not ownership: it only permits a claim attempt,
+            // whose own create CAS re-observes the key and re-applies the
+            // same policy before any purge.
+            Ok(LeaseAssessment::Reclaimable { record, reason, .. }) => {
+                log_reclaimable_preflight(&activation.session_id, &record, &reason);
+                Ok(LeaseHolderCheck::Free)
+            }
+            Ok(LeaseAssessment::Held { record, age }) => {
+                log_held_preflight(&activation.session_id, &record, &age);
                 metrics::counter!(harnx_metrics::ACTIVATION_CLAIMS_TOTAL, "outcome" => "busy_foreign")
                     .increment(1);
                 Ok(LeaseHolderCheck::Held)
             }
-            Ok(None) => Ok(LeaseHolderCheck::Free),
-            Err(error) => {
+            // A malformed Put is a preflight error, never an absence. It
+            // must use the same settlement as an observation failure.
+            Ok(LeaseAssessment::MalformedPut) | Err(_) => {
+                let error = assessment.err().unwrap_or_else(|| {
+                    anyhow::anyhow!(
+                        "Failed to decode NATS lease record for session '{}'",
+                        activation.session_id
+                    )
+                });
                 log::warn!(
                     "activation lease-holder preflight failed for '{}': {error:#}",
                     activation.session_id
@@ -366,4 +367,56 @@ fn cancel_landed_at(entries: &[(u64, SessionLogEntry)], requested_seq: Option<u6
     entries.iter().any(|(seq, entry)| {
         *seq == requested_seq && matches!(entry, SessionLogEntry::Cancel { .. })
     })
+}
+
+/// Diagnostics for a preflight that frees the delivery for a claim attempt,
+/// per reclaim reason. Age alone is never proof that the holder process
+/// died, and its log must not say so.
+fn log_reclaimable_preflight(
+    session_id: &str,
+    record: &crate::nats_lease::LeaseRecord,
+    reason: &ReclaimReason,
+) {
+    let holder_pid = record
+        .holder
+        .as_ref()
+        .map(|identity| identity.pid)
+        .unwrap_or_default();
+    match reason {
+        ReclaimReason::DeadHolder => log::info!(
+            "stale lease holder is dead on this host; proceeding to reclaim: session_id={session_id} holder_worker_id={} holder_pid={holder_pid} holder_generation={}",
+            record.worker_id,
+            record.generation
+        ),
+        ReclaimReason::BrokerAge { age, effective_ttl } => log::info!(
+            "session lease is old on the broker clock; proceeding to claim reclaim attempt: session_id={session_id} holder_worker_id={} holder_pid={holder_pid} holder_generation={} age_secs={} effective_ttl_secs={}",
+            record.worker_id,
+            record.generation,
+            age.as_secs(),
+            effective_ttl.as_secs()
+        ),
+    }
+}
+
+/// Diagnostics for a preflight that keeps deferring to the holder. An
+/// unusable clock sample keeps the holder protected and parks the delivery
+/// on the existing waiter/recheck path, so it says so loudly.
+fn log_held_preflight(
+    session_id: &str,
+    record: &crate::nats_lease::LeaseRecord,
+    age: &crate::nats_lease::HeldAge,
+) {
+    if matches!(age, crate::nats_lease::HeldAge::UnknownClock) {
+        log::warn!(
+            "broker time unavailable for lease age check; parking busy activation: session_id={session_id} holder_worker_id={} holder_generation={}",
+            record.worker_id,
+            record.generation
+        );
+    } else {
+        log::debug!(
+            "deferring busy activation before session preflight: session_id={session_id} holder_worker_id={} holder_generation={}",
+            record.worker_id,
+            record.generation
+        );
+    }
 }
