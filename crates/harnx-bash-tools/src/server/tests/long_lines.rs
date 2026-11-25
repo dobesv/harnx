@@ -124,6 +124,7 @@ async fn spawn_wait_status_default_and_explicit_byte_budgets_bound_long_lines() 
                 assert_long_line_output(&result, length, budget, 2);
                 let result = server
                     .status_impl(StatusParams {
+                        diff: None,
                         execution_id: execution_id.clone(),
                         head_lines: None,
                         tail_lines: None,

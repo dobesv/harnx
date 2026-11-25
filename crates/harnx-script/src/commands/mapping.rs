@@ -23,6 +23,9 @@ pub struct OutputMapping {
     pub stderr_text: Option<String>,
     /// structuredContent field (string or array of strings) printed on stderr.
     pub stderr: Option<String>,
+    /// structuredContent string field printed on stderr exactly as stored,
+    /// after the notes. For text meant for the reader, such as a diff.
+    pub stderr_after: Option<String>,
     /// structuredContent integer field used as the exit status.
     pub exit_code: Option<String>,
     /// Exit status for a tool error. Default 1.
@@ -126,22 +129,30 @@ fn scalar_text(value: Option<&Value>) -> String {
     }
 }
 
-/// The stderr text as stored, then the notes. The text gets a newline before
-/// the first note only when it lacks one, so text without notes stays exact.
+/// The stderr text as stored, then the notes, then the after-text. Each part
+/// gets a newline before it only when what precedes it lacks one, so text
+/// without notes stays exact.
 fn stderr(tool: &str, mapping: &OutputMapping, structured: &Value) -> String {
-    let text = mapping
-        .stderr_text
-        .as_deref()
-        .and_then(|name| structured.get(name))
+    let text = string_field(structured, mapping.stderr_text.as_deref());
+    let after = string_field(structured, mapping.stderr_after.as_deref());
+    let with_notes = append(text.to_string(), &notes(tool, mapping, structured));
+    append(with_notes, after)
+}
+
+fn string_field<'a>(structured: &'a Value, name: Option<&str>) -> &'a str {
+    name.and_then(|name| structured.get(name))
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    let notes = notes(tool, mapping, structured);
-    let separator = if !text.is_empty() && !text.ends_with('\n') && !notes.is_empty() {
-        "\n"
-    } else {
-        ""
-    };
-    format!("{text}{separator}{notes}")
+        .unwrap_or_default()
+}
+
+/// `tail` after `head`, with a newline between them when both are non-empty
+/// and `head` doesn't end in one.
+fn append(mut head: String, tail: &str) -> String {
+    if !head.is_empty() && !head.ends_with('\n') && !tail.is_empty() {
+        head.push('\n');
+    }
+    head.push_str(tail);
+    head
 }
 
 fn notes(tool: &str, mapping: &OutputMapping, structured: &Value) -> String {

@@ -172,6 +172,13 @@ fn nested_wait_schema_matches_flat_wait_properties() {
     let nested_properties = nested["properties"].as_object().unwrap();
     let mut flat_properties = wait["properties"].as_object().unwrap().clone();
     flat_properties.remove("execution_id").unwrap();
+    // `diff` belongs to the call that waits, not to spawn's inline wait.
+    let diff = flat_properties.remove("diff").unwrap();
+    assert_eq!(
+        diff["enum"],
+        json!(["none", "summary", "files", "full", null])
+    );
+    assert!(spawn["properties"].get("diff").is_some());
     assert_eq!(nested_properties, &flat_properties);
     assert_eq!(nested_properties.len(), 6);
     assert!(!nested_properties.contains_key("execution_id"));

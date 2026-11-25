@@ -148,6 +148,37 @@ fn stderr_text_missing_or_not_a_string_prints_nothing() {
     );
 }
 
+fn stderr_after(structured: Value) -> String {
+    let mapping = OutputMapping {
+        stderr_text: Some("err".into()),
+        stderr_after: Some("diff".into()),
+        ..mapping()
+    };
+    apply("t", &mapping, &result(structured), None)
+        .unwrap()
+        .stderr
+}
+
+#[test]
+fn stderr_after_follows_the_notes() {
+    let structured = json!({"err": "e\n", "notes": ["n"], "diff": "d\n"});
+    assert_eq!(stderr_after(structured), "e\nt: n\nd\n");
+}
+
+#[test]
+fn stderr_after_gets_a_newline_only_when_needed() {
+    let structured = json!({"err": "e", "notes": [], "diff": "d"});
+    assert_eq!(stderr_after(structured), "e\nd");
+    assert_eq!(stderr_after(json!({"diff": "d"})), "d");
+}
+
+#[test]
+fn empty_or_missing_stderr_after_prints_nothing() {
+    assert_eq!(stderr_after(json!({"err": "e"})), "e");
+    assert_eq!(stderr_after(json!({"err": "e", "diff": ""})), "e");
+    assert_eq!(stderr_after(json!({"err": "e", "diff": 5})), "e");
+}
+
 #[test]
 fn json_format_keeps_stderr_text() {
     let structured = json!({"err": "e", "notes": ["n"], "out": "o"});

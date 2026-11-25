@@ -77,7 +77,7 @@ fn required_only(tool: &ToolSpec, flags: &[&str]) -> bool {
         })
 }
 
-fn shell_word(word: &str) -> String {
+pub(super) fn shell_word(word: &str) -> String {
     if word
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))

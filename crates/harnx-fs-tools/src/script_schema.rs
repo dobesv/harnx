@@ -1,7 +1,7 @@
 //! The fields of each mapped tool's script-style result, for `help <tool>`.
 
 use harnx_toolset::output_field;
-use harnx_toolset::ScriptOutput;
+use harnx_toolset::{ScriptOutput, ToolSpec};
 use serde_json::{json, Value};
 
 /// `ls` and `find` print one item per line and report cut-off output as notes.
@@ -12,6 +12,45 @@ pub(crate) fn list_output(stdout: &str, summary: &str) -> ScriptOutput {
         summary: Some(summary.to_string()),
         ..Default::default()
     }
+}
+
+/// `write`, `edit`, `insert` and `re_replace` print the confirmation line and
+/// report the change on stderr.
+fn write_output() -> ScriptOutput {
+    ScriptOutput {
+        stdout: Some("message".to_string()),
+        stderr_after: Some("diff".to_string()),
+        summary: Some("a confirmation line; the change is reported on stderr".to_string()),
+        ..Default::default()
+    }
+}
+
+/// A write tool's spec with its shell form and result fields.
+pub(crate) fn write_tool(spec: ToolSpec) -> ToolSpec {
+    spec.with_script_output(write_output())
+        .with_output_schema(write_schema())
+}
+
+/// `write_attachment` takes no `diff` option, so it always reports a summary.
+pub(crate) fn write_attachment_tool(spec: ToolSpec) -> ToolSpec {
+    spec.with_script_output(write_output())
+        .with_output_schema(schema_with_diff(
+            "a one-line summary of the change; absent when nothing changed or the file is not in a git repository",
+        ))
+}
+
+fn write_schema() -> Value {
+    schema_with_diff("the change at the requested --diff level; absent when nothing changed or the file is not in a git repository")
+}
+
+fn schema_with_diff(diff: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "message": output_field("string", "the confirmation line"),
+            "diff": output_field("string", diff),
+        }
+    })
 }
 
 fn list_of(kind: &str, description: &str) -> Value {
@@ -100,9 +139,14 @@ mod tests {
                 continue;
             };
             let names = property_names(&declared(&spec.name));
-            for named in [&output.stdout, &output.stderr, &output.exit_code]
-                .into_iter()
-                .flatten()
+            for named in [
+                &output.stdout,
+                &output.stderr,
+                &output.stderr_after,
+                &output.exit_code,
+            ]
+            .into_iter()
+            .flatten()
             {
                 assert!(names.contains(named), "{} lacks {named}", spec.name);
             }
@@ -131,21 +175,65 @@ mod tests {
             .collect()
     }
 
+    struct FixedAttachment(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl crate::AttachmentResolver for FixedAttachment {
+        async fn resolve(
+            &self,
+            _url: &str,
+            _max_bytes: usize,
+        ) -> Result<Vec<u8>, crate::AttachmentResolveError> {
+            Ok(self.0.clone())
+        }
+    }
+
     #[tokio::test]
     async fn script_result_fields_match_the_declared_schema() {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         std::fs::write(root_path.join("a.txt"), "one\ntwo\n").unwrap();
+        // In a repository the write tools report a `diff` field too.
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "harnx test"],
+            &["config", "user.email", "harnx@example.com"],
+            &["add", "a.txt"],
+            &["commit", "-q", "-m", "init"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root_path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
         let dir = root_path.to_string_lossy().into_owned();
         let file = root_path.join("a.txt").to_string_lossy().into_owned();
         let mut allowlist = ResolvedAllowlist::new();
-        allowlist.insert_rwx(root_path);
-        let toolset = FsToolset::new(allowlist);
+        allowlist.insert_rwx(root_path.clone());
+        let toolset = FsToolset::new(allowlist)
+            .with_attachment_resolver(std::sync::Arc::new(FixedAttachment(b"bytes\n".to_vec())));
+        let attachment_target = root_path.join("copy.txt").to_string_lossy().into_owned();
         let calls = [
             ("read", json!({"path": file})),
             ("ls", json!({"path": dir})),
             ("find", json!({"pattern": "*.txt", "path": dir})),
             ("grep", json!({"pattern": "one", "path": dir, "context": 1})),
+            ("write", json!({"path": file, "content": "one\n"})),
+            (
+                "write_attachment",
+                json!({"path": attachment_target, "url": format!("cid:media:_temp/abcdef/{}", "a".repeat(64))}),
+            ),
+            (
+                "edit",
+                json!({"path": file, "old_text": "one", "new_text": "1"}),
+            ),
+            ("insert", json!({"path": file, "insert_text": "top\n"})),
+            (
+                "re_replace",
+                json!({"path": file, "pattern": "1", "replacement": "one"}),
+            ),
         ];
         for (tool, args) in calls {
             let allowed = property_names(&declared(tool));

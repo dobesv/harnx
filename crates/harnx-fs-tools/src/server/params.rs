@@ -1,4 +1,5 @@
 // Auto-split from server.rs for cohesion. See server/mod.rs.
+use super::mutation_result::{diff_schema, DIFF_DESCRIPTION};
 use super::*;
 
 #[derive(Debug, Deserialize)]
@@ -24,12 +25,6 @@ pub struct ReadFileParams {
     pub line_numbers: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct WriteFileParams {
-    pub path: String,
-    pub content: String,
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
@@ -48,34 +43,6 @@ pub struct WriteBytesParams {
     pub path: String,
     /// Standard padded base64 of the exact file bytes (at most 100 MiB decoded).
     pub data_base64: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct EditFileParams {
-    pub path: String,
-    pub old_text: String,
-    pub new_text: String,
-    #[serde(default)]
-    pub replace_all: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct InsertParams {
-    pub path: String,
-    #[serde(default)]
-    pub insert_line: Option<usize>,
-    pub insert_text: String,
-    #[serde(default)]
-    pub column: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ReReplaceParams {
-    pub path: String,
-    pub pattern: String,
-    pub replacement: String,
-    #[serde(default)]
-    pub replace_all: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +134,7 @@ impl JsonSchema for WriteFileParams {
                     "Full file content to write (replaces existing content).",
                     content,
                 ),
+                ("diff", DIFF_DESCRIPTION, diff_schema()),
             ],
             &["path", "content"],
         )
@@ -197,6 +165,7 @@ impl JsonSchema for EditFileParams {
                     "If true, replace all occurrences. Default: replace only the first.",
                     replace_all,
                 ),
+                ("diff", DIFF_DESCRIPTION, diff_schema()),
             ],
             &["path", "old_text", "new_text"],
         )
@@ -219,6 +188,7 @@ impl JsonSchema for InsertParams {
                 ("insert_line", "Insert after this line number. 0 = prepend before line 1; N = insert after line N; omit (or use N = total lines) to append to the end of the file.", insert_line),
                 ("insert_text", "Text to insert.", insert_text),
                 ("column", "1-indexed byte offset within the line for mid-line insertion. Default: 1 (start of line).", column),
+                ("diff", DIFF_DESCRIPTION, diff_schema()),
             ],
             &["path", "insert_text"],
         )
@@ -241,6 +211,7 @@ impl JsonSchema for ReReplaceParams {
                 ("pattern", "fancy_regex pattern (supports lookahead/lookbehind). Use $0 for full match, $1/$2 for groups.", pattern),
                 ("replacement", "Replacement string. Use $0/$1/$2 for capture groups.", replacement),
                 ("replace_all", "If true, replace all matches. Default: replace only the first (errors if more than one match).", replace_all),
+                ("diff", DIFF_DESCRIPTION, diff_schema()),
             ],
             &["path", "pattern", "replacement"],
         )
@@ -343,7 +314,7 @@ impl JsonSchema for RollbackParams {
             vec![
                 (
                     "commit_id",
-                    "The harnx snapshot commit SHA shown in a prior tool response diff header.",
+                    "The harnx snapshot commit to restore, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change; the second id, and the 'commit' line of a full diff, are the state after it.",
                     commit_id,
                 ),
                 (

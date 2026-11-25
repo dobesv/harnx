@@ -17,7 +17,7 @@ use harnx_core::safety::{
     GREP_MAX_LINE_LENGTH, LS_SCAN_HARD_LIMIT, READ_MAX_FILE_BYTES, SEARCH_FILE_MAX_BYTES,
     WRITE_MAX_BYTES,
 };
-use harnx_git_history::HistoryManager;
+use harnx_git_history::{DiffLevel, HistoryManager};
 use harnx_tool_allow::{validate_path, validate_write_path, ResolvedAllowlist};
 use harnx_toolset_server::schema::object_schema_with_desc;
 
@@ -45,6 +45,7 @@ mod allowlist_tests;
 mod attachment;
 mod handler;
 mod handlers;
+mod mutation_result;
 mod params;
 mod sandbox_transport;
 pub use sandbox_transport::SANDBOX_HTTP_MAX_REQUEST_BODY_BYTES;
@@ -53,9 +54,11 @@ pub(crate) use sandbox_transport::{location_args, WRITE_BYTES_DESCRIPTION};
 pub(crate) mod tests;
 mod walk;
 mod write;
+mod write_params;
 
 pub use params::*;
 pub(crate) use walk::*;
+pub use write_params::*;
 
 use crate::tool_templates;
 

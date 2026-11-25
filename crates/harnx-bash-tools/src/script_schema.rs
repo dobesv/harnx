@@ -44,6 +44,13 @@ fn finished_fields() -> Vec<(&'static str, Value)> {
             "stderr_log_path",
             output_field("string", "file holding all of stderr"),
         ),
+        (
+            "diff",
+            output_field(
+                "string",
+                "what the command changed in git repositories under its working directory, as the diff option asks; only when something changed",
+            ),
+        ),
     ]
 }
 

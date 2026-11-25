@@ -1,7 +1,19 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
+use super::diff_option::{decision_at, pipeline_level, SnapshotPlan};
 use super::*;
 use crate::tool_template::protocol::TOOL_PROTOCOL_ENV;
 use harnx_toolset_server::content::WithAudience;
+
+/// Says so in the log when a template runs outside the sandbox.
+fn warn_if_unsandboxed(name: &str, registered: &RegisteredToolTemplate) {
+    if registered.sandbox_enabled {
+        return;
+    }
+    log::warn!("tool '{name}' runs UNSANDBOXED (sandbox.enabled=false)");
+    if registered.ignored_grants {
+        log::warn!("tool '{name}' ignores sandbox grants because sandbox.enabled=false");
+    }
+}
 
 impl BashServer {
     // exec
@@ -27,6 +39,7 @@ impl BashServer {
             template_sandbox: None,
             on_user_message: OnUserMessage::Ignore,
             protocol: None,
+            diff: params.diff,
         })
         .await
     }
@@ -61,12 +74,7 @@ impl BashServer {
                 protocol.env_value().to_string(),
             );
         }
-        if !registered.sandbox_enabled {
-            log::warn!("tool '{name}' runs UNSANDBOXED (sandbox.enabled=false)");
-            if registered.ignored_grants {
-                log::warn!("tool '{name}' ignores sandbox grants because sandbox.enabled=false");
-            }
-        }
+        warn_if_unsandboxed(name, registered);
 
         self.exec_pipeline(ExecPipelineParams {
             command: &command,
@@ -92,6 +100,7 @@ impl BashServer {
                 pass_env: &registered.pass_env,
                 no_network: registered.no_network,
             }),
+            diff: None,
         })
         .await
     }
@@ -100,12 +109,16 @@ impl BashServer {
         &self,
         params: ExecPipelineParams<'_>,
     ) -> Result<CallToolResult, ErrorData> {
+        let level = pipeline_level(&params);
         let prepared = self
             .prepare_exec(
                 params.command,
                 params.working_dir,
                 params.extra_env,
-                "before exec",
+                SnapshotPlan {
+                    label: "before exec",
+                    level,
+                },
             )
             .await?;
         let ExecPreparation {
@@ -148,6 +161,7 @@ impl BashServer {
             stderr_log_path: &stderr_log_path,
             before_snaps: &before_snaps,
             snapshot_decision: &snapshot_decision,
+            level,
         };
         if params.protocol.is_none() && crate::toolset::invocation_wants_structured_result() {
             return Ok(self.script_exec_result(&params, outcome, finish).await);
@@ -165,13 +179,19 @@ impl BashServer {
         finish: ExecFinish<'_>,
     ) -> CallToolResult {
         // The snapshot is taken even after a timeout: the command may have
-        // changed files before it was stopped. A script gets no diff of it.
-        if !finish.before_snaps.is_empty() {
-            self.take_snapshots(finish.snapshot_decision, finish.working_dir, "after exec")
-                .await;
-        }
+        // changed files before it was stopped.
+        let changes = self
+            .snapshot_changes(
+                finish.before_snaps,
+                finish.snapshot_decision,
+                finish.working_dir,
+                "after exec",
+            )
+            .await;
+        let (diff, diff_note) = self.script_diff(&changes, finish.level).await;
         let mut ended = script_result::ended(outcome.kind, outcome.status);
         ended.notes.extend(params.line_cap_notes.iter().cloned());
+        ended.notes.extend(diff_note);
         let lines = outcome.stdout_str.lines().count() + outcome.stderr_str.lines().count();
         let bytes = outcome.stdout_str.len() + outcome.stderr_str.len();
         let prefix = match outcome.kind {
@@ -195,6 +215,7 @@ impl BashServer {
                     .then(script_result::read_log_command),
                 log_unfiltered: true,
                 notes: ended.notes,
+                diff,
             },
             format!("{prefix}, {lines} lines, {}", format_size(bytes)),
         )
@@ -247,6 +268,7 @@ impl BashServer {
                 snapshot_decision: finish.snapshot_decision,
             },
             kind,
+            finish.level,
         )
         .await
     }
@@ -262,14 +284,14 @@ impl BashServer {
         let path = validate_write_path(&params.repo_path, &self.inner.allowlist)
             .map_err(invalid_params)?;
 
-        let commit_id = ObjectId::from_hex(params.commit_id.as_bytes())
-            .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
-
         let repo_dir = harnx_git_history::discover::find_repo_for_path(&path).ok_or_else(|| {
             ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
         })?;
         validate_write_path(&repo_dir.to_string_lossy(), &self.inner.allowlist)
             .map_err(invalid_params)?;
+
+        let commit_id = harnx_git_history::resolve_commit_id(&repo_dir, &params.commit_id)
+            .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
 
         let new_commit_id = self
             .inner
@@ -290,7 +312,7 @@ impl BashServer {
         command: &str,
         working_dir: Option<&str>,
         extra_env: Option<&HashMap<String, String>>,
-        snapshot_label: &str,
+        snapshot: SnapshotPlan<'_>,
     ) -> Result<ExecPreparation, ErrorData> {
         if let Some(extra_env) = extra_env {
             Self::validate_extra_env(extra_env)?;
@@ -300,9 +322,12 @@ impl BashServer {
         }
 
         let working_dir = self.resolve_working_dir(working_dir).await?;
-        let snapshot_decision = Self::snapshot_decision_for_command(command, &working_dir);
+        let snapshot_decision = decision_at(
+            snapshot.level,
+            Self::snapshot_decision_for_command(command, &working_dir),
+        );
         let before_snap_ids = self
-            .take_snapshots(&snapshot_decision, &working_dir, snapshot_label)
+            .take_snapshots(&snapshot_decision, &working_dir, snapshot.label)
             .await;
 
         Ok(ExecPreparation {
@@ -349,42 +374,11 @@ impl BashServer {
         }
     }
 
-    pub(crate) async fn diff_snapshots(
-        &self,
-        before: &[(PathBuf, gix::ObjectId)],
-        decision: &SnapshotDecision,
-        working_dir: &Path,
-        label: &str,
-    ) -> Vec<String> {
-        if before.is_empty() {
-            return vec![];
-        }
-
-        let after = self.take_snapshots(decision, working_dir, label).await;
-        let mut diff_parts = Vec::new();
-        for (repo_dir, before_id) in before {
-            if let Some((_, after_id)) = after.iter().find(|(dir, _)| dir == repo_dir) {
-                if before_id != after_id {
-                    match self
-                        .inner
-                        .history
-                        .diff_commits(repo_dir, *before_id, *after_id)
-                        .await
-                    {
-                        Ok(diff) if !diff.is_empty() => diff_parts.push(diff),
-                        Ok(_) => {}
-                        Err(e) => log::warn!("history diff failed: {e}"),
-                    }
-                }
-            }
-        }
-        diff_parts
-    }
-
     pub(crate) async fn build_exec_success_result(
         &self,
         ctx: ExitResultCtx<'_>,
         kind: ExitKind,
+        level: DiffLevel,
     ) -> Result<CallToolResult, ErrorData> {
         let prefix = match kind {
             ExitKind::Interrupted => "stopped_by: new_message".to_owned(),
@@ -397,14 +391,15 @@ impl BashServer {
             ctx.total_lines,
             format_size(ctx.total_bytes)
         );
-        let diff_parts = self
-            .diff_snapshots(
+        let changes = self
+            .snapshot_changes(
                 ctx.before_snaps,
                 ctx.snapshot_decision,
                 ctx.working_dir,
                 "after exec",
             )
             .await;
+        let diff_parts = self.render_changes(&changes, level).await;
         Ok(Self::exit_result_with_diff(ctx, kind, summary, diff_parts))
     }
 
@@ -481,6 +476,7 @@ struct ExecFinish<'a> {
     stderr_log_path: &'a Path,
     before_snaps: &'a [(PathBuf, gix::ObjectId)],
     snapshot_decision: &'a SnapshotDecision,
+    level: DiffLevel,
 }
 
 /// The result's output block with its line and byte totals. A protocol

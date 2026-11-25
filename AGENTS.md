@@ -1244,6 +1244,20 @@ three things a tool declares decide how well it works there.
   (`harnx-mcp-bridge` and `harnx-mcp-remote`'s native mode) as a summary of its
   top-level properties, built by `output_schema_summary`.
 
+  The mapping's `stderr_after` key names a string field printed on stderr
+  exactly as stored, after the notes. It is for text meant for the person
+  reading the report, which must not enter a pipe, such as a change report.
+  The tools that report a history change (`bash_exec`, `bash_spawn`,
+  `bash_wait`, `bash_status`, `fs_write`, `fs_edit`, `fs_insert`,
+  `fs_re_replace`) take `diff` with a `DiffLevel` from `harnx-git-history`
+  (`none`, `summary`, `files`, `full`), default to `summary` in a script and
+  `full` in a direct call, and put the text in a `diff` field mapped there.
+  `harnx-bash-tools` (`server/diff_option.rs`) and `harnx-fs-tools`
+  (`server/mutation_result.rs`) are the references. Command templates take no
+  `diff` and follow the defaults. The two ids on a summary line are the
+  snapshots before and after the change, and the line's command piped into
+  `git apply -R` undoes it.
+
   The request rides on the call context (`ToolCallOrigin::structured_result`,
   set only by the fork the `bash` tool's inner calls use), not on a
   task-local: a
@@ -1320,7 +1334,10 @@ escalates:
   counts them, however often a model repeats the command. A `bash_exec` that
   fails before its command starts (an empty command, an invalid `env` key or an
   unusable `working_dir`) returns the same error each time with no id, and
-  those repeats do count. An agent whose job is polling can turn the guard
+  those repeats do count. The `bash` tool's result also carries the change
+  summary in its stderr section, with fresh snapshot ids, so a repeated script
+  that changes files no longer returns identical results and the guard does
+  not count it. An agent whose job is polling can turn the guard
   off in its front matter.
 - Tests that drive a mock model through repeated tool calls meet the guard
   too: a fifth identical call with an identical result in one turn is

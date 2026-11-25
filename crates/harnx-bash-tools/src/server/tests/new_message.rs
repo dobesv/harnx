@@ -74,6 +74,7 @@ async fn wait_stopped_by_new_message_reports_running_and_keeps_the_process() {
 
     let status = server
         .status_impl(StatusParams {
+            diff: None,
             execution_id: execution_id.clone(),
             head_lines: None,
             tail_lines: None,

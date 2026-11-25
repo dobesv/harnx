@@ -1,4 +1,5 @@
 use super::{internal_error, invalid_params, validate_write_path, FsServer, WriteAttachmentParams};
+use crate::script_result::ResultStyle;
 use crate::AttachmentResolver;
 use harnx_core::{cid_url::CidUrl, safety::WRITE_MAX_BYTES};
 use rmcp::model::{CallToolResult, ErrorData};
@@ -19,6 +20,7 @@ impl FsServer {
     pub(crate) async fn write_attachment_impl(
         &self,
         params: WriteAttachmentParams,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
         validate_write_path(&params.path, &self.allowlist).map_err(invalid_params)?;
         CidUrl::parse(&params.url)
@@ -33,6 +35,6 @@ impl FsServer {
             .resolve(&params.url, WRITE_MAX_BYTES)
             .await
             .map_err(|error| internal_error(error.to_string()))?;
-        self.write_bytes_impl(&params.path, &bytes).await
+        self.write_bytes_at(&params.path, &bytes, None, style).await
     }
 }

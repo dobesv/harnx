@@ -1,18 +1,40 @@
+use super::mutation_result::Report;
 use super::*;
+use crate::script_result::ResultStyle;
 
 impl FsServer {
     pub(crate) async fn write_file_impl(
         &self,
         params: WriteFileParams,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
-        self.write_bytes_impl(&params.path, params.content.as_bytes())
+        self.write_bytes_at(&params.path, params.content.as_bytes(), params.diff, style)
             .await
     }
 
+    /// The write the sandbox transport uses: it always reports the whole diff
+    /// as a model-style result, whoever calls it.
     pub(crate) async fn write_bytes_impl(
         &self,
         requested_path: &str,
         bytes: &[u8],
+    ) -> Result<CallToolResult, ErrorData> {
+        self.write_bytes_at(
+            requested_path,
+            bytes,
+            Some(DiffLevel::Full),
+            ResultStyle::Model,
+        )
+        .await
+    }
+
+    // qual:allow(iosp) — the size check has to run inside the file lock, so the function both decides and calls
+    pub(crate) async fn write_bytes_at(
+        &self,
+        requested_path: &str,
+        bytes: &[u8],
+        diff: Option<DiffLevel>,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
         let path = validate_write_path(requested_path, &self.allowlist).map_err(invalid_params)?;
         let repo_lock = self.repo_lock_for_path(&path);
@@ -28,24 +50,16 @@ impl FsServer {
             ));
         }
 
-        let before_snap = self.snapshot_before(&path, "before write_file").await;
+        let report = Report::new(diff, style);
+        let pending = self.begin_mutation(&path, "write_file", report).await;
         write_file_bytes(&path, requested_path, bytes)?;
 
         let text = std::str::from_utf8(bytes).ok();
-        let diff = if text.is_some() {
-            self.snapshot_after_diff(&path, before_snap, "after write_file")
-                .await
-        } else {
-            self.snapshot_after_binary_write(&path, before_snap).await
-        };
-
-        Ok(Self::mutation_success(
-            write_summary(requested_path, bytes.len(), text),
-            diff,
-        ))
+        let message = write_summary(requested_path, bytes.len(), text);
+        Ok(self.finish_mutation(pending, message, text.is_none()).await)
     }
 
-    async fn snapshot_after_binary_write(
+    pub(super) async fn snapshot_after_binary_write(
         &self,
         path: &Path,
         before: Option<gix::ObjectId>,

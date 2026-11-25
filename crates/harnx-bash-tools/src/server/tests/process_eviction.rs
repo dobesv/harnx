@@ -32,7 +32,7 @@ async fn insert_process(
                 deadline_secs: 86400,
                 exit,
                 control,
-                exit_diff: Arc::default(),
+                exit_changes: Arc::default(),
             },
         )
         .await;
@@ -83,9 +83,9 @@ async fn ttl_evicts_from_supervisor_exit_time_and_releases_cached_diff() {
         .unwrap();
     let at = observed.exited_at.unwrap();
     assert!(at >= before_spawn && at <= Instant::now());
-    entry.exit_diff.set(vec!["cached diff".to_owned()]).unwrap();
+    entry.exit_changes.set(Vec::new()).unwrap();
     let weak_entry = Arc::downgrade(&entry);
-    let weak_diff = Arc::downgrade(&entry.exit_diff);
+    let weak_diff = Arc::downgrade(&entry.exit_changes);
     drop(entry);
 
     let mut spawned = server.inner.spawned.lock().await;
@@ -222,18 +222,52 @@ async fn unrelated_tool_call_evicts_exits_without_removing_logs() {
     assert!(server.inner.spawned.lock().await.entries.is_empty());
 }
 
+fn git_in(directory: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .status()?;
+    anyhow::ensure!(status.success(), "git {args:?} failed");
+    Ok(())
+}
+
+/// A repository where `a.txt` changes between two snapshots taken by the
+/// server, as a finished process would have been paired with.
+// qual:test_helper
+async fn repo_with_one_change(
+    server: &BashServer,
+    directory: &Path,
+) -> anyhow::Result<diff_option::ChangedRepo> {
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.name", "Test User"],
+        &["config", "user.email", "test@example.com"],
+    ] {
+        git_in(directory, args)?;
+    }
+    std::fs::write(directory.join("a.txt"), "before\n")?;
+    git_in(directory, &["add", "."])?;
+    git_in(directory, &["commit", "-q", "-m", "init"])?;
+    let decision = SnapshotDecision::FullSnapshot;
+    let before = server.take_snapshots(&decision, directory, "before").await;
+    std::fs::write(directory.join("a.txt"), "after\n")?;
+    let after = server.take_snapshots(&decision, directory, "after").await;
+    let ((repo, before_id), (_, after_id)) = (before[0].clone(), after[0].clone());
+    Ok((repo, before_id, after_id))
+}
+
 #[tokio::test]
 async fn in_flight_wait_returns_full_result_after_entry_eviction() {
     let directory = TestDir::new();
     let server = server_with_paths(vec![directory.path().to_path_buf()]);
     let exit = insert_process(&server, directory.path(), "exec-waiting").await;
     let entry = server.get_spawned_entry("exec-waiting").await.unwrap();
-    entry
-        .exit_diff
-        .set(vec!["cached exit diff".to_owned()])
+    let change = repo_with_one_change(&server, directory.path())
+        .await
         .unwrap();
+    entry.exit_changes.set(vec![change]).unwrap();
     let weak_entry = Arc::downgrade(&entry);
-    let weak_diff = Arc::downgrade(&entry.exit_diff);
+    let weak_diff = Arc::downgrade(&entry.exit_changes);
     drop(entry);
     let mut wait = Box::pin(server.wait_impl(wait_params("exec-waiting", 5)));
     poll_fn(|cx| {
@@ -258,7 +292,10 @@ async fn in_flight_wait_returns_full_result_after_entry_eviction() {
     assert_eq!(extract_field(&text, "exit_code"), "7");
     assert!(text.contains("completed stdout"));
     assert!(text.contains("completed stderr"));
-    assert!(text.contains("cached exit diff"));
+    assert!(
+        text.contains("-before") && text.contains("+after"),
+        "{text}"
+    );
     assert!(weak_entry.upgrade().is_none());
     assert!(weak_diff.upgrade().is_none());
 }

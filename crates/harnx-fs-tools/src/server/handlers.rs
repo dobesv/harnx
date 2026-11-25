@@ -2,6 +2,7 @@ use base64::Engine;
 use harnx_toolset_server::content::WithAudience;
 
 // Auto-split from server.rs for cohesion. See server/mod.rs.
+use super::mutation_result::Report;
 use super::*;
 
 type ReadLinesPage<'a> = (Vec<(usize, &'a str)>, usize, usize);
@@ -114,39 +115,15 @@ impl FsServer {
             .ok()
     }
 
+    #[cfg(test)]
     pub(crate) async fn snapshot_after_diff(
         &self,
         path: &Path,
         before: Option<gix::ObjectId>,
         label: &str,
     ) -> Option<String> {
-        let before = before?;
-        let after = match self.history.snapshot_file(path, label).await {
-            Ok(after) => after,
-            Err(e) => {
-                log::warn!("history after-snapshot failed: {e}");
-                return None;
-            }
-        };
-
-        let Some(repo_dir) = harnx_git_history::discover::find_repo_for_path(path) else {
-            return Some(String::new());
-        };
-
-        Some(
-            self.history
-                .diff_commits(&repo_dir, before, after)
-                .await
-                .unwrap_or_default(),
-        )
-    }
-
-    pub(super) fn mutation_success(message: String, diff: Option<String>) -> CallToolResult {
-        let mut contents = vec![ContentBlock::text(message)];
-        if let Some(diff_content) = diff.filter(|diff| !diff.is_empty()) {
-            contents.push(ContentBlock::text(diff_content));
-        }
-        CallToolResult::success(contents)
+        self.snapshot_after_change(path, before, label, DiffLevel::Full)
+            .await
     }
 
     fn paginate_read_lines<'a>(
@@ -545,6 +522,7 @@ impl FsServer {
     pub(crate) async fn insert_impl(
         &self,
         params: InsertParams,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
         let path = validate_write_path(&params.path, &self.allowlist).map_err(invalid_params)?;
         let repo_lock = self.repo_lock_for_path(&path);
@@ -552,7 +530,9 @@ impl FsServer {
         let file_lock = self.lock_for_path(&path);
         let _file_guard = file_lock.lock().await;
 
-        let before_snap = self.snapshot_before(&path, "before insert").await;
+        let pending = self
+            .begin_mutation(&path, "insert", Report::new(params.diff, style))
+            .await;
 
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -582,23 +562,18 @@ impl FsServer {
         std::fs::write(&path, &new_content)
             .map_err(|err| internal_error(format!("failed to write '{}': {err}", params.path)))?;
 
-        let diff = self
-            .snapshot_after_diff(&path, before_snap, "after insert")
-            .await;
-
-        Ok(Self::mutation_success(
-            format!(
-                "Inserted {} bytes into {}",
-                params.insert_text.len(),
-                params.path
-            ),
-            diff,
-        ))
+        let message = format!(
+            "Inserted {} bytes into {}",
+            params.insert_text.len(),
+            params.path
+        );
+        Ok(self.finish_mutation(pending, message, false).await)
     }
 
     pub(crate) async fn re_replace_impl(
         &self,
         params: ReReplaceParams,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
         let path = validate_write_path(&params.path, &self.allowlist).map_err(invalid_params)?;
         let repo_lock = self.repo_lock_for_path(&path);
@@ -606,7 +581,9 @@ impl FsServer {
         let file_lock = self.lock_for_path(&path);
         let _file_guard = file_lock.lock().await;
 
-        let before_snap = self.snapshot_before(&path, "before re_replace").await;
+        let pending = self
+            .begin_mutation(&path, "re_replace", Report::new(params.diff, style))
+            .await;
 
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -659,19 +636,14 @@ impl FsServer {
         std::fs::write(&path, &new_content)
             .map_err(|err| internal_error(format!("failed to write '{}': {err}", params.path)))?;
 
-        let diff = self
-            .snapshot_after_diff(&path, before_snap, "after re_replace")
-            .await;
-
-        Ok(Self::mutation_success(
-            format!("Replaced {} match(es) in {}", count, params.path),
-            diff,
-        ))
+        let message = format!("Replaced {} match(es) in {}", count, params.path);
+        Ok(self.finish_mutation(pending, message, false).await)
     }
 
     pub(crate) async fn edit_file_impl(
         &self,
         params: EditFileParams,
+        style: ResultStyle,
     ) -> Result<CallToolResult, ErrorData> {
         let path = validate_write_path(&params.path, &self.allowlist).map_err(invalid_params)?;
         let repo_lock = self.repo_lock_for_path(&path);
@@ -679,7 +651,9 @@ impl FsServer {
         let file_lock = self.lock_for_path(&path);
         let _file_guard = file_lock.lock().await;
 
-        let before_snap = self.snapshot_before(&path, "before edit_file").await;
+        let pending = self
+            .begin_mutation(&path, "edit_file", Report::new(params.diff, style))
+            .await;
 
         let content = std::fs::read_to_string(&path)
             .map_err(|err| internal_error(format!("failed to read '{}': {err}", params.path)))?;
@@ -733,19 +707,13 @@ impl FsServer {
         std::fs::write(&path, new_content)
             .map_err(|err| internal_error(format!("failed to write '{}': {err}", params.path)))?;
 
-        let diff = self
-            .snapshot_after_diff(&path, before_snap, "after edit_file")
-            .await;
-
-        Ok(Self::mutation_success(
-            format!(
-                "Edited {} ({} replacement{})",
-                params.path,
-                replacements,
-                if replacements == 1 { "" } else { "s" }
-            ),
-            diff,
-        ))
+        let message = format!(
+            "Edited {} ({} replacement{})",
+            params.path,
+            replacements,
+            if replacements == 1 { "" } else { "s" }
+        );
+        Ok(self.finish_mutation(pending, message, false).await)
     }
 
     fn compile_search(
@@ -1017,17 +985,18 @@ impl FsServer {
         let path =
             validate_write_path(&params.repo_path, &self.allowlist).map_err(invalid_params)?;
 
-        // Validate inputs and resolve the repository root *before* taking the
-        // exclusive repo lock, so invalid requests fail fast without blocking
-        // concurrent edits, and so the lock is keyed on the real repo root.
-        let commit_id = gix::ObjectId::from_hex(params.commit_id.as_bytes())
-            .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
-
+        // Validate inputs and resolve the repository root and the snapshot id
+        // *before* taking the exclusive repo lock, so invalid requests fail
+        // fast without blocking concurrent edits, and so the lock is keyed on
+        // the real repo root.
         let repo_dir = harnx_git_history::discover::find_repo_for_path(&path).ok_or_else(|| {
             ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
         })?;
         validate_write_path(&repo_dir.to_string_lossy(), &self.allowlist)
             .map_err(invalid_params)?;
+
+        let commit_id = harnx_git_history::resolve_commit_id(&repo_dir, &params.commit_id)
+            .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
 
         let repo_lock = self.repo_lock_for_path(&repo_dir);
         let _repo_guard = repo_lock.write().await;

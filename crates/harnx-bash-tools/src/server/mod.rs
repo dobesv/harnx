@@ -6,7 +6,7 @@ use harnx_core::safety::{format_size, sanitize_output_text, truncate_output, Tru
 use fancy_regex::Regex;
 use gix::ObjectId;
 use harnx_git_history::classify::{classify_command, SnapshotDecision};
-use harnx_git_history::HistoryManager;
+use harnx_git_history::{DiffLevel, HistoryManager};
 #[cfg(unix)]
 use harnx_sandbox_common::build_default_sandbox_args;
 use harnx_sandbox_common::SandboxConfig;
@@ -43,6 +43,7 @@ use tokio::sync::{mpsc, watch, Mutex, OnceCell};
 use uuid::Uuid;
 
 mod command;
+mod diff_option;
 mod env;
 mod exec;
 mod exec_log;
@@ -210,9 +211,10 @@ pub(crate) struct SpawnedProcess {
     deadline_secs: u64,
     exit: watch::Receiver<Option<ProcessExit>>,
     control: mpsc::UnboundedSender<ProcessControl>,
-    /// The diff between the before-spawn and after-exit snapshots, taken by
-    /// the first wait that sees the exit and reused by every later one.
-    exit_diff: Arc<OnceCell<Vec<String>>>,
+    /// The repositories that changed between the before-spawn and after-exit
+    /// snapshots, taken by the first wait that sees the exit and reused by
+    /// every later one, so each report renders the same pair at its own level.
+    exit_changes: Arc<OnceCell<Vec<diff_option::ChangedRepo>>>,
 }
 
 struct BashServerInner {

@@ -235,11 +235,11 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             ..Default::default()
         })
         .with_output_schema(script_schema::read_schema()),
-        spec::<WriteFileParams>("write", "Write or create a file, replacing its contents. To copy attachment bytes (including binary), use write_attachment.", false, tool_templates::WRITE_CALL),
-        spec::<WriteAttachmentParams>("write_attachment", "Copy exact bytes from a cid:media: attachment, or rendered Markdown from a cid:plan: URL, to a file. Creates or overwrites destination. No text decoding.", false, tool_templates::WRITE_ATTACHMENT_CALL),
-        spec::<EditFileParams>("edit", "Replace exact text within an existing file.", false, tool_templates::EDIT_CALL),
-        spec::<InsertParams>("insert", "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N; omit insert_line (or set N = total lines) to append to the end of the file. Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.", false, tool_templates::INSERT_CALL),
-        spec::<ReReplaceParams>("re_replace", "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.", false, tool_templates::RE_REPLACE_CALL),
+        script_schema::write_tool(spec::<WriteFileParams>("write", "Write or create a file, replacing its contents. To copy attachment bytes (including binary), use write_attachment.", false, tool_templates::WRITE_CALL)),
+        script_schema::write_attachment_tool(spec::<WriteAttachmentParams>("write_attachment", "Copy exact bytes from a cid:media: attachment, or rendered Markdown from a cid:plan: URL, to a file. Creates or overwrites destination. No text decoding.", false, tool_templates::WRITE_ATTACHMENT_CALL)),
+        script_schema::write_tool(spec::<EditFileParams>("edit", "Replace exact text within an existing file.", false, tool_templates::EDIT_CALL)),
+        script_schema::write_tool(spec::<InsertParams>("insert", "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N; omit insert_line (or set N = total lines) to append to the end of the file. Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.", false, tool_templates::INSERT_CALL)),
+        script_schema::write_tool(spec::<ReReplaceParams>("re_replace", "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.", false, tool_templates::RE_REPLACE_CALL)),
         spec::<ListDirectoryParams>("ls", "List directory contents, optionally recursively. Prefer this tool over running bash ls.", true, tool_templates::LS_CALL)
         .with_script_output(script_schema::list_output("entries", "one entry per line, like ls -1"))
         .with_output_schema(script_schema::ls_schema()),
@@ -257,7 +257,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         spec::<FindFilesParams>("find", "Find files by glob pattern. Prefer this tool over running bash find.", true, tool_templates::FIND_CALL)
         .with_script_output(script_schema::list_output("paths", "one path per line, usable as --path, like find"))
         .with_output_schema(script_schema::find_schema()),
-        spec::<RollbackParams>("rollback_file", "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.", false, tool_templates::ROLLBACK_FILE_CALL),
+        spec::<RollbackParams>("rollback_file", "Restore a repository's tracked files to a harnx history snapshot and move the branch to a new commit. The commit_id is a snapshot id, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change and the second is the state after it; the 'commit' line of a full diff is the state after. A snapshot taken by a file tool holds only the file it wrote, so rolling back to one removes the repository's other tracked files. To undo one change, reverse-apply its diff as the summary line's command shows: pipe it into git apply -R.", false, tool_templates::ROLLBACK_FILE_CALL),
     ]
 }
 
@@ -599,8 +599,12 @@ mod tests {
                 !["read", "ls", "find", "grep"].contains(&spec.name.as_str())
                     && spec.script_output().is_some()
             })
-            .count();
-        assert_eq!(others, 0);
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            others,
+            ["write", "write_attachment", "edit", "insert", "re_replace"]
+        );
     }
 
     #[tokio::test]

@@ -175,6 +175,29 @@ fn help_lists_stderr_text_before_notes() {
 }
 
 #[test]
+fn help_names_the_stderr_after_field() {
+    let mapping = OutputMapping {
+        stderr_text: Some("err".into()),
+        stderr: Some("notes".into()),
+        stderr_after: Some("diff".into()),
+        ..Default::default()
+    };
+    let text = help("t", &schema(), "d", Some(&mapping), None);
+    assert!(
+        text.contains(
+            "  stderr: the `err` field, then notes from `notes`, then the `diff` field\n"
+        ),
+        "{text}"
+    );
+    let only_after = OutputMapping {
+        stderr_after: Some("diff".into()),
+        ..Default::default()
+    };
+    let text = help("t", &schema(), "d", Some(&only_after), None);
+    assert!(text.contains("  stderr: the `diff` field\n"), "{text}");
+}
+
+#[test]
 fn help_leaves_out_output_lines_for_absent_parts() {
     let mapping = OutputMapping {
         stdout: Some("text".into()),

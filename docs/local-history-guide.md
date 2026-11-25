@@ -30,11 +30,36 @@ commit <sha>
     <snapshot label>
 ```
 
-Use SHA from that `commit <sha>` line as rollback target.
+That SHA is the snapshot just after the change.
+
+### Diff levels
+
+`exec`, `spawn`, `wait` and `status` of the bash tools and `write`, `edit`, `insert` and `re_replace` of the file tools take a `diff` option that sets how much of the change they report:
+
+- `none`: no snapshot is taken and nothing is printed, so there is nothing to roll back to. On `wait` and `status` it only prints nothing for that call; the process was or was not snapshotted when it was spawned.
+- `summary`: one line per changed repository.
+- `files`: the summary line, then git's `--stat` lines for up to 50 files.
+- `full`: the diff, headed by the `commit <sha>` line shown above.
+
+A direct tool call defaults to `full`. Inside a `bash` script the default is `summary`, printed on stderr.
+
+A summary line is git's shortstat, then the command that shows the change:
+
+```text
+1 file changed, 1 insertion(+), 1 deletion(-): git -C /work/repo diff eb58d8a2f19a 3fd6fdcc1dcb
+```
+
+The first id is the snapshot before the change and the second is the snapshot just after it. To undo the change, pipe the command into `git apply -R`:
+
+```sh
+git -C /work/repo diff eb58d8a2f19a 3fd6fdcc1dcb | git -C /work/repo apply -R
+```
+
+That touches only the files the change touched and leaves the branch alone.
 
 ## The `rollback_file` Tool
 
-`rollback_file` restores repository to prior harnx history snapshot by creating new reversible commit. Pass `commit_id` from `commit <sha>` line at top of prior tool response diff.
+`rollback_file` restores repository to prior harnx history snapshot by creating new reversible commit. Pass `commit_id` as a full id or a prefix of at least 7 hex digits. The `commit <sha>` line at top of a full diff and the second id on a summary line are the state after that change; the first id on a summary line is the state before it. A snapshot taken by a file tool holds only the file it wrote, so rolling back to one removes the repository's other tracked files. To undo a single change, reverse-apply its diff as described above.
 
 Rollback process:
 1. Capture `before rollback` snapshot of current working tree.

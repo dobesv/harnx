@@ -46,12 +46,16 @@ async fn edit_file_emits_unaudienced_diff_content() {
     }
 
     let result = make_server(dir)
-        .edit_file_impl(EditFileParams {
-            path: path_string(&dir.join("tracked.txt")),
-            old_text: "old value".into(),
-            new_text: "new value".into(),
-            replace_all: None,
-        })
+        .edit_file_impl(
+            EditFileParams {
+                path: path_string(&dir.join("tracked.txt")),
+                old_text: "old value".into(),
+                new_text: "new value".into(),
+                replace_all: None,
+                diff: None,
+            },
+            ResultStyle::Model,
+        )
         .await
         .expect("edit succeeds");
 

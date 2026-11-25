@@ -1243,6 +1243,22 @@ mod tests {
     }
 
     #[test]
+    fn stderr_after_round_trips_and_is_omitted_when_none() {
+        let output = ScriptOutput {
+            stderr_after: Some("diff".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&output).expect("serialize");
+        assert_eq!(value, json!({"stderr_after": "diff"}));
+        let back: ScriptOutput = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back, output);
+        assert_eq!(
+            serde_json::to_value(ScriptOutput::default()).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
     fn script_output_none_when_absent_or_malformed() {
         assert!(tool_spec().script_output().is_none());
         let mut spec = tool_spec();
