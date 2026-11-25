@@ -49,11 +49,13 @@ A summary line is git's shortstat, then the command that shows the change:
 1 file changed, 1 insertion(+), 1 deletion(-): git -C /work/repo diff eb58d8a2f19a 3fd6fdcc1dcb
 ```
 
-The first id is the snapshot before the change and the second is the snapshot just after it. To undo the change, pipe the command into `git apply -R`:
+The first id is the snapshot before the change and the second is the snapshot just after it. To undo the change, add `--binary` to the command and pipe it into `git -C <repo> apply -R`:
 
 ```sh
-git -C /work/repo diff eb58d8a2f19a 3fd6fdcc1dcb | git -C /work/repo apply -R
+git -C /work/repo diff --binary eb58d8a2f19a 3fd6fdcc1dcb | git -C /work/repo apply -R
 ```
+
+`--binary` makes the patch usable for binary files, and `-C` on both sides makes the undo work from any directory. If your git config sets an external diff program or a textconv filter, also pass `--no-ext-diff --no-textconv`, since their output is not a patch.
 
 That touches only the files the change touched and leaves the branch alone.
 

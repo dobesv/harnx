@@ -694,7 +694,7 @@ async fn assert_default_is_a_summary(
     instance_id: &ServerScope,
     tracked: &std::path::Path,
 ) -> Result<()> {
-    let script = format!("fs_write --path {} --content summary", tracked.display());
+    let script = format!("fs_write --path {} --content summary", quoted(tracked));
     let summary = run_bash_script(config, instance_id, &script).await?;
     let (stdout, stderr) = (stdout_block(&summary), stderr_block(&summary));
     assert!(stderr.contains(": git -C "), "{summary}");
@@ -714,7 +714,7 @@ async fn assert_full_diff_goes_to_stderr(
 ) -> Result<()> {
     let script = format!(
         "fs_write --path {} --content full --diff full",
-        tracked.display()
+        quoted(tracked)
     );
     let full = run_bash_script(config, instance_id, &script).await?;
     let (stdout, stderr) = (stdout_block(&full), stderr_block(&full));
@@ -729,17 +729,44 @@ async fn assert_full_diff_goes_to_stderr(
     Ok(())
 }
 
+/// A path as one shell word, so a temp directory with a space in its name
+/// still works.
+fn quoted(path: &std::path::Path) -> String {
+    shell_words::quote(&path.to_string_lossy()).into_owned()
+}
+
+/// The pinned-baseline snapshot, as the `bash` tool description teaches it.
+const SNAPSHOT_BASE: &str = r#"base=$(bash_exec --working-dir "$d" --command 's=$(git stash create); echo ${s:-$(git rev-parse HEAD)}')"#;
+const SHOW_CHANGES: &str =
+    r#"bash_exec --working-dir "$d" --command "git status --short; git diff $base""#;
+
 fn snapshot_recipe_script(repo: &std::path::Path, tracked: &std::path::Path) -> String {
     format!(
-        r#"d={repo}
-base=$(bash_exec --working-dir "$d" --command 'git stash create')
-fs_write --path {tracked} --content changed --diff none
-fs_write --path {fresh} --content brand-new --diff none
-bash_exec --working-dir "$d" --command "git status --short; git diff ${{base:-HEAD}}""#,
-        repo = repo.display(),
-        tracked = tracked.display(),
-        fresh = repo.join("fresh.txt").display(),
+        "d={repo}\n{SNAPSHOT_BASE}\nfs_write --path {tracked} --content changed --diff none\nfs_write --path {fresh} --content brand-new --diff none\n{SHOW_CHANGES}",
+        repo = quoted(repo),
+        tracked = quoted(tracked),
+        fresh = quoted(&repo.join("fresh.txt")),
     )
+}
+
+/// From a clean tree the snapshot is HEAD itself. The recipe commits one
+/// change and leaves another uncommitted, so only a baseline pinned before
+/// the commit shows both.
+fn recipe_with_a_commit_script(repo: &std::path::Path, tracked: &std::path::Path) -> String {
+    format!(
+        "d={repo}\n{SNAPSHOT_BASE}\nfs_write --path {tracked} --content committed --diff none\nbash_exec --working-dir \"$d\" --command 'git commit -q -a -m committed'\nfs_write --path {second} --content uncommitted --diff none\n{SHOW_CHANGES}",
+        repo = quoted(repo),
+        tracked = quoted(tracked),
+        second = quoted(&repo.join("second.txt")),
+    )
+}
+
+fn commit_everything(repo: &std::path::Path) -> Result<()> {
+    for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "settle"]] {
+        let status = Command::new("git").args(&args).current_dir(repo).status()?;
+        anyhow::ensure!(status.success(), "git {args:?} failed");
+    }
+    Ok(())
 }
 
 /// The earlier write left `full` in the tracked file, so a diff against the
@@ -755,7 +782,7 @@ fn assert_recipe_diffs_against_the_snapshot(snapshot: &serde_json::Value) {
 
 /// In a script a file write confirms on stdout and reports the change on
 /// stderr: a one-line summary by default, the diff under `--diff full`.
-/// A snapshot taken first with `git stash create` gives one diff, with the
+/// A snapshot taken first (`git stash create`, or HEAD on a clean tree) gives one diff, with the
 /// new file listed by `git status`, across several changes.
 #[tokio::test(flavor = "multi_thread")]
 async fn script_change_reports_and_snapshot_recipe() -> Result<()> {
@@ -779,7 +806,14 @@ async fn script_change_reports_and_snapshot_recipe() -> Result<()> {
     assert_full_diff_goes_to_stderr(&config, &instance_id, &tracked).await?;
     let recipe = snapshot_recipe_script(repo.path(), &tracked);
     let snapshot = run_bash_script(&config, &instance_id, &recipe).await?;
-    drop(supervisor);
     assert_recipe_diffs_against_the_snapshot(&snapshot);
+
+    commit_everything(repo.path())?;
+    let recipe = recipe_with_a_commit_script(repo.path(), &tracked);
+    let committed = run_bash_script(&config, &instance_id, &recipe).await?;
+    drop(supervisor);
+    let stdout = stdout_block(&committed);
+    assert!(stdout.contains("+committed"), "{committed}");
+    assert!(stdout.contains("second.txt"), "{committed}");
     Ok(())
 }

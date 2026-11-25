@@ -1,6 +1,6 @@
 use crate::{commands::ToolSpec, description::examples};
 
-const REPORT: &str = "- A tool that changes files reports the change on stderr in one line: its size and the git diff command that shows it (pipe that command into git apply -R to undo the change). --diff full prints the diff, --diff files the changed files, --diff none skips the snapshot (nothing to roll back to).";
+const REPORT: &str = "- A tool that changes files reports the change on stderr in one line: its size and the git diff command that shows it (to undo the change, add --binary to that command and pipe it into git -C <repo> apply -R). --diff full prints the diff, --diff files the changed files, --diff none skips the snapshot (nothing to roll back to).";
 
 /// The bullet about change reports, empty unless a listed tool with a shell
 /// form takes a `diff` option. The snapshot recipe needs the agent's own
@@ -27,5 +27,5 @@ fn takes_diff(tool: &ToolSpec) -> bool {
 }
 
 fn snapshot_recipe(exec: &str) -> String {
-    format!(" For one diff across several changes, snapshot first: base=$({exec} --command 'git stash create'), make the changes, then {exec} --command \"git status --short; git diff ${{base:-HEAD}}\" (git status lists new files, which git diff leaves out).")
+    format!(" For one diff across several changes, snapshot first: base=$({exec} --command 's=$(git stash create); echo ${{s:-$(git rev-parse HEAD)}}'), make the changes, then {exec} --command \"git status --short; git diff $base\" (git status lists new files, which git diff leaves out).")
 }
