@@ -123,6 +123,11 @@ name matches zero tests, and a `--stress-count` run over that empty selection
 still reports `20/20 iterations passed` — a false green. Check the
 `Starting N tests across M binaries` line before trusting a filtered run.
 
+Substring and regex matches are spelled `test(~name)` and `test(/regex/)`.
+`~=` and `=~` are not operators for them: the filter matches zero tests and
+exits 0 — the same false green as above, so prefer the regex form unless the
+filter is exact.
+
 CI uses the same selection on pull requests and runs the whole suite on
 `main`. Mergify's merge queue tests its batches as ordinary pull requests, so
 it uses the selection too: a missing edge, or a test only the whole suite
@@ -153,6 +158,15 @@ FD-redirection tests (e.g., `cli_event_sink.rs` `final_usage_is_standalone`)
 use `dup2` to capture stdout/stderr. Under `cargo test`, libtest's own capture
 intercepts writes before `dup2` sees them, yielding empty buffers and misleading
 test failures.
+
+A test that asserts the exact escape bytes crossterm queues into an in-memory
+writer must be `#[cfg(not(windows))]`. On Windows, `queue!` routes a command
+through WinAPI — writing nothing to the writer — whenever
+`is_ansi_code_supported()` is false: always for mouse capture and the kitty
+keyboard flags, and for cursor/terminal commands when the console is not
+VT-enabled, which an in-memory `Vec<u8>` never is. The queued bytes are
+therefore not observable there; keep the decision logic in portable tests
+(see the test module of `crates/harnx-tui/src/terminal.rs`, #2913).
 
 **Do not skip any of these steps or you WILL miss problems**
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
@@ -214,6 +228,14 @@ the findings live at the other locations. Deduplicate the shared shape into a
 helper (the `start_time_server` helper in
 `crates/harnx-runtime/tests/it/bash_script_mode.rs` now serves three e2es), or
 `qual:allow(dry, fragment)` the pre-existing fragment with a written reason.
+
+The error-handling dimension clusters too. A `fn lock(&self) -> MutexGuard`
+helper recovering poison with `.unwrap_or_else(|poisoned| poisoned.into_inner())`,
+paired with `.take()` at the call site, joined fourteen pre-existing
+`lock()`/`take()` recoveries across `harnx-core`, `harnx-runtime` and
+`harnx-serve`, and the gate reported all fifteen findings as added by a change
+touching only `crates/harnx-tui/src/terminal.rs` (#2913). Inlining the recovery
+at each call site keeps the cluster below the threshold.
 
 The logic-plus-calls check (`iosp`) decides which calls go into this workspace
 by name, across all crates and without regard to imports. A new private

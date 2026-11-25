@@ -1,6 +1,6 @@
 use crate::agent_event_sink::install_tui_agent_event_sink;
 use crate::event_source::{CrosstermEventSource, EventSource};
-use crate::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
+use crate::terminal::{cleanup_terminal_state, reenter_terminal_modes, PanicTerminalHookGuard};
 use crate::tool_confirmation::ToolConfirmationReply;
 use crate::types::Tui;
 use crate::types::{
@@ -10,11 +10,8 @@ use crate::types::{
 use anyhow::Result;
 #[cfg(test)]
 use crossterm::event::KeyEvent;
-use crossterm::event::{
-    EnableBracketedPaste, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen};
+use crossterm::event::{Event, KeyEventKind};
+use crossterm::terminal::enable_raw_mode;
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
 use harnx_runtime::config::{
@@ -30,7 +27,7 @@ use ratatui::Terminal;
 use ratatui_textarea::Input as TextInput;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::io::{self, Write};
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -794,7 +791,7 @@ impl Tui {
                     Event::Paste(text) => {
                         self.handle_paste_erased(text).await;
                     }
-                    Event::Resize(_, _) => {}
+                    Event::Resize(_, _) => crate::terminal::invalidate_pre_alternate_cursor(),
                     _ => {}
                 }
             }
@@ -882,16 +879,10 @@ impl Tui {
             Some(Box::new(move || {
                 let _ = enable_raw_mode();
                 let mut stdout = io::stdout();
-                let _ = stdout.execute(EnterAlternateScreen);
-                if supports_keyboard_enhancement().unwrap_or(false) {
-                    let _ = stdout.execute(PushKeyboardEnhancementFlags(
-                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
-                    ));
-                }
-                let _ = stdout.execute(EnableMouseCapture);
-                let _ = stdout.execute(EnableBracketedPaste);
-                let _ = stdout.flush();
+                // Re-enters the alternate screen and re-captures the cursor
+                // first, so final teardown lands below the editor's output
+                // rather than at the stale pre-TUI position (#2913).
+                reenter_terminal_modes(&mut stdout);
                 // Restore terminal status indicator after external editor resumes.
                 // Re-emits last active state (Working/Blocked) bypassing diffing.
                 crate::terminal_status::restore();
