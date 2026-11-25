@@ -222,7 +222,7 @@ fn shell_tool(name: &str, with_diff: bool) -> ToolSpec {
     }
 }
 
-const CHANGE_REPORT: &str = "- A tool that changes files reports the change on stderr in one line: its size and the git diff command that shows it (pipe that command into git apply -R to undo the change). --diff full prints the diff, --diff files the changed files, --diff none skips the snapshot (nothing to roll back to).";
+const CHANGE_REPORT: &str = "- A tool that changes files reports the change on stderr in one line: its size and the git diff command that shows it (to undo the change, add --binary to that command and pipe it into git -C <repo> apply -R). --diff full prints the diff, --diff files the changed files, --diff none skips the snapshot (nothing to roll back to).";
 
 #[test]
 fn change_report_bullet_names_the_agents_own_bash_exec() {
@@ -236,12 +236,13 @@ fn change_report_bullet_names_the_agents_own_bash_exec() {
         "{bullet}"
     );
     assert!(
-        bullet.contains("base=$(shell_bash_exec --command 'git stash create')"),
+        bullet.contains(
+            "base=$(shell_bash_exec --command 's=$(git stash create); echo ${s:-$(git rev-parse HEAD)}')"
+        ),
         "{bullet}"
     );
     assert!(
-        bullet
-            .contains(r#"shell_bash_exec --command "git status --short; git diff ${base:-HEAD}""#),
+        bullet.contains(r#"shell_bash_exec --command "git status --short; git diff $base""#),
         "{bullet}"
     );
     // It sits right after the shell-form bullet and before the tools bullet.

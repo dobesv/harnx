@@ -202,8 +202,9 @@ same CLI flags, output and exit codes as in the `bash` tool's script mode:
   the snapshot ids. The first id is the snapshot before the change and the
   second is the snapshot just after it:
   `1 file changed, 1 insertion(+), 1 deletion(-): git -C /work/repo diff eb58d8a2f19a 3fd6fdcc1dcb`.
-  To undo that change, pipe the line's command into `git apply -R`:
-  `git -C /work/repo diff eb58d8a2f19a 3fd6fdcc1dcb | git -C /work/repo apply -R`.
+  To undo that change, add `--binary` to the line's command and pipe it into
+  `git -C <repo> apply -R`:
+  `git -C /work/repo diff --binary eb58d8a2f19a 3fd6fdcc1dcb | git -C /work/repo apply -R`.
   That touches only the files the change touched and leaves the branch alone.
   `fs_write`, `fs_edit`, `fs_insert` and `fs_re_replace` print a one-line
   confirmation on stdout. `rollback_file` accepts a snapshot id in full or as a
