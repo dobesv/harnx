@@ -351,6 +351,7 @@ impl Server {
             web_base_url: opened.web_base_url,
             user_id: identity.resolved_user_id().map(str::to_string),
             user_principals: identity.stampable_principals(),
+            snapshot_features: crate::transcript_snapshot::SnapshotFeatures::default(),
         };
         crate::ag_ui::ag_ui_run_for_target(
             &self.config,

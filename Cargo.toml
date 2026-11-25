@@ -52,7 +52,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.35.0"
+version = "0.35.1"
 edition = "2021"
 authors = ["sigoden <sigoden@gmail.com>"]
 description = "All-in-one LLM CLI Tool"
@@ -207,13 +207,13 @@ shellexpand = "3.1.0"
 schemars = "1.0"
 ratatui-textarea = "0.9.0"
 ratatui_widget_scrolling = "0.1.0"
-jiff = { version = "0.2.23", features = ["serde"] }
+jiff = { version = "1.0.0", features = ["serde"] }
 # jsonwebtoken 11 panics on encode/decode unless feature unification enables
 # exactly one of its crypto backends (aws_lc_rs or rust_crypto). Keep aws_lc_rs
 # the only backend workspace-wide; if another crate needs jsonwebtoken, don't
 # let it enable the other backend (check: `cargo tree -e features -i jsonwebtoken`),
 # or call `crypto::CryptoProvider::install_default` first.
-jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "12.0.0", features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
 harnx-core = { path = "crates/harnx-core" }
 harnx-credentials = { path = "crates/harnx-credentials" }
@@ -223,7 +223,7 @@ harnx-toolset = { path = "crates/harnx-toolset" }
 syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"], default-features = false }
 arboard = { version = "3.3.0", default-features = false }
 harnx-session = { path = "crates/harnx-session" }
-minijinja = { version = "2.21.0", default-features = false, features = ["builtins", "debug", "serde"] }
+minijinja = { version = "3.0.0", default-features = false, features = ["builtins", "debug", "serde"] }
 mime_guess = "2"
 open = "5"
 harnx-git-history = { path = "crates/harnx-git-history" }
