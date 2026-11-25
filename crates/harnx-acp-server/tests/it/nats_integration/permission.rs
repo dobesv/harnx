@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CancelNotification, PermissionOptionKind, RequestPermissionRequest, SessionId, StopReason,
 };
 use anyhow::{Context, Result};
@@ -76,7 +76,7 @@ fn assert_permission_request(request: &RequestPermissionRequest, session_id: &Se
     );
     assert_eq!(
         request.tool_call.fields.status,
-        Some(acp::schema::v1::ToolCallStatus::Pending)
+        Some(acp::v1::schema::ToolCallStatus::Pending)
     );
     assert_eq!(
         request.tool_call.fields.raw_input,

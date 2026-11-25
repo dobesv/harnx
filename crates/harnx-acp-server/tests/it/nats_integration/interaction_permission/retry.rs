@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::ResumeSessionRequest;
+use agent_client_protocol::v1::schema::ResumeSessionRequest;
 use anyhow::Result;
 use harnx_acp_server::permission::{ALLOW_OPTION_ID, REJECT_OPTION_ID};
 use harnx_core::session::SessionLogEntry;

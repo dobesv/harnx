@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CancelNotification, CloseSessionRequest, CloseSessionResponse, ListSessionsRequest,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
@@ -72,7 +72,7 @@ fn build_agent(agent: Arc<HarnxAgent>) -> impl acp::ConnectTo<acp::Client> {
         agent,
     );
 
-    let builder = acp::Agent.builder().name("harnx-acp-server");
+    let builder = acp::Agent.v1().name("harnx-acp-server");
     let builder = add_request_handler!(builder, async move |r, resp, _| resp
         .respond(a1.initialize(r).await?));
     let builder = add_request_handler!(builder, async move |r, resp, _| resp
@@ -110,7 +110,7 @@ fn build_agent(agent: Arc<HarnxAgent>) -> impl acp::ConnectTo<acp::Client> {
 async fn handle_list_sessions(
     agent: &HarnxAgent,
     request: ListSessionsRequest,
-    responder: acp::Responder<acp::schema::v1::ListSessionsResponse>,
+    responder: acp::v1::Responder<acp::v1::schema::ListSessionsResponse>,
     _cx: AcpConnection,
 ) -> acp::Result<()> {
     responder.respond(agent.list_sessions(request).await?)
@@ -119,7 +119,7 @@ async fn handle_list_sessions(
 async fn handle_new_session(
     agent: &Arc<HarnxAgent>,
     request: NewSessionRequest,
-    responder: acp::Responder<NewSessionResponse>,
+    responder: acp::v1::Responder<NewSessionResponse>,
     cx: AcpConnection,
 ) -> acp::Result<()> {
     agent.set_connection(cx).await;
@@ -137,7 +137,7 @@ async fn handle_new_session(
 async fn handle_load_session(
     agent: &HarnxAgent,
     request: LoadSessionRequest,
-    responder: acp::Responder<LoadSessionResponse>,
+    responder: acp::v1::Responder<LoadSessionResponse>,
     cx: AcpConnection,
 ) -> acp::Result<()> {
     agent.set_connection(cx).await;
@@ -147,7 +147,7 @@ async fn handle_load_session(
 async fn handle_resume_session(
     agent: &HarnxAgent,
     request: ResumeSessionRequest,
-    responder: acp::Responder<ResumeSessionResponse>,
+    responder: acp::v1::Responder<ResumeSessionResponse>,
     cx: AcpConnection,
 ) -> acp::Result<()> {
     agent.set_connection(cx).await;
@@ -157,7 +157,7 @@ async fn handle_resume_session(
 async fn handle_close_session(
     agent: &HarnxAgent,
     request: CloseSessionRequest,
-    responder: acp::Responder<CloseSessionResponse>,
+    responder: acp::v1::Responder<CloseSessionResponse>,
     cx: AcpConnection,
 ) -> acp::Result<()> {
     agent.set_connection(cx).await;
@@ -178,7 +178,7 @@ async fn handle_cancel_notification(
 async fn handle_prompt_request(
     agent: &Arc<HarnxAgent>,
     request: PromptRequest,
-    responder: acp::Responder<PromptResponse>,
+    responder: acp::v1::Responder<PromptResponse>,
     cx: AcpConnection,
 ) -> acp::Result<()> {
     agent.set_connection(cx).await;
@@ -189,7 +189,7 @@ async fn handle_prompt_request(
 fn spawn_prompt_request(
     agent: Arc<HarnxAgent>,
     request: PromptRequest,
-    responder: acp::Responder<PromptResponse>,
+    responder: acp::v1::Responder<PromptResponse>,
 ) {
     // Keep the dispatch loop free to process session/cancel while a turn runs.
     tokio::spawn(async move {

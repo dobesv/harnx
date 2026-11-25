@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::StopReason;
+use agent_client_protocol::v1::schema::StopReason;
 use anyhow::{Context, Result};
 use harnx_core::event::{AgentEvent, SessionEvent, TurnEvent, TurnOutcome};
 use harnx_runtime::AgentCallFn;

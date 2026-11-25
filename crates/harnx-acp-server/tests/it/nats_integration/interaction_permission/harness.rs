@@ -1,7 +1,7 @@
 //! Real JetStream log, lease and T2.2 acceptance; only the control transport is a test responder.
 use std::{sync::Arc, time::Duration};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     PermissionOptionId, RequestPermissionOutcome, RequestPermissionRequest,
     SelectedPermissionOutcome, SessionId,
 };

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::ListSessionsRequest;
+use agent_client_protocol::v1::schema::ListSessionsRequest;
 use anyhow::{Context, Result};
 use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
 use harnx_core::session::SessionLogEntry;

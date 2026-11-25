@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     LoadSessionRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification,
 };
@@ -34,7 +34,7 @@ pub(crate) enum PermissionReply {
 }
 
 pub(crate) struct TestClient {
-    pub(crate) connection: acp::ConnectionTo<acp::Agent>,
+    pub(crate) connection: acp::v1::ConnectionTo<acp::Agent>,
     pub(crate) notifications: mpsc::UnboundedReceiver<SessionNotification>,
     pub(crate) permissions: mpsc::UnboundedReceiver<RequestPermissionRequest>,
     pub(crate) permission_responses: mpsc::UnboundedSender<RequestPermissionOutcome>,
@@ -60,7 +60,7 @@ fn spawn_test_agent_transport(
     let task = tokio::spawn(async move {
         let handler_agent = Arc::clone(&agent);
         let _ = acp::Agent
-            .builder()
+            .v1()
             .on_receive_request_from(
                 acp::Client,
                 async move |request: LoadSessionRequest, responder, connection| {
@@ -86,7 +86,7 @@ fn spawn_test_client_transport(
     responses: mpsc::UnboundedReceiver<RequestPermissionOutcome>,
 ) -> (
     tokio::task::JoinHandle<()>,
-    oneshot::Receiver<acp::ConnectionTo<acp::Agent>>,
+    oneshot::Receiver<acp::v1::ConnectionTo<acp::Agent>>,
     mpsc::UnboundedReceiver<SessionNotification>,
     mpsc::UnboundedReceiver<RequestPermissionRequest>,
 ) {
@@ -98,7 +98,7 @@ fn spawn_test_client_transport(
     let (connection_tx, connection_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = acp::Client
-            .builder()
+            .v1()
             .on_receive_notification_from(
                 acp::Agent,
                 async move |notification: SessionNotification, _connection| {

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{CancelNotification, StopReason};
+use agent_client_protocol::v1::schema::{CancelNotification, StopReason};
 use anyhow::{Context, Result};
 use harnx_runtime::AgentCallFn;
 use tokio::sync::Semaphore;

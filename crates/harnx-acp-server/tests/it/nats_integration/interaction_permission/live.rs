@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::schema::v1::{CancelNotification, StopReason};
+use agent_client_protocol::v1::schema::{CancelNotification, StopReason};
 use anyhow::{Context, Result};
 use harnx_core::{instance::ServerScope, session::SessionLogEntry, tool::ToolCall};
 use harnx_runtime::{config::GlobalConfig, nats_session_log::NatsSessionLog, AgentCallFn};
@@ -182,7 +182,7 @@ async fn round_trip(
             PermissionReply::Allow => super::harness::selected("allow"),
             PermissionReply::Reject => super::harness::selected("reject"),
             PermissionReply::Cancelled => {
-                agent_client_protocol::schema::v1::RequestPermissionOutcome::Cancelled
+                agent_client_protocol::v1::schema::RequestPermissionOutcome::Cancelled
             }
             _ => unreachable!(),
         };

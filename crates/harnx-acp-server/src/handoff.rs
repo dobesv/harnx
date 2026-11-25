@@ -4,7 +4,7 @@
 //! therefore becomes user-visible text, while the source ACP session stops
 //! accepting prompts.
 
-use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
+use agent_client_protocol::v1::schema::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 use harnx_core::agent_ref::AgentRef;
 use harnx_core::event::{AgentEvent, SessionEvent};
 
