@@ -25,9 +25,9 @@
       "automerge": false
     },
     {
-      "description": "determinator 0.12 (xtask) takes guppy 0.17's PackageGraph; a newer guppy breaks the build until determinator moves",
+      "description": "determinator 0.13 (xtask) takes guppy 0.19's PackageGraph; a newer guppy breaks the build until determinator moves",
       "matchPackageNames": ["guppy"],
-      "allowedVersions": "<0.18"
+      "allowedVersions": "<0.20"
     },
     {
       "description": "The pinned A2A TCK locks rpds-py 0.30.0, which has no Python 3.15 wheel and builds with PyO3 0.27 (max 3.14). Raise this when the TCK pin moves to a lockfile that installs on 3.15",
