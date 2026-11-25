@@ -462,7 +462,10 @@ the schema honest with a test that builds a real script-style result and checks
 its keys against the schema. A third-party MCP tool needs no mapping for this:
 `harnx-mcp-bridge` and `harnx-mcp-remote`'s native mode store a summary of its
 `outputSchema` (the top-level fields only: type and first description line) in
-the same key unless the server already set one.
+the same key unless the server already set one. A field's type is its own
+`type`, else the type a local `$ref` (such as `#/$defs/Id`) points at, else the
+member types of an `anyOf` or `oneOf`; a field whose type can't be read that
+way is listed as `any`.
 
 ## Generated `bash` description
 

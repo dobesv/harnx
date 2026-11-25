@@ -30,7 +30,7 @@ pub fn output_schema_summary(schema: &Value) -> Option<Value> {
     let kept: serde_json::Map<String, Value> = properties
         .iter()
         .take(SUMMARY_MAX_PROPERTIES)
-        .map(|(name, property)| (name.clone(), summarize_property(property)))
+        .map(|(name, property)| (name.clone(), summarize_property(property, schema)))
         .collect();
     if kept.is_empty() {
         return None;
@@ -41,50 +41,85 @@ pub fn output_schema_summary(schema: &Value) -> Option<Value> {
 const SUMMARY_MAX_PROPERTIES: usize = 100;
 const SUMMARY_MAX_DESCRIPTION_CHARS: usize = 200;
 
-fn summarize_property(property: &Value) -> Value {
+fn summarize_property(property: &Value, root: &Value) -> Value {
+    let kind = declared_type(property, root, 0);
+    let item = item_type(property, root);
+    summary_entry(kind, item, first_description_line(property))
+}
+
+fn item_type(property: &Value, root: &Value) -> Option<Value> {
+    declared_type(property.get("items")?, root, 0)
+}
+
+/// The first line of the description that has text, cut to the summary's limit.
+fn first_description_line(property: &Value) -> Option<String> {
+    let text = property.get("description")?.as_str()?;
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    Some(line.chars().take(SUMMARY_MAX_DESCRIPTION_CHARS).collect())
+}
+
+/// One summarized property. `items` is kept only for an array.
+fn summary_entry(kind: Option<Value>, item: Option<Value>, description: Option<String>) -> Value {
     let mut out = serde_json::Map::new();
-    let kind = declared_type(property);
-    if let Some(kind) = &kind {
-        out.insert("type".to_string(), kind.clone());
+    let is_array = kind.as_ref().and_then(Value::as_str) == Some("array");
+    if let Some(kind) = kind {
+        out.insert("type".to_string(), kind);
     }
-    if kind.as_ref().and_then(Value::as_str) == Some("array") {
-        if let Some(item) = property.get("items").and_then(declared_type) {
-            out.insert("items".to_string(), serde_json::json!({ "type": item }));
-        }
+    if let Some(item) = item.filter(|_| is_array) {
+        out.insert("items".to_string(), serde_json::json!({ "type": item }));
     }
-    if let Some(line) = property
-        .get("description")
-        .and_then(Value::as_str)
-        .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
-    {
-        let cut: String = line.chars().take(SUMMARY_MAX_DESCRIPTION_CHARS).collect();
-        out.insert("description".to_string(), Value::String(cut));
+    if let Some(description) = description {
+        out.insert("description".to_string(), Value::String(description));
     }
     Value::Object(out)
 }
 
-/// A property's own `type`, else the member types of an `anyOf` or `oneOf`
-/// (how pydantic and schemars write an optional value), else `object` for a
-/// `$ref`.
-fn declared_type(property: &Value) -> Option<Value> {
+/// How many `$ref` and union steps a type lookup follows before giving up, so
+/// a schema that refers to itself cannot loop.
+const TYPE_LOOKUP_MAX_DEPTH: usize = 8;
+
+/// A property's own `type`, else the type of the local `$ref` it points at,
+/// else the member types of an `anyOf` or `oneOf` (how pydantic and schemars
+/// write an optional value). A reference that cannot be followed has no type:
+/// it may name a string as easily as an object.
+// qual:allow(iosp) — a recursive walk: each step decides and then descends.
+fn declared_type(property: &Value, root: &Value, depth: usize) -> Option<Value> {
     if let Some(kind) = property.get("type") {
         return Some(kind.clone());
     }
-    for key in ["anyOf", "oneOf"] {
-        if let Some(members) = property.get(key).and_then(Value::as_array) {
-            let mut kinds: Vec<Value> = Vec::new();
-            for kind in members.iter().filter_map(|m| m.get("type")?.as_str()) {
-                let kind = Value::String(kind.to_string());
-                if !kinds.contains(&kind) {
-                    kinds.push(kind);
-                }
+    if depth >= TYPE_LOOKUP_MAX_DEPTH {
+        return None;
+    }
+    if let Some(target) = local_ref(property, root) {
+        return declared_type(target, root, depth + 1);
+    }
+    let members = ["anyOf", "oneOf"]
+        .iter()
+        .find_map(|key| property.get(*key)?.as_array())?;
+    let mut kinds: Vec<Value> = Vec::new();
+    for member in members {
+        for kind in type_names(declared_type(member, root, depth + 1)) {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
             }
-            return (!kinds.is_empty()).then_some(Value::Array(kinds));
         }
     }
-    property
-        .get("$ref")
-        .map(|_| Value::String("object".to_string()))
+    (!kinds.is_empty()).then_some(Value::Array(kinds))
+}
+
+/// The schema a `$ref` into this same document names, such as `#/$defs/Id`.
+fn local_ref<'a>(property: &Value, root: &'a Value) -> Option<&'a Value> {
+    let pointer = property.get("$ref")?.as_str()?.strip_prefix('#')?;
+    root.pointer(pointer)
+}
+
+/// The type names in a `type` value, which is one name or a list of them.
+fn type_names(kind: Option<Value>) -> Vec<Value> {
+    match kind {
+        Some(Value::Array(names)) => names.into_iter().filter(Value::is_string).collect(),
+        Some(name @ Value::String(_)) => vec![name],
+        _ => Vec::new(),
+    }
 }
 
 impl ToolSpec {
@@ -185,11 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn summary_types_for_any_of_and_ref() {
+    fn summary_types_for_unions() {
         let schema = json!({"properties": {
             "maybe": {"anyOf": [{"type": "string"}, {"type": "null"}, {"type": "string"}]},
             "one": {"oneOf": [{"type": "integer"}, {"type": "null"}]},
-            "linked": {"$ref": "#/$defs/x"},
+            "either": {"anyOf": [{"type": ["string", "integer"]}, {"type": "null"}]},
             "bare": {},
             "list": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
         }});
@@ -197,12 +232,67 @@ mod tests {
         let props = &summary["properties"];
         assert_eq!(props["maybe"], json!({"type": ["string", "null"]}));
         assert_eq!(props["one"], json!({"type": ["integer", "null"]}));
-        assert_eq!(props["linked"], json!({"type": "object"}));
+        assert_eq!(
+            props["either"],
+            json!({"type": ["string", "integer", "null"]})
+        );
         assert_eq!(props["bare"], json!({}));
         assert_eq!(
             props["list"],
             json!({"type": "array", "items": {"type": ["string", "null"]}})
         );
+    }
+
+    #[test]
+    fn summary_follows_a_local_ref_to_its_type() {
+        let schema = json!({
+            "$defs": {
+                "Id": {"type": "string"},
+                "Thing": {"type": "object", "properties": {"a": {"type": "string"}}},
+                "Alias": {"$ref": "#/$defs/Id"},
+                "Loop": {"$ref": "#/$defs/Loop"},
+            },
+            "properties": {
+                "id": {"$ref": "#/$defs/Id", "description": "the id"},
+                "thing": {"$ref": "#/$defs/Thing"},
+                "alias": {"$ref": "#/$defs/Alias"},
+                "maybe_thing": {"anyOf": [{"$ref": "#/$defs/Thing"}, {"type": "null"}]},
+                "ids": {"type": "array", "items": {"$ref": "#/$defs/Id"}},
+                "missing": {"$ref": "#/$defs/Nowhere"},
+                "remote": {"$ref": "https://example.com/schema.json"},
+                "looping": {"$ref": "#/$defs/Loop"},
+            }
+        });
+        let summary = output_schema_summary(&schema).expect("summary");
+        let props = &summary["properties"];
+        assert_eq!(
+            props["id"],
+            json!({"type": "string", "description": "the id"})
+        );
+        assert_eq!(props["thing"], json!({"type": "object"}));
+        assert_eq!(props["alias"], json!({"type": "string"}));
+        assert_eq!(props["maybe_thing"], json!({"type": ["object", "null"]}));
+        assert_eq!(
+            props["ids"],
+            json!({"type": "array", "items": {"type": "string"}})
+        );
+        assert_eq!(props["missing"], json!({}));
+        assert_eq!(props["remote"], json!({}));
+        assert_eq!(props["looping"], json!({}));
+    }
+
+    #[test]
+    fn summary_of_a_summary_is_the_same() {
+        let schema = json!({
+            "$defs": {"Id": {"type": "string"}},
+            "properties": {
+                "id": {"$ref": "#/$defs/Id", "description": "the id\nmore"},
+                "maybe": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            }
+        });
+        let once = output_schema_summary(&schema).expect("summary");
+        assert_eq!(output_schema_summary(&once), Some(once.clone()));
     }
 
     #[test]

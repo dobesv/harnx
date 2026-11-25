@@ -521,20 +521,23 @@ impl NatsToolProvider {
     }
     /// Script-facing declarations by agent-visible tool name. Each declaration
     /// resolves to its own route, so a raw-name alias never becomes a key. A
-    /// tool that declares neither a mapping nor a schema has no entry.
+    /// tool that declares neither a mapping nor a schema with properties has
+    /// no entry. The schema is handed on as its summary, so `help` reads one
+    /// plain type per field however the tool wrote it (`anyOf`, `$ref`).
     pub(crate) fn script_shapes(&self) -> std::collections::BTreeMap<String, crate::ScriptShape> {
         self.declarations
             .iter()
             .filter_map(|declaration| {
                 let route = self.resolve_route(&declaration.name)?;
-                if route.script_output.is_none() && route.output_schema.is_none() {
-                    return None;
-                }
                 let shape = crate::ScriptShape {
                     output: route.script_output,
-                    output_schema: route.output_schema,
+                    output_schema: route
+                        .output_schema
+                        .as_ref()
+                        .and_then(harnx_toolset::output_schema_summary),
                 };
-                Some((declaration.name.clone(), shape))
+                let declared = shape.output.is_some() || shape.output_schema.is_some();
+                declared.then(|| (declaration.name.clone(), shape))
             })
             .collect()
     }
@@ -1663,7 +1666,20 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("nats-server required"))?;
         let client = async_nats::connect(broker.url()).await?;
         let mut provider = make_test_provider(&client).await;
-        let schema = json!({"type": "object", "properties": {"count": {"type": "integer"}}});
+        let schema = json!({
+            "type": "object",
+            "$defs": {"Id": {"type": "string"}},
+            "properties": {
+                "count": {"type": "integer", "minimum": 0},
+                "maybe": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "id": {"$ref": "#/$defs/Id"},
+            }
+        });
+        let summary = json!({"type": "object", "properties": {
+            "count": {"type": "integer"},
+            "maybe": {"type": ["string", "null"]},
+            "id": {"type": "string"},
+        }});
         let spec = |name: &str| ToolSpec {
             cancellation_guarantee: Default::default(),
             name: name.to_string(),
@@ -1677,8 +1693,9 @@ mod tests {
         let registrations = vec![global_registration(
             "fs",
             vec![
-                spec("counted").with_output_schema(schema.clone()),
+                spec("counted").with_output_schema(schema),
                 spec("plain"),
+                spec("empty").with_output_schema(json!({"type": "object"})),
             ],
         )];
         (provider.tools, provider.declarations) = build_registered_tools(
@@ -1690,7 +1707,7 @@ mod tests {
         let shapes = provider.script_shapes();
         assert_eq!(shapes.keys().collect::<Vec<_>>(), ["fs_counted"]);
         assert!(shapes["fs_counted"].output.is_none());
-        assert_eq!(shapes["fs_counted"].output_schema.as_ref(), Some(&schema));
+        assert_eq!(shapes["fs_counted"].output_schema.as_ref(), Some(&summary));
         Ok(())
     }
 

@@ -22,7 +22,7 @@ pub(crate) fn read_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "text": output_field("string", "the lines read, newline-terminated"),
+            "text": output_field("string", "the selected file text"),
             "notes": list_of("string", "what was cut off and how to continue"),
             "path": output_field("string", "the file that was read"),
             "total_lines": output_field("integer", "lines in the whole file"),
