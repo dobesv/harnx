@@ -3,13 +3,15 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use futures::stream::BoxStream;
 use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use rmcp::{
     model::ClientJsonRpcMessage,
-    transport::streamable_http_client::{
-        SseError, StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpError,
-        StreamableHttpPostResponse,
+    transport::{
+        common::client_side_sse::BoxedSseResponse,
+        streamable_http_client::{
+            StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpError,
+            StreamableHttpPostResponse,
+        },
     },
 };
 use tracing::instrument::WithSubscriber;
@@ -18,7 +20,8 @@ use super::pool::UpstreamAuth;
 
 type Headers = HashMap<HeaderName, HeaderValue>;
 type HttpResult<T> = Result<T, StreamableHttpError<SafeHttpError>>;
-type Events = BoxStream<'static, Result<sse_stream::Sse, SseError>>;
+// rmcp names the stream type, so its `sse-stream` version stays rmcp's to pick.
+type Events = BoxedSseResponse;
 
 // rmcp 3.8 keeps its 16 MiB default private. Explicit transport limits still win.
 const DEFAULT_MAX_SSE_EVENT_SIZE: usize = 16 * 1024 * 1024;
