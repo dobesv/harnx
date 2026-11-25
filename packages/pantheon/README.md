@@ -66,7 +66,7 @@ for retention priorities, research sources, and evaluation guidance.
 Install from GHCR (replace `v0.1.0` with the current release):
 
 ```sh
-harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.4.22
+harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.4.23
 ```
 
 Use a harnx build containing the model and client updates accompanying this package refresh.
