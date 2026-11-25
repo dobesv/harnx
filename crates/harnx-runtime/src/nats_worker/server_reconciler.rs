@@ -37,6 +37,10 @@ enum Slot {
     Running {
         users: HashSet<String>,
         idle_since: Option<Instant>,
+        /// Turns `true` once the session that claimed this entry first has
+        /// started the process. If that start fails or is abandoned, the
+        /// sender is dropped instead; either way, waiters stop waiting.
+        started: watch::Receiver<bool>,
     },
     /// `sweep` has begun tearing this name down and is awaiting
     /// `ServerLauncher::stop` outside the lock. Nothing may turn this back
@@ -55,6 +59,36 @@ enum Slot {
     /// entry `sweep` was about to delete out from under it — ending up with
     /// no server and no error.
     Stopping { done: watch::Receiver<()> },
+}
+
+/// What [`ServerReconciler::claim_users`] registered: the servers this
+/// session must start itself, and those another session is still starting,
+/// which [`ServerReconciler::start_claimed`] waits for instead.
+#[derive(Default)]
+pub struct Claimed {
+    to_start: Vec<(ToolServerConfig, watch::Sender<bool>)>,
+    starting: Vec<(String, watch::Receiver<bool>)>,
+}
+
+impl Claimed {
+    pub fn is_empty(&self) -> bool {
+        self.to_start.is_empty() && self.starting.is_empty()
+    }
+
+    /// The servers this session must start, then those it waits for.
+    pub fn names(&self) -> Vec<&str> {
+        self.to_start
+            .iter()
+            .map(|(server, _)| server.name.as_str())
+            .chain(self.starting.iter().map(|(name, _)| name.as_str()))
+            .collect()
+    }
+}
+
+enum Claim {
+    Start(Box<ToolServerConfig>, watch::Sender<bool>),
+    Wait(String, watch::Receiver<bool>),
+    Ready,
 }
 
 /// Reference-counts tool servers by [`ToolServerConfig::name`] across the
@@ -86,13 +120,14 @@ impl ServerReconciler {
     /// which times out and detaches `start_claimed` into the background but
     /// must not do that to `claim_users` — can call them separately instead.
     pub async fn session_started(&self, session_id: &str, servers: Vec<ToolServerConfig>) {
-        let to_start = self.claim_users(session_id, servers).await;
-        self.start_claimed(to_start).await;
+        let claimed = self.claim_users(session_id, servers).await;
+        self.start_claimed(claimed).await;
     }
 
     /// Register `session_id` as a user of each of `servers`, returning the
     /// subset that actually need starting (first user of a fresh entry, or
-    /// waited out a teardown and must start fresh).
+    /// waited out a teardown and must start fresh) and the subset another
+    /// session is still starting.
     ///
     /// Always run this to completion before any call to [`Self::session_ended`]
     /// for the same `session_id` — once it returns, `session_ended` is
@@ -102,31 +137,34 @@ impl ServerReconciler {
     /// background and times out on it can lose the race: `session_ended`
     /// runs first, sees nothing to release, and the registration that lands
     /// afterward pins the server as a "user" that will never end.
-    pub async fn claim_users(
-        &self,
-        session_id: &str,
-        servers: Vec<ToolServerConfig>,
-    ) -> Vec<ToolServerConfig> {
+    pub async fn claim_users(&self, session_id: &str, servers: Vec<ToolServerConfig>) -> Claimed {
         // Claim each name concurrently, not one at a time: a name that is
         // mid-teardown can make `claim_or_wait` wait a while, and that must
         // not delay a different server this same session also asked for.
         let claims = servers
             .into_iter()
             .map(|server| self.claim_or_wait(session_id, server));
-        futures_util::future::join_all(claims)
-            .await
-            .into_iter()
-            .flatten()
-            .collect()
+        let mut claimed = Claimed::default();
+        for claim in futures_util::future::join_all(claims).await {
+            match claim {
+                Claim::Start(server, started) => claimed.to_start.push((*server, started)),
+                Claim::Wait(name, started) => claimed.starting.push((name, started)),
+                Claim::Ready => {}
+            }
+        }
+        claimed
     }
 
-    /// Start every server [`Self::claim_users`] said needs it, then sweep.
+    /// Start every server [`Self::claim_users`] said needs it, wait for those
+    /// another session is still starting, then sweep. Without that wait, a
+    /// session that joins a server mid-start goes on to discover tools before
+    /// the server has registered any, and sees none of them.
     ///
     /// Safe to time out or abandon into the background: the only effect of
     /// skipping this is that `to_start`'s servers stay unregistered for this
     /// activation (degraded tools, not a correctness bug), because the user
     /// registration this depends on already landed in `claim_users`.
-    pub async fn start_claimed(&self, to_start: Vec<ToolServerConfig>) {
+    pub async fn start_claimed(&self, claimed: Claimed) {
         // Never hold `state` across a launcher await: starting a process and
         // waiting on its registration can take seconds, and holding the lock
         // here would serialize every session activation behind whichever
@@ -136,44 +174,58 @@ impl ServerReconciler {
         // sum each server's own startup timeout (three servers, one missing a
         // binary, is 3x that timeout), which the caller must fit inside the
         // activation's own ack window.
+        let Claimed { to_start, starting } = claimed;
         let starts = to_start
             .into_iter()
-            .map(|server| self.start_or_forget(server));
-        futures_util::future::join_all(starts).await;
+            .map(|(server, started)| self.start_or_forget(server, started));
+        let waits = starting.into_iter().map(|(_, mut started)| async move {
+            // An error means the start failed or was abandoned: stop waiting.
+            let _ = started.wait_for(|started| *started).await;
+        });
+        futures_util::future::join(
+            futures_util::future::join_all(starts),
+            futures_util::future::join_all(waits),
+        )
+        .await;
         self.sweep().await;
     }
 
     /// Register `session_id` as a user of `server`, first waiting out any
-    /// teardown already in flight for the same name. Returns `Some(server)`
+    /// teardown already in flight for the same name. Returns `Claim::Start`
     /// exactly when this call must start it itself: either it is the first
     /// user of a freshly inserted entry, or the entry it waited on finished
     /// tearing down, in which case it is now gone and needs a fresh start
     /// same as a first user would. Either way the caller starts it outside
-    /// the lock.
-    async fn claim_or_wait(
-        &self,
-        session_id: &str,
-        server: ToolServerConfig,
-    ) -> Option<ToolServerConfig> {
+    /// the lock. `Claim::Wait` means another session is still starting it.
+    async fn claim_or_wait(&self, session_id: &str, server: ToolServerConfig) -> Claim {
         loop {
             let mut waiter = {
                 let mut state = self.state.lock().await;
                 match state.get_mut(&server.name) {
-                    Some(Slot::Running { users, idle_since }) => {
+                    Some(Slot::Running {
+                        users,
+                        idle_since,
+                        started,
+                    }) => {
                         users.insert(session_id.to_string());
                         *idle_since = None;
-                        return None;
+                        if *started.borrow() {
+                            return Claim::Ready;
+                        }
+                        return Claim::Wait(server.name, started.clone());
                     }
                     Some(Slot::Stopping { done }) => done.clone(),
                     None => {
+                        let (started_tx, started) = watch::channel(false);
                         state.insert(
                             server.name.clone(),
                             Slot::Running {
                                 users: HashSet::from([session_id.to_string()]),
                                 idle_since: None,
+                                started,
                             },
                         );
-                        return Some(server);
+                        return Claim::Start(Box::new(server), started_tx);
                     }
                 }
             };
@@ -198,10 +250,15 @@ impl ServerReconciler {
     /// it come back; only a later activation will. The old worker-wide retry
     /// loop this replaced covered that case, at the cost of retrying forever
     /// in the background for a server no active session wanted.
-    async fn start_or_forget(&self, server: ToolServerConfig) {
-        if let Err(error) = self.launcher.start(&server).await {
-            log::warn!("tool server '{}' unavailable: {error:#}", server.name);
-            self.state.lock().await.remove(&server.name);
+    async fn start_or_forget(&self, server: ToolServerConfig, started: watch::Sender<bool>) {
+        match self.launcher.start(&server).await {
+            Ok(()) => {
+                started.send_replace(true);
+            }
+            Err(error) => {
+                log::warn!("tool server '{}' unavailable: {error:#}", server.name);
+                self.state.lock().await.remove(&server.name);
+            }
         }
     }
 
@@ -220,7 +277,10 @@ impl ServerReconciler {
     pub(super) async fn release_users(&self, session_id: &str) {
         let mut state = self.state.lock().await;
         for slot in state.values_mut() {
-            if let Slot::Running { users, idle_since } = slot {
+            if let Slot::Running {
+                users, idle_since, ..
+            } = slot
+            {
                 if users.remove(session_id) && users.is_empty() {
                     *idle_since = Some(Instant::now());
                 }

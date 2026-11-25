@@ -148,7 +148,7 @@ fn harness_with_post_hook(
         base_providers: vec![Arc::new(FakeTool { value, fail })],
         slot: Some(slot.clone()),
         payload_limit: None,
-        script_outputs: Default::default(),
+        script_shapes: Default::default(),
         full_payload: true,
     })
     .with_attachment_fetcher(fetcher)

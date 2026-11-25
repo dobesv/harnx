@@ -701,10 +701,15 @@ async fn connect_and_assert_http_clients(
             ProtocolVersion::V_2025_11_25
         );
     }
-    let (one_names, two_names) = tokio::join!(
-        catalog(&one, &["fs_read", "reviewer_session_prompt"]),
-        catalog(&two, &["fs_read", "reviewer_session_prompt"])
-    );
+    // Each tool server registers on its own schedule, so wait until both
+    // clients see one tool from every server before comparing the catalogs.
+    let every_server = [
+        "fs_read",
+        "attachments_attachment_create",
+        "reviewer_session_prompt",
+    ];
+    let (one_names, two_names) =
+        tokio::join!(catalog(&one, &every_server), catalog(&two, &every_server));
     assert_eq!(one_names?, two_names?);
     Ok((one, two))
 }
@@ -828,6 +833,7 @@ async fn stdio_package_cli_same_and_cross_package_names_are_callable() -> Result
             "other__crossfs_read",
             "reviewer_session_prompt",
             "other__reviewer_session_prompt",
+            "attachments_attachment_create",
         ],
     )
     .await?;

@@ -1,7 +1,7 @@
 //! ACP initialization and session creation fixture.
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::v1::{InitializeRequest, NewSessionRequest, SessionId};
+use agent_client_protocol::v1::schema::{InitializeRequest, NewSessionRequest, SessionId};
 use anyhow::Result;
 
 pub(crate) async fn initialize_and_create_session(

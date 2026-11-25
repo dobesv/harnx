@@ -1,5 +1,6 @@
 mod attachment_resolver;
 mod script_result;
+mod script_schema;
 mod script_search;
 mod server;
 mod summary;

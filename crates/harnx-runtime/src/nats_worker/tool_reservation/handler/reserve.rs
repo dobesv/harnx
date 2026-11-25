@@ -1,5 +1,6 @@
 //! Bounded reservation setup, claim acquisition, and startup publication.
 use super::*;
+use crate::nats_worker::server_reconciler::Claimed;
 
 impl Handler {
     pub(super) async fn reserve(&self, message: async_nats::Message) {
@@ -64,11 +65,7 @@ impl Handler {
         .await;
     }
 
-    async fn validate_and_claim(
-        &self,
-        id: &str,
-        request: &Reserve,
-    ) -> Result<Vec<crate::config::ToolServerConfig>> {
+    async fn validate_and_claim(&self, id: &str, request: &Reserve) -> Result<Claimed> {
         ensure!(
             request.protocol_version == TOOL_RESERVATION_PROTOCOL_VERSION,
             "unsupported tool reservation protocol version"
@@ -98,7 +95,7 @@ impl Handler {
         Ok(match &self.reconciler {
             Some(reconciler) => reconciler.claim_users(&user_token(id), servers).await,
             // Unmanaged workers return their configured scope without launching.
-            None => Vec::new(),
+            None => Claimed::default(),
         })
     }
 
@@ -107,7 +104,7 @@ impl Handler {
         id: &str,
         request: &Reserve,
         message: &async_nats::Message,
-    ) -> Option<Vec<crate::config::ToolServerConfig>> {
+    ) -> Option<Claimed> {
         let result = tokio::time::timeout(
             SESSION_TOOL_SERVER_START_TIMEOUT,
             self.validate_and_claim(id, request),

@@ -24,7 +24,7 @@ impl BashHarness {
                 base_providers: vec![inner.clone()],
                 slot: Some(slot.clone()),
                 payload_limit: None,
-                script_outputs: Default::default(),
+                script_shapes: Default::default(),
                 full_payload: true,
             },
         ));

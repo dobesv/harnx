@@ -174,6 +174,7 @@ async fn generated_attachment_idiom_roundtrips_png_through_native_toolset() {
         let commands = tool_commands(
             vec![ToolSpec {
                 output: None,
+                output_schema: None,
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 schema: tool.parameters.as_value().clone(),

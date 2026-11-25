@@ -41,9 +41,9 @@ pub struct ScriptToolProvider {
     backend: BashKitBackend,
     attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
-    /// Output mappings declared by tool servers, by agent-visible tool name.
-    /// Only Bash bodies read them; see `inner_run`.
-    script_outputs: BTreeMap<String, harnx_toolset::ScriptOutput>,
+    /// Script-facing declarations of tool servers, by agent-visible tool
+    /// name. Only Bash bodies read them; see `inner_run`.
+    script_shapes: BTreeMap<String, crate::ScriptShape>,
 }
 
 /// Inputs resolved before a round's evaluation context exists.
@@ -57,8 +57,8 @@ pub(crate) struct ScriptToolProviderConfig {
     pub payload_limit: Option<PayloadLimit>,
     pub attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     pub media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
-    /// Output mappings declared by tool servers, by agent-visible tool name.
-    pub script_outputs: BTreeMap<String, harnx_toolset::ScriptOutput>,
+    /// Script-facing declarations of tool servers, by agent-visible tool name.
+    pub script_shapes: BTreeMap<String, crate::ScriptShape>,
 }
 
 pub(super) struct ScriptToolInvocation<'a> {
@@ -100,7 +100,7 @@ impl ScriptToolProvider {
             payload_limit,
             attachment_fetcher,
             media_store,
-            script_outputs,
+            script_shapes,
         } = config;
         Self {
             tools: tools
@@ -114,7 +114,7 @@ impl ScriptToolProvider {
             backend: BashKitBackend,
             attachment_fetcher,
             media_store,
-            script_outputs,
+            script_shapes,
         }
     }
 
@@ -141,9 +141,14 @@ impl ScriptToolProvider {
                 // The run asks for structured results, so a tool's declared
                 // output mapping decides what its command prints.
                 output: self
-                    .script_outputs
+                    .script_shapes
                     .get(&declaration.name)
+                    .and_then(|shape| shape.output.as_ref())
                     .and_then(crate::bash_provider::output_mapping),
+                output_schema: self
+                    .script_shapes
+                    .get(&declaration.name)
+                    .and_then(|shape| shape.output_schema.clone()),
             })
             .collect();
         let mut commands = tool_commands(specs, adapter).map_err(|error| {

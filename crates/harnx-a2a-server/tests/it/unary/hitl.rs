@@ -66,7 +66,17 @@ async fn approve(task_id: bool) -> Result<()> {
     assert_approve_record_and_log(&http, &task, &original).await?;
     let duplicate = http.rpc("SendMessage", json!({"message": reply})).await?;
     assert_eq!(duplicate["result"]["task"]["id"], task["id"], "{duplicate}");
-    assert_eq!(http.h.llm.requests.lock().len(), 1);
+    // Count only the runner's requests: the approved handoff starts the
+    // target agent, whose own request can land at any moment from here on.
+    let runner_requests = http
+        .h
+        .llm
+        .requests
+        .lock()
+        .iter()
+        .filter(|request| request["messages"][0]["content"] == "Test runner agent")
+        .count();
+    assert_eq!(runner_requests, 1);
     Ok(())
 }
 

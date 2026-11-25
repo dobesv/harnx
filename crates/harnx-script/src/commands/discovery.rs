@@ -116,6 +116,7 @@ impl Discovery {
                     &tool.schema,
                     &tool.description,
                     tool.output.as_ref(),
+                    tool.output_schema.as_ref(),
                 )
             }),
         }

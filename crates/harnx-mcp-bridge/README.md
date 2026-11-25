@@ -102,6 +102,12 @@ value into `ToolSpec.timeout_secs` for its NATS registration.
 - Malformed values are ignored (backstop retained), not treated as `0`.
 - Direct stdio clients that ignore unknown `_meta` keys are unaffected.
 
+A wrapped tool's `outputSchema` is summarized into `harnx:output_schema`
+(`harnx_toolset::OUTPUT_SCHEMA_META_KEY`): the top-level properties only, each
+with its type and the first line of its description, so `help <tool>` in a
+`bash` script can list the result fields. A server that sets that key itself
+keeps its value.
+
 ## Result Limits and Original Attachments
 
 Every result is limited to **131,072 bytes (128 KiB)** of compact serialized `CallToolResult`

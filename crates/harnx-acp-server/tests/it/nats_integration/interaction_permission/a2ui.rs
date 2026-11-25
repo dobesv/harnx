@@ -1,6 +1,6 @@
 //! ACP answers general `a2ui` interactions through the shared text fallback.
 
-use agent_client_protocol::schema::v1::{PermissionOptionKind, ToolCallContent};
+use agent_client_protocol::v1::schema::{PermissionOptionKind, ToolCallContent};
 use anyhow::Result;
 use harnx_acp_server::permission::{A2UI_ACTION_OPTION_PREFIX, REJECT_OPTION_ID};
 use harnx_core::session::SessionLogEntry;
@@ -17,7 +17,7 @@ fn deploy_option() -> String {
 fn content_text(content: &ToolCallContent) -> Option<String> {
     match content {
         ToolCallContent::Content(content) => match &content.content {
-            agent_client_protocol::schema::v1::ContentBlock::Text(text) => Some(text.text.clone()),
+            agent_client_protocol::v1::schema::ContentBlock::Text(text) => Some(text.text.clone()),
             _ => None,
         },
         _ => None,

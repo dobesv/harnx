@@ -1,3 +1,4 @@
+mod script_schema;
 pub mod server;
 mod tool_template;
 mod tool_templates;

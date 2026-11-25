@@ -225,9 +225,9 @@ fn build_harness_with(
     extra: Vec<Arc<dyn ToolProvider>>,
     fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     full_payload: bool,
-    (declarations, script_outputs): (
+    (declarations, script_shapes): (
         Vec<harnx_core::tool::ToolDeclaration>,
-        std::collections::BTreeMap<String, harnx_toolset::ScriptOutput>,
+        std::collections::BTreeMap<String, crate::ScriptShape>,
     ),
 ) -> Harness {
     let slot = Arc::new(BashEvalContextSlot::default());
@@ -238,7 +238,7 @@ fn build_harness_with(
             base_providers: vec![inner.clone()],
             slot: Some(slot.clone()),
             payload_limit: None,
-            script_outputs,
+            script_shapes,
             full_payload,
         })
         .with_attachment_fetcher(fetcher),
@@ -573,7 +573,7 @@ async fn missing_slot_fails_closed() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
-        script_outputs: Default::default(),
+        script_shapes: Default::default(),
         full_payload: false,
     });
     let abort = create_abort_signal();
@@ -592,7 +592,7 @@ async fn inactive_provider_does_not_claim_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
-        script_outputs: Default::default(),
+        script_shapes: Default::default(),
         full_payload: false,
     });
     assert!(!bash.has_tool(BASH_TOOL_NAME));
@@ -638,7 +638,7 @@ async fn replay_reports_interrupted_for_bash_only() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
-        script_outputs: Default::default(),
+        script_shapes: Default::default(),
         full_payload: false,
     });
     let abort = create_abort_signal();
@@ -711,7 +711,7 @@ async fn inactive_provider_replay_falls_through_for_bash() {
         base_providers: vec![],
         slot: None,
         payload_limit: None,
-        script_outputs: Default::default(),
+        script_shapes: Default::default(),
         full_payload: false,
     });
     let abort = create_abort_signal();
@@ -826,7 +826,7 @@ async fn command_scoped_catalog_stays_active_and_fails_closed_without_tools() {
         base_providers: Vec::new(),
         slot: Some(slot.clone()),
         payload_limit: None,
-        script_outputs: Default::default(),
+        script_shapes: Default::default(),
         full_payload: false,
     }));
     assert!(bash.has_tool(BASH_TOOL_NAME));
@@ -917,9 +917,12 @@ async fn mapped_tool_prints_idiomatic_output() {
     });
     let outputs = std::collections::BTreeMap::from([(
         "faketool".to_string(),
-        harnx_toolset::ScriptOutput {
-            stdout: Some("text".into()),
-            stderr: Some("notes".into()),
+        crate::ScriptShape {
+            output: Some(harnx_toolset::ScriptOutput {
+                stdout: Some("text".into()),
+                stderr: Some("notes".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         },
     )]);
@@ -973,4 +976,30 @@ fn script_output_converts_with_every_field() {
         summary,
     };
     assert_eq!(super::output_mapping(&output), Some(expected));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn help_lists_the_declared_result_fields() {
+    let outputs = std::collections::BTreeMap::from([(
+        "faketool".to_string(),
+        crate::ScriptShape {
+            output: None,
+            output_schema: Some(json!({
+                "type": "object",
+                "properties": {"line_count": {"type": "integer", "description": "lines seen"}},
+            })),
+        },
+    )]);
+    let (bash, _slot, _ctx) = build_harness_with(
+        FakeProvider::new(),
+        Vec::new(),
+        None,
+        true,
+        (faketool_declarations(), outputs),
+    );
+    let abort = create_abort_signal();
+    let payload = ok(run(&bash, "help faketool", &abort).await).value;
+    let stdout = payload["stdout"].as_str().unwrap_or_default();
+    assert!(stdout.contains("FIELDS (-o json)"), "{payload}");
+    assert!(stdout.contains("line_count"), "{payload}");
 }

@@ -20,7 +20,7 @@
 //! All blocks are joined in the order they appear in the request. If any block is
 //! unsupported, the entire conversion fails immediately without partial output.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock, EmbeddedResource, EmbeddedResourceResource, ResourceLink, TextContent,
     TextResourceContents,
 };
@@ -78,7 +78,7 @@ impl std::error::Error for PromptContentError {}
 /// * `Err(PromptContentError::Empty)` - If the request has no blocks or all blocks yield whitespace.
 /// * `Err(PromptContentError::*)` - If any block is unsupported.
 pub fn parse_prompt_content(
-    request: &agent_client_protocol::schema::v1::PromptRequest,
+    request: &agent_client_protocol::v1::schema::PromptRequest,
 ) -> Result<String, PromptContentError> {
     if request.prompt.is_empty() {
         return Err(PromptContentError::Empty);
@@ -174,7 +174,7 @@ fn convert_resource_link(link: &ResourceLink) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         AudioContent, BlobResourceContents, ImageContent, PromptRequest, SessionId,
     };
 

@@ -8,7 +8,7 @@ mod live;
 #[path = "interaction_permission/retry.rs"]
 mod retry;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CancelNotification, CloseSessionRequest, LoadSessionRequest, PermissionOptionKind,
     RequestPermissionOutcome, ResumeSessionRequest,
 };

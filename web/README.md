@@ -139,11 +139,17 @@ Single-binary embedding via `rust-embed` (embedding the `web/dist` assets into t
 
 ### Compaction snapshots during streaming
 
-`patches/@assistant-ui__react-ag-ui@0.0.63.patch` fixes the pinned adapter's
+`patches/@assistant-ui__react-ag-ui@0.1.11.patch` fixes the pinned adapter's
 snapshot handling. A snapshot between tool rounds must discard the accumulator's
-completed parts and anchor the next reply on the new transcript head. Open text,
-reasoning and pending tool state stay live. Status-only events after a snapshot
-don't create an empty assistant row.
+completed parts (`RunAggregator.checkpointSnapshot`) and anchor the next reply
+on the new transcript head. Open text, reasoning and pending tool state stay
+live. Status-only events after a snapshot don't create an empty assistant row.
+The snapshot such a checkpoint imports replaces earlier reasoning and activity
+parts instead of merging them back in, so a `history_reasoning: {}` clears
+stale reasoning.
+
+The adapter notifies listeners of streamed content from a zero-delay timer, so
+a test that reads thread state right after an event waits a timer tick first.
 
 Keep the source and distributed JavaScript changes in sync when updating this
 patch. `ChatProviderCompactionStreaming.test.tsx` uses the real runtime and must

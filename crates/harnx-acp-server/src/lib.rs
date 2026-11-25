@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
     CloseSessionRequest, CloseSessionResponse, Implementation, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
@@ -60,7 +60,7 @@ use session_context::BeginTurnError;
 pub use session_context::{SessionContext, SESSION_IDLE_TTL};
 
 /// Connection to ACP client for sending notifications and permission requests.
-pub type AcpConnection = acp::ConnectionTo<acp::Client>;
+pub type AcpConnection = acp::v1::ConnectionTo<acp::Client>;
 
 /// Metadata key marking an ACP content chunk as a harnx model error.
 pub const HARNX_ERROR_META: &str = "harnx:error";
@@ -869,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn authenticate_responds_ok() {
         let agent = test_agent();
-        let method_id = agent_client_protocol::schema::v1::AuthMethodId::new("agent".to_string());
+        let method_id = agent_client_protocol::v1::schema::AuthMethodId::new("agent".to_string());
         let request = AuthenticateRequest::new(method_id);
 
         let response = agent.authenticate(request).await.unwrap();
@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn parse_prompt_content_extracts_text() {
-        use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
+        use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
         let text_content = TextContent::new("hello world".to_string());
         let request = PromptRequest::new(
             SessionId::new("test".to_string()),

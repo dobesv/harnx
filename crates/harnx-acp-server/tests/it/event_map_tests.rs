@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock as AcpContentBlock, SessionUpdate, ToolCallContent, ToolCallStatus,
     ToolCallUpdate, ToolKind as AcpToolKind,
 };

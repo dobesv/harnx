@@ -215,6 +215,16 @@ helper (the `start_time_server` helper in
 `crates/harnx-runtime/tests/it/bash_script_mode.rs` now serves three e2es), or
 `qual:allow(dry, fragment)` the pre-existing fragment with a written reason.
 
+The logic-plus-calls check (`iosp`) decides which calls go into this workspace
+by name, across all crates and without regard to imports. A new private
+`struct Row` in harnx-script made the gate report `RenderedEntry::render` in
+the TUI's markdown renderer, which builds ratatui `Row`s, as newly mixing logic
+and calls; renaming the struct cleared it. When the gate names a function you
+never touched, look for a type you added whose name a dependency's type shares,
+and rename yours. To find which new file is responsible, move the files the
+change added out of the tree one at a time and rerun the gate; it reads source
+only, so the tree need not build.
+
 The `Code quality` CI job runs the gate on pull requests and annotates the diff
 with what it finds. It is advisory: `.mergify.yml` doesn't require it.
 
@@ -1203,7 +1213,14 @@ three things a tool declares decide how well it works there.
   behaves like a command (`server/script_result.rs`): its mapping sets
   `stderr_text` for the command's own stderr, printed as stored before the
   notes, and `exit_code` for its status (a value outside 0 to 255 is reported
-  as 255).
+  as 255). A tool with a shell form also declares its result fields with
+  `ToolSpec::with_output_schema`; `help <tool>` lists them under
+  `FIELDS (-o json)`, and a test in each tool crate
+  (`script_result_fields_match_the_declared_schema`) checks that every key a
+  real result emits is declared; it does not check types. A third-party MCP
+  tool's `outputSchema` shows up the same way through both MCP routes
+  (`harnx-mcp-bridge` and `harnx-mcp-remote`'s native mode) as a summary of its
+  top-level properties, built by `output_schema_summary`.
 
   The request rides on the call context (`ToolCallOrigin::structured_result`,
   set only by the fork the `bash` tool's inner calls use), not on a
@@ -1989,6 +2006,13 @@ Resource owners keep cleanup handles outside turn/reply futures. A dropped
 `JoinHandle` detaches its task, and started `spawn_blocking` work can't be aborted.
 MCP cancellation closes only the request waiter; never restart shared
 infrastructure to cancel a call. See `docs/nats-ha.md` under "Interruption".
+
+A detached task also dies with its runtime, so cleanup a process must finish
+before it exits can't be left to one. harnx-mcp-server returns from `main` as
+soon as its aborted calls return at stdio EOF, and the tool cancel used to go
+out from a spawned task that had often not run yet. An aborted call now waits
+for its first cancel publish to be flushed (`send_cancel` in
+`nats_tool_provider/cancellation.rs`); the resends stay detached.
 
 The TUI runs broker requests as spawned tasks and only checks their join
 handles from its render loop (`pending_exit_cancel` in `harnx-tui/src/types.rs`).
