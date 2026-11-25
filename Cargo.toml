@@ -207,7 +207,7 @@ shellexpand = "3.1.0"
 schemars = "1.0"
 ratatui-textarea = "0.9.0"
 ratatui_widget_scrolling = "0.1.0"
-jiff = { version = "0.2.23", features = ["serde"] }
+jiff = { version = "1.0.0", features = ["serde"] }
 # jsonwebtoken 11 panics on encode/decode unless feature unification enables
 # exactly one of its crypto backends (aws_lc_rs or rust_crypto). Keep aws_lc_rs
 # the only backend workspace-wide; if another crate needs jsonwebtoken, don't
