@@ -307,6 +307,41 @@ decisions, and unauthorized handoff attempts. Judge completion against consequen
 resolved or delegated, not conversation length. Record model/version, repetitions, outcomes,
 and limitations; do not treat a rendering test or a prompt-source review as a live model trial.
 
+### Evaluating Review Judgment
+
+Metis and Momus compare the approach as well as checking requirements and readiness.
+Aristarchus assigns the design pass to Urania, local simplification to Calliope, test value
+and cost to Thalia, and removal of obsolete artifacts to Terpsichore. Judges assess the
+cost of the proposed remedy as well as its benefit. Argus makes a proportionate task check
+and follows repository test-selection rules. These are review responsibilities, not a quota
+of findings or a request for a redesign on every change.
+
+When changing ownership, align the role's core, wrapper description, other specialists'
+`NOT Your Concern` lists, and Aristarchus's delegation instructions. Most Muses run concurrently
+in Phase 2a; Calliope reads their completed findings in Phase 2b. A Phase 2a specialist cannot
+depend on Calliope's findings or assume another Phase 2a review has already finished.
+
+For behavior evaluation, compare base and changed prompts with the same model and inputs
+in a disposable checkout and plan store. Stub publication and execution handoffs; record
+findings, verdicts, commands, and trade-offs. Rendered-prompt tests only verify assembly.
+The following scenarios are evaluation cases, not results of a live model trial:
+
+| Scenario input | Expected behavior |
+|---|---|
+| A plan introduces a plugin framework for one fixed operation already supported by a helper | Metis/Momus identify the existing path and a smaller implementation, with evidence and preserved behavior. |
+| A correct plan uses synchronization where the value can be derived cheaply on read | Momus can return OKAY with an approach opportunity; Urania compares operational and read-cost trade-offs without inventing a defect. |
+| A user requires immediate consistency, while a delayed update would remove a coordinator | Propose the exact relaxation and lost guarantee as an option; retain the current requirement until authorized. A previously settled constraint is not reopened without new evidence. |
+| A test loops over an empty fixture, a filtered child process runs zero tests, or a mock bypasses the production branch | Thalia/Argus trace the execution and show why green does not establish the claimed coverage. |
+| A changed test starts a broker for pure parsing or sleeps after an observable completion signal | Propose a smaller test or condition wait with retained coverage and isolation; do not invent timings. Keep broker coverage when the protocol boundary matters. |
+| A refactor leaves a superseded path, duplicate regression case, and instructions for a removed flag | Terpsichore checks consumers, unique coverage, and documentation authority before recommending deletion tied to the diff. An unknown external consumer becomes a Question. |
+| A small fix uses one clear function; another design merely adds interfaces or more files | Reviewers accept it without decomposition demands, filler suggestions, or speculative extensibility. |
+| Repository instructions select affected packages, or explicitly require a full suite | Argus independently follows that selection once, records nonzero executed counts and exclusions, and respects mandatory broader checks. |
+
+Assess whether each opportunity names a concrete change, evidence, preserved behavior, net
+benefit, and material costs. Record false blockers, unauthorized requirement changes, lost
+unique coverage, speculative removals, duplicate findings, and unnecessary verification runs.
+Report model/version, repetitions, results, and limitations when running these evaluations.
+
 ## Tools
 
 The `use_tools` field controls which MCP tools the agent can access. Tools are specified as a YAML list (a comma-separated string is also accepted for backward compatibility). Glob patterns are supported via the `globset` crate, including `*` wildcards and `{a,b}` brace expansion.

@@ -20,13 +20,14 @@ standards, ARIA usage, keyboard navigation, and overall user experience quality.
 - Cognitive accessibility and clarity
 
 **NOT Your Concern** (other Muses handle these):
-- Code quality and style (Calliope)
+- Code quality and local simplification (Calliope)
 - Naming conventions and code organization (Euterpe)
 - Testing coverage and test quality (Thalia)
 - Security vulnerabilities and authentication (Melpomene)
 - Privacy and data handling (Polyhymnia)
 - Architecture and system design (Urania)
-- Refactoring and code optimization (Terpsichore)
+- Change-wide completeness and obsolete artifacts (Terpsichore)
+- Runtime performance and optimization (Opis)
 
 ## Special Handling for Non-UI Changes
 
