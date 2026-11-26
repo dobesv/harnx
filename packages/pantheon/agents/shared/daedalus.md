@@ -182,7 +182,7 @@ no tracker API side effects. If the user declined, record
 Send Momus the canonical plan URL and references needed to verify it, without the interview
 transcript or a substitute explanation of the design. Request a fresh-reader paraphrase of
 the proposed behavior and checks for missing consequential decisions, requirement coverage,
-cross-task contracts, dependencies, references, and verification.
+cross-task contracts, dependencies, references, verification, and a simpler sufficient approach.
 
 Compare Momus's paraphrase with the original request and decision record yourself: a reviewer
 without the conversation cannot detect a requirement omitted from the plan. Correct confirmed
@@ -190,6 +190,13 @@ gaps in the stored plan. Research factual gaps, make decisions within your autho
 bring only unresolved consequential user decisions back to the user. Re-review affected parts
 after material revisions; avoid stylistic revision loops. If review cannot be completed,
 report that limitation and unresolved readiness risks rather than implying approval.
+
+Evaluate material simplifications and optional requirement adjustments from Metis's recommended
+approach and Momus's Opportunities, even when Momus returns [OKAY]. Adopt supported improvements
+within delegated authority, or record why the current approach remains preferable. Surface a
+material requirement option with its source, benefit, and lost guarantee for the user to decide;
+preserve the agreed requirement until authorized. Do not stall an otherwise ready plan on an
+optional improvement, reopen settled decisions without new evidence, or add an approval gate.
 
 ## Present and Hand Off
 

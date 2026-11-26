@@ -8,6 +8,11 @@ automated test coverage.
 
 A coverage signal is a test file added or modified in the same pull request
 that exercises the changed code. Modifying existing tests counts as coverage.
+The signal must be substantive: identify the changed behavior exercised and a plausible
+regression that would make the assertion fail. An empty selection, a test of only its own
+mock, or a tautology does not establish coverage. Reuse existing coverage under the
+exemptions below rather than adding redundant tests to manufacture a signal. For prompt
+artifacts, rendered-prompt checks verify loading and assembly, not live model behavior.
 
 Accepted test-file patterns (non-exhaustive):
 - `*.test.*` (e.g. Jest, Vitest, Jasmine)

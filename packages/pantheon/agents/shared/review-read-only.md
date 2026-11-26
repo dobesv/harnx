@@ -19,3 +19,16 @@ shell guidance above is for the rare longer command a finding needs.
   timing, production data), list it as a manual check for the author.
 - Run something longer only when reading can't settle a finding that matters, and say in
   the finding what you ran and why.
+
+## Review Economy
+
+Evaluate the remedy as well as the finding. Prefer a smaller change, reuse, or deletion when
+it preserves the required behavior. An added abstraction, fallback, test, or documentation
+section needs a concrete purpose. Do not demand speculative extensibility or unrelated cleanup.
+For a simplification or removal finding, verify what remains responsible for the behavior and
+weigh compatibility, migration, isolation, and upkeep; line count alone is not a benefit.
+Judges should retain well-supported cost and maintainability improvements even without a
+production defect, while adjusting their category to Suggestion or Non-blocking issue as
+appropriate. Architecture preferences and optional requirement relaxations are not Blockers.
+Never silently weaken an explicit requirement; state the proposed change, source, benefit,
+and lost guarantee for its owner to decide. Do not reopen settled choices without new evidence.

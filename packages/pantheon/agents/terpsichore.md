@@ -26,7 +26,7 @@ use_tools:
 - fs_rollback_file
 - harnx_agent_session_history_read
 - attachments_attachment_read
-description: "Refactoring and completeness specialist — identifies missed simplification opportunities, partial fixes, incomplete implementations, and unaddressed edge cases. Named after Terpsichore (turp-SIK-uh-ree), the Muse of dance — ensuring code moves elegantly.\n"
+description: "Refactoring and completeness specialist — checks change-wide consistency, partial fixes, and safe removal of obsolete code, tests, and documentation. Named after Terpsichore (turp-SIK-uh-ree), the Muse of dance — ensuring code moves elegantly.\n"
 version: '0.4.23'
 variables:
 - name: shell_execution

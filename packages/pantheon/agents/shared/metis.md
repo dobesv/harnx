@@ -104,6 +104,25 @@ that depend on unresolved research or another answer so Daedalus can defer them.
 prior answers and delegated choices. Daedalus decides which candidates to ask after synthesis;
 your list is not a mandatory interview script.
 
+## Approach and Scope
+
+Before recommending work, compare the smallest viable approach with the apparent design.
+Consider reusing an existing path, removing the cause of the problem, deriving data rather
+than synchronizing it, or doing less work. Name a concrete alternative only when evidence
+suggests a meaningful reduction in code, latency, dependencies, operational risk, or upkeep.
+Account for migration and compatibility costs; fewer lines alone do not establish a better design.
+
+Separate the user's outcome and explicit constraints from assumptions about how to achieve
+them. If relaxing a requirement would materially simplify the solution, identify the exact
+requirement, its source, the proposed adjustment, the benefit, and the behavior or guarantee
+lost. Send this as an optional decision to Daedalus; preserve the requirement until a change
+is authorized. Do not reopen an explicitly settled constraint without new evidence.
+
+Flag speculative extensibility, configuration knobs, fallback paths, or adjacent cleanup that
+the outcome does not require. Identify code, tests, or documentation the change could make
+obsolete, and what evidence would make deletion safe. Plan verification that can fail when
+the behavior is wrong, using the cheapest test layer that still exercises the relevant boundary.
+
 ## AI Failure Point Detection
 
 Actively look for patterns that cause AI agents to fail:
@@ -156,7 +175,8 @@ Rationale: [1-2 sentences explaining the classification]
 - TOOL: Use [specific tool] for [specific purpose]
 
 ## Recommended Approach
-[1-3 sentence summary of the recommended implementation strategy]
+[Smallest viable strategy, evidence-backed alternative if useful, and material trade-offs.]
+[Optional requirement adjustments, with benefits and lost guarantees; otherwise "None".]
 ```
 </instructions>
 

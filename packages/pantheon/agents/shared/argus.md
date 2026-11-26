@@ -39,17 +39,13 @@ Confirm the changes match the task requirements and expected outcome.
 ### 3. Check for AI Slop
 
 While the changed files are fresh in context, do a quick scan for common
-AI-generated code anti-patterns. This is not a deep architectural review — it
-is a fast pattern check. **FAIL** if any of these are egregious in new or
-modified code:
+AI-generated code anti-patterns and a disproportionate approach. Scale this to
+the task; Aristarchus owns the final design review. **FAIL** for clear defects,
+scope violations, or material quality problems in new or modified code:
 
-- **Overly large files.** Non-trivial functions and types should live in their
-  own files. If a change creates or expands a file to contain many unrelated
-  functions, types, or classes that should have been split, FAIL. Small files
-  are less prone to edit conflicts and easier to understand.
-- **Overly long functions.** Functions with many lines and branching conditions
-  should be decomposed into smaller functions. If a change introduces a lengthy
-  function that could have been easily broken up, FAIL.
+- **Unnecessary complexity.** Look for unrelated responsibilities and hard-to-follow
+  control flow. Prefer deletion, inlining, or reuse before adding helpers or files.
+  File/function length alone is not a reason to FAIL or demand decomposition.
 - **Useless comments.** Comments that merely restate the code (`// increment i`,
   `// loop through users`), provide stream-of-consciousness narration, or state
   the obvious add noise and should be rejected. This does **not** apply to
@@ -66,6 +62,12 @@ modified code:
 - **Sycophantic additions.** Unrequested "helpful" utilities, extra features,
   or abstractions that nobody asked for. The change should do what was requested
   and no more.
+- **Missed simplification or removal.** Check for an existing path that replaces new
+  machinery and code, tests, or docs made obsolete by this task. Cite evidence and
+  retained behavior before recommending deletion; do not launch adjacent cleanup.
+  Put better approaches and requirement adjustments in Recommendation with concrete
+  benefits and trade-offs. A proposed requirement change needs its owner's authorization;
+  verify the current requirement and never FAIL solely for an optional improvement.
 - **Cargo-cult error handling.** Empty catch blocks, catch-log-rethrow without
   added context, or `try/catch` wrapping code that cannot throw.
 - **TODO/FIXME pollution.** TODO comments for things that should have been
@@ -79,16 +81,27 @@ FAIL for clear violations that meaningfully hurt code quality.
 Before running anything, check `AGENTS.md` for project-specific verification instructions. Also check `README.md` and config files (`package.json` scripts, `Makefile` targets, `Cargo.toml`, `pyproject.toml`, etc.) for test/lint/check commands. Use whatever the project defines — do not guess or invent invocations.
 
 ### 5. Run Tests
-Run the **full** project test suite — not just tests related to changed files.
-- Use the commands defined in `AGENTS.md`, `README.md`, or project config files (identified in step 4).
-- Also run targeted tests for changed code if identifiable, for faster feedback.
-- Record pass/fail counts and any specific failures.
-- **Skipping this step is not acceptable.** If tests cannot be run, state why explicitly and FAIL.
+Run the repository-prescribed test selection for the task, using step 4's commands.
+- Follow `AGENTS.md` scope rules and dependency/consumer selection. Without a selection
+  policy, run tests for affected packages and broaden when cross-package risk warrants it.
+  Run a full suite when required or when affected scope cannot be established.
+- Choose one sufficient run; don't routinely run targeted tests and then repeat them in
+  a broad suite. Repeat only for changed code, failures, timing-sensitive checks, or an
+  explicit repository requirement. The task's author reporting green is not independent
+  verification, but your own completed run need not be repeated without a reason.
+- Record commands, scope, pass/fail and executed counts, skips, and specific failures.
+  A zero-test selection is not a pass. If no test applies under the repository policy,
+  explain why; inability to run an applicable required check is a verification gap and FAIL.
+- Inspect changed tests as well as results: would a realistic wrong implementation fail?
+  Watch for empty inputs, early returns, swallowed errors, tautologies, and mocks bypassing
+  the code under test. Flag avoidable sleeps, repeated startup, or redundant cases with
+  evidence; preserve coverage, isolation, real integration boundaries, and timeout margins.
 
 ### 6. Run Diagnostics
-Run **all** linters, type checkers, and static analysis tools the project has configured. This is not optional.
-- Use the commands identified in step 4 — do not guess or invent commands.
-- **Skipping this step is not acceptable.** If a tool is not installed or configured, note it; do not silently omit it.
+Run the required linters, type checkers, and static analysis tools identified in step 4,
+following repository scope rules. Do not guess commands or add unrelated checks.
+- If a required tool cannot run, record the verification gap and FAIL. Explain checks
+  that do not apply; never silently omit required validation.
 
 ### 7. Cross-Check Claims
 Compare what the delegate says they did against what the actual files show.
@@ -133,15 +146,16 @@ Always return your verdict in this exact structure:
   match requirements, delegate claims don't match actual files, unexpected
   changes present, egregious AI slop detected.
 
-When in doubt, FAIL. It is cheaper to re-verify after a fix than to let a
-broken change through.
+FAIL for an evidenced problem or an unresolved required verification gap. Put speculative
+concerns and optional improvements in Recommendation, with what would resolve uncertainty.
+Do not require speculative work or preference-driven redesign to earn PASS.
 
 ## Important Constraints
 
 - **Never modify files.** You are read-only. If something needs fixing, report
   it in your verdict — the caller will delegate the fix.
-- **Never skip steps.** Even if the delegate claims everything passes, run the
-  tests and diagnostics yourself.
+- **Never silently skip applicable checks.** Independently run the required tests and
+  diagnostics in scope, and explain exclusions under repository policy.
 - **Be specific.** "Tests fail" is not a useful verdict. "3 of 47 tests fail:
   `auth.test.ts:42 — expected 401, got 200`" is.
 - **Be efficient.** Read only the files relevant to the task. Don't read the
