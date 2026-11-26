@@ -678,3 +678,54 @@ async fn package_view_of_a_glob_toolset_member_is_error() {
         "{report:#?}"
     );
 }
+
+#[tokio::test]
+async fn handoff_tool_in_a_toolset_named_by_top_level_bash_tools_is_error() {
+    let a = "---\nbash_tools: [controls]\n---\nhi\n";
+    let report = check_tools(&[
+        (
+            "config.yaml",
+            "toolsets:\n  controls: [b_session_handoff]\n",
+        ),
+        ("agents/a.md", a),
+        ("agents/b.md", "hello\n"),
+    ])
+    .await;
+
+    let found = with_code(&report, Code::UnknownTool);
+    assert_eq!(found.len(), 1, "{report:#?}");
+    assert_eq!(found[0].file.as_deref(), Some(Path::new("agents/a.md")));
+    assert_eq!(found[0].key_path.as_deref(), Some("bash_tools"));
+}
+
+#[tokio::test]
+async fn top_level_use_tools_naming_a_toolset_checks_only_the_declaration() {
+    let a = agent("controls");
+    let report = check_tools(&[
+        (
+            "config.yaml",
+            "toolsets:\n  controls: [b_session_handoff]\n",
+        ),
+        ("agents/a.md", &a),
+        ("agents/b.md", "hello\n"),
+    ])
+    .await;
+
+    assert!(tool_findings(&report).is_empty(), "{report:#?}");
+}
+
+#[tokio::test]
+async fn list_form_toolset_member_is_matched_unsplit() {
+    let report = check_tools(&[
+        (
+            "config.yaml",
+            "toolsets:\n  timey: ['b_session_prompt,b_session_prompt']\n",
+        ),
+        ("agents/b.md", "hello\n"),
+    ])
+    .await;
+
+    let found = with_code(&report, Code::UnknownTool);
+    assert_eq!(found.len(), 1, "{report:#?}");
+    assert_eq!(found[0].key_path.as_deref(), Some("toolsets"));
+}

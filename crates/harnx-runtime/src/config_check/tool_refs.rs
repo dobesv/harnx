@@ -31,11 +31,16 @@ impl ToolRef {
     /// Whether the runtime drops control tools (`bash`, handoffs, …) from
     /// what this selector selects: scripts and middleware can't call them.
     pub fn script_callable_only(&self) -> bool {
-        matches!(
-            self.key,
-            "bash_tools" | "middleware.tools" | "script_tools.tools"
-        )
+        script_callable_key(self.key)
     }
+}
+
+/// Keys whose selectors scripts resolve, keeping only tools a script may call.
+fn script_callable_key(key: &str) -> bool {
+    matches!(
+        key,
+        "bash_tools" | "middleware.tools" | "script_tools.tools"
+    )
 }
 
 /// Every tool selector in the checked files: agents' `use_tools` and
@@ -110,9 +115,11 @@ struct RefCollector<'a> {
 }
 
 impl RefCollector<'_> {
-    /// Comma-split, trimmed selectors, with toolset names expanded. In the
+    /// Comma-split, trimmed selectors, with toolset names expanded into
+    /// their members as written, which the runtime matches unsplit. In the
     /// top-level view a toolset's members are already checked where
-    /// `toolsets:` declares them, so only package views repeat them.
+    /// `toolsets:` declares them, so only package views and keys that drop
+    /// control tools repeat them.
     fn add<'s>(
         &mut self,
         source: &Path,
@@ -122,10 +129,10 @@ impl RefCollector<'_> {
     ) {
         for selector in selectors(entries) {
             match self.config.toolset_members(&selector) {
-                Some(_) if package.is_none() => {}
+                Some(_) if package.is_none() && !script_callable_key(key) => {}
                 Some(members) => {
                     let members = members.clone();
-                    self.push_all(source, key, package, true, selectors(&members));
+                    self.push_all(source, key, package, true, members);
                 }
                 None => self.push_all(source, key, package, false, [selector]),
             }
@@ -133,7 +140,7 @@ impl RefCollector<'_> {
     }
 
     fn add_members(&mut self, source: &Path, members: &[String]) {
-        self.push_all(source, "toolsets", None, true, selectors(members));
+        self.push_all(source, "toolsets", None, true, members.iter().cloned());
     }
 
     fn add_middleware(
