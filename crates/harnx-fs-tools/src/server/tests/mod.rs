@@ -135,6 +135,7 @@ mod insert_ops;
 mod protocol;
 mod read_ops;
 mod regex_replace;
+mod rollback;
 #[cfg(unix)]
 mod script_mutation;
 mod write_attachment;

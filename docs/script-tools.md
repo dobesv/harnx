@@ -208,8 +208,11 @@ same CLI flags, output and exit codes as in the `bash` tool's script mode:
   That touches only the files the change touched and leaves the branch alone.
   `fs_write`, `fs_edit`, `fs_insert` and `fs_re_replace` print a one-line
   confirmation on stdout. `rollback_file` accepts a snapshot id in full or as a
-  prefix of at least 7 hex digits, but it restores the whole repository to that
-  snapshot and moves the branch, so it is not the way to undo one change.
+  prefix of at least 7 hex digits. It restores the paths that snapshot
+  records into the working tree and leaves everything else — other files,
+  staged changes, the branch and the index — alone, so it restores a recorded
+  state rather than undoing one change; for that, reverse-apply the diff as
+  above. A snapshot with an empty tree records no paths and restores nothing.
   Command templates take no `diff` option and follow the defaults.
 
 Under BashKit's default `set -e`, a non-zero exit from an inner tool will halt

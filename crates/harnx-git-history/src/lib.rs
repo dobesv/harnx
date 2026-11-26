@@ -10,3 +10,4 @@ pub use change::resolve_commit_id;
 pub use classify::SnapshotDecision;
 pub use history::HistoryManager;
 pub use level::DiffLevel;
+pub use rollback::RollbackPreflightError;

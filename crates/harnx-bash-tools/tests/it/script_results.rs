@@ -23,13 +23,13 @@ fn sandbox_config(root: &std::path::Path) -> SandboxConfig {
     }
 }
 
-async fn toolset_in(root: &std::path::Path) -> BashToolset {
+pub(crate) async fn toolset_in(root: &std::path::Path) -> BashToolset {
     BashToolset::new(sandbox_config(root), Vec::new())
         .await
         .expect("build toolset")
 }
 
-async fn call(toolset: &BashToolset, tool: &str, args: Value, script: bool) -> Value {
+pub(crate) async fn call(toolset: &BashToolset, tool: &str, args: Value, script: bool) -> Value {
     let mut context = ToolInvocationContext::default();
     if script {
         context
@@ -694,7 +694,7 @@ impl Repo {
 }
 
 /// The `diff` field of a script-style result.
-fn diff_field(result: &Value) -> &str {
+pub(crate) fn diff_field(result: &Value) -> &str {
     result["structuredContent"]["diff"]
         .as_str()
         .unwrap_or_else(|| panic!("no diff field: {result}"))
@@ -711,7 +711,7 @@ fn texts(result: &Value) -> Vec<String> {
 }
 
 /// The before and after ids on a summary line.
-fn summary_ids(line: &str) -> (String, String) {
+pub(crate) fn summary_ids(line: &str) -> (String, String) {
     let mut words = line.split_whitespace().rev();
     let after = words.next().expect("after id");
     let before = words.next().expect("before id");
@@ -863,23 +863,6 @@ async fn a_command_spawned_at_none_has_nothing_to_show() {
     let direct = call(&repo.toolset, "wait", wait, false).await;
     assert_eq!(texts(&direct).len(), 2, "{direct}");
     assert_eq!(repo.object_count(), before);
-}
-
-#[tokio::test]
-async fn rollback_takes_the_short_id_from_a_summary_line() {
-    let repo = Repo::new().await;
-    let script = repo.exec_note("after", json!({}), true).await;
-    let summary = diff_field(&script);
-    let (_, after) = summary_ids(summary.trim_end());
-    repo.exec_note("later", json!({ "diff": "none" }), false)
-        .await;
-    let args = json!({ "commit_id": after, "repo_path": repo.directory.path() });
-    let result = call(&repo.toolset, "rollback_file", args, false).await;
-    assert!(result["isError"] != json!(true), "{result}");
-    let note = std::fs::read_to_string(repo.directory.path().join("note.txt")).unwrap();
-    // Rollback ends with a git reset, which checks files out with the
-    // machine's line-ending conversion (CRLF where `core.autocrlf` is on).
-    assert_eq!(note.replace("\r\n", "\n"), "after\n");
 }
 
 #[tokio::test]

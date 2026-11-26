@@ -143,6 +143,10 @@ fn map_result(result: Result<CallToolResult, ErrorData>) -> Result<Value, ToolIn
 /// `<name>_exec`, `<name>_read_exec_log` and so on.
 pub(crate) const TOOLSET_NAME: &str = "bash";
 
+/// The same `rollback_file` wording the filesystem server advertises, so both
+/// toolsets describe the same semantics. Keep them in sync.
+const ROLLBACK_FILE_DESCRIPTION: &str = "Restore the files recorded in a harnx history snapshot into the working tree. The commit_id is a snapshot id, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change and the second is the state after it; the 'commit' line of a full diff is the state after. Only the paths recorded in the snapshot are restored, as uncommitted working-tree changes: paths absent from the snapshot are kept, and HEAD, refs and the index are not moved. A snapshot with an empty tree restores nothing, so it cannot undo a file creation. To undo one change, reverse-apply its diff with the repository and ids from the summary line: git -C <repo> diff --binary <before> <after> | git -C <repo> apply -R.";
+
 /// Canonical specifications for the built-in bash tools.
 ///
 /// Proxy toolsets use these definitions so their schemas and display metadata
@@ -199,7 +203,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         ),
         spec::<RollbackParams>(
             "rollback_file",
-            "Restore a repository's tracked files to a harnx history snapshot and move the branch to a new commit. The commit_id is a snapshot id, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change and the second is the state after it; the 'commit' line of a full diff is the state after.",
+            ROLLBACK_FILE_DESCRIPTION,
             tool_templates::ROLLBACK_FILE_CALL,
             None,
         ),

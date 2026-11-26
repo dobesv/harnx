@@ -15,6 +15,21 @@ fn warn_if_unsandboxed(name: &str, registered: &RegisteredToolTemplate) {
     }
 }
 
+/// A rollback failure splits in two: a preflight rejection is an expected
+/// outcome the caller can recover from, anything else stays an internal
+/// protocol error. Both leave the working tree and git state untouched.
+fn rollback_failure(e: anyhow::Error) -> Result<CallToolResult, ErrorData> {
+    // qual:allow(coupling, deh) reason: "RollbackPreflightError rides the anyhow boundary typed; the handler contract classifies it by downcast, the house pattern for typed sources on anyhow errors."
+    if e.downcast_ref::<RollbackPreflightError>().is_some() {
+        tool_error(format!("rollback failed: {e}"))
+    } else {
+        Err(ErrorData::internal_error(
+            format!("rollback failed: {e}"),
+            None,
+        ))
+    }
+}
+
 impl BashServer {
     // exec
     // -----------------------------------------------------------------------
@@ -293,17 +308,22 @@ impl BashServer {
         let commit_id = harnx_git_history::resolve_commit_id(&repo_dir, &params.commit_id)
             .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
 
-        let new_commit_id = self
-            .inner
-            .history
-            .rollback(&repo_dir, commit_id)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("rollback failed: {e}"), None))?;
+        // Preflight rejections (unsafe destinations, conflicts) are expected
+        // outcomes, so they surface as recoverable tool errors; anything
+        // else stays an internal protocol error. Both leave the working tree
+        // and git state untouched.
+        let new_snapshot_id = match self.inner.history.rollback(&repo_dir, commit_id).await {
+            Ok(id) => id,
+            Err(e) => return rollback_failure(e),
+        };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Rolled back to harnx snapshot {}; new commit {} created (can be reverted)",
+            "Rolled back to harnx snapshot {}: restored only the paths recorded in that \
+             snapshot, as working-tree changes; paths absent from the snapshot, staged \
+             changes, HEAD and refs were left unchanged. New after-snapshot {} recorded \
+             (a snapshot id, not a branch commit).",
             &params.commit_id[..8.min(params.commit_id.len())],
-            new_commit_id.to_hex(),
+            new_snapshot_id.to_hex(),
         ))]))
     }
 
