@@ -32,7 +32,18 @@ async fn run() -> Result<()> {
     run_tool_service(&args).await
 }
 
+// qual:allow(iosp) — the listing branch only picks which toolset to build
 async fn run_tool_service(args: &cli::Args) -> Result<()> {
+    if args.list_tools {
+        // Listing must not start the proxy or run hooks, which can have side effects.
+        let toolset = harnx_proxy_auth::toolset::ProxyAuthToolset::new(
+            0,
+            std::path::Path::new(""),
+            &serde_json::Map::new(),
+            None,
+        );
+        return Box::pin(harnx_toolset_server::run_toolset_main(toolset)).await;
+    }
     let mut runtime = build_runtime(args).await?;
     let toolset = harnx_proxy_auth::toolset::ProxyAuthToolset::new(
         runtime.port,

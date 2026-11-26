@@ -27,7 +27,7 @@ Server starts and lists tools without a key. Calls without a key return guidance
 
 ## Run
 
-Pass `--name <NAME>` to override the registered toolset name. Native toolset mode is default:
+Pass `--name <NAME>` to override the registered toolset name. `--list-tools [--format text|json]` prints the tools the server publishes and exits without connecting to NATS; see [Listing a Server's Tools](../../docs/configuration-guide.md#listing-a-servers-tools---list-tools). Native toolset mode is default:
 
 ```bash
 harnx-exa-tools

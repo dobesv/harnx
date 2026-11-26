@@ -13,3 +13,4 @@ mod session_dump_history_nats;
 mod session_stats_cli_e2e;
 mod tmux_e2e;
 mod tool_cli;
+mod validate_cli;

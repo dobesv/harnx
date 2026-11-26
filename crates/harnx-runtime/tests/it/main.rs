@@ -18,6 +18,7 @@ mod worker;
 mod agent_prompt_rendering;
 mod agent_user_patches;
 mod bash_script_mode;
+mod config_check;
 mod event_hooks;
 mod frontend_affine_workers;
 mod interruption;

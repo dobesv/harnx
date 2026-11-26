@@ -17,6 +17,12 @@ pub(super) struct Args {
     /// MCP HTTP port (default: 3010).
     #[arg(long, requires = "mcp_http")]
     pub port: Option<u16>,
+    /// Print the advertised tools and exit. Starts nothing and needs no broker.
+    #[arg(long, conflicts_with_all = ["mcp_stdio", "mcp_http"])]
+    pub list_tools: bool,
+    /// Output shape for `--list-tools`.
+    #[arg(long, requires = "list_tools", value_parser = ["text", "json"])]
+    pub format: Option<String>,
     #[arg(long)]
     pub name: Option<String>,
     #[arg(long)]
@@ -61,6 +67,25 @@ mod tests {
             vec!["aws", "--tool-server", "--mcp-stdio", "--mcp-http"],
             vec!["aws", "--mcp-stdio", "--mcp-http"],
             vec!["aws", "--port=3010"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn list_tools_flags_parse_and_stay_strict() {
+        for args in [
+            vec!["x", "--list-tools"],
+            vec!["x", "--list-tools", "--format", "json"],
+            vec!["x", "--list-tools", "--format=json"],
+        ] {
+            assert!(Args::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["x", "--format", "json"],
+            vec!["x", "--list-tools", "--format", "yaml"],
+            vec!["x", "--list-tools", "--mcp-stdio"],
+            vec!["x", "--list-tools", "--formatt", "json"],
         ] {
             assert!(Args::try_parse_from(args).is_err());
         }

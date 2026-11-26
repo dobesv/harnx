@@ -1,8 +1,8 @@
 ---
-model: openai:gpt-6.2-sol
+model: /openai:gpt-6.2-sol   # leading / names the top-level openai client, not example-pkg/openai
 description: "A demonstration agent bundled with example-pkg"
 use_tools:
-  - bash_execute
+  - bash_exec
 ---
 
 You are a helpful assistant bundled with the `example-pkg` package.

@@ -26,7 +26,7 @@ pub use mcp::McpToolsetAdapter;
 mod lifecycle;
 mod runner;
 pub use runner::{
-    run_toolset_main, run_toolset_main_with_factory,
+    print_tool_listing, run_toolset_main, run_toolset_main_with_factory,
     run_toolset_main_with_factory_and_http_options, run_toolset_mcp_http, McpHttpOptions,
 };
 mod name;

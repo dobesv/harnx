@@ -229,7 +229,7 @@ pub(crate) fn resolve_title_agent_name(
 /// The fallback strips a leading `/` from `name` (an explicit "top-level"
 /// escape such as `/foo` resolves to the file `foo`), so we never fall back to
 /// a literal slash-prefixed name that no agent file would match.
-fn title_agent_lookup_name<'a>(
+pub(crate) fn title_agent_lookup_name<'a>(
     name: &'a str,
     resolved_name: &'a str,
     resolved_file_exists: bool,

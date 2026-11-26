@@ -144,7 +144,7 @@ impl Config {
         script_tools.finish()
     }
 
-    pub(super) fn sorted_package_dirs(packages_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    pub(crate) fn sorted_package_dirs(packages_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         // Skip unreadable directories and entries, matching the loader's
         // pre-script-tools behavior: a permission problem in `packages/`
         // must not abort startup (C12). Missing dirs are normal; other
@@ -226,7 +226,7 @@ impl Config {
         clients
     }
 
-    fn load_clients_from_dir(dir: &Path) -> Result<Vec<ClientConfig>> {
+    pub(crate) fn load_clients_from_dir(dir: &Path) -> Result<Vec<ClientConfig>> {
         if !dir.exists() {
             return Ok(vec![]);
         }

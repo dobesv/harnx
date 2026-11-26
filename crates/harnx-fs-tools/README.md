@@ -28,6 +28,7 @@ cargo install --path crates/harnx-fs-tools
 | `--host <ADDR>` | Bind address for HTTP mode (default: `0.0.0.0`). |
 | `--port <N>` | Bind port for HTTP mode (default: `3003`). |
 | `--mcp-stdio` | Run in stdio MCP backward-compatibility mode. |
+| `--list-tools [--format text\|json]` | Print the tools this server publishes and exit without connecting to NATS. See [Listing a Server's Tools](../../docs/configuration-guide.md#listing-a-servers-tools---list-tools). |
 | `--help`, `-h` | Show help. |
 
 Path lists can also come from `HARNX_TOOLS_ALLOW_READ`, `HARNX_TOOLS_ALLOW_WRITE`, `HARNX_TOOLS_ALLOW_EXEC`, and `HARNX_TOOLS_ALLOW_RWX` environment variables. Separate paths with a colon on Unix or a semicolon on Windows. Batch toggles use the corresponding `HARNX_TOOLS_ALLOW_COMMON_DEFAULT`, `HARNX_TOOLS_ALLOW_DEV_TOOLS`, `HARNX_TOOLS_ALLOW_REPO_WORK`, and `HARNX_TOOLS_ALLOW_ALL` variables. Values `1`, `true`, `yes`, and `on` enable a batch.

@@ -156,11 +156,8 @@ impl SubagentToolset {
         nats: SubagentNats,
     ) -> Self {
         let agent = agent.into();
-        let server_name = agent
-            .rsplit_once('/')
-            .map_or(agent.as_str(), |(_, stem)| stem);
         Self {
-            server_name: sanitize_for_tool_name(server_name),
+            server_name: subagent_server_name(&agent),
             agent,
             route,
             client: nats.client,
@@ -965,6 +962,29 @@ impl Toolset for SubagentToolset {
         .map_err(|error| {
             ToolInvokeError::Recoverable(format!("interrupt sub-agent '{child}': {error:#}"))
         })
+    }
+}
+
+/// The server name an agent's sub-agent toolset registers under: the
+/// agent's stem, without its package.
+fn subagent_server_name(agent: &str) -> String {
+    let stem = agent.rsplit_once('/').map_or(agent, |(_, stem)| stem);
+    sanitize_for_tool_name(stem)
+}
+
+/// The registration an agent's sub-agent toolset publishes, built without
+/// starting it, so its `<agent>_session_*` names can be known offline.
+pub(crate) fn offline_registration(agent: &str) -> harnx_toolset::Registration {
+    harnx_toolset::Registration {
+        package: harnx_core::package_namespace::pkg_from_qualified(agent).map(str::to_string),
+        config: String::new(),
+        server: subagent_server_name(agent),
+        tools: tool_specs_with_policy(agent, None),
+        schema_version: 1,
+        proto_version: 1,
+        user_id: None,
+        ownerless_only: false,
+        connection_id: None,
     }
 }
 

@@ -1,5 +1,5 @@
 use anyhow::Context;
-use harnx_mcp_bridge::{report_tools_filtered, Args, BridgeToolset};
+use harnx_mcp_bridge::{filtered_listing, Args, BridgeToolset, ListingFormatArg};
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
 use harnx_toolset_server::result_limits::ResultLimits;
 use harnx_toolset_server::{
@@ -123,10 +123,20 @@ async fn list_tools(
 ) -> anyhow::Result<ExitCode> {
     let name = args.name.as_deref().unwrap_or("mcp-diagnostic");
     let mut bridge = BridgeToolset::new(name, args.child.clone()).await?;
-    let report = report_tools_filtered(&bridge, filter);
+    let listing = filtered_listing(&bridge, filter);
     bridge.shutdown().await?;
-    print!("{report}");
+    print!("{}", render_listing(&listing, args.format)?);
     Ok(ExitCode::SUCCESS)
+}
+
+fn render_listing(
+    listing: &harnx_toolset::listing::ToolListing,
+    format: ListingFormatArg,
+) -> anyhow::Result<String> {
+    Ok(match format {
+        ListingFormatArg::Text => listing.render_text(),
+        ListingFormatArg::Json => format!("{}\n", serde_json::to_string_pretty(listing)?),
+    })
 }
 
 async fn call_tool_direct(tool_name: &str, args: &Args) -> anyhow::Result<ExitCode> {

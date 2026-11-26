@@ -32,6 +32,9 @@ pub struct PackageManifest {
 /// Contents of packages/<pkg>/package.yaml — the package's metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PackageMetadata {
+    /// The package's name, which matches its directory under `packages/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Human-readable description of the package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -40,6 +43,11 @@ pub struct PackageMetadata {
     pub license: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Oldest harnx release the package works with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harnx_min_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
 }
 
 /// Contents of packages/<pkg>.patch.yaml — local customization of installed package.

@@ -37,6 +37,22 @@ type SpawnedChild = (
     Option<ChildStderr>,
 );
 
+/// Command-line spelling of [`harnx_toolset::listing::ListingFormat`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ListingFormatArg {
+    Text,
+    Json,
+}
+
+impl From<ListingFormatArg> for harnx_toolset::listing::ListingFormat {
+    fn from(format: ListingFormatArg) -> Self {
+        match format {
+            ListingFormatArg::Text => Self::Text,
+            ListingFormatArg::Json => Self::Json,
+        }
+    }
+}
+
 /// Command-line arguments for the MCP-to-NATS bridge.
 #[derive(Clone, Debug, PartialEq, Eq, Parser)]
 #[command(trailing_var_arg = true)]
@@ -55,6 +71,12 @@ pub struct Args {
     /// from the supervisor's registration timeout alone.
     #[arg(long)]
     pub list_tools: bool,
+
+    /// Output shape of `--list-tools`: a human-readable summary, or one JSON
+    /// `ToolListing` document for tooling. Long-only; `-f` is reserved by
+    /// the `harnx` CLI.
+    #[arg(long, value_enum, default_value = "text", requires = "list_tools")]
+    pub format: ListingFormatArg,
 
     /// Wrapped MCP command followed by its arguments.
     #[arg(required = true, allow_hyphen_values = true)]
@@ -121,63 +143,20 @@ pub struct BridgeToolset {
     result_limits: ResultLimits,
 }
 
-/// Render what a wrapped server advertises, for `--list-tools`.
-///
-/// Reaching this at all establishes that the child starts, completes the MCP
-/// handshake, and answers `tools/list` — the three steps a registration
-/// timeout cannot distinguish between.
-pub fn report_tools(bridge: &BridgeToolset) -> String {
-    report_tool_specs(bridge.server_name(), bridge.cached_tools())
-}
-
-/// Render only tools matching an optional enable-tool filter.
-pub fn report_tools_filtered(
+/// The bridge's advertised tools after the optional enable-tool filter.
+pub fn filtered_listing(
     bridge: &BridgeToolset,
     filter: Option<&harnx_toolset_server::globset::GlobSet>,
-) -> String {
+) -> harnx_toolset::listing::ToolListing {
     let tools = bridge
         .cached_tools()
         .iter()
         .filter(|tool| filter.is_none_or(|set| set.is_match(&tool.name)))
         .cloned()
         .collect::<Vec<_>>();
-    report_tool_specs(bridge.server_name(), &tools)
-}
-
-fn report_tool_specs(server_name: &str, tools: &[ToolSpec]) -> String {
-    let mut out = format!("MCP server '{}': {} tool(s)\n", server_name, tools.len());
-    for tool in tools {
-        out.push_str(&format!("\n  {}\n", tool.name));
-        let description = tool.description.trim();
-        if !description.is_empty() {
-            out.push_str(&format!(
-                "    {}\n",
-                description.lines().next().unwrap_or("")
-            ));
-        }
-        let hints = [
-            tool.read_only_hint.then_some("read-only"),
-            tool.idempotent_hint.then_some("idempotent"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        if !hints.is_empty() {
-            out.push_str(&format!("    [{}]\n", hints.join(", ")));
-        }
-        append_timeout_report(&mut out, tool.timeout_secs);
-    }
-    if tools.is_empty() {
-        out.push_str("\n  (the server completed its handshake but advertises no tools)\n");
-    }
-    out
-}
-
-fn append_timeout_report(out: &mut String, timeout_secs: Option<u64>) {
-    match timeout_secs {
-        Some(0) => out.push_str("    timeout: none\n"),
-        Some(seconds) => out.push_str(&format!("    timeout: {seconds}s\n")),
-        None => {}
+    harnx_toolset::listing::ToolListing {
+        server: bridge.server_name().to_string(),
+        tools,
     }
 }
 
@@ -882,11 +861,12 @@ mod structured_result_tests;
 mod tests {
     #[cfg(unix)]
     use super::BridgeToolset;
-    // Only the unix tests exercise a real child process, so the reporter is
-    // unused elsewhere and `-D warnings` rejects the import.
+    // Only the unix tests list a real child process's tools, so on other
+    // platforms nothing here calls `filtered_listing` and `-D warnings`
+    // rejects the import.
     #[cfg(unix)]
-    use super::report_tools;
-    use super::{append_timeout_report, map_tool, prepare_call_tool_params, Args};
+    use super::filtered_listing;
+    use super::{map_tool, prepare_call_tool_params, Args};
     use opentelemetry::global;
     use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
     use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -1017,17 +997,6 @@ mod tests {
         assert_eq!(serving.name.as_deref(), Some("exa"));
     }
 
-    #[test]
-    fn timeout_report_distinguishes_disabled_explicit_and_default_timeouts() {
-        let mut report = String::new();
-
-        append_timeout_report(&mut report, Some(0));
-        append_timeout_report(&mut report, Some(45));
-        append_timeout_report(&mut report, None);
-
-        assert_eq!(report, "    timeout: none\n    timeout: 45s\n");
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn list_tools_reports_the_wrapped_server_inventory() {
@@ -1042,7 +1011,7 @@ mod tests {
         .await
         .expect("wrap plans tools");
 
-        let report = report_tools(&bridge);
+        let report = filtered_listing(&bridge, None).render_text();
         assert!(report.starts_with("MCP server 'diag':"), "{report}");
         assert!(report.contains("list_plans"), "{report}");
         // Hints come from the child's advertised metadata, not from defaults.

@@ -388,12 +388,25 @@ impl Config {
     }
 
     pub(super) fn expand_nats_server_envs(server: &mut NatsServerConfig) {
-        server.url = expand_env_string(&server.url);
-        expand_env_option(&mut server.token);
-        expand_env_option(&mut server.user_id);
-        expand_env_option(&mut server.tls_cert);
-        expand_env_option(&mut server.tls_key);
-        expand_env_option(&mut server.tls_ca);
+        for (_, value) in env_expanded_fields_mut(server) {
+            if let Some(value) = value {
+                *value = expand_env_string(value);
+            }
+        }
+    }
+
+    /// Each field of `server`, as written before expansion, that loading
+    /// would leave unexpanded, by key, with the variables it names that
+    /// aren't set in this process and have no `:-` default.
+    pub(crate) fn unset_nats_server_envs(
+        server: &NatsServerConfig,
+    ) -> Vec<(&'static str, Vec<String>)> {
+        let mut server = server.clone();
+        env_expanded_fields_mut(&mut server)
+            .into_iter()
+            .filter_map(|(key, value)| Some((key, unset_env_vars(value?))))
+            .filter(|(_, unset)| !unset.is_empty())
+            .collect()
     }
 }
 
@@ -415,14 +428,39 @@ impl From<&NatsServerConfig> for NatsEndpoint {
     }
 }
 
-fn expand_env_option(value: &mut Option<String>) {
-    if let Some(inner) = value {
-        *inner = expand_env_string(inner);
-    }
+/// The fields of a NATS server config whose `$VAR` references are expanded
+/// when the file loads, by key.
+fn env_expanded_fields_mut(
+    server: &mut NatsServerConfig,
+) -> [(&'static str, Option<&mut String>); 6] {
+    [
+        ("url", Some(&mut server.url)),
+        ("token", server.token.as_mut()),
+        ("user_id", server.user_id.as_mut()),
+        ("tls_cert", server.tls_cert.as_mut()),
+        ("tls_key", server.tls_key.as_mut()),
+        ("tls_ca", server.tls_ca.as_mut()),
+    ]
 }
 
 fn expand_env_string(value: &str) -> String {
     shellexpand::env(value).map_or_else(|_| value.to_string(), |expanded| expanded.into_owned())
+}
+
+/// The variables `expand_env_string` would fail on, in order. Expansion
+/// stops at the first, so each one found is treated as set on the next pass
+/// to reach the rest.
+fn unset_env_vars(value: &str) -> Vec<String> {
+    let mut unset: Vec<String> = Vec::new();
+    while let Err(error) = shellexpand::env_with_context(value, |name| {
+        if unset.iter().any(|found| found == name) {
+            return Ok(Some(String::new()));
+        }
+        std::env::var(name).map(Some)
+    }) {
+        unset.push(error.var_name);
+    }
+    unset
 }
 
 #[cfg(test)]

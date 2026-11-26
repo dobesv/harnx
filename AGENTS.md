@@ -803,6 +803,7 @@ provider regenerated this way loses them.
 - **Async:** All I/O is async via Tokio. Use `async fn` and `.await`.
 - **Client modules:** Provider clients live in `crates/harnx-client/src/` and follow the patterns in `macros.rs`. Config structs live in `crates/harnx-core/src/provider_config/`.
 - **Configuration:** `config.yaml` holds global settings. Clients and MCP servers use individual YAML files; agents are Markdown files with YAML front matter in `agents/`.
+- **Config validation:** `harnx validate` (`crates/harnx-runtime/src/config_check/`) parses each file with the type its runtime loader uses and calls the loader's own functions for cross-checks, so a new field needs nothing extra. A new config file kind does: add it to `ConfigLayout`/`PackageLayout` (`layout.rs`) and to `file_checks` (`unknown_keys.rs`), or the check skips it without saying so. When a loader drops something on failure instead of erroring, report the drop in `silent_drops.rs`.
 - **Dual license:** MIT OR Apache-2.0. Preserve license headers where present.
 
 ## Tool Servers
@@ -881,6 +882,8 @@ The checklist below covers every integration point. Miss any and the release fai
 8. **MCP HTTP port** — use the next free port in the sequence (e.g., 3006 after exa's 3005).
 
 9. **CI.yaml** — no per-crate edit needed; CI builds every workspace bin and selects tests with `cargo xtask affected`. If another crate's tests launch the new binary, add a `[[test-edge]]` for it to `.config/affected.toml`.
+
+10. **`harnx validate`** — `run_toolset_main` gives the binary `--list-tools [--format json]`, which the config check runs to learn its tool names. A strict front parser must accept `--list-tools` and `--format VALUE`/`--format=VALUE`, as it does `--mcp-stdio`. Add the binary and its default toolset name to `KNOWN_TOOLSET_NAMES` (`crates/harnx-runtime/src/config_check/tool_listing.rs`). Without the entry, a failed listing of the new server leaves every unmatched tool name in the config a warning instead of an `unknown-tool` error. `known_binaries_register_their_default_names` checks only the binaries already in the table.
 
 
 ### Static `ToolKind` declarations

@@ -47,7 +47,9 @@ mod subagent_toolset;
 mod tool_registry;
 pub mod tool_reservation;
 mod tool_result_budget;
-mod tool_supervisor;
+pub(crate) mod tool_supervisor;
+pub(crate) use daemon_background::tool_servers_for_view;
+pub(crate) use subagent_toolset::offline_registration as subagent_registration;
 mod web_session_url;
 mod wind_up;
 

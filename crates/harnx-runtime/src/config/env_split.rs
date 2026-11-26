@@ -176,6 +176,29 @@ impl Config {
     }
 }
 
+/// What `load_env_file` makes of one line of the `.env` file.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnvLine<'a> {
+    /// Blank or a comment.
+    Skip,
+    /// `KEY=value`, both trimmed.
+    Entry(&'a str, &'a str),
+    /// Neither: the loader skips it without saying so.
+    Invalid,
+}
+
+/// Classify one `.env` line the way `load_env_file` reads it.
+pub(crate) fn classify_env_line(line: &str) -> EnvLine<'_> {
+    let line = line.trim();
+    if line.starts_with('#') || line.is_empty() {
+        return EnvLine::Skip;
+    }
+    match line.split_once('=') {
+        Some((key, value)) if !key.trim().is_empty() => EnvLine::Entry(key.trim(), value.trim()),
+        _ => EnvLine::Invalid,
+    }
+}
+
 pub fn load_env_file() -> Result<()> {
     let env_file_path = Config::env_file();
     let contents = match read_to_string(&env_file_path) {
@@ -189,29 +212,23 @@ pub fn load_env_file() -> Result<()> {
         let _ = std::fs::set_permissions(&env_file_path, std::fs::Permissions::from_mode(0o600));
     }
     for line in contents.lines() {
-        let line = line.trim();
-        if line.starts_with('#') || line.is_empty() {
+        let EnvLine::Entry(key, value) = classify_env_line(line) else {
+            continue;
+        };
+        // Standard dotenv precedence: the ambient/inherited environment
+        // always wins. The .env file only FILLS IN variables that are
+        // not already set in the process environment — it never clobbers
+        // an inherited value. This matches python-dotenv / node dotenv /
+        // dotenvy defaults (override is opt-in, not default) and is the
+        // more secure choice: operator-injected env (systemd, Docker,
+        // K8s secrets) takes precedence over a user-writable file.
+        // Fixes #989 (previously .env unconditionally overrode inherited
+        // HARNX_LOG_* vars, which required a per-key special-case guard).
+        if env::var_os(key).is_some() {
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            if !key.is_empty() {
-                // Standard dotenv precedence: the ambient/inherited environment
-                // always wins. The .env file only FILLS IN variables that are
-                // not already set in the process environment — it never clobbers
-                // an inherited value. This matches python-dotenv / node dotenv /
-                // dotenvy defaults (override is opt-in, not default) and is the
-                // more secure choice: operator-injected env (systemd, Docker,
-                // K8s secrets) takes precedence over a user-writable file.
-                // Fixes #989 (previously .env unconditionally overrode inherited
-                // HARNX_LOG_* vars, which required a per-key special-case guard).
-                if env::var_os(key).is_some() {
-                    continue;
-                }
-                unsafe {
-                    env::set_var(key, value.trim());
-                }
-            }
+        unsafe {
+            env::set_var(key, value);
         }
     }
     Ok(())
