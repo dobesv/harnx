@@ -382,7 +382,7 @@ async fn acquire_gc_lease(
     .await
 }
 
-async fn load_optional_lease_store(
+pub(crate) async fn load_optional_lease_store(
     config: &Config,
     cluster: &str,
 ) -> anyhow::Result<Option<Store>> {
@@ -485,7 +485,7 @@ pub(crate) async fn session_lease_present(
     }
 }
 
-async fn session_reactivated(
+pub(crate) async fn session_reactivated(
     metadata_store: &SessionMetadataStore,
     session_id: &str,
     threshold: u64,
@@ -509,7 +509,7 @@ fn candidate_session_ids(records: &[ListedSession], threshold: u64) -> Vec<Strin
         .collect()
 }
 
-fn is_cleanup_candidate(record: &ListedSession, threshold: u64) -> bool {
+pub(crate) fn is_cleanup_candidate(record: &ListedSession, threshold: u64) -> bool {
     record
         .activity
         .as_ref()
@@ -519,7 +519,7 @@ fn is_cleanup_candidate(record: &ListedSession, threshold: u64) -> bool {
         < threshold as i64
 }
 
-fn cleanup_threshold(now_unix_secs: u64, days: u64) -> u64 {
+pub(crate) fn cleanup_threshold(now_unix_secs: u64, days: u64) -> u64 {
     now_unix_secs.saturating_sub(days.saturating_mul(SECONDS_PER_DAY))
 }
 
@@ -527,7 +527,7 @@ fn epoch_hour(now_unix_secs: u64) -> u64 {
     now_unix_secs / SECONDS_PER_HOUR
 }
 
-fn now_unix_secs() -> u64 {
+pub(crate) fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

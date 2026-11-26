@@ -4,6 +4,7 @@ mod cli_event_sink;
 mod cli_replay_sink;
 mod compact;
 mod credentials_cmd;
+mod expired_sessions_cmd;
 mod interact;
 mod main_runtime;
 mod oneshot_nats;
@@ -11,6 +12,8 @@ mod orphan_streams_cmd;
 mod response_inputs;
 mod session_attach;
 mod session_dump;
+mod session_stats_cmd;
+mod session_stats_render;
 mod streaming_think_segmenter;
 mod surface;
 mod tool_cmd;
@@ -235,7 +238,7 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
         Commands::Info(info_args) => run_info_command(info_args, cli).await,
         Commands::Dump(dump_args) => run_dump_command(dump_args).await.map(|()| 0),
         Commands::Open(open_args) => run_open_command(open_args).await.map(|()| 0),
-        Commands::Delete(delete_args) => run_delete_command(delete_args).await.map(|()| 0),
+        Commands::Delete(delete_args) => run_delete_command(delete_args).await,
         Commands::List(list_args) => run_list_command(list_args, cli).await,
         Commands::Interact(interact_args) => interact::run_interact_command(interact_args).await,
         Commands::Surface(surface_args) => surface::run_surface_command(surface_args).await,
@@ -271,6 +274,7 @@ async fn run_info_command(info_args: &crate::cli::InfoArgs, cli: &Cli) -> Result
         } => run_info_session(agent_name, session_id, format)
             .await
             .map(|()| 0),
+        InfoSubcommands::Sessions(args) => session_stats_cmd::run(args).await,
     }
 }
 
@@ -604,12 +608,18 @@ async fn flush_new_entries(
     Ok(())
 }
 
-async fn run_delete_command(delete_args: &crate::cli::DeleteArgs) -> Result<()> {
+async fn run_delete_command(delete_args: &crate::cli::DeleteArgs) -> Result<u8> {
     match &delete_args.command {
-        DeleteSubcommands::Session(args) => run_session_delete_command(args).await,
+        DeleteSubcommands::Session(args) => run_session_delete_command(args).await.map(|()| 0),
         DeleteSubcommands::OrphanStreams(args) => {
-            orphan_streams_cmd::run_orphan_stream_delete_command(args).await
+            orphan_streams_cmd::run_orphan_stream_delete_command(args)
+                .await
+                .map(|()| 0)
         }
+        // The expired-sessions pass maps its own exit status: a pass that ran
+        // with per-session failures still prints its summary, then exits
+        // nonzero via the returned code.
+        DeleteSubcommands::ExpiredSessions(args) => expired_sessions_cmd::run(args).await,
     }
 }
 

@@ -16,7 +16,20 @@ pub(super) fn entry_unresolved(entry: &async_nats::jetstream::kv::Entry) -> Resu
     if entry.operation != Operation::Put {
         return Ok(false);
     }
-    let doc: Value = serde_json::from_slice(&entry.value)?;
+    payload_unresolved(&entry.value)
+}
+
+/// Whether a live A2A context document holds unresolved stop, projection or
+/// publication state. Shared with the read-only hold predicate so the two
+/// cannot drift into different definitions of "unresolved".
+pub(super) fn payload_unresolved(payload: &[u8]) -> Result<bool> {
+    let doc: Value = serde_json::from_slice(payload)?;
+    context_unresolved(&doc)
+}
+
+/// Whether a parsed A2A context document holds unresolved work: a non-null
+/// active state that has not reached retirement.
+pub(super) fn context_unresolved(doc: &Value) -> Result<bool> {
     let active = doc
         .pointer("/state/active")
         .ok_or_else(|| anyhow::anyhow!("invalid A2A context state"))?;
@@ -87,12 +100,15 @@ pub(super) async fn ensure_first_settled(
     let (_, uuid) = task
         .rsplit_once('.')
         .ok_or_else(|| anyhow::anyhow!("invalid A2A task identity"))?;
-    ensure!(
-        metadata
-            .leader_value(&format!("sessions/{storage}/a2a/archive/{uuid}"))
-            .await?
-            .is_some(),
-        "A2A first admission is unallocated or unsettled; deletion refused"
-    );
+    if metadata
+        .leader_value(&format!("sessions/{storage}/a2a/archive/{uuid}"))
+        .await?
+        .is_none()
+    {
+        return Err(FenceRefused::new(
+            "A2A first admission is unallocated or unsettled; deletion refused",
+        )
+        .into());
+    }
     Ok(())
 }

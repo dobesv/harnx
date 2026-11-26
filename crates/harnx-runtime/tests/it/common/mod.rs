@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::time::sleep;
 
+/// Dropping the handle kills the server process, so a fixture that hands out
+/// only the URL must also keep the handle for as long as anything talks to
+/// that broker.
 pub struct NatsServerHandle {
     pub url: String,
     _store_dir: TempDir,
