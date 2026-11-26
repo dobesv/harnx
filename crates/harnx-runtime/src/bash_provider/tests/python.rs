@@ -27,7 +27,7 @@ async fn python_processes_tool_output_from_vfs_without_tool_bridge() {
         partial["stderr"]
             .as_str()
             .unwrap()
-            .contains("no external function handler configured"),
+            .contains("NameError: unregistered Python host function: fs_read"),
         "{partial}"
     );
     assert!(partial["trace"].as_array().unwrap().is_empty());

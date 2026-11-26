@@ -25,6 +25,7 @@ use crate::bash_inner::MAX_RETAINED_TRACE_ENTRIES;
 use crate::structured_provider::StructuredProvider;
 
 mod python;
+mod python_tools;
 
 /// `ToolError` is not `Debug`, so tests unwrap results through these helpers
 /// instead of `expect`/`expect_err`.

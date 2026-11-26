@@ -106,7 +106,7 @@ respond(r)
 async fn middleware_allowlisted_tools_bypass_chain_in_both_languages() {
     for mut entry in [
         bash("probe_aux --json '{\"value\":\"helper\"}'; next"),
-        python("call_tool('probe_aux', {'value':'helper'})\ncall_next()"),
+        python("tools.probe_aux(value='helper')\ncall_next()"),
     ] {
         entry["tools"] = json!(["probe_aux"]);
         entry["match"] = json!("^probe_");
@@ -125,10 +125,7 @@ async fn middleware_allowlisted_tools_bypass_chain_in_both_languages() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn middleware_non_allowlisted_tool_fails_in_both_languages() {
-    for entry in [
-        bash("probe_aux --json '{}'"),
-        python("call_tool('probe_aux', {})"),
-    ] {
+    for entry in [bash("probe_aux --json '{}'"), python("tools.probe_aux()")] {
         let fixture = Fixture::new(vec![entry]).await;
         let result = fixture.eval(json!({})).await.unwrap();
         assert_eq!(result.output["is_error"], true, "{}", result.output);
@@ -171,4 +168,51 @@ async fn middleware_bash_tool_inner_call_cannot_bypass_chain() {
         results[0].output
     );
     assert!(fixture.calls().is_empty());
+}
+
+/// The error text of a Python middleware script that is expected to fail.
+async fn python_failure(source: &str) -> String {
+    let mut entry = python(source);
+    entry["tools"] = json!(["probe_aux"]);
+    let fixture = Fixture::new(vec![entry]).await;
+    let output = fixture.eval(json!({})).await.unwrap().output;
+    assert!(fixture.calls().is_empty());
+    output["error"].as_str().expect("error text").to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn call_tool_is_gone() {
+    let error = python_failure("call_tool('probe_aux', {})").await;
+    assert!(
+        error.contains("NameError") && error.contains("call_tool"),
+        "{error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_middleware_script_cannot_catch_a_failed_tool_call() {
+    let source = "try:\n    tools.probe_aux(fatal=True)\nexcept Exception:\n    pass\ncall_next()";
+    let mut entry = python(source);
+    entry["tools"] = json!(["probe_aux"]);
+    let fixture = Fixture::new(vec![entry]).await;
+    let output = fixture.eval(json!({})).await.map(|result| result.output);
+    assert!(
+        output
+            .as_ref()
+            .map_or(true, |output| output["is_error"] == true),
+        "the run must fail: {output:?}"
+    );
+    let called: Vec<String> = fixture.calls().into_iter().map(|call| call.0).collect();
+    assert_eq!(
+        called,
+        ["probe_aux"],
+        "call_next must not run after the failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn middleware_python_traceback_shows_the_scripts_own_line_numbers() {
+    let error = python_failure("x = 1\n\nraise ValueError('known line')").await;
+    assert!(error.contains("line 3"), "{error}");
+    assert!(error.contains("known line"), "{error}");
 }

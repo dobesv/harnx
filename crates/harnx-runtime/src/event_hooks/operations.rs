@@ -1,7 +1,14 @@
 //! Lifecycle operations and Python/Bash adapters share one run's effects.
 
 use super::{tools::HookTools, RunState};
-use crate::{config::ResolvedEventHook, event_hook_operations::names, script_tools::ScriptTools};
+use crate::{
+    config::ResolvedEventHook,
+    event_hook_operations::names,
+    script_tools::{
+        python_tools::{with_tools, PythonToolRunner},
+        ScriptTools,
+    },
+};
 use anyhow::{anyhow, ensure, Result};
 use harnx_core::hooks::HookEventKind;
 use harnx_script::{
@@ -39,14 +46,21 @@ pub(super) fn register(
     let python_functions = ScriptPythonFunctions {
         names: names(event)
             .iter()
-            .copied()
-            .chain(tools.executor.as_ref().map(|_| "call_tool"))
-            .map(str::to_string)
+            .map(|name| (*name).to_string())
             .collect(),
         handler: Arc::new(PythonOperation {
             operations: commands,
-            tools: tools.executor,
         }),
+        prelude: None,
+    };
+    // A hook with no tool executor gets no `tools` at all.
+    let python_functions = match tools.executor {
+        Some(executor) => with_tools(
+            python_functions,
+            &tools.declarations,
+            Arc::new(HookToolRunner(executor)),
+        ),
+        None => python_functions,
     };
     (script_commands, python_functions)
 }
@@ -151,7 +165,43 @@ impl Operation {
 
 struct PythonOperation {
     operations: Vec<Arc<Operation>>,
-    tools: Option<Arc<ScriptTools>>,
+}
+
+struct HookToolRunner(Arc<ScriptTools>);
+
+#[async_trait::async_trait]
+impl PythonToolRunner for HookToolRunner {
+    async fn run_tool(
+        &self,
+        name: String,
+        arguments: Value,
+        host: ScriptHostContext,
+    ) -> ExtFunctionResult {
+        let result = self
+            .0
+            .execute(&name, arguments, host.cancel.clone())
+            .await
+            .map(Some);
+        finish(result, &host)
+    }
+}
+
+/// A failed operation or tool call stops the hook run, so it cannot be caught.
+fn finish(result: Result<Option<Value>>, host: &ScriptHostContext) -> ExtFunctionResult {
+    match result.and_then(|value| {
+        value
+            .map(crate::script_tools::conversion::to_python)
+            .transpose()
+    }) {
+        Ok(object) => ExtFunctionResult::Return(object.unwrap_or_else(MontyObject::none)),
+        Err(error) => {
+            host.control.stop();
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::RuntimeError,
+                Some(format!("{error:#}")),
+            ))
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -163,45 +213,30 @@ impl ScriptPythonHandler for PythonOperation {
         kwargs: Vec<(MontyObject, MontyObject)>,
         host: ScriptHostContext,
     ) -> ExtFunctionResult {
-        let result = async {
-            if name == "call_tool" {
-                let tools = self
-                    .tools
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("event-hook tools are not enabled"))?;
-                let (name, arguments) = crate::script_tools::python::tool_arguments(args, kwargs)?;
-                return tools
-                    .execute(&name, arguments, host.cancel.clone())
-                    .await
-                    .map(Some);
-            }
-            let operation = self
-                .operations
-                .iter()
-                .find(|operation| operation.name == name)
-                .ok_or_else(|| anyhow!("unknown event-hook function '{name}'"))?;
-            let values = bind(operation.parameters(), args, kwargs)?;
-            let args = values.iter().map(|value| match value {
-                Value::String(text) => text.clone(),
-                _ => String::new(),
-            });
-            operation.execute(&args.collect::<Vec<_>>(), &host).await
-        }
-        .await;
-        match result.and_then(|value| {
-            value
-                .map(crate::script_tools::conversion::to_python)
-                .transpose()
-        }) {
-            Ok(object) => ExtFunctionResult::Return(object.unwrap_or_else(MontyObject::none)),
-            Err(error) => {
-                host.control.stop();
-                ExtFunctionResult::Error(MontyException::new(
-                    ExcType::RuntimeError,
-                    Some(format!("{error:#}")),
-                ))
-            }
-        }
+        let result = self.execute(&name, args, kwargs, &host).await;
+        finish(result, &host)
+    }
+}
+
+impl PythonOperation {
+    async fn execute(
+        &self,
+        name: &str,
+        args: Vec<MontyObject>,
+        kwargs: Vec<(MontyObject, MontyObject)>,
+        host: &ScriptHostContext,
+    ) -> Result<Option<Value>> {
+        let operation = self
+            .operations
+            .iter()
+            .find(|operation| operation.name == name)
+            .ok_or_else(|| anyhow!("unknown event-hook function '{name}'"))?;
+        let values = bind(operation.parameters(), args, kwargs)?;
+        let args = values.iter().map(|value| match value {
+            Value::String(text) => text.clone(),
+            _ => String::new(),
+        });
+        operation.execute(&args.collect::<Vec<_>>(), host).await
     }
 }
 

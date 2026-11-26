@@ -68,8 +68,8 @@ fn attach_metadata_log(config: &GlobalConfig, log: Arc<MetadataLog>) {
 async fn event_hook_tool_timeout_allows_next_hook_and_model_turn() {
     let _guard = SINK_LOCK.lock().await;
     let hooks = hooks_config(HookEventKind::UserPromptSubmit, vec![
-        metadata_hook("timeout", "add_context('discard')\ncall_tool('harnx_read_session_meta', {})"),
-        metadata_hook("next", "r = call_tool('harnx_read_session_meta', {})\nassert r['is_error']\nadd_context('next helper ran')"),
+        metadata_hook("timeout", "add_context('discard')\ntools.harnx_read_session_meta()"),
+        metadata_hook("next", "r = tools.harnx_read_session_meta()\nassert r['is_error']\nadd_context('next helper ran')"),
     ]);
     let (config, _) = session_config_with_hooks(hooks);
     let log = Arc::new(MetadataLog {
@@ -123,10 +123,7 @@ async fn event_hook_stop_and_stop_failure_dispatch_with_tool_context() {
     for event in [HookEventKind::Stop, HookEventKind::StopFailure] {
         let hooks = hooks_config(
             event,
-            vec![metadata_hook(
-                "observe",
-                "call_tool('harnx_read_session_meta', {})",
-            )],
+            vec![metadata_hook("observe", "tools.harnx_read_session_meta()")],
         );
         let (config, _) = session_config_with_hooks(hooks);
         let log = Arc::new(MetadataLog::default());

@@ -12,7 +12,7 @@ use crate::{
 
 mod discovery;
 mod mapping;
-mod render;
+pub(crate) mod render;
 pub(crate) use discovery::unknown_command_message;
 pub use mapping::OutputMapping;
 // Shared MCP domain-error classification (PR3 round-2 review R6): the runtime

@@ -1,4 +1,4 @@
-//! Shared Python argument binding for script tool calls and middleware operations.
+//! Shared Python argument binding for script tool and middleware operations.
 
 use super::conversion::from_python;
 use anyhow::{bail, ensure, Result};
@@ -45,15 +45,4 @@ pub(crate) fn string(value: Value) -> Result<String> {
         Value::String(value) => Ok(value),
         _ => bail!("middleware argument must be a string"),
     }
-}
-
-/// Keep the hook and middleware `call_tool(name, args)` contracts identical.
-pub(crate) fn tool_arguments(
-    args: Vec<MontyObject>,
-    kwargs: Vec<(MontyObject, MontyObject)>,
-) -> Result<(String, Value)> {
-    let mut values = bind(&["name", "args"], args, kwargs)?;
-    let name = string(required(&mut values, "name")?)?;
-    let arguments = required(&mut values, "args")?;
-    Ok((name, arguments))
 }

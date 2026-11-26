@@ -6,8 +6,8 @@
 //! allowlisted URLs, and record effects with the event's operations:
 //! `add_context` (SessionStart, UserPromptSubmit), `block`/`rewrite_prompt`
 //! (UserPromptSubmit), and `resume` (Stop). Entries that declare `tools:`
-//! also get those tools as script commands and `call_tool`, through the
-//! shared bridge in `script_tools` (see "Calling tools" in
+//! also get those tools as script commands and as `tools.NAME(...)` in
+//! Python, through the shared bridge in `script_tools` (see "Calling tools" in
 //! `docs/hooks-guide.md`). Interaction operations
 //! (`confirm`, `save`, `next`, …) are intentionally not registered: an event
 //! hook that tries one fails, which the hook's `on_error` policy handles.

@@ -313,47 +313,100 @@ fn stdout_block(output: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// A broker and a real `fs_read` tool server allowed to read `dir`, with
+/// script mode configured over it. Dropping it stops the server.
+struct FsReadServer {
+    instance_id: ServerScope,
+    config: Arc<ConfigLock>,
+    _supervisor: ToolServerSupervisor,
+    _env: EnvGuard,
+    _broker: common::NatsServerHandle,
+}
+
+impl FsReadServer {
+    /// `None` when the environment has no `nats-server`.
+    async fn start(dir: &std::path::Path) -> Result<Option<Self>> {
+        let Some(broker) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+            auth_token: Some(TOKEN.to_string()),
+        })
+        .await?
+        else {
+            return Ok(None);
+        };
+        let bridge = workspace_binary("harnx-mcp-bridge")?;
+        let fs_tools = workspace_binary("harnx-fs-tools")?;
+        let env = EnvGuard::install(&[
+            (HARNX_NATS_URL_ENV, broker.url()),
+            (HARNX_NATS_TOKEN_ENV, TOKEN),
+        ]);
+        let mut fs_server = time_server_config(&bridge.to_string_lossy());
+        fs_server.name = "fs".to_string();
+        fs_server.args = ["--name", "fs", "--"]
+            .into_iter()
+            .map(str::to_string)
+            .chain([
+                fs_tools.to_string_lossy().into_owned(),
+                "--mcp-stdio".to_string(),
+                "--allow-read".to_string(),
+                dir.to_string_lossy().into_owned(),
+            ])
+            .collect();
+        let (instance_id, supervisor, config) =
+            start_script_server(broker.url(), fs_server, "__fs__fs", &["fs_read"]).await?;
+        Ok(Some(Self {
+            instance_id,
+            config,
+            _supervisor: supervisor,
+            _env: env,
+            _broker: broker,
+        }))
+    }
+}
+
 /// A file tool reached through the MCP bridge prints its shell form in a
 /// script: the request for a structured result crosses the bridge and the
 /// advertised mapping tells the script which field is stdout.
 #[tokio::test(flavor = "multi_thread")]
 async fn bridged_file_tool_prints_its_shell_form() -> Result<()> {
-    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
-        auth_token: Some(TOKEN.to_string()),
-    })
-    .await?
-    else {
-        return Ok(());
-    };
-    let bridge = workspace_binary("harnx-mcp-bridge")?;
-    let fs_tools = workspace_binary("harnx-fs-tools")?;
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("notes.txt");
     std::fs::write(&file, "alpha\nbeta\n")?;
-    let _env = EnvGuard::install(&[
-        (HARNX_NATS_URL_ENV, server.url()),
-        (HARNX_NATS_TOKEN_ENV, TOKEN),
-    ]);
-    let mut fs_server = time_server_config(&bridge.to_string_lossy());
-    fs_server.name = "fs".to_string();
-    fs_server.args = ["--name", "fs", "--"]
-        .into_iter()
-        .map(str::to_string)
-        .chain([
-            fs_tools.to_string_lossy().into_owned(),
-            "--mcp-stdio".to_string(),
-            "--allow-read".to_string(),
-            dir.path().to_string_lossy().into_owned(),
-        ])
-        .collect();
-    let (instance_id, supervisor, config) =
-        start_script_server(server.url(), fs_server, "__fs__fs", &["fs_read"]).await?;
+    let Some(fs) = FsReadServer::start(dir.path()).await? else {
+        return Ok(());
+    };
 
     let script = format!("fs_read --path {} | head -1", file.display());
-    let output = run_bash_script(&config, &instance_id, &script).await?;
-    drop(supervisor);
+    let output = run_bash_script(&fs.config, &fs.instance_id, &script).await?;
     assert_eq!(output["status"], "ok", "{output}");
     assert_eq!(stdout_block(&output), "alpha", "{output}");
+    Ok(())
+}
+
+/// Python in the `bash` tool calls a real file tool through `tools`: the
+/// result's fields come back as a dict, and a read cut by `limit` carries
+/// its note in `notes` instead of printing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn python_reads_a_file_through_tools() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let short = dir.path().join("short.txt");
+    let long = dir.path().join("long.txt");
+    std::fs::write(&short, "alpha\nbeta\n")?;
+    std::fs::write(&long, "one\ntwo\nthree\nfour\nfive\n")?;
+    let Some(fs) = FsReadServer::start(dir.path()).await? else {
+        return Ok(());
+    };
+
+    let script = format!(
+        "python3 - <<'EOF'\nprint(tools.fs_read(path={short:?})['text'], end='')\nprint('--')\nprint(tools.fs_read(path={long:?}, limit=2)['notes'])\nEOF",
+        short = short.display().to_string(),
+        long = long.display().to_string(),
+    );
+    let output = run_bash_script(&fs.config, &fs.instance_id, &script).await?;
+    assert_eq!(output["status"], "ok", "{output}");
+    let stdout = stdout_block(&output).replace("\r\n", "\n");
+    let (text, notes) = stdout.split_once("--\n").expect("separator in stdout");
+    assert_eq!(text, "alpha\nbeta\n");
+    assert!(notes.contains("offset"), "{notes}");
     Ok(())
 }
 
@@ -450,6 +503,7 @@ async fn inactive_script_mode_leaves_bash_replay_to_other_providers() -> Result<
     params.bash_context_slot = Some(slot.clone());
     let ctx = Arc::new(harnx_runtime::tool::build_tool_eval_context(params).await);
     slot.set(&ctx);
+    // qual:allow(dry, fragment) reason: "the replay e2es share the ctx-build + ToolCall fixture by design and diverge in what they assert about replay; deduplicating it would hide the replay policy under a fixture"
     let call = ToolCall::new(
         "bash".to_string(),
         json!({"script": "time_get_current_time --timezone UTC"}),

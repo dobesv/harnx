@@ -199,16 +199,25 @@ add_context "$plan_text"
 add_context "$(plans_get_plan --plan "cid:plan:team/main/sprint" -o text)"
 ```
 
-In Python, call tools with `call_tool(name, args)`:
+In Python, each tool is a function on `tools`, with the tool's property names as
+keywords:
 
 ```python
 # Entry declares tools: [fs_read]
-result = call_tool("fs_read", {"path": "RUNBOOK.md"})
+result = tools.fs_read(path="RUNBOOK.md")
 add_context(result["content"][0]["text"])
 ```
 
+A call returns the tool's direct-call result. Required properties may also be
+positional, `getattr(tools, "the-name")` reaches a tool whose name is not a
+Python identifier, and `getattr(tools, name)(**args)` calls one chosen at run
+time. The rules are the ones in the
+[Middleware Guide](middleware-guide.md#calling-tools-from-python). The old
+`call_tool(name, args)` no longer exists; `call_tool("x", {"a": 1})` becomes
+`tools.x(a=1)`.
+
 If an entry omits `tools:`, no tool commands exist in Bash (calling one returns
-command not found), and `call_tool` is not registered in Python.
+command not found), and there is no `tools` object in Python.
 
 ### Allowlist and exclusions
 
@@ -217,8 +226,9 @@ Tools are strictly filtered before execution:
 * **Host-side allowlist:** Only tools matching the entry's resolved allowlist
   can be dispatched. In Bash, unlisted tools are not registered; invoking one
   returns exit 127 (unknown command), which stops the script under the default
-  `set -e`. In Python, calling `call_tool` on an unlisted tool stops the
-  interpreter immediately. Neither language ever dispatches an unlisted tool.
+  `set -e`. In Python, an unlisted tool is not on `tools`: reaching it
+  is an `AttributeError`, which stops the script unless it catches it. Neither
+  language ever dispatches an unlisted tool.
 * **Exclusions:** Interactive and agent-steering tools are never exposed to hook
   scripts, even when a selector like `*` matches them. Specifically, `bash`,
   `ask_user`, `switch_agent`, and every `*_session_handoff` tool are excluded.
@@ -243,9 +253,10 @@ Tool execution outcomes distinguish recoverable errors from host failures:
     add_context "$(echo "$raw" | jq -r '.content[0].text')"
   fi
   ```
-* **Host-level failures stop the script:** In Python, calling an unlisted tool
-  stops the script immediately. Fatal evaluation errors and script cancellation
-  (hook timeout or session abort) stop execution immediately in both languages.
+* **Host-level failures stop the script:** In Python, a tool call that cannot
+  complete ends the run and cannot be caught. Fatal evaluation errors and script
+  cancellation (hook timeout or session abort) stop execution immediately in
+  both languages.
   In Bash, an unlisted tool is an unknown command (exit 127), so it stops the
   script unless handled or errexit is disabled. When a run fails, all effects
   recorded during that run are discarded, and the entry's `on_error` policy
@@ -513,7 +524,7 @@ args:
 #### 3. Middleware Script: `packages/pantheon/middleware/proxy-auth.py`
 ```python
 # Files are provisioned by the long-lived proxy on the bash host, not in this VFS.
-additions = call_tool("proxy_auth_environment", {})
+additions = tools.proxy_auth_environment()
 if additions.get("is_error") or additions.get("isError"):
     raise RuntimeError("proxy auth environment lookup failed")
 

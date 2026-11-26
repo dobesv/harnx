@@ -14,10 +14,10 @@ command: harnx-claude-hook-tools
 ```
 
 The default server name is `claude_hook`; its tool is `run`. A `--name` override
-changes the prefix used in `tools:` and `call_tool`. The service uses the same
-implementation for native NATS and MCP stdio. MCP HTTP is disabled because
-this tool runs request-supplied host commands without sandboxing or
-authentication. In unmanaged/cloud workers, deploy this binary
+changes the prefix used in `tools:` and in the `tools.NAME(...)` calls. The
+service uses the same implementation for native NATS and MCP stdio. MCP HTTP is
+disabled because this tool runs request-supplied host commands without
+sandboxing or authentication. In unmanaged/cloud workers, deploy this binary
 separately with the worker's NATS endpoint and `HARNX_SERVER_SCOPE`, as with
 other independently deployed tool services.
 Commands, files and `cwd` refer to the **tool-service host**, not the worker's
@@ -52,7 +52,7 @@ middleware:
                  "tool_use_id": info["tool_call_id"], "tool_input": info["arguments"]}
       pre = saved("claude-pre")
       if pre is None:
-          pre = call_tool("claude_hook_run", {"command": command, "event": "PreToolUse", "payload": payload})
+          pre = tools.claude_hook_run(command=command, event="PreToolUse", payload=payload)
           save("claude-pre", pre)
       if pre.get("is_error") or pre.get("isError"):
           deny("Claude pre-hook failed: " + str(pre))
@@ -73,7 +73,7 @@ middleware:
               payload["error"] = str(result["output"])
           post = saved("claude-post")
           if post is None:
-              post = call_tool("claude_hook_run", {"command": command, "event": event, "payload": payload})
+              post = tools.claude_hook_run(command=command, event=event, payload=payload)
               save("claude-post", post)
           if post.get("is_error") or post.get("isError"):
               deny("Claude post-hook failed. Tool already ran: " + str(post))

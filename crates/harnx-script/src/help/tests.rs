@@ -31,7 +31,8 @@ fn help_has_man_page_sections_and_property_metadata() {
     );
     let expected = concat!(
         "NAME\n    fs_read - Read a file.\n\n",
-        "SYNOPSIS\n    fs_read --file-path <string> [--max-lines <integer>] [--mode <string>] [--options <json>] [--raw|--no-raw] [--tags <string>]... [--json <object>]\n\n",
+        "SYNOPSIS\n    fs_read --file-path <string> [--max-lines <integer>] [--mode <string>] [--options <json>] [--raw|--no-raw] [--tags <string>]... [--json <object>]\n",
+        "    PYTHON  tools.fs_read(filePath, *, max_lines=None, mode=None, options=None, raw=None, tags=None)\n\n",
         "DESCRIPTION\n    Read a file.\n    Returns its contents.\n\n",
         "OPTIONS\n",
         "    --file-path <string>\n        type: string; required\n        File to read.\n",
@@ -266,4 +267,83 @@ fn help_without_properties_prints_no_fields_section() {
         assert!(!text.contains("FIELDS"), "{schema_value}");
     }
     assert!(!help("t", &schema(), "d", None, None).contains("FIELDS"));
+}
+
+fn python_line(name: &str, schema: &Value) -> String {
+    let text = help(name, schema, "Do it.", None, None);
+    text.lines()
+        .find(|line| line.starts_with("    PYTHON  "))
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+#[test]
+fn python_line_lists_required_in_schema_order_then_optional_by_name() {
+    let schema = json!({"type":"object", "required":["b", "a"], "properties":{
+        "z":{"type":"string"}, "a":{"type":"string"}, "m":{"type":"integer"}, "b":{"type":"string"}
+    }});
+    assert_eq!(
+        python_line("t", &schema),
+        "    PYTHON  tools.t(a, b, *, m=None, z=None)"
+    );
+}
+
+#[test]
+fn python_line_has_no_star_without_optional_properties_and_is_absent_without_properties() {
+    let only_required =
+        json!({"type":"object", "required":["p"], "properties":{"p":{"type":"string"}}});
+    assert_eq!(python_line("t", &only_required), "    PYTHON  tools.t(p)");
+    assert_eq!(python_line("t", &json!({"type":"object"})), "");
+    assert_eq!(
+        python_line("t", &json!({"type":"object", "properties":{}})),
+        ""
+    );
+}
+
+#[test]
+fn python_line_reaches_odd_tool_names_with_getattr() {
+    let schema = json!({"type":"object", "properties":{"p":{"type":"string"}}});
+    assert_eq!(
+        python_line("odd-name", &schema),
+        "    PYTHON  getattr(tools, \"odd-name\")(*, p=None)"
+    );
+    assert_eq!(
+        python_line("class", &schema),
+        "    PYTHON  getattr(tools, \"class\")(*, p=None)"
+    );
+}
+
+#[test]
+fn python_line_leaves_out_names_python_cannot_spell_and_ends_with_a_dict_splat() {
+    let schema = json!({"type":"object", "required":["from"], "properties":{
+        "from":{"type":"string"}, "max-depth":{"type":"integer"}, "limit":{"type":"integer"}
+    }});
+    assert_eq!(
+        python_line("t", &schema),
+        "    PYTHON  tools.t(*, limit=None, **{...})"
+    );
+    let only_odd = json!({"type":"object", "properties":{"from":{"type":"string"}}});
+    assert_eq!(python_line("t", &only_odd), "    PYTHON  tools.t(**{...})");
+}
+
+#[test]
+fn python_line_stops_positionals_at_the_first_unspellable_required_property() {
+    let schema = json!({"type":"object", "required":["a", "from", "b"], "properties":{
+        "a":{"type":"string"}, "from":{"type":"string"}, "b":{"type":"string"}, "c":{"type":"string"}
+    }});
+    assert_eq!(
+        python_line("t", &schema),
+        "    PYTHON  tools.t(a, *, b=..., c=None, **{...})"
+    );
+}
+
+#[test]
+fn python_line_with_an_unspellable_required_property_first_has_no_positionals() {
+    let schema = json!({"type":"object", "required":["from", "b"], "properties":{
+        "from":{"type":"string"}, "b":{"type":"string"}
+    }});
+    assert_eq!(
+        python_line("t", &schema),
+        "    PYTHON  tools.t(*, b=..., **{...})"
+    );
 }

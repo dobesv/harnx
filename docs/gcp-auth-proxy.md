@@ -92,7 +92,7 @@ middleware:
   - name: gcp-proxy-auth
     match: '^bash_(exec|spawn)$'
     python: |
-      additions = call_tool("proxy_auth_environment", {})
+      additions = tools.proxy_auth_environment()
       if additions.get("is_error") or additions.get("isError"):
           raise RuntimeError("proxy auth environment lookup failed")
       args = tool_input()["arguments"]

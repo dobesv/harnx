@@ -1,5 +1,5 @@
 # Files are provisioned by the long-lived proxy on the bash host, not in this VFS.
-additions = call_tool("proxy_auth_environment", {})
+additions = tools.proxy_auth_environment()
 if additions.get("is_error") or additions.get("isError"):
     raise RuntimeError("proxy auth environment lookup failed")
 

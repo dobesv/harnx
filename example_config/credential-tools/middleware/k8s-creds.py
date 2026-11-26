@@ -1,5 +1,5 @@
 # Query the Kubernetes credential provider tool service for environment additions.
-additions = call_tool("k8s_creds_environment", {})
+additions = tools.k8s_creds_environment()
 if additions.get("is_error") or additions.get("isError"):
     raise RuntimeError("k8s creds environment lookup failed")
 

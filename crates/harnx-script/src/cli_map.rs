@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::schema::{flag_table, kebab_case, properties, FlagKind, Property, Scalar};
 
-mod validation;
+pub(crate) mod validation;
 use validation::{parse_scalar, validate};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

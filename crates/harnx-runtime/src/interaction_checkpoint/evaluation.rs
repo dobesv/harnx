@@ -124,7 +124,7 @@ impl DurableRound {
                 let outcome = match tool_input {
                     // Rerun after a tool challenge: only the owning call's
                     // leaf dispatch sees the accepted responses and state,
-                    // never an allowlisted `call_tool` dispatch.
+                    // never an allowlisted `tools` call.
                     Some(input) => crate::middleware::with_tool_input(input, dispatched).await?,
                     None => dispatched.await?,
                 };

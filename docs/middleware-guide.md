@@ -80,7 +80,7 @@ host operations. Scripts are trusted configuration, not model-authored code.
 | `next [--id STEP] [JSON]` | `call_next(args=None, id=None)` | Run the rest of the chain, using current arguments when omitted. Bash also accepts JSON on stdin. |
 | `respond JSON` | `respond(result)` | Set the final result envelope. |
 | `deny REASON` | `deny(reason)` | Set an error result marked with this middleware's name. |
-| Allowlisted tool command | `call_tool(name, args)` | Invoke a helper, bypassing middleware. |
+| Allowlisted tool command | `tools.NAME(key=value, ...)` | Invoke a helper, bypassing middleware. |
 | `confirm [--id KEY] MESSAGE` | `confirm(message, id=None)` | Return success / `True` for an exactly-bound approval, failure / `False` for denial. Without an answer, stop the interpreter and request input. |
 | `answer KEY` | `answer(key)` | Read an accepted response in this frame, or exit 1 / return `None` if unanswered. Never reads tool arguments or the stash. |
 | `save KEY JSON` | `save(key, value)` | Save bounded JSON in this frame's resume stash; envelopes retain their host-owned snapshots. |
@@ -751,8 +751,9 @@ network builtins. Run `CARGO_BUILD_JOBS=8 cargo nextest run -p harnx-runtime mid
 
 Declare helpers with `tools:`; an unlisted tool is unavailable. Bash helper
 commands use the same generated flags and `--json` input as the Bash script tool.
-Python uses `call_tool(name, args)`. Tool selectors don't grant host capabilities
-beyond the selected tool's own permissions.
+Python uses `tools.NAME(...)`, described [below](#calling-tools-from-python).
+Tool selectors don't grant host capabilities beyond the selected tool's own
+permissions.
 
 An inner-script call reaching `confirm` returns
 `interaction required, can't be answered inside a script`, even with
@@ -762,6 +763,40 @@ Operator root calls auto-approve `confirm` under scoped operator consent;
 operator calls — `interact` names the reason and points at `harnx interact
 answer` for sessions, where a pending interaction can be answered from the
 CLI.
+
+### Calling tools from Python
+
+Each helper the entry declares in `tools:` is a function on `tools`, named as its
+Bash command is: `tools.fs_read(path="RUNBOOK.md")`. Keywords are the tool's
+schema property names as written, required properties may also be positional in
+the schema's order, and a name Python cannot spell is passed as `**{"from": 1}`.
+A tool whose name is not a Python identifier is `getattr(tools, "the-name")`, and
+a tool chosen at run time is `getattr(tools, name)(**args)`. `None` for an
+optional property is dropped unless its schema accepts null. The [script tools guide](script-tools.md#python)
+has the full rules. An entry without `tools:` has no `tools` object.
+
+A call returns the tool's direct-call result, the same value a model calling the
+tool gets: a text result is read as `result["content"][0]["text"]`. `call_tool`
+no longer exists, and a script that uses it fails with `NameError`;
+`call_tool("x", {"a": 1})` becomes `tools.x(a=1)`.
+
+Three kinds of failure behave differently:
+
+- **A mistake in the script** is an ordinary Python exception, raised before the
+  tool runs: `AttributeError` for a tool that is not on the allowlist,
+  `TypeError` for a missing or unknown argument, or a value of the wrong type or
+  outside its `enum`. The script can catch it like any exception it raises. Other
+  schema constraints, such as `minimum`, are left to the tool, and what it
+  refuses is the next kind of failure.
+- **A tool's own error** is not an exception. A recoverable error comes back as
+  a result marked `is_error` (or `isError`), and the script has to check it, as
+  the shipped `proxy-auth.py` does with
+  `if additions.get("is_error") or additions.get("isError"):`. A middleware that
+  skips the check carries on as if the call had worked.
+- **A call that cannot complete** ends the run and cannot be caught, so a `try`
+  around the call does not recover it. That covers a dispatch or durable-store
+  failure, a cancellation, and a tool that is not allowed. The entry's
+  `on_error` policy then applies.
 
 ### Helper tool servers and startup
 

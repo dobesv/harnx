@@ -38,7 +38,7 @@ impl Toolset for ProbeToolset {
             .map(|name| ToolSpec {
                 name: name.into(),
                 description: "Probe".into(),
-                input_schema: json!({"type":"object"}),
+                input_schema: json!({"type":"object","properties":{"value":{"type":"string"},"fatal":{"type":"boolean"}}}),
                 idempotent_hint: true,
                 read_only_hint: true,
                 timeout_secs: None,

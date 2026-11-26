@@ -123,7 +123,7 @@ async fn middleware_idle_script_cancels_without_polling_admission() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn middleware_allowlisted_call_uses_late_installed_admission_guard() {
-    let mut entry = python("call_tool('probe_aux', {})");
+    let mut entry = python("tools.probe_aux()");
     entry["tools"] = json!(["probe_aux"]);
     let mut fixture = Fixture::new(vec![entry]).await;
     fixture.ctx.work_boundary = Some(Arc::new(move |_, call| {
@@ -141,4 +141,24 @@ async fn middleware_allowlisted_call_uses_late_installed_admission_guard() {
         "{error:#}"
     );
     assert!(fixture.calls().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_middleware_without_tools_has_no_tools() {
+    let fixture = Fixture::new(vec![python("tools")]).await;
+    let result = fixture.eval(json!({})).await;
+    let text = match result {
+        Ok(result) => result.output.to_string(),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(text.contains("NameError"), "{text}");
+    assert!(text.contains("'tools'"), "{text}");
+    assert!(fixture.calls().is_empty());
+
+    let fixture = Fixture::new(vec![python(
+        "respond({'output': 'fine', 'is_error': False})",
+    )])
+    .await;
+    let result = fixture.eval(json!({})).await.expect("no tools, no problem");
+    assert_eq!(result.output, json!("fine"));
 }

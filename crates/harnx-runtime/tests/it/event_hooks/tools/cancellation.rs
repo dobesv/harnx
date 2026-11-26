@@ -12,7 +12,7 @@ async fn event_hook_tool_timeout_cancels_provider_but_not_turn_or_next_entry() {
         ),
         (
             true,
-            "add_context('before')\ncall_tool('hook_probe', {'hang': True})\nadd_context('after')",
+            "add_context('before')\ntools.hook_probe(hang=True)\nadd_context('after')",
         ),
     ] {
         let mut entry = tool_hook(python, source, EventHookOnError::Allow);
@@ -56,7 +56,7 @@ async fn event_hook_tool_timeout_cancels_provider_but_not_turn_or_next_entry() {
 async fn event_hook_turn_abort_cancels_in_flight_provider() {
     for (python, source) in [
         (false, "hook_probe --hang"),
-        (true, "call_tool('hook_probe', {'hang': True})"),
+        (true, "tools.hook_probe(hang=True)"),
     ] {
         let fixture = Fixture::new(vec![tool_hook(python, source, EventHookOnError::Deny)]).await;
         let abort = create_abort_signal();
