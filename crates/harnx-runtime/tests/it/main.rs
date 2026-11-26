@@ -40,6 +40,7 @@ mod nats_lease_controlled;
 mod nats_lease_markers;
 mod nats_local_server;
 mod nats_macro_run_limits;
+mod nats_manual_session_cleanup;
 #[cfg(feature = "fault-injection")]
 mod nats_middleware_handoff;
 mod nats_middleware_interaction;

@@ -8,6 +8,10 @@ use anyhow::{Context, Result};
 use tempfile::TempDir;
 
 /// Isolated JetStream-enabled `nats-server` process for an integration test.
+///
+/// Dropping the handle kills the server process, so a fixture that hands out
+/// only the URL must also keep the handle (or leak it) for as long as anything
+/// talks to that broker.
 pub struct NatsServerHandle {
     /// Client URL for the server.
     pub url: String,

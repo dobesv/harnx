@@ -28,10 +28,14 @@ pub use activity::{touch_activity, ActivityGuard};
 pub use delete::delete_owner;
 pub use limits::BlobTooLarge;
 pub use media::{
-    ensure_attachments_bucket as create_or_open_attachments_bucket, get_media, put_media,
+    ensure_attachments_bucket as create_or_open_attachments_bucket, get_media,
+    optional_attachments_bucket, put_media, session_attachment_summary, SessionAttachmentSummary,
     ATTACHMENTS_BUCKET,
 };
-pub use plans::{ensure_plans_bucket, PLAN_BUCKET};
+pub use plans::{
+    ensure_plans_bucket, optional_plans_bucket, session_plan_summary, SessionPlanSummary,
+    PLAN_BUCKET,
+};
 pub use resolve::{resolve, resolve_bounded, ResolvedBlob};
 
 use harnx_core::cid_url::{CidUrl, SessionRef};

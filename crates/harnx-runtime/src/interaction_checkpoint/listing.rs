@@ -69,6 +69,23 @@ impl CheckpointStore {
             .map(|_| ())
             .context("purge interaction checkpoint session prefix")
     }
+
+    /// How many live checkpoint records `session_storage_key` holds, for
+    /// read-only storage stats. The key listing keeps purge markers left by
+    /// per-key cleanup, so only entries whose latest revision is a Put count.
+    pub async fn live_session_record_count(&self, session_storage_key: &str) -> Result<usize> {
+        let pattern = format!("{}>", super::records::session_prefix(session_storage_key));
+        let mut count = 0;
+        for key in self.keys(&pattern).await? {
+            let live = leader_reads::retry_transient(|| leader_reads::entry(&self.kv, &key))
+                .await?
+                .is_some_and(|entry| entry.operation == async_nats::jetstream::kv::Operation::Put);
+            if live {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 #[derive(Deserialize)]
