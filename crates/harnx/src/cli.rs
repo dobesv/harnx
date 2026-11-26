@@ -12,7 +12,10 @@ mod delete_args;
 mod interact_args;
 mod surface_args;
 pub use credentials_args::{CredentialsArgs, CredentialsSubcommands};
-pub use delete_args::{DeleteArgs, DeleteOrphanStreamsArgs, DeleteSessionArgs, DeleteSubcommands};
+pub use delete_args::{
+    DeleteArgs, DeleteExpiredSessionsArgs, DeleteOrphanStreamsArgs, DeleteSessionArgs,
+    DeleteSubcommands,
+};
 pub use interact_args::*;
 pub use surface_args::*;
 
@@ -374,6 +377,26 @@ pub enum InfoSubcommands {
         #[arg(long, default_value = "text")]
         format: SessionFormat,
     },
+    /// Report broker-side session storage statistics (read-only)
+    Sessions(InfoSessionsArgs),
+}
+
+/// `harnx info sessions` scope selection. The cluster is always explicit; a
+/// single session id additionally requires `--agent`.
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct InfoSessionsArgs {
+    /// Cluster key from nats_servers/<name>.yaml
+    #[arg(long)]
+    pub cluster: String,
+    /// Restrict the report to one named agent (exact match; inline sessions never match)
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// One session's storage detail; requires --agent
+    #[arg(requires = "agent")]
+    pub session_id: Option<String>,
+    /// Emit the typed JSON report instead of text
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl Cli {
@@ -671,6 +694,131 @@ mod tests {
                 }),
             }))
         );
+    }
+
+    #[test]
+    fn parses_info_sessions_cluster_scope() {
+        let cli = Cli::try_parse_from(["harnx", "info", "sessions", "--cluster", "prod"]).unwrap();
+        match cli.command {
+            Some(Commands::Info(InfoArgs {
+                command: InfoSubcommands::Sessions(args),
+            })) => {
+                assert_eq!(args.cluster, "prod");
+                assert_eq!(args.agent, None);
+                assert_eq!(args.session_id, None);
+                assert!(!args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_info_sessions_agent_scope() {
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "info",
+            "sessions",
+            "--cluster",
+            "prod",
+            "--agent",
+            "plain",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Info(InfoArgs {
+                command: InfoSubcommands::Sessions(args),
+            })) => {
+                assert_eq!(args.agent.as_deref(), Some("plain"));
+                assert_eq!(args.session_id, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_info_sessions_single_session_scope_with_json() {
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "info",
+            "sessions",
+            "--cluster",
+            "prod",
+            "--agent",
+            "plain",
+            "sess-1",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Info(InfoArgs {
+                command: InfoSubcommands::Sessions(args),
+            })) => {
+                assert_eq!(args.session_id.as_deref(), Some("sess-1"));
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_info_sessions_session_id_without_agent() {
+        let result =
+            Cli::try_parse_from(["harnx", "info", "sessions", "--cluster", "prod", "sess-1"]);
+        assert!(
+            result.is_err(),
+            "a session id must require --agent at the parser layer"
+        );
+    }
+
+    #[test]
+    fn parses_delete_expired_sessions_defaults() {
+        let cli = Cli::try_parse_from(["harnx", "delete", "expired-sessions", "--cluster", "prod"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Delete(DeleteArgs {
+                command: DeleteSubcommands::ExpiredSessions(args),
+            })) => {
+                assert_eq!(args.cluster, "prod");
+                assert_eq!(args.days, None);
+                assert_eq!(args.agent, None);
+                assert_eq!(
+                    args.max,
+                    harnx_runtime::manual_session_cleanup::DEFAULT_MANUAL_CLEANUP_MAX
+                );
+                assert!(!args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_delete_expired_sessions_overrides() {
+        let cli = Cli::try_parse_from([
+            "harnx",
+            "delete",
+            "expired-sessions",
+            "--cluster",
+            "prod",
+            "--days",
+            "7",
+            "--agent",
+            "plain",
+            "--max",
+            "2",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Delete(DeleteArgs {
+                command: DeleteSubcommands::ExpiredSessions(args),
+            })) => {
+                assert_eq!(args.days, Some(7));
+                assert_eq!(args.agent.as_deref(), Some("plain"));
+                assert_eq!(args.max, 2);
+                assert!(args.dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

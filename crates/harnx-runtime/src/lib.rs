@@ -34,6 +34,7 @@ pub mod identity;
 pub mod interaction_checkpoint;
 pub mod interactions;
 pub mod local_orchestrator;
+pub mod manual_session_cleanup;
 pub mod middleware;
 pub mod nats_admin;
 pub mod nats_attachments;
@@ -56,6 +57,7 @@ mod script_tools;
 pub mod server_identity;
 pub mod session_history;
 pub mod session_meta_tool;
+pub mod session_stats;
 pub mod session_stream_gc;
 pub mod session_stream_orphans;
 #[cfg(test)]

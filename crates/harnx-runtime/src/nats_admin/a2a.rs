@@ -7,13 +7,63 @@ use anyhow::{ensure, Result};
 use async_nats::jetstream::{self, kv::Operation};
 use harnx_core::crypto::sha256;
 use serde_json::Value;
+mod hold;
 mod state;
+pub(crate) use hold::{
+    archive_key_when_inspected, context_key, evaluate_a2a_holds, leader_read_a2a_holds,
+    registry_key, reservation_key_from_registry, A2aHoldInputs, A2aHoldSummary, RecordFact,
+};
 pub(crate) use state::unresolved;
 use state::{ensure_first_settled, entry_unresolved};
+
+/// The deletion fence refused the session for live A2A state: an unresolved
+/// context, an unsettled first-message reservation, or scoped-lease
+/// contention. A refusal, not a transport or malformed-state failure — the
+/// manual cleanup pass reports it as a late skipped session, while the
+/// worker path still counts it the way it always did (an error).
+#[derive(Debug)]
+pub(crate) struct FenceRefused(&'static str);
+
+impl FenceRefused {
+    fn new(reason: &'static str) -> Self {
+        Self(reason)
+    }
+}
+
+// qual:allow(dry, boilerplate) reason: "One fixed sentence identifies the typed A2A refusal in logs; derive_more is not a workspace dependency and a macro for one impl is more boilerplate than the impl."
+impl std::fmt::Display for FenceRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for FenceRefused {}
 
 pub(crate) struct DeletionFence {
     lease: NatsSessionLease,
     registry: Option<Value>,
+}
+
+/// Acquire the scoped A2A lease that serializes deletion with A2A workers.
+/// `Err(FenceRefused)` means live ownership; transport failures propagate
+/// unchanged so the caller can distinguish them from a clean refusal.
+async fn fence_lease(metadata: &SessionMetadataStore, storage: &str) -> Result<NatsSessionLease> {
+    Ok(NatsSessionLease::acquire_scoped(
+        NatsLeaseAcquireParams {
+            jetstream: metadata.jetstream().clone(),
+            session_id: storage,
+            worker_id: format!("a2a-session-gc:{}", std::process::id()),
+            generation: 0,
+            config: NatsLeaseConfig {
+                replicas: metadata.replicas(),
+                ..Default::default()
+            },
+            session_metadata: None,
+        },
+        "a2a",
+    )
+    .await?
+    .ok_or_else(|| FenceRefused::new("A2A session is owned; retry deletion after settlement"))?)
 }
 
 pub(crate) async fn fence(
@@ -32,34 +82,22 @@ pub(crate) async fn fence(
     if registry.is_none() && context.is_none() {
         return Ok(None);
     }
-    let lease = NatsSessionLease::acquire_scoped(
-        NatsLeaseAcquireParams {
-            jetstream: metadata.jetstream().clone(),
-            session_id: storage,
-            worker_id: format!("a2a-session-gc:{}", std::process::id()),
-            generation: 0,
-            config: NatsLeaseConfig {
-                replicas: metadata.replicas(),
-                ..Default::default()
-            },
-            session_metadata: None,
-        },
-        "a2a",
-    )
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("A2A session is owned; retry deletion after settlement"))?;
+    let lease = fence_lease(metadata, storage).await?;
     // Validate exactly the revision used by purge. An old prepared owner CAS
     // can still land after a lease expires; separate point checks aren't a fence.
     let current = metadata.leader_entry(&context_key).await?;
     let validation = async {
-        ensure!(
-            !current
-                .as_ref()
-                .map(entry_unresolved)
-                .transpose()?
-                .unwrap_or(false),
-            "A2A task has unresolved stop, projections or outbox; deletion refused"
-        );
+        if current
+            .as_ref()
+            .map(entry_unresolved)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err(FenceRefused::new(
+                "A2A task has unresolved stop, projections or outbox; deletion refused",
+            )
+            .into());
+        }
         if current
             .as_ref()
             .is_none_or(|entry| entry.operation == Operation::Put)

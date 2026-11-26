@@ -668,6 +668,14 @@ nats_lease_acquisition_timeout_secs: 60
   `harnx delete orphan-streams --cluster <cluster> --grace-hours <n>`; a zero
   grace period is always rejected.
 
+  `harnx delete expired-sessions --cluster <cluster>` runs the metadata-backed
+  retention pass on demand, for sessions (not orphan streams), and reuses this
+  setting as its retention bound when `--days` is omitted: it must be set to a
+  positive value, and the command fails with a clear message when it is unset or
+  disabled. An explicit `--days <n>` overrides it for that one run without
+  changing this file or re-enabling the hourly worker GC. See the session
+  storage statistics and manual cleanup section of the command-line guide.
+
 Example `config.yaml`:
 
 ```yaml

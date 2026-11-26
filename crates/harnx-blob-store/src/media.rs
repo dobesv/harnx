@@ -6,6 +6,7 @@ use anyhow::{ensure, Context, Result};
 use async_nats::jetstream::{self, message::StreamMessage, object_store, stream};
 use base64::Engine as _;
 use futures_util::TryFutureExt;
+use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, time::Instant};
 
 use harnx_core::cid_url::CidUrl;
@@ -448,6 +449,39 @@ pub async fn delete_media_prefix(jetstream: &jetstream::Context, owner: &str) ->
     }
 
     Ok(names.len())
+}
+
+/// Live canonical attachment objects for one owner (`media/<owner>/…`), for
+/// read-only storage stats. Objects under other owners, pre-#2157 legacy names
+/// (`<sha256(session_id)>/<sha256(cid)>`, which no current owner key matches)
+/// and deleted objects are excluded. `logical_bytes` is the sum of object
+/// metadata sizes, not the bucket's physical backing-stream bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttachmentSummary {
+    pub count: usize,
+    pub logical_bytes: u64,
+}
+
+/// Count one session owner's live canonical media objects. The prefix is exact
+/// — `media/<owner>/` with the separator — so a neighbouring owner's objects
+/// are never counted, and no object payload is read.
+pub async fn session_attachment_summary(
+    store: &AttachmentsBucket,
+    owner: &str,
+) -> Result<SessionAttachmentSummary> {
+    use futures_util::StreamExt;
+    let prefix = format!("media/{owner}/");
+    let mut summary = SessionAttachmentSummary::default();
+    let mut objects = store.list().await.context("list media objects")?;
+    while let Some(info) = objects.next().await {
+        let info = info.context("read media object metadata")?;
+        if info.deleted || !info.name.starts_with(&prefix) {
+            continue;
+        }
+        summary.count += 1;
+        summary.logical_bytes += info.size as u64;
+    }
+    Ok(summary)
 }
 
 fn media_metadata_subject(key: &str) -> String {
@@ -1033,5 +1067,94 @@ mod tests {
         assert!(url
             .kv_key()
             .ends_with("/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    }
+
+    /// `session_attachment_summary` attributes objects by the exact
+    /// `media/<owner>/` prefix: canonical objects count with their logical
+    /// bytes, foreign owners, neighbour-prefixed names, pre-#2157 unscoped
+    /// legacy names and deleted objects never do.
+    #[tokio::test]
+    async fn nats_session_attachment_summary_attributes_exact_owner_prefix() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        harnx_core::require_nextest();
+        let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+        let store = super::ensure_attachments_bucket(&jetstream, 1).await?;
+        let session = harnx_core::cid_url::SessionRef::new(None, "ownership-session".into())?;
+        let owner = session.owner();
+        let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let hash_c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let hash_d = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        // Two canonical objects for the owner: 12 + 1 logical bytes.
+        super::put_media(
+            &store,
+            &crate::media_cid_url(&session, hash_a),
+            b"twelve bytes",
+            "text/plain",
+        )
+        .await?;
+        super::put_media(
+            &store,
+            &crate::media_cid_url(&session, hash_b),
+            b"x",
+            "text/plain",
+        )
+        .await?;
+        // A foreign owner's object.
+        let other = harnx_core::cid_url::SessionRef::new(None, "other-session".into())?;
+        super::put_media(
+            &store,
+            &crate::media_cid_url(&other, hash_c),
+            b"zzz",
+            "text/plain",
+        )
+        .await?;
+        // Names the exact prefix must reject: no separator after the owner, a
+        // longer name the owner is a prefix of, and a pre-#2157 unscoped
+        // legacy name.
+        async fn raw_object(
+            store: &super::AttachmentsBucket,
+            name: &str,
+            bytes: &'static [u8],
+        ) -> anyhow::Result<()> {
+            let mut data = bytes;
+            store
+                .put(
+                    async_nats::jetstream::object_store::ObjectMetadata {
+                        name: name.to_string(),
+                        ..Default::default()
+                    },
+                    &mut data,
+                )
+                .await
+                .with_context(|| format!("put raw object '{name}'"))?;
+            Ok(())
+        }
+        raw_object(&store, &format!("media/{owner}"), b"no-slash").await?;
+        raw_object(&store, &format!("media/{owner}NEIGH/h"), b"neighbour").await?;
+        raw_object(&store, &format!("legacy/{hash_d}"), b"legacy").await?;
+        // A deleted object under the owner's prefix: a tombstone, not a live
+        // object, so it must not count.
+        super::put_media(
+            &store,
+            &crate::media_cid_url(&session, hash_d),
+            b"gone",
+            "text/plain",
+        )
+        .await?;
+        store.delete(format!("media/{owner}/{hash_d}")).await?;
+
+        let summary = super::session_attachment_summary(&store, &owner).await?;
+        assert_eq!(
+            (summary.count, summary.logical_bytes),
+            (2, 13),
+            "only the two live canonical objects count, with logical bytes"
+        );
+        let other_summary = super::session_attachment_summary(&store, &other.owner()).await?;
+        assert_eq!((other_summary.count, other_summary.logical_bytes), (1, 3));
+        Ok(())
     }
 }

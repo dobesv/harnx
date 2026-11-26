@@ -1,0 +1,4 @@
+---
+harnx: minor
+---
+Adds two operator commands for broker-side session storage: `harnx info sessions --cluster <cluster>` reports read-only storage statistics for a whole cluster, one named agent, or a single session (text or typed `--json`), and `harnx delete expired-sessions --cluster <cluster>` runs a bounded, guarded retention cleanup pass on demand with `--dry-run`, `--days`, `--agent` and `--max` (default 100). Both use an explicit cluster key from `nats_servers/`; neither changes worker cleanup policy, retention configuration, or any stored setting. The shared marker-decoding fix behind the stats snapshot also stops a server-expired (TTL) session-metadata marker from aborting bulk session listing, which the periodic worker's own cleanup read path shares, so worker cleanup no longer fails on that marker.

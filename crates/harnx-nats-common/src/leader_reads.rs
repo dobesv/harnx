@@ -23,9 +23,6 @@ use bytes::Bytes;
 use std::future::Future;
 use tokio::time::Instant;
 
-/// The header a KV store writes on the markers that delete and purge a key.
-const KV_OPERATION: &str = "KV-Operation";
-
 /// The latest revision of `key`, which may be a delete or purge marker.
 pub async fn entry(store: &kv::Store, key: &str) -> Result<Option<kv::Entry>> {
     // The leader takes this subject as a filter, so a wildcard in a key would
@@ -175,19 +172,11 @@ fn is_transient(error: &anyhow::Error) -> bool {
     }
 }
 
-/// What a revision did to its key, decoded as `kv::Store` decodes it. The
-/// server marks a key it removed itself, for an age limit say, with a marker
-/// reason rather than the KV operation header.
+/// What a revision did to its key: the shared decoder, on this message's
+/// headers. The server marks a key it removed itself, for an age limit say,
+/// with a marker reason rather than the KV operation header.
 fn operation(message: &StreamMessage) -> kv::Operation {
-    if let Some(operation) = message.headers.get(KV_OPERATION) {
-        return operation.as_str().parse().unwrap_or(kv::Operation::Put);
-    }
-    let reason = message.headers.get(async_nats::header::NATS_MARKER_REASON);
-    match reason.map(|reason| reason.as_str()) {
-        Some("MaxAge" | "Purge") => kv::Operation::Purge,
-        Some("Remove") => kv::Operation::Delete,
-        _ => kv::Operation::Put,
-    }
+    crate::markers::operation(Some(&message.headers))
 }
 
 /// The keys `kv::Store` itself accepts.

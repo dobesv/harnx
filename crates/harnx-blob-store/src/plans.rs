@@ -458,6 +458,37 @@ pub async fn delete_plans_prefix(jetstream: &jetstream::Context, owner: &str) ->
     Ok(documents.len())
 }
 
+/// Live plan counts for one owner (`plan/<owner>/` keys), for read-only
+/// storage stats. `plans` counts distinct plan slugs — a plan with any number
+/// of tasks and notes is still one plan — and `documents` counts the live
+/// index, task and note rows, which is what deletion removes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPlanSummary {
+    pub plans: usize,
+    pub documents: usize,
+}
+
+/// Count one session owner's live plans. Read-only: no document bodies are
+/// fetched, and an absent bucket is the caller's business (use
+/// [`optional_plans_bucket`], which does not create it).
+pub async fn session_plan_summary(store: &kv::Store, owner: &str) -> Result<SessionPlanSummary> {
+    let prefix = format!("plan/{owner}/");
+    let keys = list_document_keys(store, &prefix).await?;
+    let mut slugs = std::collections::BTreeSet::new();
+    for key in &keys {
+        let Some(rest) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Some(slug) = rest.split('/').next() {
+            slugs.insert(slug.to_string());
+        }
+    }
+    Ok(SessionPlanSummary {
+        plans: slugs.len(),
+        documents: keys.len(),
+    })
+}
+
 /// Rendered markdown for a mutable plan document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedPlan {
@@ -870,5 +901,74 @@ mod render_tests {
                 plan_url(PlanItem::Index)
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::cid_url::{PlanItem, SessionRef};
+
+    /// `session_plan_summary` attributes documents by the exact
+    /// `plan/<owner>/` prefix: one plan is one slug no matter how many task
+    /// and note documents it holds, foreign owners never count, and deleted
+    /// documents drop out of both counters.
+    #[tokio::test]
+    async fn nats_session_plan_summary_counts_exact_owner_plans() -> Result<()> {
+        harnx_core::require_nextest();
+        let Some(server) = harnx_test_bins::spawn_nats_server().await? else {
+            return Ok(());
+        };
+        let jetstream = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+        let store = ensure_plans_bucket(&jetstream, 1).await?;
+        let session = SessionRef::new(None, "plan-owner".into())?;
+        let owner = session.owner();
+        let index = CidUrl::Plan {
+            session: session.clone(),
+            slug: "my-plan".into(),
+            item: PlanItem::Index,
+        };
+        let task = CidUrl::Plan {
+            session: session.clone(),
+            slug: "my-plan".into(),
+            item: PlanItem::Task("t01".into()),
+        };
+        let note = CidUrl::Plan {
+            session: session.clone(),
+            slug: "my-plan".into(),
+            item: PlanItem::Note("note-1".into()),
+        };
+        create_document(&store, &index, r#"{"title":"my plan"}"#).await?;
+        create_document(&store, &task, r#"{"status":"open"}"#).await?;
+        create_document(&store, &note, r#"{"body":"hello"}"#).await?;
+        // A second plan for the same owner, and one for a foreign owner.
+        let second = CidUrl::Plan {
+            session: session.clone(),
+            slug: "other-plan".into(),
+            item: PlanItem::Index,
+        };
+        create_document(&store, &second, r#"{"title":"other"}"#).await?;
+        let foreign_session = SessionRef::new(None, "foreign".into())?;
+        let foreign_plan = CidUrl::Plan {
+            session: foreign_session.clone(),
+            slug: "foreign-plan".into(),
+            item: PlanItem::Index,
+        };
+        create_document(&store, &foreign_plan, r#"{"title":"foreign"}"#).await?;
+
+        let summary = session_plan_summary(&store, &owner).await?;
+        assert_eq!(
+            (summary.plans, summary.documents),
+            (2, 4),
+            "two plans: my-plan (index, task, note) and other-plan (index)"
+        );
+        let foreign = session_plan_summary(&store, &foreign_session.owner()).await?;
+        assert_eq!((foreign.plans, foreign.documents), (1, 1));
+
+        // Deleting one document drops it from both counters.
+        delete_document(&store, &task).await?;
+        let summary = session_plan_summary(&store, &owner).await?;
+        assert_eq!((summary.plans, summary.documents), (2, 3));
+        Ok(())
     }
 }

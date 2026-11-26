@@ -276,8 +276,7 @@ impl InvocationJournal {
     /// transport still propagates, because that row may well hold a reply the
     /// caller simply could not see.
     pub async fn records_for_session(&self, session: &str) -> Result<Vec<RecordedInvocation>> {
-        self.records_under(&format!("{}.>", session_prefix(session)))
-            .await
+        self.records_under(&session_rows_subject(session)).await
     }
 
     /// `records_for_session`, narrowed to the rows made in one of `rounds`.
@@ -350,8 +349,26 @@ impl InvocationJournal {
         // Retain a small tombstone after deleting the runnable session. Delayed
         // writers must not resurrect its journal or start another invocation.
         self.write_tombstone(session).await?;
-        self.remove(&format!("{}.>", session_prefix(session))).await
+        self.remove(&session_rows_subject(session)).await
     }
+
+    /// How many live invocation rows `session` holds, for read-only storage
+    /// stats. The session tombstone lives under `deleted/`, outside the
+    /// session's rows, and purge markers do not count. Rows are not decoded:
+    /// a count must not fail over one unreadable row, and `records_for_session`
+    /// remains the way to read them.
+    pub async fn live_rows_for_session(&self, session: &str) -> Result<usize> {
+        let mut count = 0;
+        for key in self.keys(&session_rows_subject(session)).await? {
+            count += usize::from(self.live_entry(&key).await?.is_some());
+        }
+        Ok(count)
+    }
+}
+
+/// The subject pattern matching every live row `session` holds.
+fn session_rows_subject(session: &str) -> String {
+    format!("{}.>", session_prefix(session))
 }
 
 fn decode(entry: Option<kv::Entry>) -> Result<Option<RecordedInvocation>> {
