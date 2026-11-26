@@ -105,11 +105,23 @@ pub(crate) async fn delete_session_state(
 }
 
 /// Holds the A2A fence during cleanup and remembers which canonical record can
-/// be purged once cleanup succeeds.
-struct SessionMetadataDeletion {
+/// be purged once cleanup succeeds. Carried by [`GuardedSessionDeletion`] to
+/// the manual cleanup pass, which finishes the cascade it started.
+pub(crate) struct SessionMetadataDeletion {
     metadata: Option<SessionMetadataStore>,
     canonical_revision: Option<u64>,
     fence: Option<a2a::DeletionFence>,
+}
+
+/// Guarded entry into the deletion cascade for the manual expired-session
+/// cleanup pass: the freshly read canonical revision must match the listed
+/// revision the caller selected the candidate by. `RevisionChanged` means
+/// nothing was mutated and no attempt is charged; `Started` means the
+/// revision matched and the A2A fence is held, so the cascade is committed
+/// from here ([`GuardedSessionDeletion::finish`] must run).
+pub(crate) enum GuardedSessionDeletion {
+    RevisionChanged { missing: bool },
+    Started(Box<SessionMetadataDeletion>),
 }
 
 impl SessionMetadataDeletion {
@@ -131,6 +143,42 @@ impl SessionMetadataDeletion {
             deletion.fence = a2a::fence(store, session_id).await?;
         }
         Ok(deletion)
+    }
+
+    /// [`begin`]'s manual-cleanup counterpart: the freshly read canonical
+    /// revision must equal the revision the caller listed the candidate by,
+    /// closing the gap between the caller's own re-read and this cascade's
+    /// own revision read. Existing callers keep [`begin`]'s behavior.
+    /// A missing metadata store is a revision change: the bucket the
+    /// candidate was listed from is gone, so there is nothing to guard.
+    async fn begin_guarded(
+        jetstream: &async_nats::jetstream::Context,
+        session_id: &str,
+        expected_revision: u64,
+    ) -> Result<GuardedSessionDeletion> {
+        let mut deletion = Self {
+            metadata: a2a::metadata(jetstream).await?,
+            canonical_revision: None,
+            fence: None,
+        };
+        let Some(store) = &deletion.metadata else {
+            return Ok(GuardedSessionDeletion::RevisionChanged { missing: true });
+        };
+        // No payload decoding: an operator can still delete malformed metadata.
+        let key = metadata_key(session_id);
+        let entry = store
+            .leader_entry(&key)
+            .await
+            .with_context(|| format!("Failed to inspect session metadata key '{key}'"))?;
+        let Some(entry) = entry.filter(|entry| entry.operation == Operation::Put) else {
+            return Ok(GuardedSessionDeletion::RevisionChanged { missing: true });
+        };
+        if entry.revision != expected_revision {
+            return Ok(GuardedSessionDeletion::RevisionChanged { missing: false });
+        }
+        deletion.canonical_revision = Some(entry.revision);
+        deletion.fence = a2a::fence(store, session_id).await?;
+        Ok(GuardedSessionDeletion::Started(Box::new(deletion)))
     }
 
     async fn finish_a2a(&mut self, session_id: &str) -> Result<()> {
@@ -158,6 +206,45 @@ impl SessionMetadataDeletion {
                 Err(error).with_context(|| format!("Failed to delete session metadata key '{key}'"))
             }
         }
+    }
+}
+
+impl GuardedSessionDeletion {
+    /// Run the rest of the deletion cascade after [`begin_guarded`] accepted
+    /// the candidate: stream first, then lease/journal/metadata/checkpoint/
+    /// plans/media leftovers, A2A fence release, and the final canonical CAS.
+    /// The same order and final CAS as [`delete_session_state`]; a failure
+    /// part way leaves the session discoverable and retryable, exactly as the
+    /// existing cascade does.
+    pub(crate) async fn finish(
+        self,
+        jetstream: &async_nats::jetstream::Context,
+        lease_bucket: Option<async_nats::jetstream::kv::Store>,
+        session_id: &str,
+    ) -> Result<SessionDeleteResult> {
+        let GuardedSessionDeletion::Started(mut metadata) = self else {
+            anyhow::bail!("guarded deletion cascade finished before it started");
+        };
+        let stream_deleted = delete_session_stream(jetstream, session_id).await?;
+        let mut result = delete_session_leftovers(jetstream, lease_bucket, session_id).await?;
+        metadata.finish_a2a(session_id).await?;
+        result.stream_deleted = stream_deleted;
+        result.canonical_metadata = metadata.purge_canonical(session_id).await?;
+        result.metadata_keys_deleted +=
+            usize::from(result.canonical_metadata == CanonicalMetadataPurge::Purged);
+        Ok(result)
+    }
+
+    /// The manual cleanup pass's guarded cascade entry. Charge the caller's
+    /// attempt budget around this call: a revision change refunds it (a
+    /// read-only skip), everything else — including an A2A fence refusal
+    /// carried as [`a2a::FenceRefused`] — consumes it.
+    pub(crate) async fn begin(
+        jetstream: &async_nats::jetstream::Context,
+        session_id: &str,
+        expected_revision: u64,
+    ) -> Result<Self> {
+        SessionMetadataDeletion::begin_guarded(jetstream, session_id, expected_revision).await
     }
 }
 

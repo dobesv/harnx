@@ -10,6 +10,7 @@ use crate::nats_session_metadata::SessionMetadataStore;
 use anyhow::{anyhow, bail, Context, Result};
 use async_nats::header::{NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MESSAGE_ID, NATS_MESSAGE_TTL};
 use async_nats::jetstream::{self, context::PublishErrorKind, kv, stream};
+use futures_util::StreamExt;
 pub use holder_liveness::holder_reclaim_supported;
 use serde::{Deserialize, Serialize};
 use slot::{CreatedLease, LeaseSlot};
@@ -499,6 +500,70 @@ pub async fn session_has_active_lease(
     Ok(lease_holder_in(&bucket, &config, session_id)
         .await?
         .is_some())
+}
+
+/// Every live lease key in the default lease bucket (`harnx_leases`), read
+/// through one LastPerSubject consumer the way the session metadata listing
+/// reads its bucket.
+///
+/// A stats-only snapshot: delete and purge markers are ignored, the read
+/// doesn't renew anything, and the result is never a deletion authority — a
+/// lease that is live here can still expire, and one that looks gone here can
+/// still be re-read live by the cleanup guards. `Ok(None)` means the bucket
+/// does not exist, which no lease holder has ever needed on this cluster.
+pub async fn snapshot_live_lease_keys(
+    jetstream: &jetstream::Context,
+) -> Result<Option<std::collections::HashSet<String>>> {
+    let bucket = match jetstream.get_key_value(LEASE_BUCKET).await {
+        Ok(bucket) => bucket,
+        Err(error) if crate::nats_admin::kv_bucket_missing(&error) => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::Error::from(error))
+                .with_context(|| format!("Failed to open NATS lease bucket '{LEASE_BUCKET}'"));
+        }
+    };
+    let consumer = bucket
+        .stream
+        .create_consumer(async_nats::jetstream::consumer::push::OrderedConfig {
+            deliver_subject: jetstream.client().new_inbox(),
+            description: Some("lease stats snapshot".into()),
+            filter_subject: format!("{}>", bucket.prefix),
+            deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::LastPerSubject,
+            replay_policy: async_nats::jetstream::consumer::ReplayPolicy::Instant,
+            ..Default::default()
+        })
+        .await
+        .with_context(|| format!("Failed to snapshot NATS lease bucket '{LEASE_BUCKET}'"))?;
+    if consumer.cached_info().num_pending == 0 {
+        return Ok(Some(std::collections::HashSet::new()));
+    }
+    let mut messages = consumer.messages().await?;
+    let mut live = std::collections::HashSet::new();
+    while let Some(message) = messages.next().await {
+        let message = message?;
+        let info = message.info().map_err(anyhow::Error::from_boxed)?;
+        // The last delivered record can be a Delete/Purge marker left by a
+        // released lease: finish on it before the operation filter, or the
+        // loop would wait forever for a message a quiet bucket never sends.
+        let last_delivered = info.pending == 0;
+        // The same decoder the authoritative leader reads use: a revision the
+        // server removed itself carries a marker reason, not a KV operation,
+        // and must not count as a live lease.
+        let operation = harnx_nats_common::markers::operation(message.headers.as_ref());
+        if operation == kv::Operation::Put {
+            let key = message
+                .subject
+                .strip_prefix(&bucket.prefix)
+                .with_context(|| {
+                    format!("Unexpected subject in lease snapshot: {}", message.subject)
+                })?;
+            live.insert(key.to_owned());
+        }
+        if last_delivered {
+            return Ok(Some(live));
+        }
+    }
+    anyhow::bail!("NATS lease snapshot ended before catching up")
 }
 
 /// Take the lease key for `record`, reclaiming it first when the observed

@@ -617,6 +617,101 @@ Scripts run under root operator consent:
 - **Cancellation (`Ctrl+C`)**: Signals an abort, allows a 10-second drain window, releases tool reservations, and prints an `error:` line on stderr, without replay. Without `--json` the exit status is 130 when the script reports the cancellation within the drain window and 1 otherwise; with `--json` it is 1.
 - **Token budget caveat**: The CLI `--token-budget` option is parsed from global flags but is not forwarded to direct tool or script execution. Direct operator calls do not enforce token limits or create per-inner fresh token budgets.
 
+## Session Storage Statistics and Manual Cleanup
+
+Two operator commands inspect and clean up broker-side session storage without
+changing any configuration and without touching worker cleanup behavior:
+`harnx info sessions` (read-only statistics) and `harnx delete expired-sessions`
+(bounded, guarded manual retention cleanup). Both take an explicit
+`--cluster <name>` matching a cluster key from `config/nats_servers/<name>.yaml`;
+there is no `local` alias. The built-in local key is `__local__` (the managed
+broker), and these commands use named-cluster routing the same way
+`harnx delete session --cluster` does.
+
+### `harnx info sessions --cluster <cluster> [--json]`
+
+Cluster-wide storage report: metadata-backed session count (inline and
+metadata-only sessions included), session-stream totals split into matched to
+metadata / orphan with recovered key / orphan unmappable (the three reconcile
+with the whole), effective-activity age buckets (`<1d`, `1–7d`, `7–30d`, `30d+`),
+oldest/newest effective activity, the seven shared buckets
+(`KV_harnx_sessions`, `KV_harnx_tool_invocations`, the retired
+`KV_harnx_execution_control`, `KV_harnx_interaction_checkpoints`,
+`KV_harnx_plans`, `OBJ_harnx_attachments`, `KV_harnx_leases`) with physical
+backing-stream bytes and messages, per-agent totals sorted by descending stream
+bytes, and snapshot-estimated retention eligibility. Missing buckets report
+`present: false` with zero sizes; the retired execution-control bucket's absence
+is normal.
+
+### `harnx info sessions --cluster <cluster> --agent <agent> [--json]`
+
+The same totals scoped to one named agent, plus that agent's largest sessions
+(by stream bytes) and oldest sessions (by effective activity), each list capped
+at 10 entries. `--agent` is an exact named-agent match; inline sessions never
+match it and only appear in the unfiltered cluster view. Shared-bucket bytes
+cannot be attributed per agent and stay in the cluster view.
+
+### `harnx info sessions --cluster <cluster> --agent <agent> <session-id> [--json]`
+
+One session's storage detail: metadata revision and creation time, effective
+last activity, the session stream's bytes/messages/first/last sequence and
+timestamps, live holds (session lease, A2A lease, A2A unresolved context, A2A
+unsettled first-message reservation), and owned-resource counts (journal rows,
+checkpoints, plans and plan documents, attachments with logical bytes). A
+session id requires `--agent`; an unknown session is a clear error.
+
+For all three views, `--json` prints the typed report (stable field names,
+`null` for missing timestamps/sequences, structured agent identity —
+`{"kind":"named","name":...}` or `{"kind":"inline"}`) with no other text, so it
+pipes straight into `jq`. Collection is read-only: no bucket is created, no
+activity is refreshed, and `effective activity` follows the same rule as
+retention GC (activity record, falling back to metadata creation time). The
+retention block is a snapshot estimate of what a real GC pass might delete, not
+a guarantee: new leases, activity, revisions and cascade failures all change the
+outcome.
+
+### `harnx delete expired-sessions --cluster <cluster> [--days <n>] [--agent <agent>] [--max <n>] [--dry-run]`
+
+Runs one manual expired-session cleanup pass on the cluster. Candidates are
+metadata-backed sessions whose effective activity is strictly older than the
+retention days, processed oldest first; the existing deletion guards (fresh
+activity, session/A2A leases, A2A admission holds, revision checks, the full
+deletion cascade with its final revision CAS) all still apply per session.
+
+Options:
+
+- `--days <n>`: retention days for this pass. When omitted, the configured
+  `cleanup_remote_sessions_days` is used and must be set to a positive value:
+  an unset value fails with a message telling you to pass `--days` or configure
+  the setting, and `0` (retention disabled) fails the same way. `--days 0` is
+  always rejected. Passing `--days` never changes the stored configuration and
+  never re-enables the hourly worker GC.
+- `--agent <agent>`: exact named-agent filter. Inline sessions are only cleaned
+  without a filter.
+- `--max <n>`: bounds sessions admitted to the deletion path — including
+  attempts that fail or get skipped late after admission — not just successful
+  deletions, so `--max 1` can never touch a second session. Read-only skips do
+  not consume budget. Defaults to `100`, like the orphan-stream CLI. `--max 0`
+  is rejected.
+- `--dry-run`: runs the same read-only guards and preview selection and deletes
+  nothing. The sole mutation is the GC lease helper's own coordination key in
+  `harnx_leases` (the pass holds the `session_metadata_gc` lease for its
+  duration, exactly like a worker pass).
+
+The pass holds the `session_metadata_gc` leader lease; if another pass (worker
+or CLI) holds it, the command fails immediately with a retry message instead
+of waiting. It never runs the orphan-stream pass and never writes the worker's
+hourly dedup marker. `bound reached: yes` means the cap stopped the pass, not
+that exactly that many candidates remain — run the command again to continue.
+
+The report prints scanned candidates, attempted/deleted/skipped counts,
+per-session dispositions with pre-delete session-stream bytes, and totals.
+Session-stream byte estimates cover `SESSION_` streams only, not the full disk
+a cascade can reclaim. Exit status is `0` for a clean pass, nonzero when any
+session errored, any partial effects are possible, or the GC lease was lost
+mid-pass — the summary still prints first. The worker's periodic cleanup,
+orphan pass and marker behavior are unchanged by this command.
+
 ## Standalone MCP Bridge Inspection and Invocation (`harnx-mcp-bridge`)
 
 `harnx-mcp-bridge` wraps external stdio-based Model Context Protocol (MCP) servers and exposes them over NATS. For diagnostics and scripting, the bridge also supports standalone tool listing and direct tool invocation without requiring NATS.

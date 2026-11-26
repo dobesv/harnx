@@ -56,7 +56,7 @@ pub use store::{
     a2a_message_key, a2a_session_prefix, a2a_task_index_key, a2a_task_key, a2a_tasks_prefix,
     activity_key, invalidation_subject, is_cas_conflict, metadata_belongs_to_agent, metadata_key,
     read_cursor_key, read_invalidation_subject, session_prefix, SessionExtensionUpdate,
-    SessionMetadataStore, TaskIndex, TaskIndexEntry, TaskState,
+    SessionMetadataStore, SessionSnapshot, SnapshotEntry, TaskIndex, TaskIndexEntry, TaskState,
 };
 pub use tool_context::{
     store_context, tool_context, ToolContext, ToolContextEntry, TOOL_CONTEXT_NAMESPACE,
