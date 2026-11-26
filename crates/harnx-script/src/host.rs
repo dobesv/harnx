@@ -43,6 +43,10 @@ pub struct ScriptHostContext {
 pub struct ScriptPythonFunctions {
     pub names: Vec<String>,
     pub handler: Arc<dyn ScriptPythonHandler>,
+    /// Python source run before the script's own. Its lines are hidden
+    /// from tracebacks. Under `python3 -c` an `exec` snippet's frames share
+    /// the script's name `<string>`, so they are shifted as well.
+    pub prelude: Option<String>,
 }
 
 /// Async bridge to trusted host operations. Implementations can share the same

@@ -31,6 +31,7 @@ impl Host {
                 "callable".into(),
             ],
             handler: self.clone(),
+            prelude: None,
         })
     }
 }
@@ -258,6 +259,7 @@ async fn python_host_wait_observes_inclusive_deadline_and_cancellation() {
                     python_functions: Some(ScriptPythonFunctions {
                         names: vec!["host_wait".into()],
                         handler,
+                        prelude: None,
                     }),
                     fs_mounts: vec![],
                     cancel: task_cancel,
@@ -284,4 +286,232 @@ async fn python_host_wait_observes_inclusive_deadline_and_cancellation() {
         assert_eq!(result.stdout, "before\n");
         probe.assert_single_stopped();
     }
+}
+
+async fn prelude_run(prelude: &str, script: &str) -> ScriptRun {
+    let host = Arc::new(Host::default());
+    BashKitBackend
+        .run(ScriptRequest {
+            script,
+            limits: ScriptLimits::default(),
+            commands: vec![],
+            python_functions: Some(ScriptPythonFunctions {
+                names: vec!["answer".into()],
+                handler: host,
+                prelude: Some(prelude.into()),
+            }),
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        })
+        .await
+}
+
+const THREE_LINE_PRELUDE: &str = "a = 1\nb = 2\nc = 3";
+const RAISES_ON_LINE_FOUR: &str = "x = 1\ny = 2\nz = 3\nraise ValueError(\"boom\")";
+
+#[tokio::test]
+async fn a_prelude_defines_names_the_script_sees() {
+    let result = prelude_run("x = 41", "python3 -c 'print(x + 1)'").await;
+    assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
+    assert_eq!(result.stdout, "42\n");
+}
+
+#[tokio::test]
+async fn an_error_reports_the_scripts_own_line() {
+    let scripts = [
+        format!("python3 - <<'EOF'\n{RAISES_ON_LINE_FOUR}\nEOF"),
+        format!("python3 -c '{RAISES_ON_LINE_FOUR}'"),
+        format!("cat > /tmp/x.py <<'EOF'\n{RAISES_ON_LINE_FOUR}\nEOF\npython3 /tmp/x.py"),
+    ];
+    for script in scripts {
+        let result = prelude_run(THREE_LINE_PRELUDE, &script).await;
+        assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
+        assert!(result.stderr.contains("line 4"), "{result:?}");
+        assert!(!result.stderr.contains("line 8"), "{result:?}");
+        assert!(result.stderr.contains("ValueError: boom"), "{result:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_syntax_error_reports_the_scripts_own_line() {
+    let script = "python3 - <<'EOF'\nx = 1\ny = 2\nz = 3\nif x ==\nEOF";
+    let result = prelude_run(THREE_LINE_PRELUDE, script).await;
+    assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
+    assert!(result.stderr.contains("line 4"), "{result:?}");
+    assert!(!result.stderr.contains("line 7"), "{result:?}");
+}
+
+#[tokio::test]
+async fn a_frame_in_the_prelude_is_named() {
+    let prelude = "def _harnx_boom():\n    raise ValueError('inside')";
+    let script = "python3 - <<'EOF'\nx = 1\n_harnx_boom()\nEOF";
+    let result = prelude_run(prelude, script).await;
+    assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
+    assert!(
+        result.stderr.contains("File \"<harnx tools>\", line 2"),
+        "{result:?}"
+    );
+    assert!(result.stderr.contains("line 2, in <module>"), "{result:?}");
+}
+
+#[tokio::test]
+async fn a_successful_scripts_stderr_is_untouched() {
+    let result = prelude_run(
+        THREE_LINE_PRELUDE,
+        "python3 --version; python3 -c 'print(c)'",
+    )
+    .await;
+    assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
+    assert_eq!(result.stdout, "Python 3.12.0 (monty)\n3\n");
+    assert_eq!(result.stderr, "", "{result:?}");
+}
+
+#[tokio::test]
+async fn empty_and_newline_terminated_preludes_keep_the_scripts_own_line() {
+    for prelude in ["", "a = 1\n", "a = 1\nb = 2\n\n"] {
+        let script = format!("python3 - <<'EOF'\n{RAISES_ON_LINE_FOUR}\nEOF");
+        let result = prelude_run(prelude, &script).await;
+        assert_eq!(
+            result.status,
+            ScriptStatus::Error,
+            "{prelude:?}: {result:?}"
+        );
+        assert!(result.stderr.contains("line 4"), "{prelude:?}: {result:?}");
+    }
+}
+
+const EXEC_SCRIPT: &str = "x = 1\ny = 2\nz = 3\nexec(\"a = 1\\nraise ValueError('inner')\")";
+
+#[tokio::test]
+async fn an_exec_frame_under_a_heredoc_keeps_its_own_line() {
+    let scripts = [
+        format!("python3 - <<'EOF'\n{EXEC_SCRIPT}\nEOF"),
+        format!("cat > /tmp/x.py <<'EOF'\n{EXEC_SCRIPT}\nEOF\npython3 /tmp/x.py"),
+    ];
+    for script in scripts {
+        let result = prelude_run(THREE_LINE_PRELUDE, &script).await;
+        assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
+        assert!(
+            result.stderr.contains("File \"<string>\", line 2"),
+            "{result:?}"
+        );
+        assert!(!result.stderr.contains("<harnx tools>"), "{result:?}");
+        assert!(
+            result.stderr.contains(", line 4, in <module>"),
+            "{result:?}"
+        );
+    }
+}
+
+const FUTURE_SCRIPT: &str =
+    "python3 - <<'EOF'\nfrom __future__ import annotations\nprint('ran')\nEOF";
+const FUTURE_HINT: &str =
+    "python: a script that can call tools cannot use \"from __future__\" imports; remove that line";
+
+#[tokio::test]
+async fn a_future_import_fails_with_a_hint_when_a_prelude_is_set() {
+    let result = prelude_run(THREE_LINE_PRELUDE, FUTURE_SCRIPT).await;
+    assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
+    assert_eq!(result.stdout, "", "{result:?}");
+    assert!(
+        result.stderr.contains("File \"<stdin>\", line 1"),
+        "{result:?}"
+    );
+    assert!(result.stderr.contains(FUTURE_HINT), "{result:?}");
+}
+
+#[tokio::test]
+async fn a_future_import_runs_without_a_prelude() {
+    let result = host_run(FUTURE_SCRIPT, Arc::new(Host::default())).await;
+    assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
+    assert_eq!(result.stdout, "ran\n");
+}
+
+#[tokio::test]
+async fn another_failure_gets_no_future_hint() {
+    let result = prelude_run(THREE_LINE_PRELUDE, "python3 -c 'raise ValueError(1)'").await;
+    assert_eq!(result.status, ScriptStatus::Error, "{result:?}");
+    assert!(!result.stderr.contains(FUTURE_HINT), "{result:?}");
+}
+
+/// Records the tool name of every `_harnx_call` it receives.
+#[derive(Default)]
+struct NameRecorder(Mutex<Vec<String>>);
+
+#[async_trait]
+impl ScriptPythonHandler for NameRecorder {
+    async fn call(
+        &self,
+        name: String,
+        args: Vec<MontyObject>,
+        _kwargs: Vec<(MontyObject, MontyObject)>,
+        _ctx: ScriptHostContext,
+    ) -> ExtFunctionResult {
+        assert_eq!(name, crate::PYTHON_CALL_FUNCTION);
+        let tool = args.first().and_then(|arg| arg.as_ref().as_str());
+        self.0.lock().unwrap().push(
+            tool.expect("the first argument is the tool name")
+                .to_owned(),
+        );
+        ExtFunctionResult::Return(MontyObject::none())
+    }
+}
+
+async fn run_with_tools(names: &[String], python: &str) -> (ScriptRun, Vec<String>) {
+    let recorder = Arc::new(NameRecorder::default());
+    let result = BashKitBackend
+        .run(ScriptRequest {
+            script: &format!("python3 - <<'PY'\n{python}\nPY"),
+            limits: ScriptLimits::default(),
+            commands: vec![],
+            python_functions: Some(ScriptPythonFunctions {
+                names: vec![crate::PYTHON_CALL_FUNCTION.into()],
+                handler: recorder.clone(),
+                prelude: Some(crate::tools_prelude(names)),
+            }),
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        })
+        .await;
+    let seen = recorder.0.lock().unwrap().clone();
+    (result, seen)
+}
+
+#[tokio::test]
+async fn hostile_tool_names_reach_the_handler_through_the_real_interpreter() {
+    let names: Vec<String> = [
+        "has\"quote",
+        "back\\slash",
+        "new\nline",
+        "h\u{e9}llo \u{2713}",
+        "__class__",
+        "class",
+        "tools",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect();
+    let list = serde_json::to_string(&names).unwrap();
+    let (result, seen) = run_with_tools(
+        &names,
+        &format!("for n in {list}:\n    getattr(tools, n)(1)\nprint('done')"),
+    )
+    .await;
+    assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
+    assert_eq!(result.stdout, "done\n", "{result:?}");
+    assert_eq!(seen, names);
+    let (result, seen) = run_with_tools(&names, "print('untouched')").await;
+    assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
+    assert_eq!(result.stdout, "untouched\n");
+    assert!(seen.is_empty());
+}
+
+#[tokio::test]
+async fn an_unknown_tool_names_the_tools_object() {
+    let (result, _) = run_with_tools(
+        &["known".into()],
+        "try:\n    tools.nope\nexcept AttributeError as e:\n    print(e)",
+    )
+    .await;
+    assert_eq!(result.stdout, "'tools' object has no attribute 'nope'\n");
 }

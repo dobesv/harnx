@@ -1200,10 +1200,17 @@ three things a tool declares decide how well it works there.
   in a script.
 - **Structured results.** The `bash` tool's inner calls send the request
   capability `harnx:structured_result`
-  (`InnerCallExecutorConfig::structured_results`), and so does a custom
-  script tool's Bash body; direct model calls, a script tool's Python body
-  and a middleware's or hook's own `call_tool` don't. A native tool that
-  wants a shell form returns script-style fields when
+  (`InnerCallExecutorConfig::structured_results`), from Bash and from Python
+  alike, and so does a custom script tool's Bash body; direct model calls, a
+  script tool's Python body and a middleware's or hook's Python get the
+  direct-call result instead. In the `bash` tool, Python gets the value
+  `-o json` prints (the `structuredContent`, a plain object result as it is, or
+  the command's text), so a tool with a shell form needs no extra work for
+  Python. `with_tools` in
+  `crates/harnx-runtime/src/script_tools/python_tools.rs` is how a Python
+  context gets `tools`, and a context with no tools gets none; each context
+  supplies a `PythonToolRunner`. A native tool that wants a shell form returns
+  script-style fields when
   `ToolInvocationContext::wants_structured_result()`
   (`text` for a file, `paths` or `matches` for a search), declares with
   `ToolSpec::with_script_output` which field is stdout, stderr and the exit

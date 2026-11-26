@@ -505,7 +505,7 @@ async fn bash_body_prints_a_mapped_tool_like_a_command() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn python_body_inner_calls_keep_model_style_results() {
     let harness = faketool_harness(
-        json!({"python": "r = call_tool(\"faketool\", {\"path\": \"a\"})\nprint('content' in r)"}),
+        json!({"python": "r = tools.faketool(path=\"a\")\nprint('content' in r)"}),
         BTreeMap::new(),
     );
     let value = harness.call_wrap().await;

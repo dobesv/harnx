@@ -194,7 +194,7 @@ impl NatsToolProvider {
         // T4.3: a rerun after a tool challenge carries the latest challenge's
         // accepted responses and opaque state beside `run_context`, never
         // inside the arguments. Absent on first calls and on every dispatch
-        // outside the challenge owner's leaf (allowlisted `call_tool`).
+        // outside the challenge owner's leaf (allowlisted `tools` call).
         let tool_input = crate::middleware::current_tool_input();
         let request = ToolRequest {
             // Trusted caller identity: the session owner (or the operator

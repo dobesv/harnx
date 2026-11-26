@@ -16,12 +16,12 @@
 //! exit codes. That reuse is what makes decision 11's Bash exit-code/stderr
 //! parity hold by construction instead of by re-implementation. T3's Python
 //! path runs Monty bodies through the same `InnerCallRun::call` outcomes via
-//! `python.rs` host functions (`tool_input`, `call_tool`).
+//! `python.rs` host functions (`tool_input`, and `tools` through `with_tools`).
 
 mod dispatch;
 mod outcome;
 mod provider;
-mod python;
+pub(crate) mod python;
 mod tool_input;
 
 pub(crate) use provider::ScriptToolProviderConfig;

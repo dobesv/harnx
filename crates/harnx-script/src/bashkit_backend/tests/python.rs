@@ -435,3 +435,46 @@ fn python_queued_worker_cancel_and_deadline_do_not_wait_for_blocking_pool() {
     drop(release);
     runtime.block_on(blocker).unwrap();
 }
+
+fn own_lines(stderr: &str, shift: usize) -> String {
+    super::super::python_lines::own_line_numbers(stderr, "<stdin>", shift)
+}
+
+#[test]
+fn own_line_numbers_rewrites_every_frame() {
+    let stderr = "Traceback (most recent call last):\n  File \"<stdin>\", line 9, in <module>\n  File \"<stdin>\", line 2, in _harnx_call\nValueError: boom\n";
+    assert_eq!(
+        own_lines(stderr, 4),
+        "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\n  File \"<harnx tools>\", line 2, in _harnx_call\nValueError: boom\n"
+    );
+}
+
+#[test]
+fn own_line_numbers_passes_other_lines_through() {
+    let stderr = "no frames here\n    File \"x\" is not a frame\n  File \"a\", line x\nline 99\n";
+    assert_eq!(own_lines(stderr, 3), stderr);
+    assert_eq!(own_lines("", 3), "");
+}
+
+#[test]
+fn own_line_numbers_with_no_shift_keeps_lines() {
+    let stderr = "  File \"<stdin>\", line 1\n    x\nSyntaxError\n";
+    assert_eq!(own_lines(stderr, 0), stderr);
+}
+
+#[test]
+fn own_line_numbers_keeps_indentation_and_missing_trailing_newline() {
+    assert_eq!(
+        own_lines("\t File \"<stdin>\", line 7", 2),
+        "\t File \"<stdin>\", line 5"
+    );
+}
+
+#[test]
+fn own_line_numbers_leaves_frames_of_other_files_alone() {
+    let stderr = "  File \"<stdin>\", line 9, in <module>\n  File \"<string>\", line 2, in <module>\n  File \"/tmp/h.py\", line 7\n";
+    assert_eq!(
+        own_lines(stderr, 4),
+        "  File \"<stdin>\", line 5, in <module>\n  File \"<string>\", line 2, in <module>\n  File \"/tmp/h.py\", line 7\n"
+    );
+}

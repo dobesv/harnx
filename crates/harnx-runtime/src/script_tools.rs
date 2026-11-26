@@ -6,6 +6,7 @@
 
 pub(crate) mod conversion;
 pub(crate) mod python;
+pub(crate) mod python_tools;
 
 use anyhow::{anyhow, ensure, Result};
 use harnx_core::{abort::AbortSignal, tool::ToolCall};

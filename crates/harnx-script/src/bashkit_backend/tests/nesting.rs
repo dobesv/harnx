@@ -116,6 +116,7 @@ async fn chain(
             python_functions: Some(ScriptPythonFunctions {
                 names: vec!["nested".into()],
                 handler: nested,
+                prelude: None,
             }),
             fs_mounts: vec![],
             cancel,

@@ -27,7 +27,7 @@ pub fn error_text(value: &Value) -> String {
     }
 }
 
-pub(super) fn output(value: &Value, format: Option<OutputFormat>) -> String {
+pub(crate) fn output(value: &Value, format: Option<OutputFormat>) -> String {
     let structured = value.get("structuredContent");
     let text = match format {
         Some(OutputFormat::Json) => {

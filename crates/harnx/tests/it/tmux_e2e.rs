@@ -479,7 +479,7 @@ fn write_proxy_auth_fixture_files(
             "middleware": [{
                 "name": "proxy-auth",
                 "match": "^bash_(exec|spawn)$",
-                "python": "additions = call_tool(\"proxy_auth_environment\", {})\nif additions.get(\"is_error\") or additions.get(\"isError\"):\n    raise RuntimeError(\"proxy auth environment lookup failed\")\nargs = tool_input()[\"arguments\"]\ncaller_env = args.get(\"env\")\nif not isinstance(caller_env, dict):\n    caller_env = {}\nenv = additions[\"env\"]\nenv.update(caller_env)\nargs[\"env\"] = env\nrespond(call_next(args))",
+                "python": "additions = tools.proxy_auth_environment()\nif additions.get(\"is_error\") or additions.get(\"isError\"):\n    raise RuntimeError(\"proxy auth environment lookup failed\")\nargs = tool_input()[\"arguments\"]\ncaller_env = args.get(\"env\")\nif not isinstance(caller_env, dict):\n    caller_env = {}\nenv = additions[\"env\"]\nenv.update(caller_env)\nargs[\"env\"] = env\nrespond(call_next(args))",
                 "tools": ["proxy_auth_environment"],
                 "timeout": "25h",
                 "on_error": "deny"

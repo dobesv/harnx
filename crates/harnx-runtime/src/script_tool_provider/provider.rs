@@ -122,7 +122,7 @@ impl ScriptToolProvider {
     /// for the resolved inner allowlist plus `tool_input`. Pure assembly
     /// around the reused `bash` script-mode machinery; no script logic lives
     /// here. Python runs pass no CLI commands — their `tool_input` and
-    /// `call_tool` are Python host functions over the same run.
+    /// `tools` are Python host functions over the same run.
     fn bash_commands(
         &self,
         definition: &ScriptToolDefinition,
@@ -193,8 +193,8 @@ impl ScriptToolProvider {
     /// uses, so decision 11's parity holds by construction.
     ///
     /// A Bash body asks its inner calls for structured results because its
-    /// commands read each tool's output mapping. A Python body's `call_tool`
-    /// returns the model-style result, so it keeps the plain results.
+    /// commands read each tool's output mapping. A Python body's `tools` calls
+    /// return the model-style result, so it keeps the plain results.
     // qual:allow(iosp) — one optional-config branch over reused bash executor constructors; the branch is the whole logic and cannot live apart from the calls it configures
     fn inner_run(
         &self,
@@ -251,13 +251,19 @@ impl ScriptToolProvider {
             ScriptBody::Python(body) => {
                 let script = python_script(&body);
                 Ok(self
-                    .run_python_body(&script, timeout_secs, run, arguments, invocation)
+                    .run_python_body(
+                        &script,
+                        timeout_secs,
+                        run,
+                        (arguments, declarations),
+                        invocation,
+                    )
                     .await)
             }
         }
     }
 
-    /// Run a Python body: `tool_input`/`call_tool` are host functions over
+    /// Run a Python body: `tool_input` and `tools` are host functions over
     /// the shared run, with no CLI command set. Returns the run plus the
     /// reason a terminal fatal inner call recorded before stopping the host
     /// (4659980781), which the outcome reports on the `Stopped` status.
@@ -266,12 +272,17 @@ impl ScriptToolProvider {
         script: &str,
         timeout_secs: u64,
         run: Arc<crate::bash_inner::InnerCallRun>,
-        arguments: Value,
+        (arguments, declarations): (Value, &[ToolDeclaration]),
         invocation: &ScriptToolInvocation<'_>,
     ) -> (harnx_script::ScriptRun, Option<String>) {
         let fatal = std::sync::Arc::new(std::sync::OnceLock::new());
-        let functions =
-            super::python::functions(run, invocation.abort.clone(), arguments, fatal.clone());
+        let functions = super::python::functions(
+            run,
+            invocation.abort.clone(),
+            arguments,
+            declarations,
+            fatal.clone(),
+        );
         let result = self
             .run_backend(
                 script,

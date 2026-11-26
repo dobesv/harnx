@@ -1,5 +1,5 @@
 # Query the AWS credential provider tool service for environment additions.
-additions = call_tool("aws_creds_environment", {})
+additions = tools.aws_creds_environment()
 if additions.get("is_error") or additions.get("isError"):
     raise RuntimeError("AWS creds environment lookup failed")
 
