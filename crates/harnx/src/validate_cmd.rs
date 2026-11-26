@@ -175,15 +175,20 @@ fn link_packages(packages: &[PathBuf]) -> Result<CheckTarget> {
     })
 }
 
-/// The package's resolved directory and the name it installs under.
+/// The package's resolved directory and the name it installs under: the last
+/// component of `package` as given, since harnx names a package after its
+/// entry under `packages/` even when that entry is a link. A path with no
+/// such component, like `.` or `..`, is named after the directory it
+/// resolves to.
 fn package_source(package: &Path) -> Result<(PathBuf, String)> {
     let source = fs::canonicalize(package)
         .with_context(|| format!("Package directory '{}' does not exist", package.display()))?;
     if !source.is_dir() {
         bail!("Package '{}' is not a directory", package.display());
     }
-    let name = source
+    let name = package
         .file_name()
+        .or_else(|| source.file_name())
         .and_then(|name| name.to_str())
         .filter(|name| !name.starts_with('.'))
         .map(str::to_string)

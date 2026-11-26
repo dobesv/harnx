@@ -210,3 +210,44 @@ async fn remote_agent_reference_is_skipped() {
         "{report:#?}"
     );
 }
+
+#[tokio::test]
+async fn compaction_agent_is_checked_after_the_package_patch() {
+    let report = check_holding(&[
+        (
+            "packages/p/agents/a.md",
+            "---\ncompaction_agent: missing\n---\nhi\n",
+        ),
+        (
+            "packages/p.patch.yaml",
+            "agents:\n  - '.compaction_agent = \"/summary\"'\n",
+        ),
+        ("agents/summary.md", "sums\n"),
+    ])
+    .await;
+
+    assert!(
+        with_code(&report, Code::AgentNotFound).is_empty(),
+        "{report:#?}"
+    );
+}
+
+#[tokio::test]
+async fn compaction_agent_a_package_patch_adds_is_checked() {
+    let report = check_holding(&[
+        ("packages/p/agents/a.md", "hi\n"),
+        (
+            "packages/p.patch.yaml",
+            "agents:\n  - '.compaction_agent = \"missing\"'\n",
+        ),
+    ])
+    .await;
+
+    let found = with_code(&report, Code::AgentNotFound);
+    assert_eq!(found.len(), 1, "{report:#?}");
+    assert_eq!(
+        found[0].file.as_deref(),
+        Some(Path::new("packages/p/agents/a.md"))
+    );
+    assert_eq!(found[0].key_path.as_deref(), Some("compaction_agent"));
+}

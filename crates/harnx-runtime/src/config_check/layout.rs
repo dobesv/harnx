@@ -96,14 +96,9 @@ pub struct PackageLayout {
 }
 
 impl ConfigLayout {
-    /// Nothing that configures harnx: no config file, agents, clients, tool
-    /// servers or packages.
+    /// Nothing to check: no file of any kind and no package.
     pub fn is_empty(&self) -> bool {
-        self.config_file.is_none()
-            && self.agents.is_empty()
-            && self.clients.is_empty()
-            && self.tool_servers.is_empty()
-            && self.packages.is_empty()
+        self.files().is_empty() && self.packages.is_empty()
     }
 
     /// Every file the layout lists.
@@ -135,20 +130,20 @@ impl ConfigLayout {
 }
 
 impl PackageLayout {
-    fn discover(packages_dir: &Path, name: String, dir: PathBuf) -> Self {
+    fn discover(packages_dir: &Path, name: String, dir: PathBuf) -> Result<Self> {
         let patch_file = existing_file(packages_dir.join(format!("{name}.patch.yaml")));
-        Self {
+        Ok(Self {
             patch_file,
-            clients: files_with_extension(&dir.join(CLIENTS_DIR_NAME), "yaml"),
-            tool_servers: files_with_extension(&dir.join(TOOL_SERVERS_DIR_NAME), "yaml"),
-            agents: files_with_extension(&dir.join(AGENTS_DIR_NAME), "md"),
-            script_tools: files_with_extension(&dir.join(SCRIPT_TOOLS_DIR_NAME), "yaml"),
-            bash_tools: files_with_extension(&dir.join(BASH_TOOLS_DIR_NAME), "yaml"),
+            clients: files_with_extension(&dir.join(CLIENTS_DIR_NAME), "yaml")?,
+            tool_servers: files_with_extension(&dir.join(TOOL_SERVERS_DIR_NAME), "yaml")?,
+            agents: files_with_extension(&dir.join(AGENTS_DIR_NAME), "md")?,
+            script_tools: files_with_extension(&dir.join(SCRIPT_TOOLS_DIR_NAME), "yaml")?,
+            bash_tools: files_with_extension(&dir.join(BASH_TOOLS_DIR_NAME), "yaml")?,
             manifest: existing_file(dir.join(PACKAGE_MANIFEST_FILE_NAME)),
             metadata: existing_file(dir.join(PACKAGE_METADATA_FILE_NAME)),
             name,
             dir,
-        }
+        })
     }
 
     fn files(&self) -> impl Iterator<Item = &Path> {
@@ -174,24 +169,29 @@ pub fn discover(root: &Path) -> Result<ConfigLayout> {
     discover_sources(&ConfigSources::in_dir(root))
 }
 
-/// List the files `sources` names. Fails when `sources.root` can't be read;
-/// unreadable subdirectories list as empty, as the loaders treat them.
+/// List the files `sources` names. Fails when `sources.root` or any
+/// subdirectory the loaders read can't be listed: the loaders skip such a
+/// directory without a word, so the check would pass without reading it. A
+/// missing subdirectory is fine.
 pub fn discover_sources(sources: &ConfigSources) -> Result<ConfigLayout> {
     ensure_readable_dir(&sources.root)?;
     let root = sources.root.as_path();
     let packages_dir = sources.packages_dir();
+    // The loader's package listing skips what it can't read, so list the
+    // directory once here to surface the error.
+    listed_entries(&packages_dir)?;
     let packages = Config::sorted_package_dirs(&packages_dir)?
         .into_iter()
         .map(|(name, dir)| PackageLayout::discover(&packages_dir, name, dir))
-        .collect();
+        .collect::<Result<_>>()?;
     Ok(ConfigLayout {
         root: root.to_path_buf(),
         config_file: existing_file(sources.config_file.clone()),
-        clients: files_with_extension(&root.join(CLIENTS_DIR_NAME), "yaml"),
-        tool_servers: files_with_extension(&root.join(TOOL_SERVERS_DIR_NAME), "yaml"),
-        nats_servers: files_with_extension(&root.join(NATS_SERVERS_DIR_NAME), "yaml"),
-        agents: files_with_extension(&root.join(AGENTS_DIR_NAME), "md"),
-        macros: files_with_extension(&sources.macros_dir, "yaml"),
+        clients: files_with_extension(&root.join(CLIENTS_DIR_NAME), "yaml")?,
+        tool_servers: files_with_extension(&root.join(TOOL_SERVERS_DIR_NAME), "yaml")?,
+        nats_servers: files_with_extension(&root.join(NATS_SERVERS_DIR_NAME), "yaml")?,
+        agents: files_with_extension(&root.join(AGENTS_DIR_NAME), "md")?,
+        macros: files_with_extension(&sources.macros_dir, "yaml")?,
         models_override: existing_file(sources.home.join(MODELS_OVERRIDE_FILE_NAME)),
         access: existing_file(sources.home.join(ACCESS_FILE_NAME)),
         users: existing_file(sources.home.join(USERS_FILE_NAME)),
@@ -221,17 +221,28 @@ fn existing_file(path: PathBuf) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Regular files directly in `dir` with `extension`, sorted.
-fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+/// Regular files directly in `dir` with `extension`, sorted; none when `dir`
+/// doesn't exist.
+fn files_with_extension(dir: &Path, extension: &str) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = listed_entries(dir)?
+        .into_iter()
         .filter(|path| {
             path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some(extension)
         })
         .collect();
     files.sort();
-    files
+    Ok(files)
+}
+
+/// The entries of `dir`, none when it doesn't exist; any other failure to
+/// list it or one of its entries is an error.
+fn listed_entries(dir: &Path) -> Result<Vec<PathBuf>> {
+    let error = || format!("Cannot read directory '{}'", dir.display());
+    let entries = match std::fs::read_dir(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        result => result.with_context(error)?,
+    };
+    entries
+        .map(|entry| entry.map(|entry| entry.path()).with_context(error))
+        .collect()
 }

@@ -474,3 +474,26 @@ fn validate_invalid_ignore_tool_glob_exits_two() {
 
     assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
 }
+
+/// Runtime discovery names a package after its entry under `packages/`,
+/// whatever that entry links to, so a package given through a link is
+/// staged under the link's name.
+#[cfg(unix)]
+#[test]
+fn validate_package_through_a_link_uses_the_links_name() {
+    let home = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let build = source.path().join("coding-release");
+    write(
+        &build,
+        "agents/a.md",
+        "---\ntitle_agent: coding/b\n---\nhi\n",
+    );
+    write(&build, "agents/b.md", AGENT);
+    let link = source.path().join("coding");
+    std::os::unix::fs::symlink(&build, &link).unwrap();
+
+    let output = validate(home.path(), &["--package", link.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+}

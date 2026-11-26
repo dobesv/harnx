@@ -631,3 +631,50 @@ async fn known_binaries_register_their_default_names() {
         }
     }
 }
+
+#[tokio::test]
+async fn handoff_tool_in_bash_tools_is_error() {
+    let a = "---\nbash_tools: [b_session_handoff]\nuse_tools: b_session_handoff\n---\nhi\n";
+    let report = check_tools(&[("agents/a.md", a), ("agents/b.md", "hello\n")]).await;
+
+    let found = with_code(&report, Code::UnknownTool);
+    assert_eq!(found.len(), 1, "{report:#?}");
+    assert_eq!(found[0].key_path.as_deref(), Some("bash_tools"));
+    assert!(
+        found[0].message.contains("b_session_handoff"),
+        "{}",
+        found[0].message
+    );
+}
+
+#[tokio::test]
+async fn glob_toolset_member_is_error() {
+    let report = check_tools(&[
+        TIME_SERVER,
+        ("config.yaml", "toolsets:\n  timey: ['time_*']\n"),
+    ])
+    .await;
+
+    let found = with_code(&report, Code::UnknownTool);
+    assert_eq!(found.len(), 1, "{report:#?}");
+    assert_eq!(found[0].key_path.as_deref(), Some("toolsets"));
+    assert!(found[0].message.contains("exact"), "{}", found[0].message);
+}
+
+#[tokio::test]
+async fn package_view_of_a_glob_toolset_member_is_error() {
+    let a = agent("timey");
+    let report = check_tools(&[
+        TIME_SERVER,
+        ("config.yaml", "toolsets:\n  timey: ['time_*']\n"),
+        ("packages/p/agents/a.md", &a),
+    ])
+    .await;
+
+    let found = with_code(&report, Code::UnknownTool);
+    let files: Vec<_> = found.iter().map(|f| f.file.as_deref()).collect();
+    assert!(
+        files.contains(&Some(Path::new("packages/p/agents/a.md"))),
+        "{report:#?}"
+    );
+}

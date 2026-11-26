@@ -18,7 +18,7 @@ use harnx_core::package::PackagePatch;
 use harnx_core::package_namespace::resolve_package_relative_name;
 use serde_yaml::Value;
 
-use super::{CheckContext, Code, ConfigLayout, Finding, PackageLayout, Report};
+use super::{CheckContext, Code, ConfigLayout, Finding, LoadedAgent, PackageLayout, Report};
 use crate::client::ClientConfig;
 use crate::config::agent::list_agents;
 use crate::config::session_ops_title::title_agent_lookup_name;
@@ -32,7 +32,6 @@ pub fn check_silent_drops(context: &CheckContext<'_>, report: &mut Report) {
     check_models_override(layout, report);
     check_env_file(layout, report);
     check_front_matter_position(layout, report);
-    check_agent_references(layout, report);
 }
 
 fn read(path: &Path) -> Option<String> {
@@ -199,9 +198,10 @@ fn agent_exists(name: &str) -> bool {
 
 /// `title_agent` and `compaction_agent` that name no agent fall back to the
 /// default prompt. A name with `@` points at a remote cluster, which the
-/// check can't see.
-fn check_agent_references(layout: &ConfigLayout, report: &mut Report) {
-    for reference in agent_references(layout) {
+/// check can't see. Agents' values are read from `agents` as loaded, after
+/// their package patch, since that is what the runtime resolves.
+pub fn check_agent_references(layout: &ConfigLayout, agents: &[LoadedAgent], report: &mut Report) {
+    for reference in agent_references(layout, agents) {
         check_reference(layout, &reference, report);
     }
 }
@@ -215,29 +215,27 @@ struct AgentReference {
     package: Option<String>,
 }
 
-/// Every such value in `config.yaml` and the agents' front matter.
-fn agent_references(layout: &ConfigLayout) -> Vec<AgentReference> {
+/// Every such value in `config.yaml` and in the loaded agents, each named
+/// in the agent's own file.
+fn agent_references(layout: &ConfigLayout, agents: &[LoadedAgent]) -> Vec<AgentReference> {
     let mut references = Vec::new();
     if let Some(file) = &layout.config_file {
         let text = read(file).unwrap_or_default();
         references.extend(references_in(file, &text, None, &["title_agent"]));
     }
-    let local = layout.agents.iter().map(|file| (file, None));
-    let packaged = layout.packages.iter().flat_map(|p| {
-        p.agents
-            .iter()
-            .map(move |file| (file, Some(p.name.as_str())))
-    });
-    for (file, package) in local.chain(packaged) {
-        let content = read(file).unwrap_or_default();
-        let front_matter = harnx_core::agent_config::agent_front_matter(&content);
-        let text = front_matter.map(|(text, _)| text).unwrap_or_default();
-        references.extend(references_in(
-            file,
-            text,
-            package,
-            &["compaction_agent", "title_agent"],
-        ));
+    for agent in agents {
+        let values = [
+            ("compaction_agent", agent.config.compaction_agent()),
+            ("title_agent", agent.config.title_agent()),
+        ];
+        references.extend(values.into_iter().filter_map(|(key, name)| {
+            Some(AgentReference {
+                file: agent.file.clone(),
+                key,
+                name: name?.to_string(),
+                package: agent.package.clone(),
+            })
+        }));
     }
     references
 }

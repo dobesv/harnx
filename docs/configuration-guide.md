@@ -401,7 +401,8 @@ With neither `--config-dir` nor `--package`, it checks the config harnx
 itself would load, following `HARNX_CONFIG_DIR` and `HARNX_CONFIG_FILE`.
 `--config-dir` and `--package` ignore `HARNX_CONFIG_FILE` and read
 `config.yaml` from the directory they check. `--package` installs each package alone into an empty temporary config
-directory and reports paths relative to the package (`agents/x.md`), or
+directory, under the last component of the path as given (a link's own name,
+not its target's), and reports paths relative to the package (`agents/x.md`), or
 prefixed with the package name (`pantheon/agents/x.md`) when several are
 given.
 
@@ -419,7 +420,8 @@ given.
 
 The exit code is `0` when there are no errors (warnings are allowed unless
 strict), `1` when there are errors, and `2` when the check couldn't run, such
-as for a bad argument or a directory that doesn't exist.
+as for a bad argument, a directory that doesn't exist, or a subdirectory such
+as `agents/` that can't be listed.
 
 ### Output
 
@@ -470,7 +472,7 @@ and `--allow` can match on it:
 | `agent-load` | error | An agent doesn't load the way a session loads it: its package patch fails, a `variables[].path` file is missing, a `patches` filter doesn't compile, middleware or hooks don't bind, or the prompt doesn't render. |
 | `model-unresolved` | error | A `model` or `model_fallbacks` entry names a client that isn't configured, or the configured client can't resolve it. With `--package`, a model on a top-level client (`/openai:gpt-x`) that the package doesn't configure is a warning instead, since the config that installs the package provides that client. |
 | `agent-not-found` | error | `compaction_agent` or `title_agent` names no agent, so harnx falls back to its default prompt. |
-| `unknown-tool` | error | A tool name no built-in, script tool, sub-agent, handoff or listed tool server provides. |
+| `unknown-tool` | error | A tool name no built-in, script tool, sub-agent, handoff or listed tool server provides. Also a `toolsets:` member written as a pattern, since members are matched by exact name, and a control tool (`bash`, `switch_agent`, `ask_user` or a handoff) in `bash_tools`, middleware `tools:` or script tools' `tools:`, which scripts can't call. |
 | `model-not-in-catalog` | warning | The client is configured but its catalog doesn't list the model. harnx still accepts it for chat. |
 | `access-agent-unmatched` | warning | An `access.yaml` agent pattern matches no local, package or remote agent. |
 | `env-var-unset` | warning | A `nats_servers/*.yaml` value uses `${VAR}` and `VAR` isn't set where the check runs. |

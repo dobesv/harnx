@@ -193,3 +193,62 @@ async fn check_fails_for_an_invalid_ignore_glob() {
 
     assert!(format!("{error:#}").contains("'a['"), "{error:#}");
 }
+
+#[tokio::test]
+async fn only_nats_servers_is_not_empty() {
+    let report =
+        check_holding(&[("nats_servers/remote.yaml", "url: nats://localhost:4222\n")]).await;
+
+    assert!(
+        with_code(&report, Code::EmptyConfig).is_empty(),
+        "{report:#?}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_dir_is_empty() {
+    let report = check_holding(&[]).await;
+
+    assert_eq!(
+        with_code(&report, Code::EmptyConfig).len(),
+        1,
+        "{report:#?}"
+    );
+}
+
+/// A subdirectory the loaders can't list reads as holding nothing, which
+/// would let the check pass without looking at it. A file where `agents/`
+/// should be fails to list the same way on every Unix, without depending on
+/// whether the test runs as root.
+#[cfg(unix)]
+#[test]
+fn discover_fails_for_an_unlistable_subdir() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "config.yaml", "stream: true\n");
+    write(dir.path(), "agents", "not a directory\n");
+
+    let error = discover(dir.path()).unwrap_err();
+
+    assert!(format!("{error:#}").contains("agents"), "{error:#}");
+}
+
+#[tokio::test]
+async fn check_fails_when_the_loaders_read_another_dir() {
+    let checked = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    write(checked.path(), "config.yaml", "stream: true\n");
+    write(other.path(), "config.yaml", "stream: true\n");
+    let _config_dir = EnvVarGuard::set("HARNX_CONFIG_DIR", checked.path());
+    let _config_file = EnvVarGuard::set("HARNX_CONFIG_FILE", &other.path().join("config.yaml"));
+
+    let error = check_config_dir(&CheckOptions::new(checked.path().to_path_buf()))
+        .await
+        .unwrap_err();
+
+    let message = format!("{error:#}");
+    assert!(message.contains("HARNX_CONFIG_FILE"), "{message}");
+    assert!(
+        message.contains(&other.path().display().to_string()),
+        "{message}"
+    );
+}

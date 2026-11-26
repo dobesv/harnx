@@ -2,8 +2,8 @@
 //! with their tool servers started: no errors. Warnings are allowed, since
 //! a bridged server whose `npx` or `uvx` can't run here, or an access rule
 //! written for agents the example doesn't define, is expected. Every native
-//! tool server must list its tools, or the tool names using it would go
-//! unchecked and the test would pass without checking them.
+//! tool server must be found and list its tools, or the tool names using it
+//! would go unchecked and the test would pass without checking them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -96,14 +96,18 @@ const UNLISTABLE_HERE: [&str; 3] = [
     "harnx-k8s-sandbox-tools",
 ];
 
-/// No errors, and every `tool-unverified` finding is for a server in
-/// [`UNLISTABLE_HERE`].
+/// No errors, no missing tool server command, and every `tool-unverified`
+/// finding is for a server in [`UNLISTABLE_HERE`]. A missing command gets
+/// `command-not-found` instead of `tool-unverified`, so it is rejected
+/// here or the server's tool names would go unchecked unnoticed.
 fn assert_no_errors(root: &Path, report: &Report) {
     assert!(report.summary.files_checked > 0, "{report:#?}");
     let errors = report
         .findings
         .iter()
-        .filter(|finding| finding.severity == Severity::Error)
+        .filter(|finding| {
+            finding.severity == Severity::Error || finding.code == Code::CommandNotFound
+        })
         .count();
     assert_eq!(errors, 0, "\n{}", report.render_text());
     for finding in report

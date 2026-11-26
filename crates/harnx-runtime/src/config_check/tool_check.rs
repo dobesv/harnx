@@ -4,13 +4,16 @@
 use std::collections::{BTreeMap, HashMap};
 
 use globset::GlobSet;
+use harnx_core::package_namespace::sanitize_for_tool_name;
 
 use super::known_tools::{listed_registration, registration, visible_names, KnownNames};
 use super::references::{command_missing, tool_server_file};
 use super::tool_listing::{configured_names, list_servers, server_key, ServerListing};
 use super::tool_refs::{collect_tool_refs, reach, ToolRef};
 use super::{CheckContext, Code, ConfigLayout, Finding, LoadedAgent, Report};
-use crate::config::{selector_could_match_server, Config, ToolServerConfig};
+use crate::config::{
+    is_bash_inner_tool_allowed, selector_could_match_server, Config, ToolServerConfig,
+};
 use crate::server_identity::ServerIdentity;
 use crate::tool_selector::is_glob;
 
@@ -87,6 +90,24 @@ enum Outcome {
     },
     Unknown,
     GlobMatchesNothing,
+    /// A control tool named where only tools a script may call are kept.
+    NotScriptCallable,
+    /// A pattern as a toolset member, which is matched by exact name.
+    PatternInToolset,
+}
+
+/// A selector that selects nothing because of where it is written, whatever
+/// the servers list: a pattern as a toolset member, or a control tool where
+/// only tools a script may call are kept.
+fn misplaced(tool_ref: &ToolRef) -> Option<Outcome> {
+    let selector = tool_ref.selector.as_str();
+    let glob = is_glob(selector);
+    if tool_ref.exact && glob {
+        return Some(Outcome::PatternInToolset);
+    }
+    let control = !is_bash_inner_tool_allowed(selector)
+        || !is_bash_inner_tool_allowed(&sanitize_for_tool_name(selector));
+    (tool_ref.script_callable_only() && !glob && control).then_some(Outcome::NotScriptCallable)
 }
 
 /// An enabled server and the names it registers under: the one its listing
@@ -177,6 +198,9 @@ impl<'a> Checker<'a> {
     }
 
     fn outcome(&self, tool_ref: &ToolRef) -> Outcome {
+        if let Some(outcome) = misplaced(tool_ref) {
+            return outcome;
+        }
         if self.names.matches(tool_ref) {
             return Outcome::Known;
         }
@@ -267,6 +291,14 @@ impl<'a> Checker<'a> {
                     format!("{entry} is not a tool that tool server {server} lists{hint}"),
                 )
             }
+            Outcome::NotScriptCallable => Finding::of(
+                Code::UnknownTool,
+                format!("{entry} is a tool scripts can't call (bash, switch_agent, ask_user and handoff tools stay with the model), so harnx leaves it out"),
+            ),
+            Outcome::PatternInToolset => Finding::of(
+                Code::UnknownTool,
+                format!("{entry} is a toolset member written as a pattern, but harnx matches toolset members by exact name, so it selects no tool"),
+            ),
             Outcome::GlobMatchesNothing => Finding::of(
                 Code::GlobMatchesNothing,
                 format!("{entry} matches no built-in, script, sub-agent or handoff tool, and no tool a configured server lists"),

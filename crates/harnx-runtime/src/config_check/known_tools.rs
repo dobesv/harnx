@@ -10,7 +10,8 @@ use super::tool_listing::{server_key, ServerListing};
 use super::tool_refs::ToolRef;
 use crate::config::agent::list_agents;
 use crate::config::{
-    builtin_tool_names, handoff_tool_name, selector_matcher, Config, ToolServerConfig,
+    builtin_tool_names, handoff_tool_name, is_bash_inner_tool_allowed, selector_matcher, Config,
+    ToolServerConfig,
 };
 use crate::nats_worker::subagent_registration;
 use crate::server_identity::ServerIdentity;
@@ -75,11 +76,20 @@ impl KnownNames {
         self
     }
 
+    /// Whether `tool_ref` selects a known name the way the runtime selects
+    /// it: a toolset member by exact name, anything else as a glob, and for
+    /// selectors scripts resolve, only names a script may call.
     pub(super) fn matches(&self, tool_ref: &ToolRef) -> bool {
-        let matches = selector_matcher(&tool_ref.selector);
+        let glob = selector_matcher(&tool_ref.selector);
+        let selects = |name: &str| match tool_ref.exact {
+            true => name == tool_ref.selector,
+            false => glob(name),
+        };
+        let callable =
+            |name: &str| !tool_ref.script_callable_only() || is_bash_inner_tool_allowed(name);
         self.by_package
             .get(&tool_ref.agent_package)
-            .is_some_and(|names| names.iter().any(|name| matches(name)))
+            .is_some_and(|names| names.iter().any(|name| selects(name) && callable(name)))
     }
 }
 

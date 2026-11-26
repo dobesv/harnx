@@ -100,12 +100,15 @@ pub struct CheckContext<'a> {
 
 /// Check the files `options.sources` names. Fails only when the check can't
 /// run: the directory can't be read, a file named in the options doesn't
-/// exist, or an `ignore_tools` glob doesn't compile.
+/// exist, an `ignore_tools` glob doesn't compile, or harnx's path variables
+/// point the loaders somewhere else.
 ///
-/// The loaders find packages through `HARNX_CONFIG_DIR`, so for
-/// [`CheckOptions::new`] the caller points it at `config_dir` first; this
-/// function changes nothing global.
+/// The loaders find agents and packages through `HARNX_CONFIG_DIR` and
+/// `HARNX_CONFIG_FILE`, so for [`CheckOptions::new`] the caller points the
+/// first at `config_dir` and unsets the second; this function changes
+/// nothing global.
 pub async fn check_config_dir(options: &CheckOptions) -> Result<Report> {
+    ensure_loaders_read(&options.sources)?;
     let layout = discover_with_options(options)?;
     let mut report = Report::default();
     let settings = CheckSettings {
@@ -123,9 +126,32 @@ pub async fn check_config_dir(options: &CheckOptions) -> Result<Report> {
     let mut config = check_config_loads(&context, &mut report);
     silent_drops::check_silent_drops(&context, &mut report);
     let agents = agents::check_agents(&context, config.as_mut(), &mut report);
+    silent_drops::check_agent_references(&layout, &agents, &mut report);
     references::check_references(&context, config.as_ref(), &mut report);
     tool_check::check_tools(&context, config.as_ref(), &agents, &ignore, &mut report).await;
     Ok(report.finish(&settings))
+}
+
+/// Some checks go through runtime loaders that find agents and packages
+/// from harnx's environment rather than from `sources`. Checked against two
+/// different directories, an agent the layout lists would never be loaded,
+/// and its problems would go unreported.
+fn ensure_loaders_read(sources: &ConfigSources) -> Result<()> {
+    let from_env = ConfigSources::from_env();
+    let mismatch = |what: &str, expected: &Path, actual: &Path| {
+        anyhow::anyhow!(
+            "harnx reads {what} from '{}' (HARNX_CONFIG_DIR, HARNX_CONFIG_FILE), not from the checked '{}': point HARNX_CONFIG_DIR at the checked directory and unset HARNX_CONFIG_FILE, or check the config harnx would load",
+            actual.display(),
+            expected.display()
+        )
+    };
+    if from_env.root != sources.root {
+        return Err(mismatch("agents", &sources.root, &from_env.root));
+    }
+    if from_env.home != sources.home {
+        return Err(mismatch("packages", &sources.home, &from_env.home));
+    }
+    Ok(())
 }
 
 /// The layout, with `--access-rules` and `--users` in place of the files the
@@ -148,7 +174,7 @@ fn check_not_empty(context: &CheckContext<'_>, report: &mut Report) {
     if context.layout.is_empty() {
         report.push(Finding::of(
             Code::EmptyConfig,
-            "nothing to check: no config.yaml, agents, clients, tool servers or packages",
+            "nothing to check: no config.yaml, agents, clients, servers, other config files or packages",
         ));
     }
 }

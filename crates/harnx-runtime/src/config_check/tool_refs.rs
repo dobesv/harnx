@@ -22,6 +22,20 @@ pub struct ToolRef {
     pub key: &'static str,
     /// The package whose view of tool names the selector is resolved in.
     pub agent_package: Option<String>,
+    /// A toolset member, which the runtime matches by exact name rather than
+    /// as a glob.
+    pub exact: bool,
+}
+
+impl ToolRef {
+    /// Whether the runtime drops control tools (`bash`, handoffs, …) from
+    /// what this selector selects: scripts and middleware can't call them.
+    pub fn script_callable_only(&self) -> bool {
+        matches!(
+            self.key,
+            "bash_tools" | "middleware.tools" | "script_tools.tools"
+        )
+    }
 }
 
 /// Every tool selector in the checked files: agents' `use_tools` and
@@ -111,15 +125,15 @@ impl RefCollector<'_> {
                 Some(_) if package.is_none() => {}
                 Some(members) => {
                     let members = members.clone();
-                    self.push_all(source, key, package, selectors(&members));
+                    self.push_all(source, key, package, true, selectors(&members));
                 }
-                None => self.push_all(source, key, package, [selector]),
+                None => self.push_all(source, key, package, false, [selector]),
             }
         }
     }
 
     fn add_members(&mut self, source: &Path, members: &[String]) {
-        self.push_all(source, "toolsets", None, selectors(members));
+        self.push_all(source, "toolsets", None, true, selectors(members));
     }
 
     fn add_middleware(
@@ -140,6 +154,7 @@ impl RefCollector<'_> {
         source: &Path,
         key: &'static str,
         package: Option<&str>,
+        exact: bool,
         selectors: impl IntoIterator<Item = String>,
     ) {
         self.refs
@@ -148,6 +163,7 @@ impl RefCollector<'_> {
                 source: source.to_path_buf(),
                 key,
                 agent_package: package.map(str::to_string),
+                exact,
             }));
     }
 }
