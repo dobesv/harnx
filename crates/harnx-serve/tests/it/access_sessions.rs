@@ -372,6 +372,90 @@ async fn access_nats_foreign_and_legacy_sessions_are_hidden_on_every_subroute() 
     Ok(())
 }
 
+/// Issue #2944: a `prompt`-scope caller can supply the metadata PATCH payload
+/// on the collection POST. The body changes what is created, never who owns
+/// it: the owner stays the authenticated caller, identity payloads are
+/// rejected without reserving, an admin-only caller stays denied, and the
+/// patch lands in the first KV write.
+#[tokio::test]
+async fn access_nats_prompt_creator_supplies_creation_metadata_body() -> Result<()> {
+    let Some(f) = fixture(true).await? else {
+        return Ok(());
+    };
+    // KV revisions are bucket-global stream sequence numbers, so the created
+    // record's first write is exactly one past the current message count.
+    // Reservation also writes the reserved activity record (+2), so a
+    // reserve-then-PATCH implementation would first reach the patch at +3.
+    let stream = f
+        .jetstream
+        .get_stream(format!(
+            "KV_{}",
+            harnx_runtime::nats_session_metadata::SESSION_METADATA_BUCKET
+        ))
+        .await?;
+    let prior_messages = stream.cached_info().state.messages;
+    let created = f
+        .request(Method::POST, "/v1/agents/allowed/sessions", "alice")
+        .json(&json!({
+            "title": {"value": "  Batch run  ", "manual": true},
+            "variables": {"BATCH": "nightly"},
+            "overrides": {"model": "test:reserved-model"}
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let body: Value = created.json().await?;
+    let id = body["session_id"]
+        .as_str()
+        .context("reserved session id")?
+        .to_string();
+    let record = f
+        .store
+        .get_for_agent(&id, "allowed")
+        .await?
+        .context("canonical metadata")?;
+    assert_eq!(
+        record.revision,
+        prior_messages + 1,
+        "the patch must be in the first write, not a follow-up mutation"
+    );
+    assert_eq!(record.metadata.title.value.as_deref(), Some("Batch run"));
+    assert!(record.metadata.title.manual);
+    assert_eq!(
+        record.metadata.variables.get("BATCH").map(String::as_str),
+        Some("nightly")
+    );
+    assert_eq!(
+        record.metadata.overrides.model.as_deref(),
+        Some("test:reserved-model")
+    );
+    assert_eq!(
+        session_properties(&record.metadata)?.text("user_id"),
+        Some("alice"),
+        "identity comes from authentication, never from the payload"
+    );
+
+    // The rejected identity field reserves nothing: only the accepted
+    // creation added a record to the seeded three.
+    let rejected = f
+        .request(Method::POST, "/v1/agents/allowed/sessions", "alice")
+        .json(&json!({"user_id": "attacker"}))
+        .send()
+        .await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(f.store.list().await?.len(), 4);
+
+    // An admin-only caller stays denied even with a valid metadata body.
+    let denied = f
+        .request(Method::POST, "/v1/agents/allowed/sessions", "admin")
+        .json(&json!({"title": {"value": "Admin batch"}}))
+        .send()
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(f.store.list().await?.len(), 4);
+    Ok(())
+}
+
 #[tokio::test]
 async fn access_nats_admin_reads_operates_foreign_and_legacy_sessions_but_cannot_create(
 ) -> Result<()> {
