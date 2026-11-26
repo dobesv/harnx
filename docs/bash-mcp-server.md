@@ -118,7 +118,7 @@ Built-in tool names are reserved: a command template named `exec`, `spawn`, `sta
 | `wait` | Wait on a background process | `execution_id`, `seconds` (1 to 240) or `forever`, `diff`, output filters |
 | `terminate` | Stop a background process | `execution_id`, `signal` (`SIGTERM` default, `SIGKILL`, `SIGINT`, `SIGHUP`) |
 | `read_exec_log` | Read server-owned execution logs | `execution_id`, `stream` (`stdout`/`stderr`), paging and filter options |
-| `rollback_file` | Restore a repository's tracked files to a harnx history snapshot and move the branch to a new commit | `commit_id` (a snapshot id, in full or as a prefix of at least 7 hex digits: the first id on a summary line is the state before a change, the second id and the `commit <sha>` line of a full diff are the state after) |
+| `rollback_file` | Restore the files recorded in a harnx history snapshot into the working tree; paths absent from the snapshot and the repository's HEAD, refs and index are left unchanged | `commit_id` (a snapshot id, in full or as a prefix of at least 7 hex digits: the first id on a summary line is the state before a change, the second id and the `commit <sha>` line of a full diff are the state after) |
 | Command templates | Predefined script execution | Declared template parameters, plus reserved controls (`timeout_secs`, `head_lines`, `tail_lines`, `max_output_bytes`) |
 
 `spawn`, `status` and `wait` reject arguments they do not declare. In particular, `wait` no longer takes `timeout_secs` (use `seconds`), and a nested `wait` object does not either.

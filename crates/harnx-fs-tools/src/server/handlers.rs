@@ -7,6 +7,11 @@ use super::*;
 
 type ReadLinesPage<'a> = (Vec<(usize, &'a str)>, usize, usize);
 
+/// One text for the `rollback_file` tool wherever the filesystem server
+/// advertises it (toolset and `--mcp-stdio` back-compat list). The bash
+/// toolset carries the same wording in its own crate; keep them in sync.
+pub(crate) const ROLLBACK_FILE_DESCRIPTION: &str = "Restore the files recorded in a harnx history snapshot into the working tree. The commit_id is a snapshot id, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change and the second is the state after it; the 'commit' line of a full diff is the state after. Only the paths recorded in the snapshot are restored, as uncommitted working-tree changes: paths absent from the snapshot are kept, and HEAD, refs and the index are not moved. A snapshot with an empty tree restores nothing, so it cannot undo a file creation. To undo one change, reverse-apply its diff with the repository and ids from the summary line: git -C <repo> diff --binary <before> <after> | git -C <repo> apply -R.";
+
 impl FsServer {
     pub(crate) async fn observation_for_args(
         &self,
@@ -977,6 +982,21 @@ impl FsServer {
     }
 }
 
+/// A rollback failure splits in two: a preflight rejection is an expected
+/// outcome the caller can recover from, anything else stays an internal
+/// protocol error. Both leave the working tree and git state untouched.
+fn rollback_failure(e: anyhow::Error) -> Result<CallToolResult, ErrorData> {
+    // qual:allow(coupling, deh) reason: "RollbackPreflightError rides the anyhow boundary typed; the handler contract classifies it by downcast, the house pattern for typed sources on anyhow errors."
+    if e.downcast_ref::<RollbackPreflightError>().is_some() {
+        tool_error(format!("rollback failed: {e}"))
+    } else {
+        Err(ErrorData::internal_error(
+            format!("rollback failed: {e}"),
+            None,
+        ))
+    }
+}
+
 impl FsServer {
     pub(crate) async fn rollback_file_impl(
         &self,
@@ -1001,16 +1021,22 @@ impl FsServer {
         let repo_lock = self.repo_lock_for_path(&repo_dir);
         let _repo_guard = repo_lock.write().await;
 
-        let new_commit_id = self
-            .history
-            .rollback(&repo_dir, commit_id)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("rollback failed: {e}"), None))?;
+        // Preflight rejections (unsafe destinations, conflicts) are expected
+        // outcomes, so they surface as recoverable tool errors; anything
+        // else stays an internal protocol error. Both leave the working tree
+        // and git state untouched.
+        let new_snapshot_id = match self.history.rollback(&repo_dir, commit_id).await {
+            Ok(id) => id,
+            Err(e) => return rollback_failure(e),
+        };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Rolled back to harnx snapshot {}; new commit {} created (can be reverted)",
+            "Rolled back to harnx snapshot {}: restored only the paths recorded in that \
+             snapshot, as working-tree changes; paths absent from the snapshot, staged \
+             changes, HEAD and refs were left unchanged. New after-snapshot {} recorded \
+             (a snapshot id, not a branch commit).",
             &params.commit_id[..8.min(params.commit_id.len())],
-            new_commit_id.to_hex(),
+            new_snapshot_id.to_hex(),
         ))]))
     }
 }
