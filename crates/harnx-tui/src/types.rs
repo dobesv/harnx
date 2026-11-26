@@ -340,6 +340,8 @@ pub(super) struct App {
     pub(super) monitored_sessions: HashMap<MonitoredSessionKey, MonitoredSessionState>,
     /// Fullscreen child-session drilldown stack. The last invocation is displayed.
     pub(super) subagent_view_stack: Vec<SubAgentView>,
+    /// Which surface owns keys while a `ConfirmInteraction` tray is pending.
+    pub(crate) interaction_focus: InteractionFocus,
 }
 
 #[derive(Clone, Copy)]
@@ -368,6 +370,16 @@ impl MonitoredSessionKey {
     pub fn storage_key(&self) -> String {
         harnx_core::session_identity::session_key(Some(&self.agent), &self.session_id)
     }
+}
+
+/// Keyboard focus while a `ConfirmInteraction` tray is pending. The tray owns
+/// input unless an exclusive read view (browse/detail/cid document/subagent
+/// view/archive) retains focus for reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InteractionFocus {
+    #[default]
+    Tray,
+    Reading,
 }
 
 #[derive(Clone, Debug)]
@@ -1178,6 +1190,7 @@ impl Default for App {
             use_utc_timestamps: false,
             monitored_sessions: HashMap::new(),
             subagent_view_stack: Vec::new(),
+            interaction_focus: InteractionFocus::Tray,
         }
     }
 }

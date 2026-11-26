@@ -96,26 +96,7 @@ impl Tui {
             )],
             SessionEvent::CompactingCompleted { outcome, .. } => match outcome {
                 harnx_core::session::CompactOutcome::Compacted => {
-                    // Normal completion - reload transcript
-                    self.app.transcript = session_history_transcript_items(&self.config).await;
-                    self.subagent_rows_dirty = true;
-                    self.app.streaming_open = false;
-                    // A compaction can land mid-turn after some assistant text has
-                    // already streamed. The rebuild drops the parent streamed row, so its
-                    // replacement index must also be cleared before the eventual Final event.
-                    self.app.main_streamed_text_idx = None;
-                    self.app.streamed_text_idx = None;
-                    // The rebuild drops all SourceHeading entries, so the next
-                    // output must re-emit its heading even if it shares the prior
-                    // source. Without this, the first post-compaction message would
-                    // render without an agent label.
-                    self.app.last_ui_output_source = None;
-                    // The transcript is entirely rebuilt, so any prior focus/anchor
-                    // indices reference now-different items even when still in
-                    // bounds. Clear selection/detail state unconditionally.
-                    self.app.transcript_focus = None;
-                    self.app.transcript_selection_anchor = None;
-                    self.pin_transcript_to_bottom();
+                    self.rebuild_transcript_after_compaction().await;
                     vec![]
                 }
                 harnx_core::session::CompactOutcome::Unchanged(reason) => {
@@ -147,6 +128,39 @@ impl Tui {
             )],
             _ => vec![],
         }
+    }
+
+    /// Reload the transcript after a compaction completed. The transcript is
+    /// entirely rebuilt, so any prior focus/anchor indices reference
+    /// now-different items even when still in bounds.
+    async fn rebuild_transcript_after_compaction(&mut self) {
+        self.app.transcript = session_history_transcript_items(&self.config).await;
+        self.subagent_rows_dirty = true;
+        self.app.streaming_open = false;
+        // A compaction can land mid-turn after some assistant text has
+        // already streamed. The rebuild drops the parent streamed row, so its
+        // replacement index must also be cleared before the eventual Final event.
+        self.app.main_streamed_text_idx = None;
+        self.app.streamed_text_idx = None;
+        // The rebuild drops all SourceHeading entries, so the next
+        // output must re-emit its heading even if it shares the prior
+        // source. Without this, the first post-compaction message would
+        // render without an agent label.
+        self.app.last_ui_output_source = None;
+        self.app.transcript_focus = None;
+        self.app.transcript_selection_anchor = None;
+        // A compaction rebuilds the transcript, so a browse selection can
+        // only be stale. Clear the flag too, regardless of a pending modal:
+        // a surviving flag with no row would later route arrow keys into
+        // the hidden composer (review B2).
+        self.app.transcript_browsing = false;
+        // While a confirmation is pending, the rebuild must not strand a read
+        // view whose root rows vanished: keep independently loaded views,
+        // restore the tray otherwise.
+        if self.interaction_pending() {
+            self.normalize_reading_after_transcript_rebuild();
+        }
+        self.pin_transcript_to_bottom();
     }
 
     fn clear_pending_tool_seq_on_turn_end(&mut self, event: &AgentEvent, is_sub_agent: bool) {

@@ -39,7 +39,12 @@ the terminal handle selection. To copy the entire last response, use `.copy`.
 
 ### Transcript and sub-agent navigation
 
-When the input is blank, `↑` enters transcript navigation. Navigable rows
+When the input is blank, `↑` enters transcript navigation. Press `Esc` in the
+composer to unfocus the input and enter transcript navigation even with an
+in-progress draft (after dismissing completions or clearing inline selection);
+`Esc` again (or `↓` past the last item) returns to the input with your draft
+intact. Use `PgUp`/`PgDn` (or `g`/`G`, `Home`/`End`) to scroll in transcript
+navigation. Navigable rows
 include user and assistant messages, tool calls, compaction markers,
 sub-agent sessions, and markdown links. Press `Enter` on a focused sub-agent
 row to open it in the fullscreen transcript surface. On a compaction marker,
@@ -65,6 +70,30 @@ extends the selection to a range of rows):
 
 When an action cannot apply to the selection (for example, `e` on an assistant
 message), a notice appears in the footer instead of nothing happening.
+
+### Reading while a confirmation is pending
+
+While a middleware confirmation tray is open, the transcript stays readable:
+press `Esc` (or `↑` from an empty note) to browse the transcript and linked
+documents with the usual navigation keys. Your typed note and composer draft
+are preserved and restored when you come back. Browsing is read-only while a
+request is pending — editing, deleting, rewinding, inserting into the composer,
+opening surfaces, and switching sessions are refused with a footer notice, and
+`Ctrl+D` answers nothing while reading (press `Esc` to return to the tray
+instead). `Ctrl+C` keeps its usual interruption behavior.
+
+`Enter` in a read view opens items, documents, and links; it never approves the
+pending request. When a request arrives while you are already reading, the open
+view keeps focus and the tray shows only a one-line pending hint at the bottom.
+Answering a child from an open child view (`a`) instead shows the tray at the
+bottom of the screen with the child view above it; `Esc` resumes that view.
+
+When you return to the tray from reading — including after a transcript refresh
+closes the last view — decisions stay refused until two seconds pass without
+any keypress or paste, so a held `Enter` cannot cross from reading into an
+approval. The tray footer counts that window down. If a refresh removes the row
+you were browsing, an open document, archive, or child view stays up; only when
+no view survives does the tray return.
 
 In the `cid:` document viewer, `Tab`/`↓` selects the next link and
 `Shift+Tab`/`↑` selects the previous link. Press `Enter` to follow the selected

@@ -118,19 +118,29 @@ impl Tui {
         Some(url.clone())
     }
 
+    /// The focused HandoffSession row's target, or None when no handoff row
+    /// is focused.
+    fn focused_handoff_target(&self) -> Option<(String, String)> {
+        let focus = self.app.transcript_focus?;
+        let item = self.app.transcript.get(focus)?;
+        let TranscriptItem::HandoffSession { agent, session_id } = item else {
+            return None;
+        };
+        Some((agent.clone(), session_id.clone()))
+    }
+
     /// Open the target session for a focused HandoffSession row.
     /// Returns true if the focused row was handled, including navigation errors.
     async fn open_focused_root_handoff_session(&mut self) -> bool {
-        let focus = match self.app.transcript_focus {
-            Some(f) => f,
-            None => return false,
-        };
-        let Some(item) = self.app.transcript.get(focus).cloned() else {
+        let Some((agent, session_id)) = self.focused_handoff_target() else {
             return false;
         };
-        let TranscriptItem::HandoffSession { agent, session_id } = item else {
-            return false;
-        };
+        if self.refuse_when_pending_interaction() {
+            // Root handoff-session switching would tear down the pending
+            // request's session; refuse regardless of llm_busy (plan
+            // decision 6).
+            return true;
+        }
         if self.app.llm_busy {
             // Completion persistence uses the active session from this shared config.
             self.app.transcript.push(TranscriptItem::StatusLine(

@@ -197,6 +197,27 @@ impl Tui {
 }
 
 impl ArchiveView {
+    /// Test-only browser over prebuilt items, so deterministic regressions
+    /// can render the archive view without a session log (review B3).
+    #[cfg(test)]
+    pub(crate) fn browser_for_tests(items: Vec<TranscriptItem>) -> ArchiveBrowser {
+        let mut scroll = ScrollState::new();
+        scroll.follow = false;
+        ArchiveBrowser {
+            entries: Vec::new(),
+            declarations: HashMap::new(),
+            cluster: "test-cluster".into(),
+            views: vec![ArchiveView {
+                before: 1,
+                marker: None,
+                focus: items.iter().position(TranscriptItem::is_navigable),
+                items,
+                scroll,
+                scroll_to_focus: true,
+            }],
+        }
+    }
+
     fn focused_compaction(&self) -> Option<u64> {
         match self.items.get(self.focus?)? {
             TranscriptItem::CompactionMarker { .. } => {

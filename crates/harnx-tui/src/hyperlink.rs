@@ -495,6 +495,7 @@ mod tests {
             submitting: false,
             error: None,
             last_key_at: std::time::Instant::now(),
+            decision_guard_until: None,
         };
 
         terminal

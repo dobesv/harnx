@@ -1,12 +1,13 @@
 use crate::markdown_render::{MarkdownBlockData, RenderedEntry};
 use crate::subagent_render::{render_subagent_detail, render_subagent_row};
 use crate::types::{
-    App, ModalState, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES,
+    App, InteractionFocus, ModalState, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT,
+    SPINNER_FRAMES,
 };
 use crate::types::{RenderEntryState, RenderedCache, Tui};
 use harnx_core::event::{AgentEvent, SessionEvent, TurnEvent};
 use harnx_runtime::config::GlobalConfig;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -17,6 +18,47 @@ use unicode_width::UnicodeWidthStr;
 mod runtime_note;
 
 use runtime_note::TranscriptDisplay;
+
+fn render_bottom_attachments(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    y: u16,
+    attachments: &[crate::types::Attachment],
+) {
+    let names: Vec<&str> = attachments
+        .iter()
+        .map(|attachment| attachment.display_name.as_str())
+        .collect();
+    let footer_text = format!("  Attached: {}   [.detach to remove]", names.join(", "));
+    let footer_area = ratatui::layout::Rect::new(area.x, y, area.width, 1);
+    let footer = Paragraph::new(Line::from(Span::styled(
+        footer_text,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::DIM),
+    )));
+    frame.render_widget(footer, footer_area);
+}
+
+fn render_bottom_notice(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    y: u16,
+    notice: Option<&str>,
+) {
+    let Some(notice) = notice else {
+        return;
+    };
+    if y >= area.y + area.height {
+        return;
+    }
+    let notice_area = ratatui::layout::Rect::new(area.x, y, area.width, 1);
+    let para = Paragraph::new(Line::from(Span::styled(
+        format!(" {notice}"),
+        Style::default().fg(Color::Yellow),
+    )));
+    frame.render_widget(para, notice_area);
+}
 
 fn dim_style(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::DIM)
@@ -598,10 +640,19 @@ impl Tui {
 
     fn bottom_region_height(&self, input_width: u16, screen_height: u16) -> u16 {
         if let Some(ModalState::ConfirmInteraction(state)) = &self.app.modal {
-            return self
+            let height = self
                 .interaction_modal_height(input_width, state)
                 .max(crate::interaction_confirmation::MIN_MODAL_HEIGHT)
                 .min(screen_height);
+            // A retained read view renders above the focused tray: bound the
+            // tray to half the screen so it cannot obscure the view (plan
+            // decision 7).
+            if self.read_view_active() && self.app.interaction_focus == InteractionFocus::Tray {
+                return height.min(
+                    (screen_height / 2).max(crate::interaction_confirmation::MIN_MODAL_HEIGHT),
+                );
+            }
+            return height;
         }
         if let Some(ModalState::SurfaceAction(state)) = &self.app.modal {
             return crate::surfaces::render::surface_modal_height(input_width, state)
@@ -631,7 +682,8 @@ impl Tui {
         let attachment_height = u16::from(!self.app.attachments.is_empty());
         let status_height =
             u16::from(self.has_root_cancellation() && self.cancellation_editor_restored());
-        input_height + attachment_height + status_height
+        let notice_height = u16::from(self.app.footer_notice_text().is_some());
+        input_height + attachment_height + status_height + notice_height
     }
 
     fn render_confirmation_tray(
@@ -680,13 +732,15 @@ impl Tui {
 
         let show_status = self.has_root_cancellation() && self.cancellation_editor_restored();
         let show_attachments = !self.app.attachments.is_empty();
+        let notice = self.app.footer_notice_text().map(str::to_string);
 
         let status_height = u16::from(show_status);
         let attachment_height = u16::from(show_attachments);
+        let notice_height = u16::from(notice.is_some());
 
         let input_area_height = area
             .height
-            .saturating_sub(status_height + attachment_height)
+            .saturating_sub(status_height + attachment_height + notice_height)
             .max(1);
 
         let input_area = ratatui::layout::Rect::new(area.x, area.y, area.width, input_area_height);
@@ -705,22 +759,8 @@ impl Tui {
         frame.render_widget(&self.app.input, input_area);
 
         if show_attachments {
-            let names: Vec<&str> = self
-                .app
-                .attachments
-                .iter()
-                .map(|attachment| attachment.display_name.as_str())
-                .collect();
-            let footer_text = format!("  Attached: {}   [.detach to remove]", names.join(", "));
             let y = area.y + input_area_height;
-            let footer_area = ratatui::layout::Rect::new(area.x, y, area.width, 1);
-            let footer = Paragraph::new(Line::from(Span::styled(
-                footer_text,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::DIM),
-            )));
-            frame.render_widget(footer, footer_area);
+            render_bottom_attachments(frame, area, y, &self.app.attachments);
         }
 
         if show_status {
@@ -728,6 +768,9 @@ impl Tui {
             let status_area = ratatui::layout::Rect::new(area.x, y, area.width, 1);
             self.render_compact_cancellation_status(frame, status_area);
         }
+
+        let notice_y = area.y + input_area_height + attachment_height + status_height;
+        render_bottom_notice(frame, area, notice_y, notice.as_deref());
     }
 
     fn render_overlay_modal(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
@@ -742,8 +785,65 @@ impl Tui {
             }
         }
     }
+
+    /// Reading focus: render the active read view fullscreen, reserving one
+    /// bottom row for a compact pending-confirmation hint instead of the
+    /// fullscreen modal overlay (plan decision 7).
+    fn render_reading_view_with_hint(&mut self, frame: &mut Frame<'_>, size: Rect) {
+        let hint_height = u16::from(size.height > 1);
+        let view = Rect::new(
+            size.x,
+            size.y,
+            size.width,
+            size.height.saturating_sub(hint_height).max(1),
+        );
+        self.render_exclusive_transcript(frame, view);
+        let hint = Rect::new(
+            size.x,
+            size.y + view.height,
+            size.width,
+            size.height.saturating_sub(view.height),
+        );
+        self.render_pending_reading_hint(frame, hint);
+    }
+
+    fn render_pending_reading_hint(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let label = match &self.app.modal {
+            Some(ModalState::ConfirmInteraction(state)) if state.child.is_some() => {
+                "Child confirmation pending"
+            }
+            Some(ModalState::ConfirmInteraction(state))
+                if state.pending.kind == "a2ui" || state.pending.kind == "url" =>
+            {
+                "Interaction pending"
+            }
+            _ => "Middleware confirmation pending",
+        };
+        // Active feedback (refusals, paste consumed, no-target) outranks
+        // the generic reminder for the notice's lifetime (review B3).
+        let suffix = match self.app.footer_notice_text() {
+            Some(notice) => notice.to_string(),
+            None => "Esc: return to answer".to_string(),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" ⏸ {label} — {suffix}"),
+                Style::default().fg(Color::Yellow),
+            ))),
+            area,
+        );
+    }
     pub(crate) fn draw(&mut self, frame: &mut Frame<'_>) {
         let size = frame.area();
+        // Reading focus: the active read view renders fullscreen (plan
+        // decision 7).
+        if self.reading_view_holds_focus() {
+            self.render_reading_view_with_hint(frame, size);
+            return;
+        }
         let input_width = size.width.saturating_sub(2).max(1);
 
         let bottom_height = self.bottom_region_height(input_width, size.height);
@@ -777,32 +877,15 @@ impl Tui {
                 (entry.total_height as usize, entry.clone())
             });
 
-        // Clamp position to the freshly-updated last_max_position.
-        //
-        // `scroll_down()` and `scroll_up()` operate against the *previous*
-        // render's `last_max_position`.  When content grows between frames
-        // (e.g. a streaming LLM response makes a transcript item taller),
-        // the old ceiling is too small: `scroll_down` hits it prematurely and
-        // sets `follow = true` at the wrong value.  On the next render the
-        // real max is updated, but by then `position` is stuck above the
-        // actual maximum.  Every subsequent `scroll_up` tick then burns off
-        // the excess before any visual movement occurs — the "dead zone".
-        //
-        // Clamping here, immediately after the real max is known, prevents
-        // position from ever drifting above `last_max_position`.  This costs
-        // nothing (it is a simple saturating compare) and eliminates the
-        // dead zone completely.
-        if !self.app.scroll_state.follow {
-            self.app.scroll_state.position = self
-                .app
-                .scroll_state
-                .position
-                .min(self.app.scroll_state.last_max_position);
-        }
+        self.clamp_scroll_position();
 
         self.app.last_known_input_width = chunks[1].width.saturating_sub(2).max(1);
 
         self.render_bottom_region(frame, chunks[1]);
+
+        // A focused tray over a retained read view (explicit child Answer)
+        // replaces the main region with that view, bounded by the tray.
+        let tray_over_read_view = self.render_read_view_under_tray(frame, chunks[0]);
 
         // Render completion popup above the input area
         if !self.app.completions.is_empty() {
@@ -879,7 +962,7 @@ impl Tui {
             frame.render_widget(popup, popup_area);
         }
 
-        if self.render_exclusive_transcript(frame, size) {
+        if self.render_exclusive_transcript_area(frame, size, tray_over_read_view) {
             if let Some(modal) = &self.app.modal.clone() {
                 self.render_modal(frame, size, modal);
             }
@@ -888,6 +971,69 @@ impl Tui {
 
         // Render other modals on top of everything else
         self.render_overlay_modal(frame, size);
+    }
+
+    /// Reading focus while a read view is active: the active read view renders
+    /// fullscreen — minus one hint row — and the pending confirmation never
+    /// covers it (plan decision 7).
+    fn reading_view_holds_focus(&self) -> bool {
+        self.interaction_reading() && self.read_view_active()
+    }
+
+    /// The pending tray has focus and a retained read view is still open
+    /// (explicit child Answer): the tray renders bounded, above that view.
+    fn tray_over_read_view(&self) -> bool {
+        self.interaction_pending()
+            && self.app.interaction_focus == InteractionFocus::Tray
+            && self.read_view_active()
+    }
+
+    /// Clamp position to the freshly-updated last_max_position.
+    ///
+    /// `scroll_down()` and `scroll_up()` operate against the *previous*
+    /// render's `last_max_position`.  When content grows between frames
+    /// (e.g. a streaming LLM response makes a transcript item taller),
+    /// the old ceiling is too small: `scroll_down` hits it prematurely and
+    /// sets `follow = true` at the wrong value.  On the next render the
+    /// real max is updated, but by then `position` is stuck above the
+    /// actual maximum.  Every subsequent `scroll_up` tick then burns off
+    /// the excess before any visual movement occurs — the "dead zone".
+    ///
+    /// Clamping here, immediately after the real max is known, prevents
+    /// position from ever drifting above `last_max_position`.  This costs
+    /// nothing (it is a simple saturating compare) and eliminates the
+    /// dead zone completely.
+    fn clamp_scroll_position(&mut self) {
+        if !self.app.scroll_state.follow {
+            self.app.scroll_state.position = self
+                .app
+                .scroll_state
+                .position
+                .min(self.app.scroll_state.last_max_position);
+        }
+    }
+
+    /// Render the retained read view into the main region when the pending
+    /// tray has focus over it (explicit child Answer). Returns whether that
+    /// is the active layout.
+    fn render_read_view_under_tray(&mut self, frame: &mut Frame<'_>, area: Rect) -> bool {
+        let over = self.tray_over_read_view();
+        if over {
+            self.render_exclusive_transcript(frame, area);
+        }
+        over
+    }
+
+    /// The exclusive transcript region (sub-agent/archive/detail) takes the
+    /// full area, unless the pending tray already renders over a retained
+    /// read view.
+    fn render_exclusive_transcript_area(
+        &mut self,
+        frame: &mut Frame<'_>,
+        size: Rect,
+        skip: bool,
+    ) -> bool {
+        !skip && self.render_exclusive_transcript(frame, size)
     }
 
     pub(super) fn input_height(&self, available_width: u16) -> u16 {

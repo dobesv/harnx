@@ -265,3 +265,25 @@ async fn accepted_interrupt_returns_to_editor_with_draft_intact() {
     assert_eq!(tui.app.input.lines(), &["keep me"]);
     assert!(!tui.app.llm_busy);
 }
+
+#[tokio::test]
+async fn cancellation_esc_still_restores_editor_instead_of_browsing() {
+    let mut tui = Tui::init(&test_config()).await.expect("init test TUI");
+    tui.app
+        .transcript
+        .push(crate::types::TranscriptItem::UserText {
+            text: "Navigable row".to_string(),
+            seq: Some(1),
+            timestamp: None,
+        });
+    tui.active_remote_session = Some(("root".into(), "local".into()));
+    let (_targets, factory) = recording_cancel_factory();
+    tui.set_exit_cancel_factory(factory);
+    tui.start_cancellation("root".into(), "local".into());
+
+    tui.handle_key(key(KeyCode::Esc)).await.unwrap();
+
+    assert!(tui.cancellation_editor_restored());
+    assert!(!tui.app.transcript_browsing);
+    assert_eq!(tui.app.transcript_focus, None);
+}

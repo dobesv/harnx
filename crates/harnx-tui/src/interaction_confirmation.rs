@@ -1,6 +1,6 @@
 //! Durable middleware decisions are separate from legacy live HITL bool replies.
 
-use crate::types::{ModalState, TranscriptItem, Tui};
+use crate::types::{InteractionFocus, ModalState, TranscriptItem, Tui};
 use harnx_runtime::interactions::{derive_pending_interactions, InteractionDecisionOutcome};
 use ratatui_textarea::TextArea;
 use std::time::Instant;
@@ -16,7 +16,9 @@ pub(crate) use shared::{
 mod child;
 mod child_decision;
 mod decision;
+mod focus;
 mod footer;
+mod keys;
 mod observe;
 pub(crate) use child::{answerable, pending_for_progress, ChildClient};
 mod render;
@@ -74,6 +76,11 @@ pub(super) struct InteractionModal {
     pub a2ui: Option<a2ui::A2UIFormState>,
     pub note: TextArea<'static>,
     pub last_key_at: Instant,
+    /// Return-safety guard deadline (binding review clarification): set when
+    /// tray focus is restored from a read view. Until `Instant::now()` passes
+    /// it, decision keys are refused without sending a decision, and every key
+    /// or paste restarts the clock. `None` keeps initial-presentation semantics.
+    pub decision_guard_until: Option<Instant>,
     pub scroll: u16,
     pub submitting: bool,
     pub error: Option<String>,
@@ -107,6 +114,10 @@ pub(super) struct InteractionClient {
     accepted: Vec<InteractionKey>,
     read_error: Option<String>,
     decisions: Vec<JoinHandle<()>>,
+    /// Unexpired return-safety quiet interval carried across a passive
+    /// same-session successor presentation (review P1). Timing state only —
+    /// note, form and request identity are request-local and never carried.
+    carried_guard_until: Option<Instant>,
 }
 
 impl InteractionClient {
@@ -167,6 +178,7 @@ impl Tui {
                 pending: None,
                 accepted: Vec::new(),
                 read_error: None,
+                carried_guard_until: None,
             };
             self.interactions.observer = target.map(|target| {
                 observe::spawn(
@@ -229,6 +241,17 @@ impl Tui {
         {
             return;
         }
+        // A snapshot may replace the pending request. Carry an unexpired
+        // return-safety interval to the successor so a legacy held key
+        // cannot decide it (review P1); only timing is carried, and it
+        // survives an intervening empty snapshot.
+        if let Some(ModalState::ConfirmInteraction(state)) = &self.app.modal {
+            if let Some(deadline) = state.decision_guard_until {
+                if Instant::now() < deadline {
+                    self.interactions.carried_guard_until = Some(deadline);
+                }
+            }
+        }
         if let Some(ModalState::ConfirmInteraction(state)) = &self.app.modal {
             let current = self
                 .interactions
@@ -269,16 +292,36 @@ impl Tui {
             a2ui,
             note: TextArea::default(),
             last_key_at: Instant::now(),
+            // Initial presentation keeps existing gate semantics; only a
+            // reading->tray restoration arms the return guard. A carried
+            // interval from a replaced predecessor keeps its outstanding
+            // window without re-arming (review P1).
+            decision_guard_until: self
+                .interactions
+                .carried_guard_until
+                .take()
+                .filter(|deadline| Instant::now() < *deadline),
             scroll: 0,
             submitting: false,
             error: None,
         })));
+        // Passive arrival: keep an active read view focused (plan decision 2);
+        // with none open, the tray takes focus.
+        self.app.interaction_focus = if self.read_view_active() {
+            InteractionFocus::Reading
+        } else {
+            InteractionFocus::Tray
+        };
         crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Blocked);
     }
 
     fn clear_interaction_modal(&mut self) {
         if matches!(self.app.modal, Some(ModalState::ConfirmInteraction(_))) {
             self.app.modal = None;
+            // Request replacement, cancellation, or resolution clears stale
+            // reading focus without destroying valid reading state (binding
+            // review clarification); a fresh presentation re-decides.
+            self.app.interaction_focus = InteractionFocus::Tray;
             if self.app.llm_busy {
                 crate::terminal_status::set_status(crate::terminal_status::TerminalStatus::Working);
             }
