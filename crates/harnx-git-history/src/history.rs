@@ -771,6 +771,21 @@ mod tests {
         assert!(status.success(), "git commit failed");
     }
 
+    /// Create the manager and take the first snapshot of `tracked.txt` in a
+    /// repo tracked by its canonical path — the shared preamble of the
+    /// manager bookkeeping tests.
+    async fn manager_with_first_snapshot(
+        repo_dir: &Path,
+        label: &str,
+    ) -> (HistoryManager, gix::ObjectId) {
+        let history = HistoryManager::new();
+        let first = history
+            .snapshot_file(&repo_dir.join("tracked.txt"), label)
+            .await
+            .expect("first snapshot succeeds via lazy discovery");
+        (history, first)
+    }
+
     #[test]
     fn test_collect_files_file_count_cap() {
         let guard = env_lock().lock().expect("env lock");
@@ -902,18 +917,13 @@ mod tests {
         add_file_to_git(&repo_dir, "tracked.txt", b"old\n");
         commit_git(&repo_dir);
 
-        let history = HistoryManager::new();
-        let file_path = repo_dir.join("tracked.txt");
-        let before = history
-            .snapshot_file(&file_path, "before edit")
-            .await
-            .expect("snapshot succeeds via lazy discovery");
+        let (history, before) = manager_with_first_snapshot(&repo_dir, "before edit").await;
 
         // Subsequent edit + snapshot + diff must all succeed against the
         // lazily-tracked repo so end-to-end edit_file diff generation works.
-        std::fs::write(&file_path, b"new\n").expect("rewrite tracked.txt");
+        std::fs::write(repo_dir.join("tracked.txt"), b"new\n").expect("rewrite tracked.txt");
         let after = history
-            .snapshot_file(&file_path, "after edit")
+            .snapshot_file(&repo_dir.join("tracked.txt"), "after edit")
             .await
             .expect("second snapshot succeeds");
         let diff = history
@@ -924,6 +934,60 @@ mod tests {
         assert!(
             diff.contains("+new"),
             "diff should include addition: {diff}"
+        );
+    }
+
+    /// `HistoryManager::rollback` records its after-snapshot as the session's
+    /// last snapshot, so the next snapshot in the same session must chain from
+    /// the rollback after-ID. Uses the canonical repo path — the same key
+    /// `snapshot_file` inserts under — which is how production entry points
+    /// reach the session map. (Bookkeeping for non-canonical caller paths is a
+    /// known separate gap and is not exercised here.)
+    #[tokio::test]
+    async fn rollback_after_id_is_parent_of_next_manager_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo_dir = temp_dir.path().canonicalize().expect("canonicalize");
+        init_git_repo(&repo_dir);
+        add_file_to_git(&repo_dir, "tracked.txt", b"v1\n");
+        commit_git(&repo_dir);
+
+        let (history, _first) = manager_with_first_snapshot(&repo_dir, "first").await;
+        let file = repo_dir.join("tracked.txt");
+
+        std::fs::write(&file, b"v2\n").expect("write v2");
+        let second = history
+            .snapshot_file(&file, "second")
+            .await
+            .expect("second snapshot");
+
+        // Roll back to the second snapshot: it recorded "v2", so the
+        // working tree must return to it while the after-ID is what the
+        // manager hands back.
+        std::fs::write(&file, b"v3\n").expect("write v3");
+        let rollback_after = history.rollback(&repo_dir, second).await.expect("rollback");
+        let restored = std::fs::read(&file).expect("read restored file");
+        assert_eq!(
+            restored, b"v2\n",
+            "rollback should restore the target snapshot's contents"
+        );
+
+        std::fs::write(&file, b"v4\n").expect("write v4");
+        let next = history
+            .snapshot_file(&file, "next")
+            .await
+            .expect("next snapshot");
+
+        let repo = gix::open(&repo_dir).expect("open repo");
+        let commit = repo
+            .find_object(next)
+            .expect("find next snapshot")
+            .peel_to_commit()
+            .expect("peel next snapshot commit");
+        let parent = commit.parent_ids().next().map(|id| id.detach());
+        assert_eq!(
+            parent,
+            Some(rollback_after),
+            "next manager snapshot must chain from the rollback after-ID"
         );
     }
 }

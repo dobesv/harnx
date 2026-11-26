@@ -9,7 +9,7 @@ Local history feature automatically snapshots files before and after every mutat
 Key characteristics:
 - **Zero-config**: Automatically activates when a mutated path belongs to a git repository.
 - **Transparent**: Snapshots are stored as standard git commit objects with no dedicated refs. Diff responses identify snapshot using `commit <sha>` line at top.
-- **Safe Rollback**: `rollback_file` tool can restore repository to any prior snapshot using forward commits, ensuring no history is ever lost.
+- **Safe Rollback**: `rollback_file` restores the files recorded in any prior snapshot into the working tree, leaving unrelated paths, staged changes and Git's history untouched.
 
 ## How Snapshots Work
 
@@ -57,19 +57,23 @@ git -C /work/repo diff --binary eb58d8a2f19a 3fd6fdcc1dcb | git -C /work/repo ap
 
 `--binary` makes the patch usable for binary files, and `-C` on both sides makes the undo work from any directory. If your git config sets an external diff program or a textconv filter, also pass `--no-ext-diff --no-textconv`, since their output is not a patch.
 
-That touches only the files the change touched and leaves the branch alone.
+That touches only the files the change touched and leaves the branch alone. It undoes the recorded patch when it applies cleanly, which is not necessarily every real-world effect of the command. The two snapshots it compares hold only what the capture limits below allowed, and neither is a durable backup ref: unreachable snapshot objects are eventually pruned by `git gc` (see [Storage Location](#storage-location)).
 
 ## The `rollback_file` Tool
 
-`rollback_file` restores repository to prior harnx history snapshot by creating new reversible commit. Pass `commit_id` as a full id or a prefix of at least 7 hex digits. The `commit <sha>` line at top of a full diff and the second id on a summary line are the state after that change; the first id on a summary line is the state before it. A snapshot taken by a file tool holds only the file it wrote, so rolling back to one removes the repository's other tracked files. To undo a single change, reverse-apply its diff as described above.
+`rollback_file` restores the files recorded in a prior harnx history snapshot into the working tree. Pass `commit_id` as a full id or a prefix of at least 7 hex digits. The `commit <sha>` line at top of a full diff and the second id on a summary line are the state after that change; the first id on a summary line is the state before it.
+
+Only the paths recorded in the snapshot are restored, and the restored contents appear as uncommitted working-tree changes. Paths absent from the snapshot are left exactly as they are — including files a file tool's snapshot never saw — and HEAD, refs and the index are never moved: rolling back does not create a branch commit. A snapshot with an empty tree records no paths, so rolling back to it restores nothing; it cannot undo the creation of a file. To undo one change, reverse-apply its diff as described above.
+
+The id the tool returns in its success message is the new after-snapshot of the working tree: an ordinary snapshot id, not a branch commit.
 
 Rollback process:
-1. Capture `before rollback` snapshot of current working tree.
-2. Restore files from target harnx snapshot tree.
-3. Capture new rollback snapshot chained from step 1.
-4. Hard reset working tree to new rollback snapshot commit.
+1. Check every destination the snapshot names, refusing unsafe ones before touching anything.
+2. Capture `before rollback` snapshot of current working tree.
+3. Restore the files recorded in the target harnx snapshot tree.
+4. Capture `after rollback` snapshot chained from step 2.
 
-Result: rollback itself is reversible because current state is preserved in `before rollback` snapshot.
+Result: rollback itself is reversible because current state is preserved in `before rollback` snapshot. A rollback whose destination has been replaced by a symlink or directory, or would escape the repository, is refused before anything is written and reported as a recoverable tool error.
 
 ## What Gets Snapshotted
 
@@ -110,8 +114,9 @@ Unreferenced snapshot commits are cleaned up by normal `git gc` pruning rules. D
 ## Caveats and Gotchas
 
 - **Metadata Loss**: As noted, symlinks and executable bits are lost. This can break `node_modules/.bin/` or shell scripts.
-- **Repo-wide Rollback**: Rollback affects whole repo, not single file.
-- **Overwriting Changes**: `rollback_file` overwrites uncommitted manual changes in working tree. These changes are captured in `before rollback` snapshot and are recoverable as long as commit remains in object store.
+- **Target-only Restore**: `rollback_file` restores the paths the snapshot recorded and leaves every other path, staged changes and Git history untouched. A file-tool snapshot holds only the file it wrote, so rolling back to one does not touch the repository's other files.
+- **Overwriting Changes**: `rollback_file` overwrites the uncommitted working-tree changes of the paths the snapshot records. Those changes are captured in the `before rollback` snapshot and are recoverable only while that commit remains in the object store; unreachable snapshots are subject to `git gc` pruning.
+- **Non-atomic Restore**: A multi-path restore writes each recorded path one at a time, so an I/O failure partway through can leave some paths already restored. The destination preflight checks what exists before the restore starts but does not guard against the filesystem changing while it runs. The file tools serialize repository writes with an in-process lock; the bash tool's `rollback_file` takes no such lock.
 - **Performance**: Large repositories (thousands of files) may experience latency during mutating operations as snapshots are captured.
 - **Git Dependency**: Requires `git` on `$PATH`. If missing, history is silently disabled.
 - **Mid-session Repos**: Repo discovery occurs at startup. If you `git init` new repo while harnx is running, it will not be snapshotted until harnx restarts.

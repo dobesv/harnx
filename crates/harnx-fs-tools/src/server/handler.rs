@@ -77,7 +77,7 @@ impl ServerHandler for FsServer {
                     .with_input_schema::<FindFilesParams>()
                     .annotate(read_only.clone())
                     .with_meta(make_tool_meta(tool_templates::FIND_CALL)),
-                Tool::new("rollback_file", "Restore a repository's tracked files to a harnx history snapshot and move the branch to a new commit. The commit_id is a snapshot id, in full or as a prefix of at least 7 hex digits. The first id on a summary line is the state before that change and the second is the state after it; the 'commit' line of a full diff is the state after. A snapshot taken by a file tool holds only the file it wrote, so rolling back to one removes the repository's other tracked files. To undo one change, reverse-apply its diff with the repository and ids from the summary line: git -C <repo> diff --binary <before> <after> | git -C <repo> apply -R.", Map::new())
+                Tool::new("rollback_file", ROLLBACK_FILE_DESCRIPTION, Map::new())
                     .with_input_schema::<RollbackParams>()
                     .with_meta(make_tool_meta(tool_templates::ROLLBACK_FILE_CALL)),
             ];
