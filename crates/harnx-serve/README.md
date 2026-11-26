@@ -88,7 +88,7 @@ never used as a persistence or routing key.
 | `GET` | `/v1/agents` | `application/json` | List all configured agents. |
 | `GET` | `/v1/agents/:agent` | `application/json` | Agent details (name, description, active sessions). |
 | `GET` | `/v1/agents/:agent/sessions` | `application/json` | List sessions for the agent. |
-| `POST` | `/v1/agents/:agent/sessions` | `application/json` | Reserve a server-generated short session ID. |
+| `POST` | `/v1/agents/:agent/sessions` | `application/json` | Reserve a server-generated short session ID; optional metadata patch body is applied to the initial record. |
 | `GET` | `/v1/agents/:agent/sessions/:session` | `application/json` | Legacy active-history message array. Use JSON-RPC `session/get` for the compaction-aware default snapshot. |
 | `GET` | `/v1/agents/:agent/sessions/:session/history` | `application/json` | Read-only transcript page, selected by compaction or inclusive sequence range. |
 | `GET` | `/v1/agents/:agent/sessions/:session/metadata` | `application/json` | Read redacted canonical session metadata. |
@@ -142,6 +142,48 @@ Errors: 400 for malformed CIDs, 404 if blob not found or caller is unauthorized.
 - Parts are processed in order and the first error wins; a failed request returns no refs even if earlier parts were stored (stored parts are content-addressed and harmless).
 - If the object-store write fails, the response is `503` (broker unreachable) or `500` (other store error) with an `{"error": ...}` body and no refs. With access rules on, the upload additionally re-reads the session's metadata before buffering the body to prove the session still exists; a session that was deleted or replaced by then returns `404` `{"error": "session no longer exists"}` with no refs, and that read does touch the broker even for requests that later fail validation. With access rules off, validation errors (`400`/`413`/`415`) that occur before the first accepted part never touch the broker, so they are returned unchanged even when the broker is down. Once a part is accepted, the broker has been used: a later part's validation error still wins (the request returns no refs), but a broker failure storing that part can surface first.
 - Sessions that have a metadata record (rules on or off) are also re-checked after each stored part: a session deleted or replaced between the put and that re-read returns `404` `{"error": "session no longer exists"}` with no refs, and the object version that part just wrote is removed from the object store (`purge_media_version`: its metadata message and that version's chunks — never a newer same-CID version and never a dedup hit). A failed re-read is not treated as deletion: it returns `503`/`500` and purges nothing. Sessions that were never created through the API store unrechecked and their blobs have no garbage collection.
+
+### Session Creation
+
+`POST /v1/agents/:agent/sessions` reserves a server-generated short session ID and returns `201` with `{"session_id": "<id>"}`. The request body is optional: no body (or a zero-byte body) reserves the session with the agent's configured defaults, and nothing about the response changes.
+
+When a body is sent, it must be the same metadata patch payload the session metadata endpoint accepts, and it is applied to the session's canonical metadata when the reserved ID is first created — not as a follow-up update after reservation:
+
+```json
+{
+  "title": { "value": "Batch run", "manual": true },
+  "variables": { "batch": "nightly" },
+  "overrides": { "model": "openai:gpt-4o" }
+}
+```
+
+Every field is optional (all three may be omitted — `{}` is a no-op):
+
+- `title`: stored trimmed. `manual` defaults to `false`; send `"manual": true` to mark the title manual, which suppresses later generated titles. A blank `value` clears the title.
+- `variables`: when supplied, replaces the agent's configured variables wholesale (no merge); omitted or `null` keeps them. Values are stored as-is in the canonical session metadata record — durable until the session is removed — and are not treated as secrets; the metadata read endpoint redacts values to names and a set/unset flag.
+- `overrides`: when supplied, replaces the explicit session override pins wholesale; omitted or `null` keeps them. A named-agent session is created with no explicit pins — the agent's configured overrides are runtime fallbacks, not persisted pins — so omitting `overrides` and sending `{"overrides": []}` both leave the explicit pin set empty.
+
+Bodyless creation:
+
+```sh
+curl -X POST http://127.0.0.1:8000/v1/agents/my-agent/sessions
+```
+
+Creation with an explicit manual title and variables:
+
+```sh
+curl -X POST http://127.0.0.1:8000/v1/agents/my-agent/sessions \
+  -H "content-type: application/json" \
+  -d '{"title": {"value": "Batch run", "manual": true}, "variables": {"batch": "nightly"}}'
+```
+
+Contract details:
+
+- No `Content-Type` is required for either empty or nonempty bodies.
+- Legacy sequence forms the patch types accept stay accepted, including `[]` (no-op) and `{"overrides": []}` (empty override replacement).
+- Identity fields (`user_id`, `session_id`, …), other record fields, and unknown keys are not writable here: they are rejected with `400`. The stored owner is never taken from the body. With access rules on, it is the authenticated caller; with rules off, an unauthenticated creation falls back to the server's configured default user ID, or stores no owner if none is configured.
+- Malformed JSON, `null`, primitive values, and non-deserializable shapes return `400` without reserving a session. Bodies over 256 KiB return `413`. Validation runs before any reservation work, so an invalid body fails fast instead of waiting on reservation retries.
+- Permissions are unchanged: `POST` on the collection requires `prompt` scope; admin-only callers receive `403` and nothing is created.
 
 ### Session Listing and Pagination
 

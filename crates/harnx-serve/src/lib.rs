@@ -954,23 +954,20 @@ impl Server {
     /// is stamped read-only when a route creates a session.
     async fn handle_agents_sessions_route(
         &self,
-        method: &Method,
-        req: &hyper::Request<Incoming>,
+        req: hyper::Request<Incoming>,
         target: &crate::session_actor::ResolvedAgentTarget,
         scoped: &harnx_runtime::config::GlobalConfig,
         access: Option<(&AccessRules, CallerView<'_>)>,
     ) -> Result<AppResponse> {
-        self.handle_sessions_route(
-            method,
-            req.headers(),
-            SessionsRouteContext::new(target, scoped, req.uri().query())
-                .with_identity(
-                    RequestIdentity::user_id(req).as_deref(),
-                    RequestIdentity::of(req).stampable_principals().as_ref(),
-                )
-                .with_access(access),
-        )
-        .await
+        // The query and identity are extracted as owned/locals so the request
+        // itself can be handed to the collection route for body consumption.
+        let query = req.uri().query().map(str::to_string);
+        let identity = RequestIdentity::of(&req);
+        let principals = identity.stampable_principals();
+        let context = SessionsRouteContext::new(target, scoped, query.as_deref())
+            .with_identity(identity.user_id.as_deref(), principals.as_ref())
+            .with_access(access);
+        self.handle_sessions_route(req, context).await
     }
 
     async fn handle_agent_tree(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
@@ -1005,7 +1002,7 @@ impl Server {
                 }
             }
             AgentsRoute::Sessions => {
-                self.handle_agents_sessions_route(&method, &req, &target, &scoped, access)
+                self.handle_agents_sessions_route(req, &target, &scoped, access)
                     .await
             }
             AgentsRoute::Session => {

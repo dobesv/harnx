@@ -228,3 +228,186 @@ fn initializer_mismatch_error_redacts_inline_instructions() {
     assert!(!message.contains("stored private instructions"));
     assert!(!message.contains("requested private instructions"));
 }
+
+fn creation_patch(payload: Value) -> SessionMetadataPatch {
+    serde_json::from_value(payload).expect("test patch payload is valid")
+}
+
+fn pinned_overrides() -> SessionOverrides {
+    SessionOverrides {
+        model: Some("test:pinned-model".to_string()),
+        temperature: Some(0.2),
+        use_tools: Some(vec!["fs_read".to_string()]),
+        model_fallbacks: vec!["test:first-fallback".to_string()],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn initializer_metadata_patch_sets_title_variables_and_overrides() {
+    let patch = creation_patch(serde_json::json!({
+        "title": {"value": "  Batch run  ", "manual": true},
+        "variables": {"BATCH": "nightly"},
+        "overrides": {"model": "test:reserved-model"}
+    }));
+    let mut initializer = SessionInitializer::named("metis", AgentVariables::default());
+    initializer.overrides = SessionOverrides {
+        temperature: Some(0.2),
+        ..Default::default()
+    };
+    let metadata = SessionMetadata::new("session-1", initializer.with_metadata_patch(patch));
+
+    assert_eq!(metadata.title.value.as_deref(), Some("Batch run"));
+    assert!(metadata.title.manual);
+    assert_eq!(metadata.variables.len(), 1);
+    assert_eq!(
+        metadata.variables.get("BATCH").map(String::as_str),
+        Some("nightly")
+    );
+    // Supplied overrides replace the initializer's pins wholesale.
+    assert_eq!(
+        metadata.overrides.model.as_deref(),
+        Some("test:reserved-model")
+    );
+    assert_eq!(metadata.overrides.temperature, None);
+    metadata.validate("session-1").unwrap();
+}
+
+#[test]
+fn initializer_metadata_patch_preserves_defaults_identity_and_extensions() {
+    let variables = AgentVariables::from_iter([("KEEP".to_string(), "yes".to_string())]);
+    let mut base = SessionInitializer::named("metis", variables.clone());
+    base.overrides = pinned_overrides();
+    base.parent = Some(ParentLink {
+        session_id: "parent-1".to_string(),
+        tool_call_id: "call-1".to_string(),
+    });
+    base = base.with_user_id("owner");
+
+    // Both a missing patch and an explicit `{}` must construct identical
+    // defaults: the patch is optional and each of its fields is too.
+    for patch in [None, Some(SessionMetadataPatch::default())] {
+        let mut initializer = base.clone();
+        if let Some(patch) = patch {
+            initializer = initializer.with_metadata_patch(patch);
+        }
+        let metadata = SessionMetadata::new("session-1", initializer.clone());
+        assert_eq!(metadata.title, SessionTitle::default());
+        assert_eq!(metadata.variables, variables);
+        assert_eq!(metadata.overrides, pinned_overrides());
+        assert_eq!(
+            metadata.agent,
+            SessionAgentSource::Named {
+                name: "metis".to_string()
+            }
+        );
+        assert_eq!(metadata.parent, initializer.parent);
+        assert_eq!(metadata.worker_fence_token, 0);
+        let properties = session_properties(&metadata).unwrap();
+        assert_eq!(properties.text("user_id"), Some("owner"));
+        metadata.validate("session-1").unwrap();
+    }
+}
+
+#[test]
+fn initializer_patch_title_trims_clears_and_honors_manual() {
+    for (title, value, manual) in [
+        (
+            serde_json::json!({"value": "  Trimmed  ", "manual": true}),
+            Some("Trimmed"),
+            true,
+        ),
+        (
+            serde_json::json!({"value": "  Trimmed  ", "manual": false}),
+            Some("Trimmed"),
+            false,
+        ),
+        // `manual` defaults to false, exactly like a PATCH payload.
+        (serde_json::json!({"value": "Auto"}), Some("Auto"), false),
+        // A blank title clears the record and never keeps a manual flag.
+        (
+            serde_json::json!({"value": "   ", "manual": true}),
+            None,
+            false,
+        ),
+        (
+            serde_json::json!({"value": null, "manual": true}),
+            None,
+            false,
+        ),
+    ] {
+        let patch = creation_patch(serde_json::json!({"title": title}));
+        let metadata = SessionMetadata::new(
+            "session-1",
+            SessionInitializer::named("metis", AgentVariables::default())
+                .with_metadata_patch(patch),
+        );
+        assert_eq!(metadata.title.value.as_deref(), value);
+        assert_eq!(metadata.title.manual, manual);
+        assert_eq!(metadata.title.last_updated_tokens, 0);
+    }
+}
+
+#[test]
+fn initializer_patch_replaces_supplied_pins_and_preserves_omitted_ones() {
+    let variables = AgentVariables::from_iter([("KEEP".to_string(), "yes".to_string())]);
+    let mut base = SessionInitializer::named("metis", variables.clone());
+    base.overrides = pinned_overrides();
+
+    // A supplied override set replaces the populated pins.
+    let patch = creation_patch(serde_json::json!({"overrides": {"temperature": 0.9}}));
+    let metadata = SessionMetadata::new("session-1", base.clone().with_metadata_patch(patch));
+    assert_eq!(metadata.overrides.temperature, Some(0.9));
+    assert_eq!(metadata.overrides.model, None);
+    assert_eq!(metadata.overrides.use_tools, None);
+    assert!(metadata.overrides.model_fallbacks.is_empty());
+    // Omitted overrides preserve them, while supplied variables replace.
+    let patch = creation_patch(serde_json::json!({"variables": {"BATCH": "nightly"}}));
+    let metadata = SessionMetadata::new("session-1", base.with_metadata_patch(patch));
+    assert_eq!(metadata.overrides, pinned_overrides());
+    assert_eq!(metadata.variables.len(), 1);
+    assert_eq!(
+        metadata.variables.get("BATCH").map(String::as_str),
+        Some("nightly")
+    );
+}
+
+#[test]
+fn creation_manual_title_maps_to_the_loaded_worker_sentinel() {
+    // A creation-patch manual title persists as `manual: true` with
+    // `last_updated_tokens: 0`; the worker load bridge (base_session, and
+    // session_turn's hydration) maps manual to usize::MAX so title
+    // generation never fires for it.
+    let patch = creation_patch(serde_json::json!({
+        "title": {"value": "Batch run", "manual": true}
+    }));
+    let metadata = SessionMetadata::new(
+        "session-1",
+        SessionInitializer::named("metis", AgentVariables::default()).with_metadata_patch(patch),
+    );
+    assert_eq!(metadata.title.last_updated_tokens, 0);
+    let session = metadata.base_session();
+    assert_eq!(session.title.as_deref(), Some("Batch run"));
+    assert_eq!(session.title_last_updated_tokens, usize::MAX);
+    assert!(!session.need_generate_title(1));
+}
+
+#[test]
+fn patched_initializer_construction_matches_the_shared_patch_helper() {
+    let patch = creation_patch(serde_json::json!({
+        "title": {"value": "  Batch run  ", "manual": true},
+        "variables": {"BATCH": "nightly"},
+        "overrides": {"model": "test:reserved-model"}
+    }));
+    let variables = AgentVariables::from_iter([("KEEP".to_string(), "yes".to_string())]);
+    let via_initializer = SessionMetadata::new(
+        "session-1",
+        SessionInitializer::named("metis", variables.clone()).with_metadata_patch(patch.clone()),
+    );
+    let mut via_helper =
+        SessionMetadata::new("session-1", SessionInitializer::named("metis", variables));
+    super::view::apply_typed_patch(&mut via_helper, &patch);
+    assert_eq!(via_initializer.title, via_helper.title);
+    assert_eq!(via_initializer.variables, via_helper.variables);
+    assert_eq!(via_initializer.overrides, via_helper.overrides);
+}
