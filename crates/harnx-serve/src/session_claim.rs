@@ -13,10 +13,11 @@
 
 use anyhow::{anyhow, Result};
 use harnx_core::access_rules::AccessRules;
+use http::StatusCode;
 use hyper::body::Incoming;
 
 use crate::session_actor::ResolvedAgentTarget;
-use crate::{Server, ERROR_STATUS_MARKER};
+use crate::Server;
 
 /// Request extension the guard inserts when the canonical owner record is
 /// absent and the request may qualify for implicit creation. Only
@@ -168,7 +169,10 @@ pub(crate) fn guard_not_found() -> anyhow::Error {
 /// The scope refusal the session collection route uses (R5, decision D2):
 /// same message, same error shape, nothing created.
 pub(crate) fn creation_scope_denied() -> anyhow::Error {
-    anyhow!("session creation requires prompt scope{ERROR_STATUS_MARKER}403")
+    crate::error_with_status(
+        "session creation requires prompt scope",
+        StatusCode::FORBIDDEN,
+    )
 }
 
 /// The shared opening of a deferred claim, independent of representation:

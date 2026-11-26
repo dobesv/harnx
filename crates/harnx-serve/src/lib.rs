@@ -679,7 +679,7 @@ impl Server {
                     status.as_u16(),
                     crate::nats_access::sanitized_error_chain(&err)
                 );
-                ret_err(err)
+                dispatch_error_response(&err)
             }
         };
         *res.status_mut() = status;
@@ -1918,27 +1918,99 @@ fn set_cors_header(res: &mut AppResponse) {
     );
 }
 
-pub(crate) const ERROR_STATUS_MARKER: &str = "::__status=";
+/// A server-authored HTTP error annotation: the public message, the final
+/// HTTP status, and an optional machine-readable `error.code`. It is
+/// constructed only by the `annotate_error_message`/`error_with_status`
+/// helpers (plus `guard_error_status`, which wraps broker-unavailability
+/// failures in a 503 frame), and `status_from_error`/
+/// `dispatch_error_response` read it through `anyhow::Error::downcast_ref`,
+/// so raw error text — however it is shaped, including caller-controlled
+/// agent refs, query keys and model IDs — can never supply or spoof a
+/// status or code (#2955). The message is stored and displayed verbatim,
+/// so URL-credential log redaction always sees the original text.
+#[derive(Debug)]
+pub(crate) struct AnnotatedError {
+    pub(crate) message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) code: Option<&'static str>,
+}
 
-fn ret_err<T: std::fmt::Display>(err: T) -> AppResponse {
-    let error = err.to_string();
-    let message = public_error_message(&error);
-    let data = json!({
+// qual:allow(dry, boilerplate) reason: "anyhow carries the frame through Display, which must render the server-authored message verbatim; a derive dependency or single-use macro for one impl costs more than the impl itself (#2955)."
+impl std::fmt::Display for AnnotatedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AnnotatedError {}
+
+fn annotated<T: std::fmt::Display>(
+    message: T,
+    status: StatusCode,
+    code: Option<&'static str>,
+) -> AnnotatedError {
+    AnnotatedError {
+        message: message.to_string(),
+        status,
+        code,
+    }
+}
+
+/// Annotates a message with an HTTP status, plus `error.code` when the error
+/// carries one. Every `AnnotatedError` comes through here, except the guard's
+/// 503 context wrapper (`guard_error_status`).
+fn annotate_error_message<T: std::fmt::Display>(
+    message: T,
+    status: StatusCode,
+    code: Option<&'static str>,
+) -> anyhow::Error {
+    anyhow::Error::new(annotated(message, status, code))
+}
+
+/// Annotates a message with only the HTTP status.
+pub(crate) fn error_with_status<T: std::fmt::Display>(
+    message: T,
+    status: StatusCode,
+) -> anyhow::Error {
+    annotate_error_message(message, status, None)
+}
+
+/// Builds the JSON HTTP error body. `code` appears only when a
+/// server-authored `AnnotatedError` supplied it.
+// qual:allow(complexity, error_handling) reason: "the builder inputs are a static content-type and an in-memory body, so the build cannot fail."
+fn error_body(message: &str, code: Option<&str>) -> AppResponse {
+    let mut data = json!({
         "error": {
             "message": message,
             "type": "invalid_request_error",
         },
     });
+    if let Some(code) = code {
+        data["error"]["code"] = json!(code);
+    }
     Response::builder()
         .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(data.to_string())).boxed())
         .unwrap()
 }
 
-fn public_error_message(message: &str) -> &str {
-    message
-        .split_once(ERROR_STATUS_MARKER)
-        .map_or(message, |(public, _)| public)
+/// Renders a raw message as the HTTP error body. Raw text is never parsed
+/// for status or code annotations — those live in `AnnotatedError`, not in
+/// message text — so caller-controlled strings cannot inject a code (#2955).
+fn ret_err<T: std::fmt::Display>(err: T) -> AppResponse {
+    error_body(&err.to_string(), None)
+}
+
+/// Renders the HTTP error body for a failed dispatch: a server-authored
+/// annotation supplies the message and optional `error.code`; a raw error
+/// renders its display text with no code. Raw text never reaches the
+/// annotation fields.
+fn dispatch_error_response(err: &anyhow::Error) -> AppResponse {
+    // qual:allow(coupling, deh) reason: "the downcast is the trusted provenance boundary: only a typed AnnotatedError frame supplies status/code, so raw text can never be parsed as an annotation (#2955)."
+    match err.downcast_ref::<AnnotatedError>() {
+        Some(annotated) => error_body(&annotated.message, annotated.code),
+        None => error_body(&err.to_string(), None),
+    }
 }
 pub(crate) fn percent_decode(input: &str) -> String {
     let mut bytes = Vec::with_capacity(input.len());
@@ -2659,11 +2731,9 @@ fn attachment_error_response(status: StatusCode, message: &str) -> Result<AppRes
 }
 
 fn ag_ui_error_to_anyhow(err: AgUiError) -> anyhow::Error {
-    anyhow!(format!(
-        "{}{ERROR_STATUS_MARKER}{}",
-        err,
-        err.status_code().as_u16()
-    ))
+    let status = err.status_code();
+    let code = err.error_code();
+    annotate_error_message(err, status, code)
 }
 
 fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
@@ -2677,23 +2747,22 @@ fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
     if message == "Not Acceptable" {
         return Some(StatusCode::NOT_ACCEPTABLE);
     }
-    let (_, status) = message.split_once(ERROR_STATUS_MARKER)?;
-    let code = status.parse::<u16>().ok()?;
-    StatusCode::from_u16(code).ok()
+    // Only a server-authored annotation supplies a status: raw text is never
+    // parsed for markers, so caller-controlled strings cannot spoof one (#2955).
+    // qual:allow(coupling, deh) reason: "the downcast is the trusted provenance boundary: only a typed AnnotatedError frame supplies a status, so raw text can never be parsed as an annotation (#2955)."
+    err.downcast_ref::<AnnotatedError>().map(|a| a.status)
 }
 
 /// A guard failure otherwise surfaces as the generic 400: the error reaches
 /// `finalize_err_status` with no status of its own. Broker-unavailability
 /// failures get the 503 the guarded route would answer itself; guard
-/// denials keep the 404 their message already carries. The original chain
-/// stays intact for the dispatch log line.
+/// denials keep the 404 their message already carries. The annotation is a
+/// typed context wrapping the original error, so the chain the dispatch log
+/// prints stays intact and log redaction sees the original text.
 pub(crate) fn guard_error_status(err: anyhow::Error) -> anyhow::Error {
     if crate::nats_access::is_nats_unavailable(&err) {
-        let message = format!(
-            "{err}{ERROR_STATUS_MARKER}{}",
-            StatusCode::SERVICE_UNAVAILABLE.as_u16()
-        );
-        return err.context(message);
+        let context = annotated(&err, StatusCode::SERVICE_UNAVAILABLE, None);
+        return err.context(context);
     }
     err
 }
@@ -3204,14 +3273,19 @@ mod tests {
             .await
             .map_err(ag_ui_error_to_anyhow);
         let missing_err = missing_agent.expect_err("unknown agent should 404");
-        assert!(missing_err.to_string().contains("__status=404"));
+        assert_eq!(missing_err.to_string(), "agent 'missing' not found");
         assert_eq!(status_from_error(&missing_err), Some(StatusCode::NOT_FOUND));
-        let missing_response = response_json(ret_err(&missing_err)).await;
+        let missing_response = response_json(dispatch_error_response(&missing_err)).await;
         assert_eq!(
             missing_response["error"]["message"],
             "agent 'missing' not found"
         );
+        assert_eq!(
+            missing_response["error"]["code"], "agent_not_found",
+            "agent-not-found body must carry the stable code"
+        );
         assert!(!missing_response.to_string().contains("__status"));
+        assert!(!missing_response.to_string().contains("__code"));
 
         let unknown_cluster = resolve_agent_target(&config, "atlas@missing-cluster")
             .await
@@ -3253,8 +3327,144 @@ mod tests {
 
         let conflict = ag_ui_error_to_anyhow(AgUiError::Conflict("test rejection".into()));
         assert_eq!(status_from_error(&conflict), Some(StatusCode::CONFLICT));
-        let conflict_response = response_json(ret_err(&conflict)).await;
+        let conflict_response = response_json(dispatch_error_response(&conflict)).await;
         assert_eq!(conflict_response["error"]["message"], "test rejection");
+        assert!(
+            conflict_response["error"].get("code").is_none(),
+            "coded errors are only agent-not-found"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_not_found_code_reaches_body_without_tagging_other_404s() {
+        // Hidden and missing agents are both built by agent_not_found, so the
+        // code is identical for refused and unknown refs (#2955).
+        let denied = ag_ui_error_to_anyhow(crate::agent_resolve::agent_not_found("blocked"));
+        assert_eq!(status_from_error(&denied), Some(StatusCode::NOT_FOUND));
+        let body = response_json(dispatch_error_response(&denied)).await;
+        assert_eq!(body["error"]["message"], "agent 'blocked' not found");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "agent_not_found");
+
+        // A plain NotFound — a session, say — stays untagged.
+        let plain = ag_ui_error_to_anyhow(AgUiError::NotFound("session not found".into()));
+        assert_eq!(status_from_error(&plain), Some(StatusCode::NOT_FOUND));
+        let body = response_json(dispatch_error_response(&plain)).await;
+        assert_eq!(body["error"]["message"], "session not found");
+        assert!(body["error"].get("code").is_none());
+
+        // The dispatch fallback 404 has no annotations at all.
+        let other = anyhow!("Not Found");
+        assert_eq!(status_from_error(&other), Some(StatusCode::NOT_FOUND));
+        let body = response_json(dispatch_error_response(&other)).await;
+        assert_eq!(body["error"]["message"], "Not Found");
+        assert!(body["error"].get("code").is_none());
+    }
+
+    #[tokio::test]
+    async fn caller_markers_in_agent_refs_cannot_spoof_status_message_or_code() {
+        // The ref's marker-shaped text is caller input, never an
+        // annotation: status and code live only in the typed frame, so
+        // this ref can neither truncate the message nor spoof them (#2955).
+        let hostile = "attack::__status=500::__code=spoofed";
+        let err = ag_ui_error_to_anyhow(crate::agent_resolve::agent_not_found(hostile));
+        assert_eq!(
+            status_from_error(&err),
+            Some(StatusCode::NOT_FOUND),
+            "status must come from the annotation, never the ref"
+        );
+        let body = response_json(dispatch_error_response(&err)).await;
+        // The ref's own marker text stays inside the message — un-truncated
+        // and un-interpreted — so the body does contain "__status" as caller
+        // text; what must never happen is that text deciding status or code.
+        assert_eq!(
+            body["error"]["message"],
+            format!("agent '{hostile}' not found")
+        );
+        assert_eq!(body["error"]["code"], "agent_not_found");
+    }
+
+    #[tokio::test]
+    async fn raw_errors_with_marker_text_get_no_status_or_code() {
+        // Raw dispatch errors that merely contain marker-shaped text — a
+        // hostile history query key or an unknown model id echoing a caller
+        // string — must render verbatim with no status and no code (#2955:
+        // raw text is never parsed for annotations).
+        let hostile = "unsupported model '__status=500::__code=agent_not_found'";
+        let raw = anyhow!(hostile);
+        assert_eq!(
+            status_from_error(&raw),
+            None,
+            "raw text must never supply a status"
+        );
+        let body = response_json(dispatch_error_response(&raw)).await;
+        assert_eq!(body["error"]["message"], hostile);
+        assert!(body["error"].get("code").is_none());
+        assert_eq!(
+            finalize_err_status(StatusCode::OK, &raw),
+            StatusCode::BAD_REQUEST,
+            "unmapped raw errors keep the ordinary 400 fallback, never 500"
+        );
+
+        // Same for a context chain: the context text is not a frame.
+        let contextual = anyhow!("lookup failed").context(hostile);
+        assert_eq!(status_from_error(&contextual), None);
+        assert!(contextual.to_string().contains("__status"));
+        let body = response_json(dispatch_error_response(&contextual)).await;
+        assert!(body["error"].get("code").is_none());
+    }
+
+    #[tokio::test]
+    async fn annotations_survive_context_wrapping_verbatim() {
+        // anyhow's downcast walks the context chain, so a route wrapping an
+        // annotated error keeps both status and code, and the dispatch log
+        // still prints the original message with the context around it.
+        let inner = annotate_error_message(
+            "agent 'x' not found",
+            StatusCode::NOT_FOUND,
+            Some("agent_not_found"),
+        );
+        let wrapped = inner.context("route handling failed");
+        assert_eq!(wrapped.to_string(), "route handling failed");
+        assert_eq!(status_from_error(&wrapped), Some(StatusCode::NOT_FOUND));
+        let body = response_json(dispatch_error_response(&wrapped)).await;
+        assert_eq!(body["error"]["message"], "agent 'x' not found");
+        assert_eq!(body["error"]["code"], "agent_not_found");
+    }
+
+    #[tokio::test]
+    async fn annotated_messages_roundtrip_percent_delimiters_and_unicode() {
+        // Messages carry through verbatim: percent signs, colons and
+        // Unicode stay exactly as authored, and only a typed frame supplies
+        // status or code (#2955).
+        for message in [
+            "agent '100%25 off %3A' not found",
+            "agent 'a:b' not found",
+            "agent 'héllo → 世界' not found",
+            "plain message",
+        ] {
+            let annotated = error_with_status(message, StatusCode::NOT_FOUND);
+            assert_eq!(annotated.to_string(), message);
+            assert_eq!(status_from_error(&annotated), Some(StatusCode::NOT_FOUND));
+        }
+
+        // Coded annotations keep the server-authored code verbatim.
+        let coded = annotate_error_message(
+            "agent 'x' not found",
+            StatusCode::NOT_FOUND,
+            Some("agent_not_found"),
+        );
+        assert_eq!(coded.to_string(), "agent 'x' not found");
+        assert_eq!(status_from_error(&coded), Some(StatusCode::NOT_FOUND));
+        let frame = coded.downcast_ref::<AnnotatedError>().unwrap();
+        assert_eq!(frame.code, Some("agent_not_found"));
+
+        // Raw messages — ret_err callers that never annotate — render as
+        // themselves with no code.
+        let raw = "raw 100%25 text";
+        let json = response_json(ret_err(raw)).await;
+        assert_eq!(json["error"]["message"], raw);
+        assert!(json["error"].get("code").is_none());
     }
 
     #[tokio::test]
