@@ -263,14 +263,18 @@ hook, each returns the tool's direct-call result, a dict with a `content` list.
   also be positional, in the order the schema lists its properties. A property
   whose name Python cannot spell, such as the keyword `from` or a name with a
   dash, is passed as `**{"from": 1}`. A keyword with value `None` for an optional
-  property is dropped, as an omitted flag is. `help <tool>` in the `bash` tool
-  shows the call as its `PYTHON` line.
+  property is dropped, as an omitted flag is, unless the property's schema
+  accepts null, in which case the tool gets the null. `help <tool>` in the
+  `bash` tool shows the call as its `PYTHON` line.
 - **Argument mistakes.** A keyword the schema doesn't list is a `TypeError`,
   unless the schema allows additional properties (`additionalProperties: true`
   or a schema), in which case it is passed through. A missing required property
-  and a value the schema rejects are a `TypeError` too. A wrong tool name is an
-  `AttributeError`. Both are raised before the tool is called, in every context,
-  and a script can catch them like any exception it raises.
+  is a `TypeError` too, and so is a value of the wrong type or one outside the
+  property's `enum`. A wrong tool name is an `AttributeError`. Both are raised
+  before the tool is called, in every context, and a script can catch them like
+  any exception it raises. The rest of a schema (`minimum`, `pattern`, a
+  union's branches and the like) is not checked here: the tool gets the value,
+  and what it refuses is a tool error, not a `TypeError`.
 - **No `from __future__` imports.** The `tools` setup runs before the
   script, and the interpreter wants `from __future__` imports first, so a script
   that can call tools fails if it starts with one. The error says to remove

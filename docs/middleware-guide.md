@@ -772,7 +772,7 @@ schema property names as written, required properties may also be positional in
 the schema's order, and a name Python cannot spell is passed as `**{"from": 1}`.
 A tool whose name is not a Python identifier is `getattr(tools, "the-name")`, and
 a tool chosen at run time is `getattr(tools, name)(**args)`. `None` for an
-optional property is dropped. The [script tools guide](script-tools.md#python)
+optional property is dropped unless its schema accepts null. The [script tools guide](script-tools.md#python)
 has the full rules. An entry without `tools:` has no `tools` object.
 
 A call returns the tool's direct-call result, the same value a model calling the
@@ -784,8 +784,10 @@ Three kinds of failure behave differently:
 
 - **A mistake in the script** is an ordinary Python exception, raised before the
   tool runs: `AttributeError` for a tool that is not on the allowlist,
-  `TypeError` for a missing, unknown or invalid argument. The script can catch it
-  like any exception it raises.
+  `TypeError` for a missing or unknown argument, or a value of the wrong type or
+  outside its `enum`. The script can catch it like any exception it raises. Other
+  schema constraints, such as `minimum`, are left to the tool, and what it
+  refuses is the next kind of failure.
 - **A tool's own error** is not an exception. A recoverable error comes back as
   a result marked `is_error` (or `isError`), and the script has to check it, as
   the shipped `proxy-auth.py` does with

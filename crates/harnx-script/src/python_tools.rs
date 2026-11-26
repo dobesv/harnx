@@ -30,10 +30,15 @@ pub fn tools_prelude(tool_names: &[String]) -> String {
 /// A `tools.NAME(...)` call's arguments as the tool's JSON arguments, in the
 /// order the schema lists its properties; a keyword that is not a listed
 /// property is passed through after them only when the schema is open (its
-/// top-level `additionalProperties` is `true` or an object, or it has no
-/// `properties` key at all), and is a `TypeError` otherwise. A name in
+/// top-level `additionalProperties` is `true` or an object, or it has neither
+/// that key nor `properties`), and is a `TypeError` otherwise. A name in
 /// `required` that `properties` does not list is a required keyword with no
 /// positional slot, as it is for the Bash flags.
+///
+/// `None` for an optional argument is left out unless the argument's schema
+/// accepts null, which is how a tool says a null means something. Values are
+/// checked for their direct type and `enum` only; a tool applies the rest of
+/// its schema itself.
 pub fn bind_python_call(
     tool: &str,
     input_schema: &Value,
@@ -45,7 +50,7 @@ pub fn bind_python_call(
     place_keywords(input_schema, &mut bound, kwargs).map_err(fail)?;
     let required = all_required(input_schema);
     check_required(&required, &bound).map_err(fail)?;
-    drop_optional_nulls(&required, &mut bound);
+    drop_optional_nulls(input_schema, &required, &mut bound);
     validate_values(input_schema, &bound).map_err(fail)?;
     Ok(in_schema_order(input_schema, bound))
 }
@@ -103,11 +108,22 @@ fn all_required(schema: &Value) -> Vec<&str> {
 }
 
 fn is_open(schema: &Value) -> bool {
-    schema.get("properties").is_none()
-        || matches!(
-            schema.get("additionalProperties"),
-            Some(Value::Bool(true) | Value::Object(_))
-        )
+    match schema.get("additionalProperties") {
+        Some(Value::Bool(open)) => *open,
+        Some(Value::Object(_)) => true,
+        _ => schema.get("properties").is_none(),
+    }
+}
+
+/// The schema an argument's value has to fit: its own property's, or for a
+/// free-form keyword the one `additionalProperties` gives, when it gives one.
+fn value_schema<'a>(schema: &'a Value, key: &str) -> Option<&'a Value> {
+    let listed = schema.get("properties").and_then(|p| p.get(key));
+    listed.or_else(|| {
+        schema
+            .get("additionalProperties")
+            .filter(|extra| extra.is_object())
+    })
 }
 
 fn place_positionals(required: &[&str], args: Vec<Value>) -> Result<Map<String, Value>, String> {
@@ -167,14 +183,17 @@ fn check_required(required: &[&str], bound: &Map<String, Value>) -> Result<(), S
     }
 }
 
-fn drop_optional_nulls(required: &[&str], bound: &mut Map<String, Value>) {
-    bound.retain(|key, value| !value.is_null() || required.contains(&key.as_str()));
+fn drop_optional_nulls(schema: &Value, required: &[&str], bound: &mut Map<String, Value>) {
+    bound.retain(|key, value| {
+        !value.is_null()
+            || required.contains(&key.as_str())
+            || value_schema(schema, key).is_some_and(accepts_null)
+    });
 }
 
 fn validate_values(schema: &Value, bound: &Map<String, Value>) -> Result<(), String> {
-    let properties = schema.get("properties");
     for (key, value) in bound {
-        let Some(property) = properties.and_then(|p| p.get(key)) else {
+        let Some(property) = value_schema(schema, key) else {
             continue;
         };
         if value.is_null() && accepts_null(property) {

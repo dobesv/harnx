@@ -301,20 +301,77 @@ fn bind_to(schema: &Value, kwargs: Vec<(&str, Value)>) -> Result<Value, String> 
 
 #[test]
 fn free_form_keywords_pass_through_when_additional_properties_allows_them() {
-    for extra in [json!(true), json!({"type": "string"})] {
+    let schema = json!({
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+        "additionalProperties": true
+    });
+    let bound = bind_to(
+        &schema,
+        vec![("z", json!(1)), ("b", json!("B")), ("y", json!("Y"))],
+    );
+    let bound = bound.unwrap();
+    assert_eq!(bound, json!({"b": "B", "z": 1, "y": "Y"}));
+    let keys: Vec<&String> = bound.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["b", "z", "y"]);
+}
+
+#[test]
+fn a_free_form_keyword_is_checked_against_the_additional_properties_schema() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "additionalProperties": {"type": "string"}
+    });
+    assert_eq!(
+        bind_to(&schema, vec![("z", json!("Z")), ("a", json!("A"))]).unwrap(),
+        json!({"a": "A", "z": "Z"})
+    );
+    assert_eq!(
+        bind_to(&schema, vec![("z", json!(1))]).unwrap_err(),
+        "t() argument 'z': expected string, got 1"
+    );
+}
+
+#[test]
+fn explicit_additional_properties_false_closes_a_schema_with_no_properties_key() {
+    let schema = json!({"type": "object", "additionalProperties": false});
+    assert_eq!(bind_to(&schema, vec![]).unwrap(), json!({}));
+    assert_eq!(
+        bind_to(&schema, vec![("x", json!(1))]).unwrap_err(),
+        "t() got an unexpected keyword argument 'x'"
+    );
+}
+
+#[test]
+fn none_for_a_nullable_optional_property_stays_null() {
+    for nullable in [
+        json!({"type": ["string", "null"]}),
+        json!({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+        json!({"type": "string", "nullable": true}),
+    ] {
         let schema = json!({
             "type": "object",
-            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
-            "additionalProperties": extra
+            "properties": {"a": nullable, "b": {"type": "string"}}
         });
-        let bound = bind_to(
-            &schema,
-            vec![("z", json!(1)), ("b", json!("B")), ("y", json!(2))],
+        let bound = bind_to(&schema, vec![("a", Value::Null), ("b", Value::Null)]);
+        assert_eq!(bound.unwrap(), json!({"a": null}));
+    }
+}
+
+#[test]
+fn none_for_a_free_form_keyword_stays_only_when_its_schema_accepts_null() {
+    let nullable = json!({"type": "object", "additionalProperties": {"type": ["string", "null"]}});
+    assert_eq!(
+        bind_to(&nullable, vec![("x", Value::Null)]).unwrap(),
+        json!({"x": null})
+    );
+    for extra in [json!(true), json!({"type": "string"})] {
+        let schema = json!({"type": "object", "additionalProperties": extra});
+        assert_eq!(
+            bind_to(&schema, vec![("x", Value::Null)]).unwrap(),
+            json!({})
         );
-        let bound = bound.unwrap();
-        assert_eq!(bound, json!({"b": "B", "z": 1, "y": 2}));
-        let keys: Vec<&String> = bound.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["b", "z", "y"]);
     }
 }
 
