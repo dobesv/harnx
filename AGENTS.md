@@ -1619,6 +1619,14 @@ trusted creation code through `SessionInitializer`, because access rules and
 agent tailoring trust what they hold. See "Session properties" in
 `docs/nats-ha.md`.
 
+`SessionInitializer` is never serialized, so it can carry in-memory-only
+fields (`metadata_patch` in `nats_session_metadata/initializer.rs`, applied
+by `SessionMetadata::new` before the first KV create) without touching the
+wire schema. Creation-time settings must ride the initializer so they are in
+the initial record; reserve-then-mutate leaves the session briefly durable
+without its intended settings, and the first-write regression tests in
+`nats_session_creation.rs` reject that shape.
+
 ### HTTP Test Clients and Proxy Environments
 
 Integration tests for harnx-serve that make loopback HTTP requests **must disable ambient proxy configuration** to avoid malformed `Accept` headers. HTTP proxies may aggregate repeated `Accept` fields (e.g. `Accept: text/html` followed by `Accept: text/event-stream`) into a single comma-separated value, which breaks content negotiation.

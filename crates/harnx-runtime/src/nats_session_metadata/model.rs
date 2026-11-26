@@ -170,7 +170,7 @@ impl SessionMetadata {
                     .expect("session properties are JSON-serializable"),
             );
         }
-        Self {
+        let mut metadata = Self {
             schema_version: SESSION_METADATA_SCHEMA_VERSION,
             session_id: session_id.into(),
             created_at: Utc::now(),
@@ -183,7 +183,14 @@ impl SessionMetadata {
             extensions,
             worker_fence_token: 0,
             worker_projection: None,
+        };
+        // The creation patch shares the PATCH field semantics and lands in the
+        // first persisted record, never as a follow-up mutation after the
+        // reservation's KV create.
+        if let Some(patch) = &initializer.metadata_patch {
+            super::view::apply_typed_patch(&mut metadata, patch);
         }
+        metadata
     }
 
     pub fn storage_key(&self) -> String {

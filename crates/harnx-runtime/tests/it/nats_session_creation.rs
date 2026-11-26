@@ -208,3 +208,49 @@ async fn concurrent_explicit_creators_share_one_metadata_record_and_stream() -> 
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_session_carries_its_creation_patch_in_the_first_metadata_write() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        return Ok(());
+    };
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = jetstream::new(client);
+    let store = SessionMetadataStore::ensure(&jetstream, 1).await?;
+    let patch: harnx_runtime::nats_session_metadata::SessionMetadataPatch =
+        serde_json::from_value(serde_json::json!({
+            "title": {"value": "  Batch run  ", "manual": true},
+            "variables": {"batch": "nightly"},
+            "overrides": {"model": "test:reserved-model"}
+        }))?;
+    let initializer =
+        SessionInitializer::named("test-agent", Default::default()).with_metadata_patch(patch);
+
+    let session_id =
+        harnx_runtime::utils::session_name::reserve_short_session_id(&store, &initializer).await?;
+
+    let key = initializer.session_key(&session_id);
+    let record = store
+        .get(&key)
+        .await?
+        .expect("reservation creates canonical metadata");
+    // The patch must live in the very first KV create. JetStream KV
+    // revisions are stream-global sequence numbers, and this fixture's
+    // bucket is empty, so the reserved metadata is revision 1. Reservation
+    // then writes the reserved activity record (revision 2), so a
+    // reserve-then-PATCH implementation would first reach the patch at
+    // revision 3.
+    assert_eq!(record.revision, 1);
+    assert_eq!(record.metadata.title.value.as_deref(), Some("Batch run"));
+    assert!(record.metadata.title.manual);
+    assert_eq!(
+        record.metadata.variables.get("batch").map(String::as_str),
+        Some("nightly")
+    );
+    assert_eq!(
+        record.metadata.overrides.model.as_deref(),
+        Some("test:reserved-model")
+    );
+    Ok(())
+}

@@ -1,3 +1,4 @@
+use super::super::view::apply_typed_patch;
 use super::*;
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::kv;
@@ -9,8 +10,11 @@ impl SessionMetadataStore {
         session_id: &str,
         patch: SessionMetadataPatch,
     ) -> Result<MetadataRecord> {
-        self.patch(session_id, |metadata| apply_typed_patch(metadata, &patch))
-            .await
+        self.patch(session_id, |metadata| {
+            apply_typed_patch(metadata, &patch);
+            Ok(())
+        })
+        .await
     }
 
     pub async fn apply_patch_for_agent(
@@ -22,7 +26,10 @@ impl SessionMetadataStore {
         self.patch_guarded(
             &harnx_core::session_identity::session_key(Some(agent), session_id),
             PatchGuard::for_agent(agent),
-            |metadata| apply_typed_patch(metadata, &patch),
+            |metadata| {
+                apply_typed_patch(metadata, &patch);
+                Ok(())
+            },
         )
         .await
     }
@@ -38,28 +45,6 @@ impl SessionMetadataStore {
         })
         .await
     }
-}
-
-fn apply_typed_patch(metadata: &mut SessionMetadata, patch: &SessionMetadataPatch) -> Result<()> {
-    if let Some(title) = &patch.title {
-        metadata.title.value = title
-            .value
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        metadata.title.manual = metadata.title.value.is_some() && title.manual;
-        if metadata.title.value.is_none() {
-            metadata.title.last_updated_tokens = 0;
-        }
-    }
-    if let Some(variables) = &patch.variables {
-        metadata.variables = variables.clone();
-    }
-    if let Some(overrides) = &patch.overrides {
-        metadata.overrides = overrides.clone();
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Default)]
