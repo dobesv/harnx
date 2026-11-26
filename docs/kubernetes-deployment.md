@@ -393,6 +393,16 @@ Add the volume and mount to your `harnx-worker` deployment:
 
 See [Customizing pantheon agents for your environment](../packages/pantheon/README.md#customizing-pantheon-agents-for-your-environment) in `packages/pantheon/README.md` for full patch syntax, filter examples, and variable override rules.
 
+### Validating the config before it ships
+
+Run `harnx validate` in the CI of the repository that holds these ConfigMaps,
+so a misspelled key, a patch that fails or an agent naming a tool that doesn't
+exist fails the pull request instead of showing up in a worker's logs. The
+tool servers here run as their own Deployments, so CI checks a temporary
+config directory that adds `tool_servers/*.yaml` entries for them. See
+[Checking a cloud deployment in CI](configuration-guide.md#checking-a-cloud-deployment-in-ci)
+for the workflow.
+
 ---
 
 ## Timing receipt compatibility cutover and rollback

@@ -104,13 +104,14 @@ fn initial_allow_inputs() -> AllowInputs {
     }
 }
 
-const PASSTHROUGH_FLAGS: [(&str, &str); 6] = [
+const PASSTHROUGH_FLAGS: [(&str, &str); 7] = [
     ("--metrics-addr", "--metrics-addr="),
     ("--healthz-addr", "--healthz-addr="),
     ("--host", "--host="),
     ("--port", "--port="),
     ("--name", "--name="),
     ("--enable-tool", "--enable-tool="),
+    ("--format", "--format="),
 ];
 
 struct ParseState<'a> {
@@ -180,7 +181,7 @@ fn parse_args_from(
                 mcp_http = true;
                 None
             }
-            "--mcp-stdio" => None,
+            "--mcp-stdio" | "--list-tools" => None,
             "--help" | "-h" => print_help_and_exit(),
             other => {
                 return Err(format!(
@@ -233,6 +234,8 @@ fn print_help_and_exit() -> ! {
     eprintln!("                            Also honors HARNX_FS_SANDBOX_TRANSPORT");
     eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
     eprintln!("  --name <NAME>             Override the registered toolset name");
+    eprintln!("  --list-tools              Print the advertised tools and exit");
+    eprintln!("  --format <text|json>      Output shape for --list-tools");
     eprintln!("  --port <PORT>             MCP HTTP bind port (default: 3003)");
     eprintln!(
         "  --enable-tool <glob>      Enable only tools matching the glob pattern (repeatable)."
@@ -334,6 +337,27 @@ mod tests {
             parse_args_from(&args, AllowInputs::default(), false)
                 .expect("name override should pass through");
         }
+    }
+
+    fn parse_flags(flags: &[&str]) -> Result<(AllowInputs, bool), String> {
+        let args = std::iter::once("harnx-fs-tools")
+            .chain(flags.iter().copied())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        parse_args_from(&args, AllowInputs::default(), false)
+    }
+
+    #[test]
+    fn accepts_list_tools_flags() {
+        assert!(parse_flags(&["--list-tools"]).is_ok());
+        assert!(parse_flags(&["--list-tools", "--format", "json"]).is_ok());
+        assert!(parse_flags(&["--list-tools", "--format=json"]).is_ok());
+    }
+
+    #[test]
+    fn rejects_format_typo() {
+        assert!(parse_flags(&["--list-tools", "--formatt", "json"]).is_err());
+        assert!(parse_flags(&["--list-tools", "--formatt=json"]).is_err());
     }
 }
 

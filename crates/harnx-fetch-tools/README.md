@@ -16,7 +16,7 @@ cargo install --path crates/harnx-fetch-tools
 harnx-fetch-tools
 ```
 
-Pass `--name <NAME>` to override the registered toolset name. MCP HTTP mode listens on port 3006 by default:
+Pass `--name <NAME>` to override the registered toolset name. `--list-tools [--format text|json]` prints the tools the server publishes and exits without connecting to NATS; see [Listing a Server's Tools](../../docs/configuration-guide.md#listing-a-servers-tools---list-tools). MCP HTTP mode listens on port 3006 by default:
 
 ```bash
 harnx-fetch-tools --mcp-http --host 127.0.0.1 --port 3006

@@ -332,8 +332,14 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("k8s credentials server thread panicked"))?
 }
 
+// qual:allow(iosp) — the listing branch only picks which toolset to build
 async fn run() -> Result<()> {
     let args = Args::parse();
+    if args.list_tools {
+        // Tool names don't depend on a kubeconfig, so listing must not need one.
+        let toolset = toolset::K8sCredsToolset::new(std::path::Path::new(""));
+        return Box::pin(harnx_toolset_server::run_toolset_main(toolset)).await;
+    }
     let state = build_app_state(&args).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = start_server(Arc::clone(&state), listener).await?;

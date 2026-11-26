@@ -49,3 +49,5 @@ documents:                       # RAG document paths (relative to config dir)
 
 You are a helpful AI assistant. Your task is to help the user with their questions and tasks.
 {% if "developers" in __user__.groups %}You may use filesystem write and edit tools to modify files.{% endif %}
+
+{{system_context}}

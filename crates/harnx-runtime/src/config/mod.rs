@@ -34,7 +34,7 @@ pub(crate) mod session_timing;
 pub(crate) mod session_tool_results;
 mod settings_split;
 mod tool_selection;
-pub(crate) use tool_selection::is_bash_inner_tool_allowed;
+pub(crate) use tool_selection::{is_bash_inner_tool_allowed, selector_matcher};
 mod tool_servers_split;
 
 pub(crate) use self::bash_declaration::{synthesize_bash_declaration, BASH_TOOL_NAME};
@@ -95,9 +95,11 @@ pub use self::agent::{
 };
 pub(crate) use self::attachments::attachment_marker;
 pub use self::attachments::{write_attachment, Base64Encoder};
+pub(crate) use self::env_split::{classify_env_line, EnvLine};
 pub use self::input::Input;
+pub(crate) use self::patches_split::apply_client_patch;
+use self::patches_split::package_dir_name;
 pub(crate) use self::patches_split::server_display_name;
-use self::patches_split::{apply_client_patch, package_dir_name};
 use self::session::Session;
 pub use self::session_meta::{
     find_matching_session, sort_sessions_for_picker, sort_sessions_for_picker_with_context,
@@ -221,6 +223,11 @@ const BUILTIN_TOOLS: [BuiltinTool; 3] = [
     ),
 ];
 
+/// Names of the built-in tools, which need no tool server.
+pub(crate) fn builtin_tool_names() -> impl Iterator<Item = &'static str> {
+    BUILTIN_TOOLS.iter().map(|(name, _)| *name)
+}
+
 fn builtin_tool_declarations(selectors: &[String]) -> Vec<ToolDeclaration> {
     let selected = |name: &str| {
         selectors
@@ -304,6 +311,12 @@ fn handoff_description(agent_name: &str, catalog_description: Option<&str>) -> S
     }
 }
 
+/// The handoff tool for an agent whose handoff display name is
+/// `display_name` ([`harnx_core::package_namespace::handoff_display_name`]).
+pub(crate) fn handoff_tool_name(display_name: &str) -> String {
+    format!("{display_name}_session_handoff")
+}
+
 fn handoff_tool_declarations_for_agents(
     active_pkg: Option<&str>,
 ) -> (Vec<ToolDeclaration>, HashMap<String, String>) {
@@ -315,6 +328,7 @@ fn handoff_tool_declarations_for_agents(
             let display_name =
                 harnx_core::package_namespace::handoff_display_name(&agent_name, active_pkg);
             handoff_targets.insert(display_name.clone(), agent_name.clone());
+            let name = handoff_tool_name(&display_name);
 
             let parameters = crate::tool::JsonSchema::new(serde_json::json!({
                 "type": "object",
@@ -340,7 +354,7 @@ fn handoff_tool_declarations_for_agents(
                 });
 
             ToolDeclaration {
-                name: format!("{display_name}_session_handoff"),
+                name,
                 description: handoff_description(&agent_name, catalog_description),
                 parameters,
                 mcp_tool_name: None,

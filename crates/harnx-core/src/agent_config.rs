@@ -45,6 +45,37 @@ pub fn collect_agent_variables(values: &[String]) -> Result<Option<AgentVariable
 static RE_METADATA: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)\A-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
 
+/// An agent file split at its front matter.
+struct AgentMarkdownParts<'a> {
+    front_matter: &'a str,
+    /// Byte offset of `front_matter` in the file.
+    offset: usize,
+    prompt: &'a str,
+}
+
+/// Split an agent file into its front matter and prompt, both trimmed. `None`
+/// when the file doesn't start with a `---` block.
+fn split_agent_markdown(content: &str) -> Option<AgentMarkdownParts<'_>> {
+    let caps = RE_METADATA.captures(content).ok().flatten()?;
+    let (metadata, prompt) = (caps.get(1)?, caps.get(2)?);
+    let untrimmed = metadata.as_str();
+    let front_matter = untrimmed.trim();
+    Some(AgentMarkdownParts {
+        front_matter,
+        offset: metadata.start() + (untrimmed.len() - untrimmed.trim_start().len()),
+        prompt: prompt.as_str().trim(),
+    })
+}
+
+/// The front matter of an agent file, as [`AgentConfig::from_markdown`] reads
+/// it, with the byte offset it starts at. `None` when there is none or it is
+/// empty; such a file is all prompt.
+pub fn agent_front_matter(content: &str) -> Option<(&str, usize)> {
+    split_agent_markdown(content)
+        .filter(|parts| !parts.front_matter.is_empty())
+        .map(|parts| (parts.front_matter, parts.offset))
+}
+
 // --- Toolset-value serde helpers ---------------------------------------------
 //
 // `use_tools:` in an agent front-matter may be either a comma-separated string
@@ -251,14 +282,10 @@ struct PatchRuntimeState {
 
 impl AgentConfig {
     pub fn from_markdown(name: &str, content: &str) -> Result<Self> {
-        let mut metadata = "";
-        let mut prompt = content.trim();
-        if let Ok(Some(caps)) = RE_METADATA.captures(content) {
-            if let (Some(metadata_value), Some(prompt_value)) = (caps.get(1), caps.get(2)) {
-                metadata = metadata_value.as_str().trim();
-                prompt = prompt_value.as_str().trim();
-            }
-        }
+        let (metadata, prompt) = match split_agent_markdown(content) {
+            Some(parts) => (parts.front_matter, parts.prompt),
+            None => ("", content.trim()),
+        };
         let prompt = prompt.to_string();
         let frontmatter = if metadata.is_empty() {
             AgentFrontMatter::default()
@@ -786,9 +813,11 @@ pub enum AgentRole {
 
 // --- AgentFrontMatter (serialized shape of an agent.md front-matter block) ---
 
+/// The front matter of an agent file as it is written: what
+/// [`AgentConfig::from_markdown`] deserializes and `export` writes back.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
-struct AgentFrontMatter {
+pub struct AgentFrontMatter {
     #[serde(
         rename(serialize = "model", deserialize = "model"),
         skip_serializing_if = "Option::is_none"

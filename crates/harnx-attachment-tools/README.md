@@ -18,6 +18,7 @@ By default, the server runs in native NATS toolset mode and connects using stand
 | `--nats-url <URL>` | NATS server URL (default: `$HARNX_NATS_URL` or `nats://127.0.0.1:4222`). |
 | `--mcp-http [--mcp-http-listener <ADDR>]` | Serve MCP over Streamable HTTP at `/mcp`. |
 | `--mcp-stdio` | Run in stdio MCP backward-compatibility mode. |
+| `--list-tools [--format text\|json]` | Print the tools this server publishes and exit without connecting to NATS. See [Listing a Server's Tools](../../docs/configuration-guide.md#listing-a-servers-tools---list-tools). |
 | `--name <NAME>` | Override the registered toolset name (default: `attachments`). |
 | `--enable-tool <GLOB>` | Only publish tools matching the given glob pattern. |
 | `--metrics-addr <ADDR>` | Serve Prometheus metrics at `http://ADDR/metrics`. |

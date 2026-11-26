@@ -263,6 +263,31 @@ args:
   - status
 ```
 
+### Listing a Server's Tools (`--list-tools`)
+
+Every native tool server and `harnx-mcp-bridge` accept `--list-tools`, which
+prints the tools the server would publish and exits without connecting to
+NATS. Pass the same `args:` as in the server's YAML file, since `--name`,
+`--enable-tool` and the server's own options change what it lists:
+
+```sh
+harnx-time-tools --list-tools --name clock --enable-tool 'convert*'
+harnx-mcp-bridge --list-tools --name context7 -- npx -y @upstash/context7-mcp
+```
+
+`--format json` prints one JSON document instead of text: the server's
+agent-visible name in `server`, and in `tools` each tool's spec as the server
+registers it (`name`, `description`, `input_schema`, the read-only and
+idempotent hints, `timeout_secs`, and `meta`, which carries the output schema
+and kind when the tool declares them). Agents call a tool as
+`<server>_<name>`. `harnx validate` reads this output to check
+tool names (see [Validating Configuration](#validating-configuration)).
+
+`harnx-mcp-bridge` starts the wrapped command to ask it, so that command's
+runtime (`npx`, `uvx`) must be installed. Without `--name`, the bridge reports
+the placeholder name `mcp-diagnostic`. `harnx-k8s-sandbox-tools` has no
+`--list-tools`, since it needs a cluster to build its tool set.
+
 ## NATS Servers (`nats_servers/`)
 
 Harnx supports high-availability distributed mode via NATS. Each cluster is defined in a file like `nats_servers/local.yaml`.
@@ -345,6 +370,228 @@ This directory includes:
 - `clients/` examples for OpenAI, Claude, Gemini, Bedrock, Azure, Vertex AI, and more.
 - `tool_servers/` examples for filesystem, shell, and web search.
 - `agents/` examples for interactive assistants and sub-agents (auto-registered as NATS delegation toolsets).
+
+## Validating Configuration
+
+`harnx validate` checks a config directory, or a package, without starting
+harnx or connecting to a broker. Run it in CI before deploying a config or
+publishing a package. It parses every file harnx reads and reports:
+
+- files that don't parse, and keys harnx ignores. A misspelled
+  `cleanup_remote_sessions_days` loads without complaint and leaves session
+  retention off; the check reports it as an unknown key.
+- problems harnx accepts at runtime without an error: one bad file in a
+  package's `clients/` dropping all of that package's clients, a package patch
+  that fails, an agent that doesn't load, a `compaction_agent` or
+  `title_agent` that names no agent.
+- references that don't resolve: models and their clients, agents named in
+  `access.yaml`, `${VAR}` in `nats_servers/*.yaml`, tool server commands.
+- tool names that no built-in, script tool, sub-agent, handoff or tool server
+  provides, in agents' `use_tools` and `bash_tools`, `config.yaml`'s
+  `use_tools` and `toolsets:`, middleware `tools:` lists and script tools'
+  `tools:`.
+
+```sh
+harnx validate                                    # the config harnx would load
+harnx validate --config-dir ./deploy/harnx-config
+harnx validate --package packages/pantheon --package packages/coding
+```
+
+With neither `--config-dir` nor `--package`, it checks the config harnx
+itself would load, following `HARNX_CONFIG_DIR` and `HARNX_CONFIG_FILE`.
+`--config-dir` and `--package` ignore `HARNX_CONFIG_FILE` and read
+`config.yaml` from the directory they check. `--package` installs each package alone into an empty temporary config
+directory and reports paths relative to the package (`agents/x.md`), or
+prefixed with the package name (`pantheon/agents/x.md`) when several are
+given.
+
+| Option | Effect |
+| --- | --- |
+| `--config-dir DIR` | Check `DIR` instead of harnx's config directory. |
+| `--package DIR` | Check a package as if installed alone. Repeatable; can't be combined with `--config-dir`. |
+| `--access-rules FILE` | Check `FILE` instead of `<config-dir>/access.yaml`. |
+| `--users FILE` | Check `FILE` instead of `<config-dir>/users.yaml`. |
+| `--tools check\|skip` | `check` (the default) starts tool servers to list their tools. `skip` starts none and counts the tool references it couldn't verify in the summary. |
+| `--ignore-tool GLOB` | Treat tool names matching `GLOB` as valid. Repeatable. |
+| `--strict` | Fail on warnings too. |
+| `--allow CODE[:GLOB]` | Drop findings with `CODE` before counting, only in files matching `GLOB` when it's given. Repeatable. See [Allowing findings](#allowing-findings). |
+| `--format text\|json` | Output format, `text` by default. |
+
+The exit code is `0` when there are no errors (warnings are allowed unless
+strict), `1` when there are errors, and `2` when the check couldn't run, such
+as for a bad argument or a directory that doesn't exist.
+
+### Output
+
+The text format prints one line per finding, with the code in brackets, the
+file relative to the checked directory and, where the parser gives one, a
+line number. A summary line follows:
+
+```text
+error[unknown-key]: config.yaml: unknown key cleanup_remote_session_days (did you mean cleanup_remote_sessions_days?)
+error[unknown-tool]: agents/helper.md: use_tools entry 'time_wiat' is not a tool that tool server 'time' lists; did you mean time_wait?
+3 files checked, 2 errors, 0 warnings, 0 tool references unverified
+```
+
+`--format json` prints the same as one document:
+
+```json
+{
+  "findings": [
+    {
+      "severity": "error",
+      "code": "unknown-key",
+      "file": "config.yaml",
+      "key_path": "cleanup_remote_session_days",
+      "message": "unknown key cleanup_remote_session_days (did you mean cleanup_remote_sessions_days?)"
+    }
+  ],
+  "summary": {
+    "files_checked": 3,
+    "errors": 1,
+    "warnings": 0,
+    "suppressed": 0,
+    "tools_unverified": 0,
+    "tools_ignored": 0
+  }
+}
+```
+
+A finding carries `line` when the parser reports one and `key_path` when the
+finding is about a key. `code` doesn't change between releases, so CI scripts
+and `--allow` can match on it:
+
+| Code | Severity | Reported when |
+| --- | --- | --- |
+| `parse-error` | error | A file doesn't parse, or the config as a whole doesn't load. |
+| `unknown-key` | error | A key harnx ignores. |
+| `unknown-client-type` | error | A client's `type:` names no provider. |
+| `silent-drop` | error | harnx would drop something at runtime: all of a package's clients because one file is bad, or a client whose package patch fails. |
+| `agent-load` | error | An agent doesn't load the way a session loads it: its package patch fails, a `variables[].path` file is missing, a `patches` filter doesn't compile, middleware or hooks don't bind, or the prompt doesn't render. |
+| `model-unresolved` | error | A `model` or `model_fallbacks` entry names a client that isn't configured, or the configured client can't resolve it. With `--package`, a model on a top-level client (`/openai:gpt-x`) that the package doesn't configure is a warning instead, since the config that installs the package provides that client. |
+| `agent-not-found` | error | `compaction_agent` or `title_agent` names no agent, so harnx falls back to its default prompt. |
+| `unknown-tool` | error | A tool name no built-in, script tool, sub-agent, handoff or listed tool server provides. |
+| `model-not-in-catalog` | warning | The client is configured but its catalog doesn't list the model. harnx still accepts it for chat. |
+| `access-agent-unmatched` | warning | An `access.yaml` agent pattern matches no local, package or remote agent. |
+| `env-var-unset` | warning | A `nats_servers/*.yaml` value uses `${VAR}` and `VAR` isn't set where the check runs. |
+| `command-not-found` | warning | An enabled tool server's command isn't next to `harnx` or on `PATH`. |
+| `tool-unverified` | warning | A tool server couldn't list its tools, so the references to it can't be checked. Reported once per server, with the reason. |
+| `glob-matches-nothing` | warning | A tool glob matches no known tool. |
+| `front-matter-not-at-start` | warning | An agent file has a `---` block near the top that harnx reads as prompt text, because it doesn't start at the first byte. |
+| `models-override-version` | warning | `models-override.yaml` is for another harnx version, so harnx ignores it. |
+| `env-line-invalid` | warning | A `.env` line isn't `KEY=value`, so harnx skips it. |
+| `empty-config` | warning | The directory holds nothing to check. |
+
+### Tool names
+
+To check tool names, the check runs every enabled tool server with
+`--list-tools --format json` followed by the server's configured `args:` and
+`env:` (see [Listing a Server's Tools](#listing-a-servers-tools---list-tools)),
+in parallel, with 30 seconds for each. A server that can't be listed makes its
+references `tool-unverified` warnings rather than errors: its command is
+missing, it failed or timed out, or a bridged server's `npx` or `uvx` isn't
+installed. `harnx-mcp-remote` servers need each user's credentials and
+`harnx-k8s-sandbox-tools` needs a cluster, so neither is run and their tools
+are always unverified.
+
+A server that can't be listed leaves only the names under its own prefixes
+unverified. The check reads those prefixes from the server's configuration:
+the `--name` of a harnx tool server, a bridge or `harnx-mcp-remote`, else a
+harnx tool server's default name (`grep` for `harnx-grep-tools`), and the
+`--bash-name`, `--fs-name` and `--sandbox-name` of
+`harnx-k8s-sandbox-tools`. Other names are still `unknown-tool` errors. Only
+a command the check doesn't know, whose prefix it can't tell, leaves every
+name that matches no other server unverified.
+
+Some tool names exist only in a deployment the check can't see, such as the
+`sandbox_*` tools of a Kubernetes sandbox gateway the config directory doesn't
+list. Ignore those with `--ignore-tool`.
+
+### Allowing findings
+
+`--allow` drops findings before they're counted, so warnings that appear on
+every CI run (unset secrets, `harnx-mcp-remote` servers, bridged servers whose
+runtime isn't installed) don't fail a `--strict` check. Dropped findings are
+counted as suppressed in the summary.
+
+```sh
+harnx validate --config-dir ./harnx-config --strict \
+  --allow env-var-unset \
+  --allow 'tool-unverified:tool_servers/context7.yaml'
+```
+
+`CODE` is one of the codes in the table above; an unknown code stops the check
+with exit code `2`. `GLOB` matches the file path as the report prints it:
+relative to the checked directory, with `/` separators, and with `*` stopping
+at `/`, so `nats_servers/*` covers that directory's files and not deeper ones.
+With `--package`, paths are relative to the package, or start with the package
+name when several are checked.
+
+### Checking a cloud deployment in CI
+
+In a cloud deployment, tool servers usually run as their own Deployments and
+the workers don't start them, so the config directory the pods mount may have
+no `tool_servers/` entries for them. Build a temporary config directory in CI
+that runs locally but matches the cloud configuration as closely as it can:
+the same `config.yaml`, agents, clients, packages, package patches,
+`access.yaml` and `users.yaml`, plus a `tool_servers/*.yaml` for each server
+the cloud runs, with the same `--name` and `--enable-tool` arguments. Then
+validate that directory.
+
+This GitHub Actions workflow assumes the repository holds the mounted config
+in `harnx-config/` and the tool server files for CI in `ci/tool_servers/`. It
+runs in the harnx release image, which has `harnx` and every tool server on
+`PATH`:
+
+```yaml
+name: Validate harnx config
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    container:
+      # Use the release you deploy (one that has `harnx validate`).
+      image: ghcr.io/dobesv/harnx:<version>
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build a local copy of the cloud config
+        run: |
+          dir="$RUNNER_TEMP/harnx-config"
+          mkdir -p "$dir"
+          cp -R harnx-config/. "$dir/"
+          # The servers the cloud runs as Deployments, configured to run
+          # locally under the same names.
+          mkdir -p "$dir/tool_servers"
+          cp ci/tool_servers/*.yaml "$dir/tool_servers/"
+          # If the pods install packages at start-up, install the same
+          # versions here, for example:
+          #   HARNX_CONFIG_DIR="$dir" harnx-pkg add <url> <tag>
+
+      - name: Validate
+        run: harnx validate --config-dir "$RUNNER_TEMP/harnx-config"
+```
+
+For a cloud that runs `harnx-time-tools` as its own Deployment,
+`ci/tool_servers/time.yaml` is just:
+
+```yaml
+command: harnx-time-tools
+```
+
+Pantheon's agents use `sandbox_*` tools from the Kubernetes sandbox gateway
+(`harnx-k8s-sandbox-tools`), which the package doesn't configure. Either add a
+`ci/tool_servers/*.yaml` for the gateway, with the same `--sandbox-name` and
+other name arguments as the cloud, or pass `--ignore-tool 'sandbox_*'`. The
+check never runs the gateway, so with the file its tools are `tool-unverified`
+warnings rather than `unknown-tool` errors.
+
+Tool names that exist only in the cloud go in `--ignore-tool` flags on the
+Validate step, and warnings that fire on every run in `--allow` flags.
 
 ---
 

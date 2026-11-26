@@ -107,6 +107,8 @@ impl<'a> CallerView<'a> {
 #[derive(Debug, Clone)]
 struct CompiledAccessRule {
     agents: GlobSet,
+    /// The `agents:` patterns, in the order `agents` holds their globs.
+    agent_patterns: Vec<String>,
     scopes: ScopeSet,
     users: GlobSet,
     groups: GlobSet,
@@ -162,6 +164,20 @@ impl AccessRules {
             || caller.roles.iter().any(|r| rule.roles.is_match(r))
     }
 
+    /// The `agents:` patterns that match none of `agents`, each with its
+    /// zero-based rule index, so a rule written for an agent that doesn't
+    /// exist can be reported.
+    pub fn agent_patterns_matching_none<S: AsRef<str>>(&self, agents: &[S]) -> Vec<(usize, &str)> {
+        self.rules
+            .iter()
+            .enumerate()
+            .flat_map(|(index, rule)| {
+                rule.patterns_matching_none(agents)
+                    .map(move |pattern| (index, pattern))
+            })
+            .collect()
+    }
+
     /// Either scope makes an agent visible.
     pub fn can_see_agent(&self, agent_ref: &str, caller: CallerView<'_>) -> bool {
         !self.scopes_for(agent_ref, caller).is_empty()
@@ -206,11 +222,29 @@ impl CompiledAccessRule {
 
         Ok(Self {
             agents: compile_rule_globs(&spec.agents, rule_index, RuleGlobField::Agents)?,
+            agent_patterns: spec.agents.clone(),
             scopes: scope_set,
             users: compile_rule_globs(&spec.users, rule_index, RuleGlobField::Users)?,
             groups: compile_rule_globs(&spec.groups, rule_index, RuleGlobField::Groups)?,
             roles: compile_rule_globs(&spec.roles, rule_index, RuleGlobField::Roles)?,
         })
+    }
+
+    fn patterns_matching_none<'a, S: AsRef<str>>(
+        &'a self,
+        agents: &[S],
+    ) -> impl Iterator<Item = &'a str> {
+        let mut matched = vec![false; self.agent_patterns.len()];
+        for agent in agents {
+            for glob in self.agents.matches(agent.as_ref()) {
+                matched[glob] = true;
+            }
+        }
+        self.agent_patterns
+            .iter()
+            .zip(matched)
+            .filter(|(_, matched)| !matched)
+            .map(|(pattern, _)| pattern.as_str())
     }
 
     fn check_selector_presence(spec: &AccessRuleSpec, rule_index: usize) -> Result<()> {
@@ -397,6 +431,24 @@ rules:
         assert!(empty
             .scopes_for("sisyphus", CallerView::from_users(&["bob"]))
             .is_empty());
+    }
+
+    #[test]
+    fn agent_patterns_matching_none_names_rule_and_pattern() {
+        let rules = AccessRules::from_yaml(
+            r#"
+rules:
+  - agents: [sisyphus, "coding/*"]
+    users: [bob]
+  - agents: [ghost, "sisy*"]
+    users: [bob]
+"#,
+        )
+        .unwrap();
+
+        let unmatched = rules.agent_patterns_matching_none(&["sisyphus", "coding/coder"]);
+
+        assert_eq!(unmatched, vec![(1, "ghost")]);
     }
 
     #[test]

@@ -163,4 +163,16 @@ mod tests {
 
         assert_eq!(ClientConfig::Unknown.type_name(), "");
     }
+
+    #[test]
+    fn deserialize_as_picks_the_variant_each_type_name_tags() {
+        for &type_name in ClientConfig::TYPE_NAMES {
+            let config = ClientConfig::deserialize_as(type_name, json!({}))
+                .expect("every listed type has a provider struct")
+                .expect("an empty provider config deserializes");
+            assert_eq!(config.type_name(), type_name);
+        }
+
+        assert!(ClientConfig::deserialize_as("opneai", json!({})).is_none());
+    }
 }

@@ -30,6 +30,12 @@ harnx-mcp-bridge --list-tools -- npx -y @modelcontextprotocol/server-everything
 
 The bridge launches the child, initializes the MCP session, queries `tools/list`, prints advertised tools with descriptions and hints to stdout, shuts down the child cleanly, and exits with code 0.
 
+Add `--format json` (before `--`) to print the listing as JSON instead, in the same shape as the native tool servers' `--list-tools --format json`: the server name in `server` and each tool's spec in `tools`. The server name is `--name` when given and `mcp-diagnostic` otherwise, so pass the `--name` the server is deployed with. `harnx validate` uses this output to check tool names.
+
+```sh
+harnx-mcp-bridge --list-tools --format json --name everything -- npx -y @modelcontextprotocol/server-everything
+```
+
 ### 3. Standalone Direct Tool Invocation (`--call-tool`)
 
 Execute a specific tool directly on the wrapped MCP server:

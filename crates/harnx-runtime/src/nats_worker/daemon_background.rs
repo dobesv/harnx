@@ -312,7 +312,7 @@ pub(super) fn configured_worker_services(config: &GlobalConfig) -> Vec<ToolServe
 ///
 /// Does not consult the active agent or global `use_tools`. Matching is conservative
 /// because tool declarations aren't available until the servers have started.
-pub(super) fn tool_servers_for_view(
+pub(crate) fn tool_servers_for_view(
     config: &Config,
     package: Option<&str>,
     selectors: &[String],
