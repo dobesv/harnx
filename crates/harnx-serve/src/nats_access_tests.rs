@@ -481,3 +481,52 @@ fn url_credential_redaction_covers_realistic_shapes() {
         "connect to nats://***@broker:4222 and tls://***@other:4223, then nats://plain:4224 ok"
     );
 }
+
+#[test]
+fn annotated_and_wrapped_errors_keep_credentials_redactable() {
+    // Regression (#2955): annotated errors carry their message as verbatim
+    // text in a typed frame — never percent-encoded — so the URL-credential
+    // redactor still sees and masks the original userinfo. A reversible
+    // encoding before logging would let credentials persist in the dispatch
+    // log. The first case builds a synthetic BadRequest and routes it
+    // through the real adapter, ag_ui_error_to_anyhow — the same conversion
+    // a malformed request body takes — but does not run an actual serde
+    // deserialization failure.
+    let serde_echo = "nats://user:secret@broker:4222 was not a string";
+    let malformed_body = crate::ag_ui_error_to_anyhow(crate::ag_ui::AgUiError::BadRequest(
+        format!("invalid AG-UI request body: {serde_echo}"),
+    ));
+    let rendered = sanitized_error_chain(&malformed_body);
+    assert!(
+        !rendered.contains("user:secret"),
+        "credentials must be redacted: {rendered}"
+    );
+    assert!(
+        rendered.contains("nats://***@broker:4222"),
+        "the URL stays identifiable without its userinfo: {rendered}"
+    );
+    assert!(
+        !rendered.contains("%3A") && !rendered.contains("%2F"),
+        "no reversibly encoded duplicates may survive: {rendered}"
+    );
+
+    // A wrapped source keeps every frame's literal text, so both the
+    // context and the raw source are redacted. This is an ordinary string
+    // .context() chain; the typed guard wrapper (guard_error_status) is not
+    // exercised here.
+    let source = anyhow!("dial nats://ops:hunter2@broker:4222 failed");
+    let wrapped = source.context("session metadata read failed");
+    let rendered = sanitized_error_chain(&wrapped);
+    assert!(
+        !rendered.contains("ops:hunter2"),
+        "source-frame credentials must be redacted: {rendered}"
+    );
+    assert!(
+        rendered.contains("nats://***@broker:4222"),
+        "the source URL stays identifiable: {rendered}"
+    );
+    assert!(
+        !rendered.contains("%3A") && !rendered.contains("%2F"),
+        "no reversibly encoded duplicates may survive: {rendered}"
+    );
+}

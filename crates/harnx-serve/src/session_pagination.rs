@@ -1,11 +1,10 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use base64::Engine as _;
 use harnx_runtime::config::SessionMeta;
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use crate::ERROR_STATUS_MARKER;
 
 pub(crate) const CURSOR_VERSION: u32 = 1;
 pub(crate) const MAX_CURSOR_LEN: usize = 1024;
@@ -80,35 +79,42 @@ pub(crate) fn encode_cursor(session: &SessionMeta) -> Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json_bytes))
 }
 
+/// A caller-controlled message, annotated with the 400 status the pagination
+/// errors all share. The annotation is typed and server-authored, so hostile
+/// cursor payloads cannot influence status or code (#2955).
+fn bad_request<T: std::fmt::Display>(message: T) -> anyhow::Error {
+    crate::error_with_status(message, StatusCode::BAD_REQUEST)
+}
+
 pub(crate) fn decode_cursor(raw: &str) -> Result<(SessionCursor, Option<SystemTime>)> {
     if raw.is_empty() {
-        bail!("cursor parameter must not be empty{ERROR_STATUS_MARKER}400");
+        return Err(bad_request("cursor parameter must not be empty"));
     }
     if raw.len() > MAX_CURSOR_LEN {
-        bail!("cursor parameter exceeds maximum allowed length{ERROR_STATUS_MARKER}400");
+        return Err(bad_request(
+            "cursor parameter exceeds maximum allowed length",
+        ));
     }
     let trimmed = raw.trim_end_matches('=');
     let json_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(trimmed)
-        .map_err(|_| anyhow!("invalid cursor encoding{ERROR_STATUS_MARKER}400"))?;
+        .map_err(|_| bad_request("invalid cursor encoding"))?;
 
-    let cursor: SessionCursor = serde_json::from_slice(&json_bytes)
-        .map_err(|_| anyhow!("invalid cursor payload{ERROR_STATUS_MARKER}400"))?;
+    let cursor: SessionCursor =
+        serde_json::from_slice(&json_bytes).map_err(|_| bad_request("invalid cursor payload"))?;
 
     if cursor.v != CURSOR_VERSION {
-        bail!(
-            "unsupported cursor version: {}{ERROR_STATUS_MARKER}400",
+        return Err(bad_request(format!(
+            "unsupported cursor version: {}",
             cursor.v
-        );
+        )));
     }
     if cursor.id.is_empty() {
-        bail!("invalid cursor: id must not be empty{ERROR_STATUS_MARKER}400");
+        return Err(bad_request("invalid cursor: id must not be empty"));
     }
 
     let modified = match cursor.modified {
-        Some(ts) => {
-            Some(SystemTime::try_from(ts).map_err(|msg| anyhow!("{msg}{ERROR_STATUS_MARKER}400"))?)
-        }
+        Some(ts) => Some(SystemTime::try_from(ts).map_err(bad_request)?),
         None => None,
     };
 
@@ -164,7 +170,7 @@ fn parse_unique_parameter<T>(
     parse: impl FnOnce(&str) -> Result<T>,
 ) -> Result<()> {
     if slot.is_some() {
-        bail!("duplicate query parameter '{key}'{ERROR_STATUS_MARKER}400");
+        return Err(bad_request(format!("duplicate query parameter '{key}'")));
     }
     *slot = Some(parse(value)?);
     Ok(())
@@ -173,9 +179,9 @@ fn parse_unique_parameter<T>(
 fn parse_session_limit(value: &str) -> Result<usize> {
     let parsed = value
         .parse::<u64>()
-        .map_err(|_| anyhow!("limit must be a positive integer{ERROR_STATUS_MARKER}400"))?;
+        .map_err(|_| bad_request("limit must be a positive integer"))?;
     if parsed == 0 {
-        bail!("limit must be a positive integer{ERROR_STATUS_MARKER}400");
+        return Err(bad_request("limit must be a positive integer"));
     }
     Ok(parsed.min(MAX_LIMIT as u64) as usize)
 }
@@ -336,6 +342,10 @@ mod tests {
         let v2_encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v2_json);
         let err = decode_cursor(&v2_encoded).unwrap_err();
         assert!(err.to_string().contains("unsupported cursor version: 2"));
+        assert_eq!(
+            crate::status_from_error(&err),
+            Some(StatusCode::BAD_REQUEST)
+        );
 
         // Empty session ID
         let empty_id = serde_json::to_vec(&json!({
@@ -446,9 +456,10 @@ mod tests {
             ("limit=0&cursor=!", positive_integer),
         ] {
             let err = parse_session_list_query(Some(query)).unwrap_err();
+            assert_eq!(err.to_string(), message, "{query}");
             assert_eq!(
-                err.to_string(),
-                format!("{message}{ERROR_STATUS_MARKER}400"),
+                crate::status_from_error(&err),
+                Some(StatusCode::BAD_REQUEST),
                 "{query}"
             );
         }
@@ -456,9 +467,10 @@ mod tests {
         let cursor = encode_cursor(&test_session("sess-1", None)).unwrap();
         let err =
             parse_session_list_query(Some(&format!("cursor={cursor}&%63ursor=!"))).unwrap_err();
+        assert_eq!(err.to_string(), "duplicate query parameter 'cursor'");
         assert_eq!(
-            err.to_string(),
-            format!("duplicate query parameter 'cursor'{ERROR_STATUS_MARKER}400")
+            crate::status_from_error(&err),
+            Some(StatusCode::BAD_REQUEST)
         );
     }
 

@@ -10,7 +10,7 @@
 //! refusal is the guard's 404 with nothing else done — never the actor's
 //! 409 Rejected.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use harnx_core::access_rules::AccessRules;
 use harnx_runtime::nats_session::{create_or_read_session_metadata, SessionMetadataClaim};
 use harnx_runtime::nats_session_metadata::{
@@ -19,13 +19,17 @@ use harnx_runtime::nats_session_metadata::{
 
 use crate::session_actor::{ResolvedAgentTarget, SessionKey};
 use crate::session_claim::guard_not_found;
-use crate::{ensure_frontend_nats_owner, serve_nats_jetstream, Server, ERROR_STATUS_MARKER};
+use crate::{ensure_frontend_nats_owner, serve_nats_jetstream, Server};
+use http::StatusCode;
 
 /// A reservation failure is broker-side, never an authorization verdict:
 /// log the cause server-side and answer with the fixed 503-class body the
 /// attachment preflight already uses for the same outage (decision D5).
 pub(crate) fn session_metadata_unavailable() -> anyhow::Error {
-    anyhow!("session metadata unavailable{ERROR_STATUS_MARKER}503")
+    crate::error_with_status(
+        "session metadata unavailable",
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
 }
 
 /// Map a claim-path broker error like the guard maps its own reads (review
@@ -323,9 +327,11 @@ mod tests {
             UpdateError::new(UpdateErrorKind::TimedOut),
         );
         let mapped = claim_read_error(anyhow::Error::new(stalled));
+        assert_eq!(mapped.to_string(), "session metadata unavailable");
         assert_eq!(
-            mapped.to_string(),
-            format!("session metadata unavailable{ERROR_STATUS_MARKER}503")
+            crate::status_from_error(&mapped),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "a broker outage must carry the 503 annotation"
         );
 
         // A broker answer — the key already exists — is not an outage: the
