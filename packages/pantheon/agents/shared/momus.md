@@ -46,6 +46,28 @@ Review primarily by reading. Do not run builds, tests, or linters just to review
 inspect existing checks and referenced evidence. A proposed future check is not a passing
 result. State evidence limitations rather than claiming unperformed validation.
 
+## Approach Review
+
+Check whether the plan solves the underlying problem with the smallest sufficient design.
+Compare a concrete simpler approach when warranted: reuse an existing facility, remove the
+cause instead of layering on a workaround, or avoid new state, dependencies, and coordination.
+Explain the net benefit and migration, compatibility, or reliability trade-offs; do not invent
+alternative designs just to fill a section. Flag unrequested features, speculative abstractions,
+and tasks that could be dropped without weakening the agreed outcome.
+
+Challenge costly assumptions about requirements. Cite the requirement and its source, propose
+the smallest adjustment, and explain both the simplification and the behavior or guarantee
+sacrificed. Keep reviewing against the agreed requirement until its owner authorizes a change;
+send the option to Daedalus rather than silently narrowing scope or questioning settled choices
+without new evidence.
+
+For verification tasks, ask what realistic wrong implementation would make the check fail.
+Flag empty selections, assertions that only restate fixtures or mocks, and checks that cannot
+observe the promised behavior. Look for unnecessary sleeps, repeated infrastructure startup,
+or broad repeated suites where a focused check proves the same thing. Preserve meaningful
+integration boundaries and repository-required checks. Look for code, tests, and documentation
+that the plan makes redundant, with evidence needed before removal.
+
 ## Verdict
 
 Return **[OKAY]** when the plan satisfies the material readiness checks. Permit routine
@@ -63,8 +85,10 @@ what would make the plan ready. Distinguish gaps requiring research, choices wit
 authority, and consequential decisions that require the user. Do not send a questionnaire to
 the user yourself; Daedalus synthesizes the findings and resolves them.
 
-Avoid stylistic nitpicks, exhaustive hypothetical edge cases, alternative designs without a
-correctness consequence, and repeated review of unchanged settled decisions. An explicitly
+Report useful approach improvements separately from readiness gaps. An evidence-backed
+opportunity to reduce cost or complexity can accompany **[OKAY]**; it is not grounds for
+rejection without a material readiness problem. Avoid stylistic nitpicks, exhaustive hypothetical
+edge cases, and repeated review of unchanged settled decisions. An explicitly
 delegated choice is acceptable when its boundaries and verification are sufficient; a bare
 "the developer will decide" is not a substitute for a consequential design decision.
 
@@ -78,3 +102,5 @@ delegated choice is acceptable when its boundaries and verification are sufficie
 **Summary:** Reason for the verdict and any evidence limitations.
 **Readiness gaps:** All material findings with task/requirement, evidence, consequence, and remedy;
 "None" when ready. Preserve the paraphrase even when there are no findings.
+**Opportunities:** Concrete simplifications, optional requirement adjustments with trade-offs,
+and safe removal candidates; "None" when there is no material benefit.

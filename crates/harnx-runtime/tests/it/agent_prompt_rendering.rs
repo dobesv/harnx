@@ -743,6 +743,123 @@ fn planning_prompts_do_not_restore_question_quotas_or_early_approval_gates() {
     }
 }
 
+/// Exercise installation and assembly, not model judgment. Compare whole core
+/// fragments so a resolved variable whose body is omitted or truncated fails.
+#[test]
+fn review_prompts_assemble_full_role_guidance_without_obsolete_overrides() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+
+    for name in [
+        "metis",
+        "momus",
+        "daedalus",
+        "aristarchus",
+        "argus",
+        "urania",
+        "calliope",
+        "thalia",
+        "terpsichore",
+        "erato",
+        "nemesis",
+        "polyhymnia",
+        "tyche",
+    ] {
+        let core = fs::read_to_string(
+            workspace_root.join(format!("packages/pantheon/agents/shared/{name}.md")),
+        )
+        .expect("read reviewer core");
+        let prompt =
+            render_agent_prompt(&format!("pantheon/{name}"), &[]).expect("render reviewer");
+        assert_eq!(prompt.matches(core.trim()).count(), 1, "{name}");
+    }
+
+    let momus = render_agent_prompt("pantheon/momus", &[]).expect("render Momus");
+    let normalized = momus.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(!normalized.contains("alternative designs without a correctness consequence"));
+    let argus = render_agent_prompt("pantheon/argus", &[]).expect("render Argus");
+    for obsolete in [
+        "Run the **full** project test suite",
+        "Also run targeted tests",
+        "When in doubt, FAIL",
+        "Non-trivial functions and types should live in their",
+    ] {
+        assert!(!argus.contains(obsolete), "Argus restores: {obsolete}");
+    }
+
+    let aristarchus = render_agent_prompt("pantheon/aristarchus", &[]).expect("render Aristarchus");
+    for obsolete in [
+        "pr_type",
+        "Draft/WIP blast-radius cap",
+        "Draft/WIP review — only promotion-blocking",
+    ] {
+        assert!(
+            !aristarchus.contains(obsolete),
+            "Aristarchus restores: {obsolete}"
+        );
+    }
+}
+
+/// All specialists and judges share the remedy-cost and requirement-authority
+/// rules; resolving a variable without including it in the prompt is insufficient.
+#[test]
+fn muses_and_judges_render_shared_review_economy_once() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+    let policy = fs::read_to_string(
+        workspace_root.join("packages/pantheon/agents/shared/review-read-only.md"),
+    )
+    .expect("read shared review policy");
+
+    for name in [
+        "calliope",
+        "euterpe",
+        "thalia",
+        "melpomene",
+        "polyhymnia",
+        "erato",
+        "terpsichore",
+        "urania",
+        "nemesis",
+        "opis",
+        "tyche",
+        "laocoon",
+        "minos",
+        "rhadamanthus",
+        "aeacus",
+    ] {
+        let prompt =
+            render_agent_prompt(&format!("pantheon/{name}"), &[]).expect("render reviewer");
+        assert_eq!(prompt.matches(policy.trim()).count(), 1, "{name}");
+    }
+}
+
+/// Coverage policy must be interpolated by both consumers, not merely loaded
+/// into a file-backed variable that the wrapper can forget to reference.
+#[test]
+fn coverage_policy_renders_once_for_coordinator_and_testing_specialist() {
+    harnx_core::require_nextest();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let (_temp, _config_guard) = install_packages(&workspace_root);
+    let policy = fs::read_to_string(
+        workspace_root.join("packages/pantheon/agents/shared/policy-test-coverage.md"),
+    )
+    .expect("read coverage policy");
+
+    for qualified_name in ["pantheon/aristarchus", "pantheon/thalia"] {
+        let prompt = render_agent_prompt(qualified_name, &[]).expect("render coverage consumer");
+        assert_eq!(prompt.matches(policy.trim()).count(), 1, "{qualified_name}");
+    }
+}
+
 /// Argus is the between-task check; Aristarchus is the final review. The
 /// assembled coordinator prompts must not ask for Argus right before or
 /// alongside the review (#2728), but must keep it for review-exempt changes.
