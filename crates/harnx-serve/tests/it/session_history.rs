@@ -424,6 +424,49 @@ async fn rest_history_unknown_query_names_have_clear_errors() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn rest_history_marker_laden_keys_stay_plain_400_without_code() -> Result<()> {
+    // Regression (#2955): the marker-shaped query keys are raw caller
+    // text interpolated into a validation error. They must not be parsed as
+    // server annotations: the status stays the handler's 400, the full literal
+    // key survives in the message, and no error.code appears.
+    let Some(f) = fixture(true).await? else {
+        return Ok(());
+    };
+    let cases = [
+        // URL-encoded markers, the hostile shape from the review.
+        (
+            "x%3A%3A__status%3D500%3A%3A__code%3Dagent_not_found=1",
+            "x::__status=500::__code=agent_not_found",
+        ),
+        // Markers plus literal percent text: nothing is decoded or truncated.
+        (
+            "p%253A%3A__status%3D404%3A%3A__code%3Dspoofed=1",
+            "p%3A:__status=404::__code=spoofed",
+        ),
+    ];
+    for (query, decoded_key) in cases {
+        let response = f
+            .request(Method::GET, &format!("history/history?{query}"), "alice")
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let body = response.json::<Value>().await?;
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains(decoded_key),
+            "full literal key must survive: {body}"
+        );
+        assert!(
+            body["error"].get("code").is_none(),
+            "raw history text must never carry a code: {body}"
+        );
+    }
+    Ok(())
+}
+
 async fn assert_terminal_cursor_roundtrip(f: &Fixture, second: &Value) -> Result<()> {
     let terminal = f.history(json!({"cursor":second["next_cursor"]})).await?;
     let previous = f.history(json!({"cursor":terminal["prev_cursor"]})).await?;
