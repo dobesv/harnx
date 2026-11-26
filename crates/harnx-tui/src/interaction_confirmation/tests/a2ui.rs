@@ -7,7 +7,7 @@ use harnx_core::session::SessionLogEntry;
 use harnx_runtime::interactions::InteractionDecisionOutcome;
 use serde_json::{json, Value};
 
-fn sample_a2ui_payload() -> Value {
+pub(super) fn sample_a2ui_payload() -> Value {
     json!({
         "version": "1.0",
         "createSurface": {
@@ -57,7 +57,7 @@ fn a2ui_entry(seq: u64, id: &str, payload: Value) -> (u64, SessionLogEntry) {
     )
 }
 
-fn a2ui_round_entries(id: &str, payload: Value) -> Vec<(u64, SessionLogEntry)> {
+pub(super) fn a2ui_round_entries(id: &str, payload: Value) -> Vec<(u64, SessionLogEntry)> {
     vec![
         (
             1,

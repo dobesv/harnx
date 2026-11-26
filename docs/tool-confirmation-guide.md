@@ -129,7 +129,14 @@ ready and shows one request at a time.
 - Type or paste an optional note. `Shift+Enter` or `Alt+Enter` adds a newline.
 - Press `Enter` to approve after two seconds without typing, or `Ctrl+D` to deny.
 - Use `PageUp`/`PageDown` to scroll a long message.
-- Press `Ctrl+C` to interrupt through the normal session cancellation tray.
+- Press `Esc` (or `↑` from an empty note) to browse the transcript, plans, and
+  linked documents while the request stays pending — your note is preserved and
+  restored when you return. Browsing is read-only while a request is pending:
+  `Enter` opens items and links but never answers, and `Ctrl+D` shows a notice
+  instead of denying. `Ctrl+C` keeps its interruption behavior at all times.
+- After returning to the tray from reading, decisions stay refused until two
+  seconds pass without any keypress or paste, so a held key cannot cross from
+  reading into an approval; the tray footer counts that window down.
 
 The note is stored in `InteractionResponse.note`, not queued as a separate user
 message. Rejected answers appear in the tray or transcript. A request answered
@@ -138,7 +145,8 @@ approve or deny the durable request; reconnect to answer remaining work.
 
 For direct child sessions awaiting approval, press lowercase `a` on the
 selected root child row, root detail pane, or opened child header displaying
-`⏸ Awaiting input: <message>  a/answer` to answer directly without navigating away.
+`⏸ Awaiting input: <message>  a/answer` to answer directly without navigating
+away.
 
 ### A2A
 

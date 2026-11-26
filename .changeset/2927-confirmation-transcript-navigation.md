@@ -1,0 +1,5 @@
+---
+harnx: minor
+---
+
+The TUI no longer locks navigation behind a pending middleware confirmation. While the confirmation tray is open, `Esc` (or `↑` from an empty note) browses the transcript, plans, and linked documents with the usual navigation keys; the typed note and composer draft are preserved and restored when you return. Browsing is read-only while a request is pending — `Enter` opens items and links but never answers, edits/deletes/rewinds/inserts are refused with a footer notice, and `Ctrl+C` keeps its interruption behavior. A request that arrives while you are reading keeps the open view focused with a one-line pending hint; answering a child from an open child view shows the tray at the bottom of the screen with the child view above it. After any return to the tray from reading, decisions stay refused until two seconds pass without a keypress or paste, so a held `Enter` cannot cross from reading into an approval. This also includes the composer-side transcript browsing shipped with it: `Esc` in the composer enters transcript navigation without losing your draft, and `↓` past the last item or `Esc` again returns to it.

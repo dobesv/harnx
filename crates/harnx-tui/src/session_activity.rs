@@ -104,7 +104,10 @@ impl Tui {
         }
     }
 
-    async fn refresh_shared_session_transcript(&mut self, stamp: &EventStamp) {
+    /// Rebuild the transcript from durable history. `pub(crate)` so the
+    /// pending-interaction regressions can exercise the real refresh path
+    /// (review B1/B2), not only the normalization helper.
+    pub(crate) async fn refresh_shared_session_transcript(&mut self, stamp: &EventStamp) {
         let transcript = crate::lifecycle::session_history_transcript_items(&self.config).await;
         if !stamp.allows(&self.live_events) {
             return;
@@ -122,6 +125,12 @@ impl Tui {
         self.app.transcript_selection_anchor = None;
         self.subagent_rows_dirty = true;
         self.pin_transcript_to_bottom();
+        // While a confirmation is pending, keep independently loaded read
+        // views alive across the rebuild and restore the guarded tray when
+        // none survives (binding review clarification).
+        if self.interaction_pending() {
+            self.normalize_reading_after_transcript_rebuild();
+        }
     }
 
     pub(super) async fn handle_turn_activity(

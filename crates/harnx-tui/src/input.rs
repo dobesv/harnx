@@ -20,6 +20,7 @@ use std::time::Duration;
 /// handler returns, so an unbounded mark-read would stall the exit. Ctrl+D means
 /// "quit now": mark read best-effort, then exit regardless.
 const CTRL_D_MARK_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const BROWSE_PAGE_LINES: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerCommand {
@@ -112,14 +113,68 @@ impl Tui {
         self.mark_current_session_read(false).await;
     }
 
-    async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
+    /// Enter fullscreen transcript browsing at the last navigable item without
+    /// mutating composer, note, or form state. Returns `false` when the
+    /// transcript has no navigable items, leaving focus unchanged.
+    pub(super) fn enter_transcript_browsing(&mut self) -> bool {
+        let Some(target) = self.find_prev_navigable(self.app.transcript.len()) else {
+            return false;
+        };
+        self.clear_footer_notice();
+        self.app.completions.clear();
+        self.app.transcript_focus = Some(target);
+        self.app.transcript_browsing = true;
+        self.app.scroll_state.follow = false;
+        self.app.scroll_to_focused_item = true;
+        self.app.transcript_selection_anchor = None;
+        self.refresh_input_chrome();
+        true
+    }
+
+    async fn exit_transcript_browsing(&mut self) {
+        self.clear_footer_notice();
+        self.app.transcript_browsing = false;
+        self.app.transcript_focus = None;
+        self.app.transcript_selection_anchor = None;
+        self.app.scroll_state.follow = true;
+        self.refresh_input_chrome();
+        // Mark read on exit from transcript focus/browsing (if unread).
+        self.mark_current_session_read(false).await;
+    }
+
+    fn scroll_browsing_page(&mut self, up: bool) {
+        self.clear_footer_notice();
+        for _ in 0..BROWSE_PAGE_LINES {
+            if up {
+                self.app.browsing_view_scroll.scroll_up();
+            } else {
+                self.app.browsing_view_scroll.scroll_down();
+            }
+        }
+    }
+
+    async fn handle_ordinary_esc(&mut self) {
+        self.clear_footer_notice();
+        if self.app.detail_view_open {
+            self.app.detail_view_open = false;
+            // Return to browsing view (transcript_browsing stays true if it was true)
+        } else if self.app.transcript_focus.is_some() {
+            self.exit_transcript_browsing().await;
+        } else if !self.app.completions.is_empty() {
+            self.app.completions.clear();
+        } else {
+            // ESC with no special state: mark read (if unread) and enter browse.
+            self.mark_current_session_read(false).await;
+            if !self.enter_transcript_browsing() {
+                self.app.show_footer_notice("Nothing to browse");
+            }
+        }
+    }
+
+    pub(super) async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, KeyModifiers::NONE) => {
-                self.clear_footer_notice();
-                self.app.transcript_browsing = false;
-                self.app.transcript_focus = None;
-                self.app.transcript_selection_anchor = None;
-                self.app.scroll_state.follow = true;
+                self.handle_browsing_esc().await;
             }
             (KeyCode::Up, KeyModifiers::NONE) => {
                 self.handle_up_key(key);
@@ -132,6 +187,12 @@ impl Tui {
             }
             (KeyCode::Down, KeyModifiers::SHIFT) => {
                 self.handle_down_key_shift();
+            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => {
+                self.scroll_browsing_page(true);
+            }
+            (KeyCode::PageDown, KeyModifiers::NONE) => {
+                self.scroll_browsing_page(false);
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 self.clear_footer_notice();
@@ -166,6 +227,15 @@ impl Tui {
             _ => {} // consume all other keys to prevent bleed to input
         }
         Ok(())
+    }
+
+    /// Top-level browse Esc exits browsing; while a confirmation is pending it
+    /// returns to the guarded tray, not the hidden composer (plan decision 5).
+    async fn handle_browsing_esc(&mut self) {
+        self.exit_transcript_browsing().await;
+        if self.interaction_pending() {
+            self.arm_interaction_return_guard();
+        }
     }
 
     /// Type-erased seam for the run loop (PR #2835 Windows CI query-depth
@@ -205,6 +275,7 @@ impl Tui {
                 self.handle_down_key_shift();
             }
             (KeyCode::PageUp, KeyModifiers::NONE) => {
+                self.clear_footer_notice();
                 if self.app.detail_view_open {
                     for _ in 0..10 {
                         self.app.detail_view_scroll.scroll_up();
@@ -216,6 +287,7 @@ impl Tui {
                 }
             }
             (KeyCode::PageDown, KeyModifiers::NONE) => {
+                self.clear_footer_notice();
                 if self.app.detail_view_open {
                     for _ in 0..10 {
                         self.app.detail_view_scroll.scroll_down();
@@ -233,23 +305,7 @@ impl Tui {
                 self.handle_tab(true).await;
             }
             (KeyCode::Esc, KeyModifiers::NONE) => {
-                self.clear_footer_notice();
-                if self.app.detail_view_open {
-                    self.app.detail_view_open = false;
-                    // Return to browsing view (transcript_browsing stays true if it was true)
-                } else if self.app.transcript_focus.is_some() {
-                    self.app.transcript_focus = None;
-                    self.app.transcript_selection_anchor = None;
-                    self.app.transcript_browsing = false;
-                    self.app.scroll_state.follow = true;
-                    // Mark read on exit from transcript focus (if unread)
-                    self.mark_current_session_read(false).await;
-                } else if !self.app.completions.is_empty() {
-                    self.app.completions.clear();
-                } else {
-                    // ESC with no special state: mark read (if unread)
-                    self.mark_current_session_read(false).await;
-                }
+                self.handle_ordinary_esc().await;
             }
             // D4: Keyboard actions on selected transcript item(s)
             // All mutation shortcuts are blocked while the detail view is open.
@@ -312,6 +368,7 @@ impl Tui {
         if self.app.transcript_focus.is_some() {
             return;
         }
+        self.clear_footer_notice();
         // First character typed marks the current session read when needed.
         self.mark_current_session_read(false).await;
         // Exit history preview on any editing key — keep current content as new draft.
@@ -382,6 +439,9 @@ impl Tui {
         if self.handle_child_answer_key(key) {
             return Some(Ok(()));
         }
+        if let Some(res) = self.pending_reading_key(key).await {
+            return Some(res);
+        }
         if self.app.modal.is_none() && self.app.archive_browser.is_some() {
             if self.app.detail_view_open {
                 return Some(self.handle_detail_view_key(key).await);
@@ -402,6 +462,16 @@ impl Tui {
         } else {
             None
         }
+    }
+
+    /// A pending confirmation stays readable: keys route to the active read
+    /// view instead of the modal (plan decision 3/6). None when no read view
+    /// holds focus or a cancellation modal is up.
+    async fn pending_reading_key(&mut self, key: KeyEvent) -> Option<Result<()>> {
+        if self.interaction_reading() && self.cancellation.is_none() {
+            return Some(self.handle_pending_reading_key(key).await);
+        }
+        None
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -476,6 +546,11 @@ impl Tui {
         None
     }
 
+    fn preview_history_prev(&mut self) {
+        self.history_prev();
+        self.refresh_input_chrome();
+    }
+
     fn handle_up_key(&mut self, key: KeyEvent) {
         self.clear_footer_notice();
         if self.app.detail_view_open {
@@ -492,6 +567,9 @@ impl Tui {
                 self.app.scroll_state.follow = false;
                 self.app.scroll_to_focused_item = true;
                 self.app.transcript_selection_anchor = None;
+            } else if self.interaction_pending() {
+                // Clamped at the first item: no composer-history fallback
+                // while a confirmation is pending (plan decision 5).
             } else {
                 self.app.transcript_focus = None;
                 self.app.transcript_selection_anchor = None;
@@ -499,42 +577,17 @@ impl Tui {
                 // Do NOT restore follow here — user is entering history preview
                 // and the transcript position should stay where it is.
                 // follow is restored by Esc or when a new message is submitted.
-
-                let before = self.app.history_index;
-                self.history_prev();
-                let moved = self.app.history_index.is_some()
-                    && (self.app.history_index != before || self.app.history_preview);
-                if moved {
-                    self.app.history_preview = true;
-                    self.refresh_input_chrome();
-                }
+                self.preview_history_prev();
             }
-        } else if self.input_is_blank() && !self.app.transcript.is_empty() {
-            if let Some(prev) = self.find_prev_navigable(self.app.transcript.len()) {
-                self.app.transcript_focus = Some(prev);
-                self.app.transcript_browsing = true;
-                self.app.scroll_state.follow = false;
-                self.app.scroll_to_focused_item = true;
-                self.app.transcript_selection_anchor = None;
-            } else {
-                let before = self.app.history_index;
-                self.history_prev();
-                let moved = self.app.history_index.is_some()
-                    && (self.app.history_index != before || self.app.history_preview);
-                if moved {
-                    self.app.history_preview = true;
-                    self.refresh_input_chrome();
-                }
-            }
+        } else if self.input_is_blank() && self.enter_transcript_browsing() {
+            // Entered transcript browsing at the last navigable item.
+        } else if self.interaction_reading() {
+            // A pending confirmation owns the keyboard while reading; arrows
+            // must never fall through to the hidden composer or history
+            // (review B2).
+            self.show_pending_interaction_notice();
         } else if self.app.history_preview || self.input_is_blank() {
-            let before = self.app.history_index;
-            self.history_prev();
-            let moved = self.app.history_index.is_some()
-                && (self.app.history_index != before || self.app.history_preview);
-            if moved {
-                self.app.history_preview = true;
-                self.refresh_input_chrome();
-            }
+            self.preview_history_prev();
         } else {
             self.app.input.input(TextInput::from(key));
         }
@@ -549,27 +602,49 @@ impl Tui {
 
         if !self.app.completions.is_empty() {
             self.app.scroll_state.scroll_down();
-        } else if let Some(focus) = self.app.transcript_focus {
-            if let Some(next) = self.find_next_navigable(focus) {
-                self.app.transcript_focus = Some(next);
-                self.app.transcript_browsing = true;
-                self.app.scroll_state.follow = false;
-                self.app.scroll_to_focused_item = true;
-                self.app.transcript_selection_anchor = None;
-            } else {
-                self.app.transcript_focus = None;
-                self.app.transcript_selection_anchor = None;
-                self.app.transcript_browsing = false;
-                self.app.scroll_state.follow = true;
-            }
+            return;
+        }
+        if let Some(focus) = self.app.transcript_focus {
+            self.down_from_focused_transcript_row(focus);
+        } else if self.interaction_reading() {
+            // A pending confirmation owns the keyboard while reading; Down
+            // must never fall through to the hidden composer or history
+            // (review B2).
+            self.show_pending_interaction_notice();
         } else if self.app.history_preview {
-            self.history_next();
-            if self.app.history_index.is_none() {
-                self.app.history_preview = false;
-            }
-            self.refresh_input_chrome();
+            self.down_history_preview();
         } else {
             self.app.input.input(TextInput::from(key));
+        }
+    }
+
+    fn down_from_focused_transcript_row(&mut self, focus: usize) {
+        if let Some(next) = self.find_next_navigable(focus) {
+            self.app.transcript_focus = Some(next);
+            self.app.transcript_browsing = true;
+            self.app.scroll_state.follow = false;
+            self.app.scroll_to_focused_item = true;
+            self.app.transcript_selection_anchor = None;
+        } else {
+            self.exit_browse_to_tray();
+        }
+    }
+
+    fn down_history_preview(&mut self) {
+        self.history_next();
+        self.refresh_input_chrome();
+    }
+
+    /// Down past the last item leaves browsing; while a confirmation is
+    /// pending, that returns to the guarded tray, not the composer (plan
+    /// decision 5).
+    fn exit_browse_to_tray(&mut self) {
+        self.app.transcript_focus = None;
+        self.app.transcript_selection_anchor = None;
+        self.app.transcript_browsing = false;
+        self.app.scroll_state.follow = true;
+        if self.interaction_pending() {
+            self.arm_interaction_return_guard();
         }
     }
 
@@ -629,6 +704,7 @@ impl Tui {
             Some(i) => i, // Already at oldest
         };
         self.app.history_index = Some(next_index);
+        self.app.history_preview = true;
         let text = self.app.history[next_index].clone();
         self.set_input_text(&text);
     }
@@ -637,10 +713,11 @@ impl Tui {
         match self.app.history_index {
             None => {} // Not in history navigation
             Some(0) => {
-                // Back to draft
+                // Back to draft, which also ends the preview.
                 self.app.history_index = None;
                 let draft = self.app.history_draft.clone();
                 self.set_input_text(&draft);
+                self.app.history_preview = false;
             }
             Some(i) => {
                 let next = i - 1;
@@ -940,6 +1017,11 @@ impl Tui {
     /// user message proceeds normally: `.edit message <from>-<to>` rewrites
     /// only the user entry, leaving tool-round rows in the range untouched.
     pub(super) async fn handle_transcript_edit(&mut self) -> Result<()> {
+        if self.refuse_when_pending_interaction() {
+            // Read-only browsing while a confirmation is pending, even when
+            // the session is idle (plan decision 6).
+            return Ok(());
+        }
         if self.app.llm_busy {
             self.show_busy_notice();
             return Ok(());
@@ -993,6 +1075,11 @@ impl Tui {
 
     /// Handle 'd' or Delete key: open delete confirmation modal.
     pub(super) fn handle_transcript_delete(&mut self) {
+        if self.refuse_when_pending_interaction() {
+            // Read-only browsing while a confirmation is pending, even when
+            // the session is idle (plan decision 6).
+            return;
+        }
         if self.app.llm_busy {
             // Mutating history while a turn runs races the worker: deleting an
             // in-flight ToolCalls round leaves results appending onto a stale
@@ -1010,6 +1097,16 @@ impl Tui {
 
     /// Handle 'i' key: copy item text into input field, clear focus.
     fn handle_transcript_insert(&mut self) {
+        if self.refuse_when_pending_interaction() {
+            // Insert writes the hidden composer; refuse while a confirmation
+            // is pending (plan decision 6).
+            return;
+        }
+        self.insert_focused_transcript_text();
+    }
+
+    /// Copy the focused row's text into the composer and leave browsing.
+    fn insert_focused_transcript_text(&mut self) {
         let Some(focus) = self.app.transcript_focus else {
             self.app.show_footer_notice("Nothing selected");
             return;
@@ -1067,6 +1164,11 @@ impl Tui {
     /// Always rewinds to the *earliest* selected item regardless of selection
     /// direction, so Shift+selecting up vs down yields the same target.
     pub(super) fn handle_transcript_rewind(&mut self) {
+        if self.refuse_when_pending_interaction() {
+            // Read-only browsing while a confirmation is pending, even when
+            // the session is idle (plan decision 6).
+            return;
+        }
         if self.app.llm_busy {
             // Rewinding while a turn runs drops the round the worker is about
             // to append results for (#2557 review).

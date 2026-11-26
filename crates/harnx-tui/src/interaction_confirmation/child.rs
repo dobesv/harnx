@@ -232,10 +232,16 @@ impl Tui {
                 a2ui: None,
                 note: TextArea::default(),
                 last_key_at: Instant::now(),
+                // Explicit Answer focuses the tray; initial presentation
+                // semantics, no return guard.
+                decision_guard_until: None,
                 scroll: 0,
                 submitting: false,
                 error: None,
             })));
+            // An explicit child Answer always focuses its confirmation tray;
+            // the underlying child/read stack is preserved above it.
+            self.app.interaction_focus = crate::types::InteractionFocus::Tray;
             return;
         }
     }

@@ -250,7 +250,14 @@ pub(super) fn detail_view_content(app: &App) -> (Vec<Vec<Line<'static>>>, String
 
 pub(super) fn detail_view_footer_text(app: &App) -> String {
     if app.doc_view.is_some() {
-        " ↑↓/Tab: select link  Enter: open  Backspace/Esc: back  PgUp/PgDn: scroll".to_string()
+        // An active notice outranks the link legend for its short lifetime;
+        // otherwise reading feedback is invisible in the document viewer
+        // (review B3).
+        match app.footer_notice_text() {
+            Some(notice) => format!(" {notice}"),
+            None => " ↑↓/Tab: select link  Enter: open  Backspace/Esc: back  PgUp/PgDn: scroll"
+                .to_string(),
+        }
     } else if app.detail_view_entry.is_some() {
         " ↑↓/scroll  PgUp/PgDn/scroll  g/G top/bot  ESC/back".to_string()
     } else if let Some(notice) = app.footer_notice_text() {

@@ -7,6 +7,8 @@
 use super::*;
 
 mod action_notices;
+#[path = "composer_browsing_tests.rs"]
+mod composer_browsing_tests;
 mod footer_notices;
 mod seq_assignment;
 

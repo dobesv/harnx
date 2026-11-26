@@ -4,8 +4,8 @@ use crate::terminal::{cleanup_terminal_state, reenter_terminal_modes, PanicTermi
 use crate::tool_confirmation::ToolConfirmationReply;
 use crate::types::Tui;
 use crate::types::{
-    App, ModalState, PendingMessage, ToolConfirmationEvent, TranscriptItem, TuiEvent,
-    SPINNER_FRAMES, TICK_RATE,
+    App, InteractionFocus, ModalState, PendingMessage, ToolConfirmationEvent, TranscriptItem,
+    TuiEvent, SPINNER_FRAMES, TICK_RATE,
 };
 use anyhow::Result;
 #[cfg(test)]
@@ -106,6 +106,7 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
     (items.len(), bytes)
 }
 
+// qual:allow(complexity, max_function_lines=63) reason: "the App field list grows one line per frontend concern (interaction focus here)"
 fn build_initial_app(
     config: &GlobalConfig,
     initial_transcript: Vec<TranscriptItem>,
@@ -169,6 +170,7 @@ fn build_initial_app(
         use_utc_timestamps: false,
         monitored_sessions: HashMap::new(),
         subagent_view_stack: Vec::new(),
+        interaction_focus: InteractionFocus::Tray,
     })
 }
 
