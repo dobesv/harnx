@@ -890,7 +890,7 @@ Holding either `prompt` or `admin` makes the agent visible in agent listings and
 When access rules are enabled:
 
 - **Missing caller identity**: HTTP `401 Unauthorized` (JSON error payload `{ "error": { "message": "missing user identity", ... } }` in `harnx-serve`, or JSON-RPC code `-32000` in A2A).
-- **Hidden agent**: An agent on which the caller holds no scopes returns HTTP `404 Not Found` (or JSON-RPC `-32001` `task not found` in A2A). The response is identical to an unknown agent, preventing enumeration.
+- **Hidden agent**: An agent on which the caller holds no scopes returns HTTP `404 Not Found` (or JSON-RPC `-32001` `task not found` in A2A). The response is identical to an unknown agent, preventing enumeration. In `harnx-serve`, both hidden and unknown agents answer with the same HTTP error body, which carries `"code": "agent_not_found"` as a stable machine-readable discriminator; other errors, including other 404s, have no `code`, and JSON-RPC responses keep their numeric codes.
 - **Foreign or forbidden session**: Accessing a session owned by another user without `admin` scope returns HTTP `404 Not Found` (or JSON-RPC `-32001`).
 - **Session creation without `prompt`**: Attempting to create a session with only `admin` scope returns HTTP `403 Forbidden` (`session creation requires prompt scope`) in `harnx-serve`, or JSON-RPC code `-32010` in `harnx-a2a-server`.
 - **Client-chosen session IDs in harnx-serve**: Callers with `prompt` scope can create a session with a client-chosen ID by sending a first prompt to `POST /v1/agents/{agent}/sessions/{session}`, or reserve a server-generated short ID via `POST /v1/agents/{agent}/sessions`:

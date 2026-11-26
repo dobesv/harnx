@@ -81,6 +81,8 @@ fn validate_agent_reference(config: &Config, agent_ref: &str) -> Result<(), AgUi
     }
 }
 
+/// Missing or access-hidden agent. Hidden and unknown agents must answer
+/// identically, so every construction goes through this one helper.
 pub(crate) fn agent_not_found(agent_ref: &str) -> AgUiError {
-    AgUiError::NotFound(format!("agent '{agent_ref}' not found"))
+    AgUiError::AgentNotFound(format!("agent '{agent_ref}' not found"))
 }

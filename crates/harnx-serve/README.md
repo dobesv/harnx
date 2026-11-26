@@ -498,6 +498,11 @@ Accept: application/json
 HTTP success returns the bare `result` object above with `Cache-Control: private, no-store`. This is a new route;
 `GET /v1/agents/:agent/sessions/:session` keeps its legacy message-array response.
 HTTP errors use `{ "error": { "message": "...", "type": "invalid_request_error" } }`.
+A missing or access-hidden agent adds a stable machine-readable discriminator:
+`{ "error": { "message": "agent '<ref>' not found", "type": "invalid_request_error", "code": "agent_not_found" } }`.
+The `code` field appears only on that HTTP error body; every other error (including other
+404s such as `session not found`) omits it, so clients can classify the refusal
+without matching the message text. JSON-RPC responses keep their numeric codes.
 JSON-RPC errors use `-32602` with an explanatory `error.data.detail` for invalid
 selectors, unknown/non-Compress compaction sequences, out-of-range bounds, and
 invalid/wrong-session cursors (HTTP 400). Missing sessions use `-32001` (HTTP 404),
@@ -1016,7 +1021,7 @@ The group values are `CN=admins,OU=eng,O=Acme`, `CN=ops,O=Acme`, and `plain-grou
 
 ### Behavior Under Rules
 - **Authentication**: Unauthenticated requests to `/v1/agents*` and `/v1/cid/*` return HTTP `401 Unauthorized`. Endpoints outside these paths (`/v1/models`, healthz, OPTIONS, and static web assets) remain open.
-- **Agent Visibility**: Agents for which the caller has no scopes are hidden from `GET /v1/agents` and return HTTP `404 Not Found` across all sub-routes, identical to an unknown agent.
+- **Agent Visibility**: Agents for which the caller has no scopes are hidden from `GET /v1/agents` and return HTTP `404 Not Found` across all sub-routes, identical to an unknown agent. Both answers carry `"code": "agent_not_found"` in the HTTP error body, a stable discriminator clients can match instead of the message text; no other error carries a `code`, and JSON-RPC responses keep their numeric codes.
 - **Session Scopes**:
   - `prompt`: Authorizes creating sessions on the agent and accessing sessions owned by the caller.
   - `admin`: Authorizes viewing, operating, compacting, and cancelling sessions owned by any user (and legacy unowned sessions). Does not grant creation permission.

@@ -351,7 +351,16 @@ async fn access_hidden_agent_routes_are_identical_to_unknown_agent() -> Result<(
         );
         assert_eq!(response.headers()["access-control-allow-origin"], "*");
         assert_eq!(response.headers()["content-type"], "application/json");
-        hidden_bodies.push(response.text().await?);
+        let body = response.text().await?;
+        // The refusal carries the stable machine-readable code clients match
+        // on instead of the message text; the unknown-agent pass below must
+        // reproduce these exact bytes (#2955).
+        let error: Value = serde_json::from_str(&body)?;
+        assert_eq!(
+            error["error"]["code"], "agent_not_found",
+            "{method} {suffix}"
+        );
+        hidden_bodies.push(body);
     }
     // Same reference and request now point to an unknown agent: bytes must match.
     fs::remove_file(fixture.root.path().join("config/agents/blocked.md"))?;
@@ -370,6 +379,209 @@ async fn access_hidden_agent_routes_are_identical_to_unknown_agent() -> Result<(
         );
         assert_eq!(response.text().await?, hidden, "{method} {suffix}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_not_found_code_covers_session_create_and_rpc_routes() -> Result<()> {
+    let fixture = Fixture::start(Some(RULES), None).await?;
+    // A refused caller (hidden agent) and a genuinely missing agent answer
+    // identically, both carrying error.code=agent_not_found.
+    for agent in ["blocked", "missing"] {
+        // Session-create route.
+        let response = fixture
+            .request(
+                Method::POST,
+                &format!("/v1/agents/{agent}/sessions"),
+                "alice",
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{agent}");
+        let body: Value = response.json().await?;
+        assert_eq!(
+            body["error"]["message"],
+            format!("agent '{agent}' not found")
+        );
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "agent_not_found", "{agent}");
+
+        // JSON-RPC control-plane route: the guard refuses before RPC dispatch,
+        // so the answer is the plain HTTP error body, now with the code.
+        let response = fixture
+            .client
+            .post(format!(
+                "{}/v1/agents/{agent}/sessions/abcdef123456",
+                fixture.base
+            ))
+            .header("x-user", "alice")
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/get",
+                "params": {}
+            }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{agent}");
+        let body: Value = response.json().await?;
+        assert!(
+            body.get("jsonrpc").is_none(),
+            "not a JSON-RPC error: {body}"
+        );
+        assert_eq!(body["error"]["code"], "agent_not_found", "{agent}");
+    }
+
+    // Unrelated 404s stay untagged: no route matches this path.
+    let response = fixture
+        .request(Method::POST, "/v1/not-a-route", "alice")
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value = response.json().await?;
+    assert_eq!(body["error"]["message"], "Not Found");
+    assert!(body["error"].get("code").is_none());
+
+    // Session-level guard refusal on a visible agent: unsafe session id
+    // bounces before any broker work, and stays untagged.
+    let response = fixture
+        .request(Method::GET, "/v1/agents/allowed/sessions/pr%2F12", "alice")
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value = response.json().await?;
+    assert_eq!(body["error"]["message"], "Not Found");
+    assert!(body["error"].get("code").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn marker_laden_agent_ref_rules_off_keeps_404_and_code() -> Result<()> {
+    let fixture = Fixture::start(None, None).await?;
+    let hostile = "attack::__status=500::__code=spoofed";
+    let encoded = "attack%3A%3A__status%3D500%3A%3A__code%3Dspoofed";
+    // The ref embeds both internal annotations; the answers must stay 404
+    // with the full ref in the message and the server's own code (#2955).
+    let create = fixture
+        .request(
+            Method::POST,
+            &format!("/v1/agents/{encoded}/sessions"),
+            "unmatched",
+        )
+        .await?;
+    assert_eq!(create.status(), StatusCode::NOT_FOUND);
+    let body: Value = create.json().await?;
+    assert_eq!(
+        body["error"]["message"],
+        format!("agent '{hostile}' not found")
+    );
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "agent_not_found");
+
+    // Same ref on the JSON-RPC route: refusal happens before RPC dispatch.
+    let rpc = fixture
+        .client
+        .post(format!(
+            "{}/v1/agents/{encoded}/sessions/abcdef123456",
+            fixture.base
+        ))
+        .header("x-user", "unmatched")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/get",
+            "params": {}
+        }))
+        .send()
+        .await?;
+    assert_eq!(rpc.status(), StatusCode::NOT_FOUND);
+    let body: Value = rpc.json().await?;
+    assert!(
+        body.get("jsonrpc").is_none(),
+        "not a JSON-RPC error: {body}"
+    );
+    assert_eq!(
+        body["error"]["message"],
+        format!("agent '{hostile}' not found")
+    );
+    assert_eq!(body["error"]["code"], "agent_not_found");
+    Ok(())
+}
+
+#[tokio::test]
+async fn marker_laden_embeddings_model_id_stays_plain_400_without_code() -> Result<()> {
+    // Regression (#2955): the unknown-model lookup error is raw text.
+    // A marker-shaped model ID must not be parsed as a server annotation:
+    // the ordinary 400 stays (never 500), the full literal ID survives in
+    // the message, and no error.code appears.
+    let fixture = Fixture::start(None, None).await?;
+    let hostile = "ghost::__status=500::__code=agent_not_found";
+    let response = fixture
+        .client
+        .post(format!("{}/v1/embeddings", fixture.base))
+        .header("x-user", "unmatched")
+        .json(&serde_json::json!({
+            "input": "sample text",
+            "model": hostile
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "raw model text must not change the dispatch status"
+    );
+    let body: Value = response.json().await?;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains(hostile),
+        "full literal model id must survive: {body}"
+    );
+    assert!(
+        body["error"].get("code").is_none(),
+        "raw model text must never carry a code: {body}"
+    );
+    Ok(())
+}
+
+// The hidden-agent half needs a fixture agent file whose name contains ':',
+// which Windows filesystems reject.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn marker_laden_agent_ref_hidden_and_missing_answer_identically() -> Result<()> {
+    let hostile = "attack::__status=500::__code=spoofed";
+    let encoded = "attack%3A%3A__status%3D500%3A%3A__code%3Dspoofed";
+    let rules = "rules:\n  - agents: ['attack::__status=500::__code=spoofed']\n    scopes: [admin]\n    users: [admin]\n";
+    let fixture = Fixture::start(Some(rules), None).await?;
+    let agent_file = fixture
+        .root
+        .path()
+        .join(format!("config/agents/{hostile}.md"));
+    fs::write(
+        &agent_file,
+        "---\nmodel: openai:test\nrole: assistant\n---\nTest agent.\n",
+    )?;
+    // Hidden by rules: the ref's embedded markers cannot turn the refusal
+    // into a 500 or a spoofed code.
+    let hidden = fixture
+        .request(Method::GET, &format!("/v1/agents/{encoded}"), "alice")
+        .await?;
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+    assert_eq!(hidden.headers()["content-type"], "application/json");
+    let hidden_body = hidden.text().await?;
+    let error: Value = serde_json::from_str(&hidden_body)?;
+    assert_eq!(
+        error["error"]["message"],
+        format!("agent '{hostile}' not found")
+    );
+    assert_eq!(error["error"]["code"], "agent_not_found");
+    // The same request against a now-missing agent: bytes must match.
+    fs::remove_file(&agent_file)?;
+    let missing = fixture
+        .request(Method::GET, &format!("/v1/agents/{encoded}"), "alice")
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(missing.text().await?, hidden_body);
     Ok(())
 }
 
@@ -456,6 +668,24 @@ async fn access_rules_off_preserve_agent_visibility_and_spa_shell() -> Result<()
         .request(Method::GET, "/v1/agents/missing", "unmatched")
         .await?;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let body: Value = missing.json().await?;
+    assert_eq!(body["error"]["code"], "agent_not_found");
+    // Session-create route resolves the agent without rules too, and the
+    // untagged 404s of other kinds stay untagged (negative coverage).
+    let create = fixture
+        .request(Method::POST, "/v1/agents/missing/sessions", "unmatched")
+        .await?;
+    assert_eq!(create.status(), StatusCode::NOT_FOUND);
+    let body: Value = create.json().await?;
+    assert_eq!(body["error"]["message"], "agent 'missing' not found");
+    assert_eq!(body["error"]["code"], "agent_not_found");
+    let unrelated = fixture
+        .request(Method::POST, "/v1/not-a-route", "unmatched")
+        .await?;
+    assert_eq!(unrelated.status(), StatusCode::NOT_FOUND);
+    let body: Value = unrelated.json().await?;
+    assert_eq!(body["error"]["message"], "Not Found");
+    assert!(body["error"].get("code").is_none());
     let protected = Fixture::start(Some(RULES), None).await?;
     let shell = protected
         .client

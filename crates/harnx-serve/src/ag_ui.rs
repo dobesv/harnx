@@ -211,6 +211,10 @@ impl tokio_stream::Stream for GuardedEventStream {
 pub enum AgUiError {
     BadRequest(String),
     NotFound(String),
+    /// The agent does not exist, or access rules hide it from the caller.
+    /// Same HTTP shape as `NotFound`, plus a stable `error.code` so clients
+    /// can classify the refusal without matching the message text (#2955).
+    AgentNotFound(String),
     Conflict(String),
     Internal(String),
 }
@@ -219,18 +223,32 @@ impl AgUiError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::NotFound(_) | Self::AgentNotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    /// Stable machine-readable discriminator rendered as `error.code`, or
+    /// `None` for errors that carry no code.
+    pub fn error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::AgentNotFound(_) => Some(AGENT_NOT_FOUND_ERROR_CODE),
+            Self::BadRequest(_) | Self::NotFound(_) | Self::Conflict(_) | Self::Internal(_) => None,
+        }
+    }
 }
+
+/// `error.code` for a missing or access-hidden agent. Hidden and unknown
+/// agents must keep identical responses, so both share this code.
+pub const AGENT_NOT_FOUND_ERROR_CODE: &str = "agent_not_found";
 
 impl std::fmt::Display for AgUiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadRequest(msg)
             | Self::NotFound(msg)
+            | Self::AgentNotFound(msg)
             | Self::Conflict(msg)
             | Self::Internal(msg) => f.write_str(msg),
         }

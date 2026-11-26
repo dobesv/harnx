@@ -1454,7 +1454,7 @@ async fn resolve_agent_returns_not_found_for_unknown_agent() {
         .expect_err("missing agent should fail");
     assert_eq!(
         err,
-        AgUiError::NotFound("agent 'missing-agent' not found".to_string())
+        AgUiError::AgentNotFound("agent 'missing-agent' not found".to_string())
     );
 }
 
@@ -1521,7 +1521,7 @@ async fn resolve_agent_rejects_unsafe_bare_names_and_accepts_safe_local_and_remo
             .expect_err("unsafe bare agent name must not resolve");
         assert_eq!(
             error,
-            AgUiError::NotFound(format!("agent '{agent_ref}' not found"))
+            AgUiError::AgentNotFound(format!("agent '{agent_ref}' not found"))
         );
     }
 
