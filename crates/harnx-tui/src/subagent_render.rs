@@ -428,23 +428,14 @@ impl Tui {
                 spinner_index: options.spinner_index,
             },
         );
-        let entries = render_child_entries(
-            &mut state.transcript,
-            ChildEntryRender {
-                focus: state.transcript_focus,
-                streaming_open: state.streaming_open,
-                width: chunks[1].width,
-                options,
-                theme,
-            },
-        );
-        scroll_focused_child_into_view(state, chunks[1]);
-        state.scroll.render(frame, chunks[1], &entries, |entry| {
-            (entry.total_height as usize, entry.clone())
-        });
-        if !state.scroll.follow {
-            state.scroll.position = state.scroll.position.min(state.scroll.last_max_position);
-        }
+        let render = ChildEntryRender {
+            focus: state.transcript_focus,
+            streaming_open: state.streaming_open,
+            width: chunks[1].width,
+            options,
+            theme,
+        };
+        render_child_body(state, frame, chunks[1], render);
         let can_stop = matches!(
             view.status,
             SubAgentStatus::Running | SubAgentStatus::Unconfirmed
@@ -452,7 +443,24 @@ impl Tui {
             .progress
             .as_ref()
             .is_some_and(|p| state.execution_id.as_deref() == Some(&p.snapshot.invocation_id));
-        render_child_footer(frame, chunks[2], can_stop);
+        let footer_notice = self.app.footer_notice_text().map(str::to_string);
+        render_child_footer(frame, chunks[2], can_stop, footer_notice.as_deref());
+    }
+}
+
+fn render_child_body(
+    state: &mut MonitoredSessionState,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    render: ChildEntryRender<'_>,
+) {
+    let entries = render_child_entries(&mut state.transcript, render);
+    scroll_focused_child_into_view(state, area);
+    state.scroll.render(frame, area, &entries, |entry| {
+        (entry.total_height as usize, entry.clone())
+    });
+    if !state.scroll.follow {
+        state.scroll.position = state.scroll.position.min(state.scroll.last_max_position);
     }
 }
 
@@ -471,13 +479,19 @@ fn scroll_focused_child_into_view(state: &mut MonitoredSessionState, area: Rect)
     state.scroll_to_focused_item = false;
 }
 
-fn render_child_footer(frame: &mut Frame<'_>, area: Rect, can_stop: bool) {
-    let stop = if can_stop { "  Ctrl+C/Stop" } else { "" };
+/// Child-view footer. An active notice (refusal, paste consumed, no-target)
+/// outranks the legend for its short lifetime; otherwise feedback would be
+/// invisible in the child view (review B3).
+fn render_child_footer(frame: &mut Frame<'_>, area: Rect, can_stop: bool, notice: Option<&str>) {
+    let footer = match notice {
+        Some(notice) => format!(" {notice}"),
+        None => {
+            let stop = if can_stop { "  Ctrl+C/Stop" } else { "" };
+            format!(" ↑↓/browse  ENTER/open  PgUp/PgDn/scroll  g/G top/bot  ESC/back{stop}")
+        }
+    };
     frame.render_widget(
-        Paragraph::new(format!(
-            " ↑↓/browse  ENTER/open  PgUp/PgDn/scroll  g/G top/bot  ESC/back{stop}"
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         area,
     );
 }

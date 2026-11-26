@@ -9,6 +9,8 @@ impl Tui {
     pub(crate) fn render_archive_view(&mut self, frame: &mut Frame<'_>, size: Rect) {
         frame.render_widget(Clear, size);
         let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(size);
+        // Captured before the mutable archive borrow below.
+        let footer_notice = self.app.footer_notice_text().map(str::to_string);
         let browser = self.app.archive_browser.as_mut().expect("archive browser");
         let depth = browser.views.len();
         let view = browser.views.last_mut().expect("archive view");
@@ -38,10 +40,19 @@ impl Tui {
         } else {
             ""
         };
-        let footer = format!(
-            " Earlier history before compaction {} (level {depth}, read-only)\n ↑↓/browse{earlier_hint}  PgUp/PgDn/scroll  ESC/back",
-            view.before,
-        );
+        // An active notice outranks the hint line for its short lifetime;
+        // otherwise reading feedback is invisible in the archive view
+        // (review B3).
+        let footer = match footer_notice.as_deref() {
+            Some(notice) => format!(
+                " Earlier history before compaction {} (level {depth}, read-only)\n {notice}",
+                view.before,
+            ),
+            None => format!(
+                " Earlier history before compaction {} (level {depth}, read-only)\n ↑↓/browse{earlier_hint}  PgUp/PgDn/scroll  ESC/back",
+                view.before,
+            ),
+        };
         frame.render_widget(Paragraph::new(footer), chunks[1]);
     }
 }

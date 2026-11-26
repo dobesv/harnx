@@ -243,6 +243,13 @@ fn render_text_with_cursor(spans: &mut Vec<Span<'static>>, text: &str, cursor: u
     }
 }
 
-pub(super) fn footer_help(interrupt: &str) -> String {
-    format!("Tab navigate · Space select · Enter activate · Ctrl+D deny · Ctrl+C {interrupt}")
+pub(super) fn footer_help(interrupt: &str, guard_remaining: Option<f32>) -> String {
+    match guard_remaining {
+        Some(secs) => {
+            format!("Enter/Ctrl+D unlock in {secs:.1}s of quiet keys · Ctrl+C {interrupt}")
+        }
+        None => format!(
+            "Tab navigate · Space select · Enter activate · Ctrl+D deny · Ctrl+C {interrupt}"
+        ),
+    }
 }

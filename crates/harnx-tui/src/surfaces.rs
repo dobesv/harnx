@@ -300,7 +300,13 @@ impl Tui {
         else {
             return false;
         };
-        let surface_id = surface_id.clone();
+        // End the transcript borrow before the refusal guard mutates self.
+        let (surface_id, resolved) = (surface_id.clone(), resolved.clone());
+        if self.refuse_when_pending_interaction() {
+            // Opening another surface while a confirmation is pending; the
+            // pending tray is not a dismissible dialog (plan decision 6).
+            return true;
+        }
         if let Some(resolved) = resolved {
             self.app.show_footer_notice(&format!(
                 "Surface already answered: {resolved}. Surfaces are first-wins."

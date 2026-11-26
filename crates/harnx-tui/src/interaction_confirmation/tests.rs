@@ -3,6 +3,7 @@ use super::*;
 use harnx_core::session::SessionLogEntry;
 use serde_json::json;
 mod a2ui;
+mod read_view;
 mod ui;
 
 fn request(seq: u64, id: &str, kind: &str) -> (u64, SessionLogEntry) {

@@ -1,15 +1,12 @@
+//! Rendering of the interaction tray: modal geometry and body lines.
+
 use super::{footer::interaction_footer, InteractionModal, Tui};
-use crate::tool_confirmation::TOOL_CONFIRM_IDLE_GATE;
-use crate::types::ModalState;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
-use std::time::Instant;
 
-const SCROLL_PAGE_LINES: u16 = 10;
 const NOTE_HEIGHT: u16 = 3;
 const BORDERS_HEIGHT: usize = 2;
 pub(crate) const MIN_MODAL_HEIGHT: u16 = 6;
@@ -17,137 +14,16 @@ const A2UI_BODY_COLUMNS: u16 = 80;
 
 // qual:allow(coupling, oi) reason: "Rendering and key handling extend the shared TUI, following the existing per-concern modules."
 impl Tui {
-    pub(crate) fn paste_interaction_note(&mut self, text: &str) -> bool {
-        let Some(ModalState::ConfirmInteraction(state)) = self.app.modal.as_mut() else {
-            return false;
-        };
-        insert_pasted_text(state, text);
-        true
-    }
-
-    pub(crate) async fn handle_interaction_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-            if self.interrupt_child_confirmation() {
-                return;
-            }
-            self.clear_interaction_modal();
-            // The durable observer can beat the activity monitor on attach.
-            self.active_remote_session = self.interactions.target.clone();
-            self.handle_ctrl_c().await;
-            return;
-        }
-        let Some(ModalState::ConfirmInteraction(state)) = self.app.modal.as_mut() else {
-            return;
-        };
-        if state.submitting {
-            return;
-        }
-        let now = Instant::now();
-        if state.a2ui.is_some() {
-            self.handle_a2ui_interaction_key(key, now);
-        } else {
-            self.handle_confirm_interaction_key(key, now);
-        }
-    }
-
-    fn handle_a2ui_interaction_key(&mut self, key: KeyEvent, now: Instant) {
-        let Some(ModalState::ConfirmInteraction(state)) = self.app.modal.as_mut() else {
-            return;
-        };
-        let Some(form) = &mut state.a2ui else {
-            return;
-        };
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                self.submit_a2ui_interaction("deny".into());
-                return;
-            }
-            (KeyCode::Tab, KeyModifiers::NONE) => {
-                state.last_key_at = now;
-                form.focus_next();
-                return;
-            }
-            (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
-                state.last_key_at = now;
-                form.focus_prev();
-                return;
-            }
-            (KeyCode::PageUp, _) => {
-                state.scroll = state.scroll.saturating_sub(SCROLL_PAGE_LINES);
-                return;
-            }
-            (KeyCode::PageDown, _) => {
-                state.scroll = state.scroll.saturating_add(SCROLL_PAGE_LINES);
-                return;
-            }
-            _ => {}
-        }
-
-        if form.focus == super::a2ui::FocusTarget::Note {
-            self.handle_a2ui_note_key(key, now);
-            return;
-        }
-
-        state.last_key_at = now;
-        if let Some(super::a2ui::A2UIAction::Submit(name)) = form.handle_key(key) {
-            self.submit_a2ui_interaction(name);
-        }
-    }
-
-    fn handle_a2ui_note_key(&mut self, key: KeyEvent, now: Instant) {
-        let Some(ModalState::ConfirmInteraction(state)) = self.app.modal.as_mut() else {
-            return;
-        };
-        let primary = state.a2ui.as_ref().and_then(|f| f.primary_action());
-        match (key.code, key.modifiers) {
-            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT)
-            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                state.last_key_at = now;
-                state.note.insert_newline();
-            }
-            (KeyCode::Enter, KeyModifiers::NONE) => {
-                if let Some(action) = primary {
-                    self.submit_a2ui_interaction(action);
-                }
-            }
-            _ => {
-                state.last_key_at = now;
-                state.note.input(key);
-            }
-        }
-    }
-
-    fn handle_confirm_interaction_key(&mut self, key: KeyEvent, now: Instant) {
-        let Some(ModalState::ConfirmInteraction(state)) = self.app.modal.as_mut() else {
-            return;
-        };
-        match (key.code, key.modifiers) {
-            (KeyCode::Enter, KeyModifiers::NONE) => {
-                if now.saturating_duration_since(state.last_key_at) >= TOOL_CONFIRM_IDLE_GATE {
-                    self.submit_interaction(true);
-                }
-            }
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => self.submit_interaction(false),
-            (KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT)
-            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                state.last_key_at = now;
-                state.note.insert_newline();
-            }
-            (KeyCode::PageUp, _) => state.scroll = state.scroll.saturating_sub(SCROLL_PAGE_LINES),
-            (KeyCode::PageDown, _) => state.scroll = state.scroll.saturating_add(SCROLL_PAGE_LINES),
-            _ => {
-                state.last_key_at = now;
-                state.note.input(key);
-            }
-        }
-    }
-
     pub(crate) fn interaction_modal_height(&self, width: u16, state: &InteractionModal) -> u16 {
         let body = interaction_body(state);
         let height = Paragraph::new(body)
             .wrap(Wrap { trim: false })
             .line_count(width.saturating_sub(2).max(1));
-        let footer = interaction_footer(state, self.interactions.read_error.as_deref());
+        let footer = interaction_footer(
+            state,
+            self.interactions.read_error.as_deref(),
+            self.app.footer_notice_text(),
+        );
         let footer_height = Paragraph::new(footer)
             .wrap(Wrap { trim: false })
             .line_count(width.saturating_sub(2).max(1));
@@ -186,7 +62,12 @@ impl Tui {
             inner,
             super::ModalBodyParts {
                 body: interaction_body(state),
-                footer: interaction_footer(state, self.interactions.read_error.as_deref()).into(),
+                footer: interaction_footer(
+                    state,
+                    self.interactions.read_error.as_deref(),
+                    self.app.footer_notice_text(),
+                )
+                .into(),
                 note_height: if is_url { 0 } else { NOTE_HEIGHT },
             },
             &mut state.scroll,
@@ -204,20 +85,6 @@ impl Tui {
                 "Note (optional)",
             );
         }
-    }
-}
-
-fn insert_pasted_text(state: &mut InteractionModal, text: &str) {
-    if state.submitting {
-        return;
-    }
-    state.last_key_at = Instant::now();
-    let pasted_into_form = state
-        .a2ui
-        .as_mut()
-        .is_some_and(|form| form.paste_text(text));
-    if !pasted_into_form {
-        state.note.insert_str(text);
     }
 }
 

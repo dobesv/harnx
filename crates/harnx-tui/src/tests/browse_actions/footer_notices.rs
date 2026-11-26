@@ -37,6 +37,8 @@ async fn navigation_keys_clear_footer_notice() {
     // (CodeRabbit review of PR #2622 flagged the scroll keys).
     let browse_keys = [
         (KeyCode::Up, KeyModifiers::NONE),
+        (KeyCode::PageUp, KeyModifiers::NONE),
+        (KeyCode::PageDown, KeyModifiers::NONE),
         (KeyCode::Esc, KeyModifiers::NONE),
         (KeyCode::Char('g'), KeyModifiers::NONE),
         (KeyCode::Char('G'), KeyModifiers::NONE),
