@@ -1,4 +1,7 @@
-use super::{ParentLink, SessionAgentSource, SessionOverrides, SessionProperties, ToolContext};
+use super::{
+    ParentLink, SessionAgentSource, SessionMetadataPatch, SessionOverrides, SessionProperties,
+    ToolContext,
+};
 use anyhow::Result;
 use harnx_core::agent_config::AgentVariables;
 use harnx_core::cid_url::SessionRef;
@@ -15,8 +18,13 @@ pub struct SessionInitializer {
     /// Set when this session is being created as a sub-agent child, so its
     /// metadata records the parent invocation that created it.
     pub parent: Option<ParentLink>,
+    /// Metadata a client supplied with the session-creation request, applied
+    /// to the initial canonical record before it is first persisted. The
+    /// initializer is not serialized, so this never reaches the wire schema.
+    pub metadata_patch: Option<SessionMetadataPatch>,
 }
 
+// qual:allow(dry, boilerplate) reason: "Set-and-return builders are the established pattern for SessionInitializer; adding a builder-derive dependency for three trivial setters costs more than the pattern."
 impl SessionInitializer {
     pub fn session_key(&self, session_id: &str) -> String {
         harnx_core::session_identity::session_key(self.agent_name(), session_id)
@@ -39,6 +47,7 @@ impl SessionInitializer {
             tool_context: ToolContext::default(),
             properties: SessionProperties::default(),
             parent: None,
+            metadata_patch: None,
         }
     }
 
@@ -56,7 +65,19 @@ impl SessionInitializer {
             tool_context: ToolContext::default(),
             properties: SessionProperties::default(),
             parent: None,
+            metadata_patch: None,
         }
+    }
+
+    /// Supply the metadata this session is created with, applied to the initial
+    /// canonical record before it is first persisted. Field semantics match a
+    /// metadata PATCH: supplied variables and overrides replace the
+    /// initializer-derived values, omitted fields keep them, and a title is
+    /// stored trimmed with `manual` honored only when it is nonempty.
+    #[must_use]
+    pub fn with_metadata_patch(mut self, patch: SessionMetadataPatch) -> Self {
+        self.metadata_patch = Some(patch);
+        self
     }
 
     #[must_use]

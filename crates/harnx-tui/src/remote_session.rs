@@ -115,6 +115,9 @@ async fn target_initializer(
         tool_context: harnx_runtime::nats_session_metadata::tool_context(&metadata)?,
         properties: Default::default(),
         parent: metadata.parent.clone(),
+        // The target already exists; creation metadata was applied when its
+        // record was first written, so a reload adds no new patch.
+        metadata_patch: None,
     };
     Ok((metadata.session_id, initializer))
 }

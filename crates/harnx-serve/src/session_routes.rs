@@ -171,15 +171,19 @@ impl Server {
         }
     }
 
-    pub(super) async fn handle_sessions_route(
+    pub(super) async fn handle_sessions_route<B>(
         &self,
-        method: &Method,
-        headers: &HeaderMap,
+        req: hyper::Request<B>,
         context: SessionsRouteContext<'_>,
-    ) -> Result<AppResponse> {
-        match negotiate_agents_route(method, headers, AgentsRoute::Sessions)? {
-            AgentsRepresentation::Json if *method == Method::POST => {
+    ) -> Result<AppResponse>
+    where
+        B: Body<Data = Bytes> + Send + Unpin,
+        B::Error: std::fmt::Display,
+    {
+        match negotiate_agents_route(req.method(), req.headers(), AgentsRoute::Sessions)? {
+            AgentsRepresentation::Json if *req.method() == Method::POST => {
                 self.create_session_json(
+                    req,
                     context.target,
                     context.scoped,
                     context.user_id.map(str::to_string),
@@ -215,13 +219,39 @@ impl Server {
         }
     }
 
-    async fn create_session_json(
+    /// Reserve a new session ID. The request body is optional: zero bytes
+    /// reserve with configured defaults, anything else must deserialize as a
+    /// `SessionMetadataPatch` and is applied to the initial canonical record
+    /// before it is first persisted — never as a follow-up mutation after the
+    /// reservation. Parsing runs before the broker is touched, so invalid
+    /// bodies are rejected (400) without reserving, and cannot become local
+    /// reservation retries that run into the reservation timeout.
+    async fn create_session_json<B>(
         &self,
+        req: hyper::Request<B>,
         target: &crate::session_actor::ResolvedAgentTarget,
         scoped: &harnx_runtime::config::GlobalConfig,
         user_id: Option<String>,
         user_principals: Option<harnx_core::user_principals::UserPrincipals>,
-    ) -> Result<AppResponse> {
+    ) -> Result<AppResponse>
+    where
+        B: Body<Data = Bytes> + Send + Unpin,
+        B::Error: std::fmt::Display,
+    {
+        let Some(body) = collect_metadata_request_body(req, "session creation metadata").await?
+        else {
+            return metadata_payload_too_large();
+        };
+        let patch = if body.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice::<harnx_runtime::nats_session_metadata::SessionMetadataPatch>(
+                    &body,
+                )
+                .context("invalid session metadata patch")?,
+            )
+        };
         ensure_frontend_nats_owner(target.cluster()).await?;
         let mut initializer = harnx_runtime::SessionInitializer::from_config(&scoped.read())?;
         if let Some(user_id) = user_id {
@@ -229,6 +259,9 @@ impl Server {
         }
         if let Some(principals) = user_principals {
             initializer = initializer.with_user_principals(&principals);
+        }
+        if let Some(patch) = patch {
+            initializer = initializer.with_metadata_patch(patch);
         }
         let session_id =
             Config::reserve_new_session_id_with_initializer(scoped, initializer).await?;
@@ -580,7 +613,16 @@ mod tests {
             .expect("resolve session creator");
 
         let response = server
-            .create_session_json(&target, &scoped, None, None)
+            .create_session_json(
+                hyper::Request::builder()
+                    .method(Method::POST)
+                    .body(Full::new(Bytes::new()))
+                    .expect("create session request"),
+                &target,
+                &scoped,
+                None,
+                None,
+            )
             .await
             .expect("create session response");
 
@@ -588,6 +630,358 @@ mod tests {
         assert!(response_json(response).await["session_id"]
             .as_str()
             .is_some_and(|session_id| !session_id.is_empty()));
+    }
+
+    fn creation_request(body: Bytes) -> hyper::Request<Full<Bytes>> {
+        hyper::Request::builder()
+            .method(Method::POST)
+            .body(Full::new(body))
+            .expect("session creation request")
+    }
+
+    async fn create_session(
+        server: &Server,
+        target: &crate::session_actor::ResolvedAgentTarget,
+        scoped: &harnx_runtime::config::GlobalConfig,
+        body: Bytes,
+    ) -> Result<AppResponse> {
+        server
+            .create_session_json(creation_request(body), target, scoped, None, None)
+            .await
+    }
+
+    async fn created_session_id(
+        server: &Server,
+        target: &crate::session_actor::ResolvedAgentTarget,
+        scoped: &harnx_runtime::config::GlobalConfig,
+        body: Bytes,
+    ) -> String {
+        let response = create_session(server, target, scoped, body)
+            .await
+            .expect("session creation response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response_json(response).await["session_id"]
+            .as_str()
+            .expect("reserved session id")
+            .to_string()
+    }
+
+    async fn stored_record(
+        store: &harnx_runtime::nats_session_metadata::SessionMetadataStore,
+        session_id: &str,
+        agent: &str,
+    ) -> harnx_runtime::nats_session_metadata::MetadataRecord {
+        store
+            .get_for_agent(session_id, agent)
+            .await
+            .expect("read stored metadata")
+            .expect("reserved metadata")
+    }
+
+    /// Broker-backed creation fixture: a sandboxed config with `agent`, a
+    /// server with the agent resolved, and the metadata store, so every
+    /// creation test sets up through one shared path.
+    struct CreationFixture {
+        _sandbox: TestConfigSandbox,
+        store: harnx_runtime::nats_session_metadata::SessionMetadataStore,
+        server: Server,
+        target: crate::session_actor::ResolvedAgentTarget,
+        scoped: harnx_runtime::config::GlobalConfig,
+    }
+
+    async fn creation_fixture(agent: &str, front_matter: &str) -> Option<CreationFixture> {
+        let sandbox = TestConfigSandbox::new();
+        if !crate::test_support::ensure_test_nats().await {
+            return None;
+        }
+        sandbox.write_agent_with_front_matter(agent, front_matter, "You create sessions.");
+        let config = sandbox.config();
+        let store = test_metadata_store(&config).await;
+        let global = Arc::new(ConfigLock::new(config));
+        let server = Server::new(&global, std::path::PathBuf::from("web-assets"));
+        let (target, scoped) = crate::resolve_agent_target(&server.config, agent)
+            .await
+            .expect("resolve creation agent");
+        Some(CreationFixture {
+            _sandbox: sandbox,
+            store,
+            server,
+            target,
+            scoped,
+        })
+    }
+
+    /// The issue's core regression: the creation body's fields must live in
+    /// the very first KV create, not in a follow-up PATCH after reservation.
+    /// The revision assertion fails any reserve-then-PATCH implementation.
+    #[tokio::test]
+    async fn create_session_json_persists_supplied_metadata_in_the_first_write() {
+        harnx_core::require_nextest();
+        let Some(f) = creation_fixture("session-creator", "model: openai:gpt-4o").await else {
+            return;
+        };
+        let server = &f.server;
+        let target = &f.target;
+        let scoped = &f.scoped;
+        let store = &f.store;
+
+        // No Content-Type header on purpose: creation bodies never require one.
+        let id = created_session_id(
+            server,
+            target,
+            scoped,
+            Bytes::from(
+                serde_json::json!({
+                    "title": {"value": "  Batch run  ", "manual": true},
+                    "variables": {"BATCH": "nightly"},
+                    "overrides": {"model": "test:reserved-model"}
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+
+        let record = stored_record(store, &id, "session-creator").await;
+        assert_eq!(
+            record.revision, 1,
+            "the creation patch must land in the initial KV create"
+        );
+        assert_eq!(record.metadata.title.value.as_deref(), Some("Batch run"));
+        assert!(record.metadata.title.manual);
+        assert_eq!(
+            record.metadata.variables.get("BATCH").map(String::as_str),
+            Some("nightly")
+        );
+        assert_eq!(
+            record.metadata.overrides.model.as_deref(),
+            Some("test:reserved-model")
+        );
+    }
+
+    /// Omitted fields keep the configured defaults; supplied ones replace
+    /// them wholesale, exactly like a metadata PATCH.
+    #[tokio::test]
+    async fn create_session_json_preserves_configured_defaults_and_replaces_supplied_fields() {
+        harnx_core::require_nextest();
+        let Some(f) = creation_fixture(
+            "session-defaults",
+            "model: openai:gpt-4o\nvariables:\n  - name: TEAM\n    description: Team color\n    default: red\n",
+        )
+        .await
+        else {
+            return;
+        };
+        let server = &f.server;
+        let target = &f.target;
+        let scoped = &f.scoped;
+        let store = &f.store;
+
+        // Title only: the configured variable survives, the title is stored
+        // with manual defaulting to false (a creation title is not implicitly
+        // manual), and the explicit overrides stay empty.
+        let id = created_session_id(
+            server,
+            target,
+            scoped,
+            Bytes::from(serde_json::json!({"title": {"value": "Auto"}}).to_string()),
+        )
+        .await;
+        let record = stored_record(store, &id, "session-defaults").await;
+        assert_eq!(record.metadata.title.value.as_deref(), Some("Auto"));
+        assert!(!record.metadata.title.manual);
+        assert_eq!(
+            record.metadata.variables.get("TEAM").map(String::as_str),
+            Some("red"),
+            "omitted variables must keep the agent's configured defaults"
+        );
+        assert_eq!(record.metadata.overrides, Default::default());
+
+        // Supplied variables replace the configured set wholesale.
+        let replaced = created_session_id(
+            server,
+            target,
+            scoped,
+            Bytes::from(serde_json::json!({"variables": {"BATCH": "nightly"}}).to_string()),
+        )
+        .await;
+        let record = stored_record(store, &replaced, "session-defaults").await;
+        assert_eq!(record.metadata.variables.len(), 1);
+        assert_eq!(
+            record.metadata.variables.get("BATCH").map(String::as_str),
+            Some("nightly")
+        );
+        assert!(
+            !record.metadata.variables.contains_key("TEAM"),
+            "supplied variables replace the configured set, they do not merge"
+        );
+    }
+
+    /// A bodyless POST and every accepted no-op patch shape reserve with the
+    /// configured defaults: zero bytes mean no patch at all, and the legacy
+    /// Serde sequence forms (`[]`, `{"overrides":[]}`) behave like `{}`.
+    #[tokio::test]
+    async fn create_session_json_accepts_bodyless_and_noop_patch_shapes() {
+        harnx_core::require_nextest();
+        let Some(f) = creation_fixture(
+            "session-defaults",
+            "model: openai:gpt-4o\nvariables:\n  - name: TEAM\n    description: Team color\n    default: red\n",
+        )
+        .await
+        else {
+            return;
+        };
+        let server = &f.server;
+        let target = &f.target;
+        let scoped = &f.scoped;
+        let store = &f.store;
+
+        for body in [
+            Bytes::new(),
+            Bytes::from_static(b"{}"),
+            Bytes::from_static(b"[]"),
+            Bytes::from_static(b"{\"overrides\":[]}"),
+        ] {
+            let id = created_session_id(server, target, scoped, body).await;
+            let record = stored_record(store, &id, "session-defaults").await;
+            assert_eq!(record.metadata.title, Default::default());
+            assert_eq!(
+                record.metadata.variables.get("TEAM").map(String::as_str),
+                Some("red")
+            );
+            assert_eq!(record.metadata.overrides, Default::default());
+        }
+    }
+
+    /// `manual` defaults to false, is honored only for nonempty titles, and a
+    /// blank title clears the record — the same normalization a PATCH applies.
+    #[tokio::test]
+    async fn create_session_json_title_semantics_match_the_metadata_patch() {
+        harnx_core::require_nextest();
+        let Some(f) = creation_fixture("session-creator", "model: openai:gpt-4o").await else {
+            return;
+        };
+        let server = &f.server;
+        let target = &f.target;
+        let scoped = &f.scoped;
+        let store = &f.store;
+
+        for (title, value, manual) in [
+            (
+                serde_json::json!({"value": "  Trimmed  "}),
+                Some("Trimmed"),
+                false,
+            ),
+            (
+                serde_json::json!({"value": "  Trimmed  ", "manual": false}),
+                Some("Trimmed"),
+                false,
+            ),
+            (
+                serde_json::json!({"value": "Manual", "manual": true}),
+                Some("Manual"),
+                true,
+            ),
+            (
+                serde_json::json!({"value": "   ", "manual": true}),
+                None,
+                false,
+            ),
+        ] {
+            let id = created_session_id(
+                server,
+                target,
+                scoped,
+                Bytes::from(serde_json::json!({"title": title}).to_string()),
+            )
+            .await;
+            let record = stored_record(store, &id, "session-creator").await;
+            assert_eq!(record.metadata.title.value.as_deref(), value);
+            assert_eq!(record.metadata.title.manual, manual);
+        }
+    }
+
+    /// Malformed and non-deserializable bodies are rejected with a 400 before
+    /// anything is reserved: identity fields and unknown keys are not
+    /// writable, and nothing reaches the broker's reservation path. A
+    /// reserve-first implementation would surface these as 15-second local
+    /// reservation timeouts instead of an immediate 400.
+    #[tokio::test]
+    async fn create_session_json_rejects_invalid_payloads_before_reserving() {
+        harnx_core::require_nextest();
+        let Some(f) = creation_fixture("session-creator", "model: openai:gpt-4o").await else {
+            return;
+        };
+        let server = &f.server;
+        let target = &f.target;
+        let scoped = &f.scoped;
+        let store = &f.store;
+
+        for body in [
+            "{",                                                // malformed JSON
+            "   ",                                              // whitespace-only
+            "null",                                             // JSON null
+            "5",                                                // primitive
+            "\"text\"",                                         // primitive string
+            "{\"session_id\": \"hijack\"}",                     // identity field
+            "{\"user_id\": \"attacker\", \"variables\": {}}",   // identity field
+            "{\"title\": {\"value\": \"x\", \"bogus\": true}}", // unknown nested field
+            "{\"unknown\": 1}",                                 // unknown top-level field
+        ] {
+            let error = create_session(server, target, scoped, Bytes::from(body))
+                .await
+                .expect_err(&format!("body '{body}' must be rejected"));
+            assert!(
+                error.to_string().contains("invalid session metadata patch"),
+                "body '{body}' rejected with: {error:#}"
+            );
+            assert_eq!(
+                crate::finalize_err_status(StatusCode::OK, &error),
+                StatusCode::BAD_REQUEST,
+                "body '{body}' must map to 400"
+            );
+        }
+        assert!(
+            store.list().await.expect("list sessions").is_empty(),
+            "rejected creation bodies must never reserve a session"
+        );
+    }
+
+    /// Oversized bodies keep the metadata limit: 413 either from the declared
+    /// Content-Length or from the bounded read, and nothing is reserved.
+    #[tokio::test]
+    async fn create_session_json_returns_payload_too_large_without_reserving() {
+        harnx_core::require_nextest();
+        let Some(f) = creation_fixture("session-creator", "model: openai:gpt-4o").await else {
+            return;
+        };
+        let server = &f.server;
+        let target = &f.target;
+        let scoped = &f.scoped;
+        let store = &f.store;
+
+        let declared = hyper::Request::builder()
+            .method(Method::POST)
+            .header(
+                http::header::CONTENT_LENGTH,
+                SESSION_METADATA_REQUEST_MAX_BYTES + 1,
+            )
+            .body(Full::new(Bytes::from_static(b"{}")))
+            .expect("oversized-header request");
+        let response = server
+            .create_session_json(declared, target, scoped, None, None)
+            .await
+            .expect("oversized-header response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let oversized = Bytes::from(vec![b'x'; SESSION_METADATA_REQUEST_MAX_BYTES + 1]);
+        let response = create_session(server, target, scoped, oversized)
+            .await
+            .expect("oversized-body response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            store.list().await.expect("list sessions").is_empty(),
+            "oversized creation bodies must never reserve a session"
+        );
     }
 
     #[tokio::test]
@@ -901,7 +1295,6 @@ mod tests {
         let (target, scoped) = crate::resolve_agent_target(&server.config, "plain")
             .await
             .expect("resolve agent target");
-        let headers = HeaderMap::new();
 
         let invalid_queries = [
             "limit=0",
@@ -917,8 +1310,10 @@ mod tests {
         for query in invalid_queries {
             let err = server
                 .handle_sessions_route(
-                    &Method::GET,
-                    &headers,
+                    hyper::Request::builder()
+                        .method(Method::GET)
+                        .body(Full::new(Bytes::new()))
+                        .expect("session list request"),
                     SessionsRouteContext::new(&target, &scoped, Some(query)),
                 )
                 .await
@@ -1024,7 +1419,13 @@ mod tests {
         context: SessionsRouteContext<'_>,
     ) -> serde_json::Value {
         let response = server
-            .handle_sessions_route(&Method::GET, &HeaderMap::new(), context)
+            .handle_sessions_route(
+                hyper::Request::builder()
+                    .method(Method::GET)
+                    .body(Full::new(Bytes::new()))
+                    .expect("session list request"),
+                context,
+            )
             .await
             .expect("session list response");
         assert_eq!(response.status(), StatusCode::OK);

@@ -112,7 +112,7 @@ impl RedactedSessionMetadata {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionMetadataPatch {
     pub title: Option<SessionTitlePatch>,
@@ -120,10 +120,42 @@ pub struct SessionMetadataPatch {
     pub overrides: Option<SessionOverrides>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionTitlePatch {
     pub value: Option<String>,
     #[serde(default)]
     pub manual: bool,
+}
+
+/// Apply a typed metadata patch in place.
+///
+/// Infallible by construction: each field is either replaced or left alone.
+/// Shared by the metadata PATCH mutations and the initial canonical record a
+/// `SessionInitializer`'s patch builds (`SessionMetadata::new`), so both paths
+/// keep identical field semantics. Titles are stored trimmed, a blank title
+/// clears the record (manual flag reset), and supplied variables or overrides
+/// replace their initializer-derived values wholesale.
+pub(in crate::nats_session_metadata) fn apply_typed_patch(
+    metadata: &mut SessionMetadata,
+    patch: &SessionMetadataPatch,
+) {
+    if let Some(title) = &patch.title {
+        metadata.title.value = title
+            .value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        metadata.title.manual = metadata.title.value.is_some() && title.manual;
+        if metadata.title.value.is_none() {
+            metadata.title.last_updated_tokens = 0;
+        }
+    }
+    if let Some(variables) = &patch.variables {
+        metadata.variables = variables.clone();
+    }
+    if let Some(overrides) = &patch.overrides {
+        metadata.overrides = overrides.clone();
+    }
 }
