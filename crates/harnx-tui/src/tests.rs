@@ -12678,3 +12678,5 @@ mod d2_fixture;
 mod mid_turn_compaction;
 
 mod d4_fixture;
+
+mod cid_document_tests;

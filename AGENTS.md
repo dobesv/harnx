@@ -29,27 +29,12 @@ hashes for semantically-identical payloads with different key ordering.
 ```
 ├── Cargo.toml                  # [workspace] manifest — shared dep versions live here
 ├── crates/
-│   ├── harnx/                  # Main CLI and TUI crate
+│   ├── harnx/                  # Main CLI crate (entry point, CLI parsing, session/runtime glue)
 │   │   ├── Cargo.toml
-│   │   ├── assets/             # Bundled assets (syntax/theme .bin, HTML playgrounds)
 │   │   ├── models.yaml         # Model catalog (providers, pricing, capabilities)
-│   │   ├── tests/              # Integration tests
-│   │   └── src/
-│   │       ├── main.rs         # Entry point for the `harnx` binary
-│   │       ├── lib.rs          # Library root — re-exports modules
-│   │       ├── cli.rs          # CLI argument parsing (clap)
-│   │       ├── serve.rs        # HTTP server mode
-│   │       ├── tool.rs         # Built-in tool definitions
-│   │       ├── mcp_safety.rs   # MCP tool safety classification
-│   │       ├── config/         # Configuration, agent/session management
-│   │       ├── render/         # Markdown + streaming output
-│   │       ├── tui/            # Interactive TUI (ratatui)
-│   │       ├── commands.rs     # Dot-command handlers (.help, .model, .session, …)
-│   │       ├── rag/            # RAG pipeline
-│   │       ├── mcp/            # MCP client/server integration
-│   │       ├── hooks/          # Event hook system
-│   │       ├── utils/          # Shared utilities
-│   │       └── bin/            # Bins that share harnx library code (mcp-bash, mcp-fs)
+│   │   └── tests/              # Integration tests
+│   ├── harnx-tui/              # Interactive TUI (ratatui) — src/markdown_render.rs, src/render.rs, src/tests.rs
+│   ├── harnx-render/           # CLI terminal rendering (markdown + ANSI), bundled syntax/theme assets
 │   ├── harnx-plans-tools/        # Toolset server: NATS-backed plan and todo management (standalone crate)
 │   ├── harnx-attachment-tools/   # Toolset server: NATS-backed attachment and media management (standalone crate)
 │   ├── harnx-blob-store/        # NATS-backed blob storage for attachments and plans (standalone crate)

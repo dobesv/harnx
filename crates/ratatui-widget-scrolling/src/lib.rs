@@ -1,3 +1,12 @@
+//! Scroll-state helper shared by the TUI transcript and detail views.
+//!
+//! Testing note: `cargo nextest run -p ratatui_widget_scrolling` alone fails
+//! at link time with `undefined symbol: _critical_section_1_0_acquire`: this
+//! crate depends on `ratatui-core` with `default-features = false`, and the
+//! `critical-section` backend is only feature-unified when built together
+//! with `harnx-tui` (via the `ratatui` crate's std features). Run both
+//! packages together: `cargo nextest run -p harnx-tui -p ratatui_widget_scrolling`.
+
 use std::collections::HashMap;
 use std::iter::zip;
 
@@ -28,6 +37,13 @@ pub type FullItems = Option<(std::ops::Range<IndexInHeightLog>, Rect)>;
 /// (i.e. it fits between the bottom of the viewport and somewhere inside it),
 /// this is `0`.
 pub type PartialBottomItem = Option<(IndexInHeightLog, Rect, usize)>;
+
+/// Geometry for rendering scrollable items and optional scrollbar chrome separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollAreas {
+    pub content: Rect,
+    pub scrollbar: Option<Rect>,
+}
 
 pub struct ScrollState {
     pub last_max_position: usize,
@@ -91,6 +107,12 @@ impl ScrollState {
         let changed = self.position != self.last_max_position;
         self.position = self.last_max_position;
         changed
+    }
+
+    /// Returns the cached element heights recorded for `width`, if any.
+    // qual:api — inspected by harnx-tui resize tests to verify post-margin cache keys.
+    pub fn cached_heights_for_width(&self, width: u16) -> Option<&[usize]> {
+        self.render_height_cache.get(&width).map(Vec::as_slice)
     }
 
     /// Copy the height cache from `other` into `self`.
@@ -161,26 +183,38 @@ impl ScrollState {
 
     fn render_scrollbar(
         frame: &mut Frame,
-        area: Rect,
+        scrollbar_area: Option<Rect>,
         scroll_position: usize,
         max_scroll_offset: usize,
     ) {
-        use ratatui_core::layout::Margin;
         use ratatui_widgets::scrollbar::{Scrollbar, ScrollbarState};
 
+        let Some(scrollbar_area) = scrollbar_area else {
+            return;
+        };
+        if scrollbar_area.is_empty() || max_scroll_offset == 0 {
+            return;
+        }
         let scrollbar = Scrollbar::default()
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"));
         let mut scrollbar_state =
             ScrollbarState::new(max_scroll_offset).position(max_scroll_offset - scroll_position);
-        frame.render_stateful_widget(
-            scrollbar,
-            area.outer(Margin {
-                vertical: 0,
-                horizontal: 1,
-            }),
-            &mut scrollbar_state,
-        );
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+
+    fn scroll_offsets(
+        &mut self,
+        height_log: &[ElementHeight],
+        viewport_height: usize,
+    ) -> (usize, usize) {
+        let total_height: usize = height_log.iter().sum();
+        let max_scroll_offset = total_height.saturating_sub(viewport_height);
+        if self.follow {
+            self.position = max_scroll_offset;
+        }
+        let scroll_offset = max_scroll_offset.saturating_sub(self.position);
+        (max_scroll_offset, scroll_offset)
     }
 
     /// Renders the currently visible elements according to the scroll position.
@@ -197,60 +231,48 @@ impl ScrollState {
         ElementWidget: Widget,
         F: Fn(&'a Element) -> (ElementHeight, ElementWidget),
     {
-        //                                      |
-        // ┌────────┐                  ┌────────▼────────┐
-        // │ Height │ Get last heights │ Calculate which │
-        // │ Cache  ├──────────────────► Elements will   │
-        // └───▲────┘                  │ be visible      │
-        //     │                       └────────┬────────┘
-        //     │                                │
-        //     │                       ┌────────▼────────┐
-        //     │                       │ Try to render   │
-        //     │                       │ the visible     │
-        // ┌───┴─────────┐             │ elements        │
-        // │ Update the  │             └────────┬────────┘
-        // │ cache with  │                      │
-        // │ new heights │             ┌────────▼────────┐
-        // └───▲─────────┘             │ Does the height │
-        //     │          ┌──┐         │ of rendered     │
-        //     └──────────┤No◄─────────┤ elements match  │
-        //                └──┘         │ the height in   │
-        //                             │ the cache?      │
-        //                             └────────┬────────┘
-        //                                      │
-        //                                    ┌─▼─┐
-        //                                    │Yes│
-        //                                    └─┬─┘
-        //                                      │
-        //                               ┌──────▼──────┐
-        //                               │ Display the │
-        //                               │ result!     │
-        //                               └─────────────┘
+        use ratatui_core::layout::Margin;
 
+        self.render_in_areas(
+            frame,
+            ScrollAreas {
+                content: area,
+                scrollbar: Some(area.outer(Margin {
+                    vertical: 0,
+                    horizontal: 1,
+                })),
+            },
+            elements,
+            render_element,
+        );
+    }
+
+    /// Renders visible elements into `areas.content` and paints overflow scrollbar
+    /// chrome into `areas.scrollbar` (or suppresses it when `None`).
+    // qual:allow(iosp) — retry loop converges cached element heights across try_render_scroll_state passes
+    pub fn render_in_areas<'a, Element, ElementWidget, F>(
+        &mut self,
+        frame: &mut Frame,
+        areas: ScrollAreas,
+        elements: &'a [Element],
+        render_element: F,
+    ) where
+        ElementWidget: Widget,
+        F: Fn(&'a Element) -> (ElementHeight, ElementWidget),
+    {
+        const MAX_RENDER_ATTEMPTS: usize = 10;
+
+        let area = areas.content;
         let viewport_height = area.height as usize;
         let viewport_width = area.width;
-
         let mut height_log = self
             .get_height_log_from_cache_for_width(viewport_width, elements.len())
             .clone();
 
-        // Loop until we successfully rendered the current scroll position
-        // Render attempts might fail if the cache is out of sync.
-        // We limit the number of attempts to avoid infinite loops if heights are unstable.
-        for _ in 0..10 {
-            let total_height: usize = height_log.iter().sum();
-
-            // No need to scroll at all, when everything fits on the screen
-            let max_scroll_offset = total_height.saturating_sub(viewport_height);
-
-            if self.follow {
-                self.position = max_scroll_offset;
-            }
-
-            // Inverted scrolling behaviour
-            let scroll_offset = max_scroll_offset.saturating_sub(self.position);
-
-            // Try rendering. This updates the height_log regardless of its success
+        // Retry when the cached height log diverges from actual rendered heights.
+        for _ in 0..MAX_RENDER_ATTEMPTS {
+            let (max_scroll_offset, scroll_offset) =
+                self.scroll_offsets(&height_log, viewport_height);
             let result = try_render_scroll_state(
                 frame,
                 area,
@@ -259,19 +281,10 @@ impl ScrollState {
                 elements,
                 &render_element,
             );
-
-            // All good? Update the cache and end the loop
             if result.is_ok() {
-                // Update the cache
                 self.render_height_cache.insert(viewport_width, height_log);
-
                 self.last_max_position = max_scroll_offset;
-
-                // More content than fits on the screen? Show scrollbar
-                if total_height > viewport_height {
-                    Self::render_scrollbar(frame, area, scroll_offset, max_scroll_offset);
-                }
-
+                Self::render_scrollbar(frame, areas.scrollbar, scroll_offset, max_scroll_offset);
                 break;
             }
         }
@@ -1263,5 +1276,121 @@ mod tests {
             !changed_bottom_again,
             "scroll_to_bottom should return false when already at bottom"
         );
+    }
+
+    struct PlainLines(&'static [&'static str]);
+
+    impl Widget for PlainLines {
+        fn render(self, area: Rect, buf: &mut ratatui_core::buffer::Buffer) {
+            for (dy, text) in self.0.iter().enumerate() {
+                let y = area.y + dy as u16;
+                if y >= area.bottom() {
+                    break;
+                }
+                for (dx, ch) in text.chars().enumerate() {
+                    let x = area.x + dx as u16;
+                    if x >= area.right() {
+                        break;
+                    }
+                    buf[(x, y)].set_char(ch);
+                }
+            }
+        }
+    }
+
+    fn draw_rows<F>(width: u16, height: u16, f: F) -> Vec<String>
+    where
+        F: FnOnce(&mut Frame),
+    {
+        use ratatui_core::backend::TestBackend;
+        use ratatui_core::terminal::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(f).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn render_default_paints_scrollbar_immediately_outside_content() {
+        let mut state = ScrollState::new();
+        state.follow = false;
+        let items = [PlainLines(&["line1", "line2", "line3", "line4", "line5"])];
+
+        let rows = draw_rows(8, 3, |frame| {
+            state.render(frame, Rect::new(0, 0, 7, 3), &items, |item| {
+                (item.0.len(), PlainLines(item.0))
+            });
+        });
+
+        assert_eq!(state.last_max_position, 2);
+        assert_eq!(rows[0].chars().nth(7), Some('↑'));
+        assert_eq!(rows[2].chars().nth(7), Some('↓'));
+        assert!(rows[0].starts_with("line1"));
+    }
+
+    #[test]
+    fn render_in_areas_paints_scrollbar_in_separate_column_leaving_margins_blank() {
+        let mut state = ScrollState::new();
+        state.follow = false;
+        let items = [PlainLines(&["aaa", "bbb", "ccc", "ddd", "eee", "fff"])];
+
+        // 10-column area: 2 left margin + 5 content + 2 right margin + 1 scrollbar
+        let rows = draw_rows(10, 4, |frame| {
+            state.render_in_areas(
+                frame,
+                ScrollAreas {
+                    content: Rect::new(2, 1, 5, 3),
+                    scrollbar: Some(Rect::new(9, 1, 1, 3)),
+                },
+                &items,
+                |item| (item.0.len(), PlainLines(item.0)),
+            );
+        });
+
+        assert_eq!(state.last_max_position, 3);
+        assert_eq!(rows[0], "          ");
+        assert!(rows[1].starts_with("  aaa    "));
+        assert_eq!(rows[1].chars().nth(9), Some('↑'));
+        assert_eq!(rows[1].chars().nth(7), Some(' '));
+        assert_eq!(rows[1].chars().nth(8), Some(' '));
+        assert_eq!(rows[3].chars().nth(9), Some('↓'));
+    }
+
+    #[test]
+    fn render_in_areas_without_scrollbar_hides_chrome_but_keeps_scrolling() {
+        let mut state = ScrollState::new();
+        state.follow = false;
+        let items = [PlainLines(&["row0", "row1", "row2", "row3"])];
+
+        let _ = draw_rows(4, 2, |frame| {
+            state.render_in_areas(
+                frame,
+                ScrollAreas {
+                    content: Rect::new(0, 0, 4, 2),
+                    scrollbar: None,
+                },
+                &items,
+                |item| (item.0.len(), PlainLines(item.0)),
+            );
+        });
+        assert_eq!(state.last_max_position, 2);
+        assert!(state.scroll_to_bottom());
+
+        let rows = draw_rows(4, 2, |frame| {
+            state.render_in_areas(
+                frame,
+                ScrollAreas {
+                    content: Rect::new(0, 0, 4, 2),
+                    scrollbar: None,
+                },
+                &items,
+                |item| (item.0.len(), PlainLines(item.0)),
+            );
+        });
+        assert_eq!(rows, vec!["row2", "row3"]);
+        assert!(!rows.iter().any(|r| r.contains('↑') || r.contains('↓')));
     }
 }

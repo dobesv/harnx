@@ -70,7 +70,13 @@ In the `cid:` document viewer, `Tab`/`↓` selects the next link and
 `Shift+Tab`/`↑` selects the previous link. Press `Enter` to follow the selected
 link. `Backspace` or `Esc` returns to the previous document, then closes the
 viewer at the start of its history. Use `PgUp`/`PgDn`, `Home`/`End`, or
-`g`/`G` to scroll.
+`g`/`G` to scroll. Documents render as formatted Markdown: adjacent blocks
+(headings, paragraphs, lists, code, quotes, tables) are separated by one blank
+row and nested lists keep their indentation. When the viewport allows, the
+document is inset with two blank columns on each side and one blank row below
+the top border, with the scrollbar at the far right, outside those margins;
+on tiny terminals the margins shrink so at least one content column and row
+remain.
 
 Inside a child transcript:
 
