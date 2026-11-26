@@ -19,6 +19,8 @@ pub(super) struct EventTools {
 #[derive(Default)]
 pub(super) struct HookTools {
     pub commands: Vec<Arc<dyn ScriptCommand>>,
+    /// The tools behind `commands`, which Python reaches as `tools`.
+    pub declarations: Vec<harnx_core::tool::ToolDeclaration>,
     pub executor: Option<Arc<ScriptTools>>,
 }
 
@@ -115,6 +117,7 @@ impl EventTools {
         ));
         Ok(HookTools {
             commands: tool_commands(&declarations, executor.clone())?,
+            declarations,
             executor: Some(executor),
         })
     }

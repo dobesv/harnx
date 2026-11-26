@@ -12,6 +12,7 @@ pub mod description;
 pub mod fs_attachments;
 pub mod help;
 mod host;
+mod python_tools;
 mod schema;
 pub mod tool_inference;
 
@@ -24,6 +25,9 @@ pub use bashkit::{ExcType, ExtFunctionResult, MontyException, MontyObject, Objec
 pub use bashkit::{FileSystem, FsLimits, InMemoryFs, ReadOnlyFs};
 pub use bashkit_backend::BashKitBackend;
 pub use host::{ScriptControl, ScriptHostContext, ScriptPythonFunctions, ScriptPythonHandler};
+pub use python_tools::{
+    bind_python_call, python_value, tools_prelude, PythonCallError, PYTHON_CALL_FUNCTION,
+};
 pub use tokio_util::sync::CancellationToken;
 
 /// The allocator the embedded Python VM meters its memory through. A binary

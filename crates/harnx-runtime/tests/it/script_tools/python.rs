@@ -1,5 +1,5 @@
 //! Python script-tool bodies (T3): Monty runs through the same backend,
-//! inner run and budgets as Bash; `tool_input`/`call_tool` are Python host
+//! inner run and budgets as Bash; `tool_input` and `tools` are Python host
 //! functions over the same `InnerCallRun` the Bash CLI commands use.
 
 use super::*;
@@ -18,7 +18,7 @@ async fn python_and_bash_wrappers_share_the_wrapped_tool_with_the_model() -> Res
             ),
             python_tool(
                 "wrap_python",
-                r#"result = call_tool("probe_run", {"value": "from-python"})
+                r#"result = tools.probe_run(value="from-python")
 print(result["value"])"#,
                 json!(["probe_run"]),
             ),
@@ -71,15 +71,15 @@ print(args["number"])"#,
     Ok(())
 }
 
-/// `call_tool` uses the shared binding: positional and keyword forms both
+/// `tools` uses the shared binding: plain and `**` keyword forms both
 /// work and the result converts back to Python values.
 #[tokio::test(flavor = "multi_thread")]
 async fn python_call_tool_binds_arguments_and_returns_values() -> Result<()> {
     let config = test_config(
         &[python_tool(
             "call_wrap",
-            r#"r1 = call_tool("probe_run", {"value": "positional"})
-r2 = call_tool(name="probe_run", args={"value": "keyword"})
+            r#"r1 = tools.probe_run(value="positional")
+r2 = tools.probe_run(**{"value": "keyword"})
 print(r1["value"])
 print(r2["value"])"#,
             json!(["probe_run"]),
@@ -99,8 +99,35 @@ print(r2["value"])"#,
     Ok(())
 }
 
+/// `call_tool` is not a function in a script tool's Python: a tool is an
+/// attribute of `tools`, so the old spelling fails as Python's own `NameError`.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_tool_is_gone() -> Result<()> {
+    let config = test_config(
+        &[python_tool(
+            "old_wrap",
+            r#"call_tool("probe_run", {})"#,
+            json!(["probe_run"]),
+        )],
+        "---\nuse_tools: [old_wrap]\n---\n",
+        Vec::new(),
+    );
+    let probe = Arc::new(Probe::default());
+    let fixture = fixture(config, probe.clone()).await;
+
+    let output = eval_one(&fixture.ctx, "old_wrap", json!({"number": 1})).await;
+    assert!(is_error(&output), "{output}");
+    let error = output.to_string();
+    assert!(
+        error.contains("NameError") && error.contains("call_tool"),
+        "{error}"
+    );
+    assert!(probe.calls().is_empty());
+    Ok(())
+}
+
 /// Non-allowlisted tools, `bash`, control tools and other script tools are
-/// refused, each raising a catchable exception that names the tool.
+/// not attributes of `tools`, so each raises a catchable `AttributeError`.
 #[tokio::test(flavor = "multi_thread")]
 async fn python_refusals_raise_catchable_named_exceptions() -> Result<()> {
     let config = test_config(
@@ -110,8 +137,8 @@ async fn python_refusals_raise_catchable_named_exceptions() -> Result<()> {
                 r#"count = 0
 for name in ["probe_aux", "bash", "ask_user", "ghost_tool", "helper_wrap"]:
     try:
-        call_tool(name, {})
-    except RuntimeError:
+        getattr(tools, name)()
+    except AttributeError:
         count = count + 1
 print(count)"#,
                 json!(["probe_run"]),
@@ -150,7 +177,7 @@ async fn python_inner_tool_error_raises_and_fails_the_run() -> Result<()> {
     let config = test_config(
         &[python_tool(
             "boom_wrap",
-            r#"call_tool("probe_run", {"recoverable": True})"#,
+            r#"tools.probe_run(recoverable=True)"#,
             json!(["probe_run"]),
         )],
         "---\nuse_tools: [boom_wrap]\n---\n",
@@ -177,7 +204,7 @@ async fn python_middleware_denial_raises() -> Result<()> {
     let config = test_config(
         &[python_tool(
             "deny_wrap",
-            r#"call_tool("probe_run", {})"#,
+            r#"tools.probe_run()"#,
             json!(["probe_run"]),
         )],
         "---\nuse_tools: [deny_wrap]\n---\n",
@@ -206,7 +233,7 @@ async fn python_interaction_requirement_raises() -> Result<()> {
     let config = test_config(
         &[python_tool(
             "confirm_wrap",
-            r#"call_tool("probe_run", {})"#,
+            r#"tools.probe_run()"#,
             json!(["probe_run"]),
         )],
         "---\nuse_tools: [confirm_wrap]\n---\n",
@@ -265,7 +292,7 @@ async fn timed_python_tool_fixture(name: &str, body: &str, tools: Value) -> (Fix
     (fixture, probe)
 }
 
-/// Python `call_tool` routes through the same `InnerCallRun` as the Bash
+/// Python `tools` calls route through the same `InnerCallRun` as the Bash
 /// commands, so the 1000-call budget applies; the concurrency cap holds by
 /// the same construction (one shared semaphore per run, decision 11). Monty
 /// is single-threaded, so the budget is the observable bound here.
@@ -273,7 +300,7 @@ async fn timed_python_tool_fixture(name: &str, body: &str, tools: Value) -> (Fix
 async fn python_calls_share_the_call_budget() -> Result<()> {
     let body = r#"i = 0
 while i < 1005:
-    call_tool("probe_run", {})
+    tools.probe_run()
     i = i + 1"#;
     let (fixture, probe) = timed_python_tool_fixture("loop_wrap", body, json!(["probe_run"])).await;
 
@@ -304,10 +331,10 @@ while i < 1005:
 async fn python_fatal_inner_call_stops_the_run_despite_except() -> Result<()> {
     let body = r#"for i in range(20000):
     try:
-        call_tool("ghost_tool", {})
+        tools.probe_run()
     except RuntimeError:
         pass
-call_tool("probe_run", {"value": "must-not-run"})"#;
+tools.probe_run(value="must-not-run")"#;
     let (fixture, probe) = timed_python_tool_fixture("spin_wrap", body, json!(["probe_run"])).await;
 
     let output = eval_one(&fixture.ctx, "spin_wrap", json!({"number": 1})).await;
@@ -320,9 +347,14 @@ call_tool("probe_run", {"value": "must-not-run"})"#;
         error.contains("stopped") && error.contains("tool-call attempts"),
         "the host stop and the attempt-cap fatal must be reported: {error}"
     );
-    assert_eq!(
-        probe.call_count(),
-        0,
+    // The successful calls spend the 1000-call budget; the rejected ones
+    // after it are what reach the attempt cap.
+    assert_eq!(probe.call_count(), 1000);
+    assert!(
+        probe
+            .calls()
+            .iter()
+            .all(|call| call.1["value"] != "must-not-run"),
         "the call after the except block must never dispatch"
     );
     Ok(())
@@ -405,7 +437,7 @@ while i < 210:
 async fn python_timeout_stops_the_script_and_cancels_inner_calls() -> Result<()> {
     let mut tool = python_tool(
         "hang_wrap",
-        r#"call_tool("probe_run", {"hang": True})"#,
+        r#"tools.probe_run(hang=True)"#,
         json!(["probe_run"]),
     );
     tool["timeout"] = json!("1s");
@@ -435,7 +467,7 @@ async fn python_abort_stops_the_script_and_cancels_inner_calls() -> Result<()> {
     let config = test_config(
         &[python_tool(
             "hang_wrap",
-            r#"call_tool("probe_run", {"hang": True})"#,
+            r#"tools.probe_run(hang=True)"#,
             json!(["probe_run"]),
         )],
         "---\nuse_tools: [hang_wrap]\n---\n",
@@ -468,5 +500,31 @@ async fn python_abort_stops_the_script_and_cancels_inner_calls() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(5), probe.dropped.notified())
         .await
         .expect("the pending inner call must observe the abort");
+    Ok(())
+}
+
+/// A script tool that declares no tools has no `tools` object; its Python
+/// behaves as it did before `tools` existed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_python_body_without_tools_has_no_tools() -> Result<()> {
+    let config = test_config(
+        &[
+            python_tool("reads_tools", "print(tools)", json!([])),
+            python_tool("ignores_tools", "print('fine')", json!([])),
+        ],
+        "---\nuse_tools: [reads_tools, ignores_tools]\n---\n",
+        Vec::new(),
+    );
+    let fixture = fixture(config, Arc::new(Probe::default())).await;
+
+    let output = eval_one(&fixture.ctx, "reads_tools", json!({"number": 1})).await;
+    assert!(is_error(&output), "{output}");
+    let error = output["error"].as_str().expect("error message");
+    assert!(error.contains("NameError"), "{error}");
+    assert!(error.contains("'tools'"), "{error}");
+
+    let output = eval_one(&fixture.ctx, "ignores_tools", json!({"number": 1})).await;
+    assert!(!is_error(&output), "{output}");
+    assert_eq!(display_text(&output).trim(), "fine");
     Ok(())
 }

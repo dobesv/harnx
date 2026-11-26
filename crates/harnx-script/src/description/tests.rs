@@ -279,3 +279,26 @@ fn change_report_bullet_needs_a_shell_form_and_a_diff_property() {
         assert!(!text.contains("reports the change on stderr"), "{text}");
     }
 }
+
+#[test]
+fn python_paragraph_teaches_tools_only_when_the_script_has_tools() {
+    let with = bash_tool_description(&fixture(), 8, 1000);
+    for phrase in [
+        "tools.NAME(property=value, ...)",
+        "getattr(tools, \"odd-name\")",
+        "a non-zero exit_code doesn't raise",
+        "A tool failure raises RuntimeError",
+        "within the command call limit",
+    ] {
+        assert!(with.contains(phrase), "missing {phrase}");
+    }
+    let without = bash_tool_description(&[], 8, 1000);
+    assert!(!without.contains("tools.NAME"));
+    assert!(!without.contains("RuntimeError"));
+    assert!(without.contains("No subprocesses or network requests."));
+    for text in [&with, &without] {
+        assert!(!text.contains("call_tool"));
+        assert!(!text.contains("~95"));
+        assert!(!text.contains("work budget"));
+    }
+}

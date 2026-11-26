@@ -38,7 +38,7 @@ pub(crate) fn checkpoint_tool_request_state(checkpoint: &ToolCallCheckpoint) -> 
 }
 
 /// Scope one tool challenge's rerun input to its owning call's leaf dispatch.
-/// Allowlisted middleware `call_tool` dispatches run outside this scope, so
+/// Allowlisted middleware `tools` calls run outside this scope, so
 /// they never see another tool's answers.
 pub async fn with_tool_input<F: Future>(input: ToolInputResume, future: F) -> F::Output {
     TOOL_INPUT.scope(input, future).await

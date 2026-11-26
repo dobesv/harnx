@@ -13,6 +13,7 @@ use crate::{
 mod capture;
 mod outcome;
 mod python;
+mod python_lines;
 mod resolver;
 mod shell;
 mod worker;

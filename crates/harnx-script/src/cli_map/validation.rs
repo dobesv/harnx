@@ -39,7 +39,7 @@ fn is_integer_number(number: &Number) -> bool {
 
 /// Validate direct types and enums, not an entire JSON Schema dialect. References
 /// and unions deliberately pass through; admission/provider validation owns them.
-pub(super) fn validate(schema: &Value, value: &Value) -> Result<(), String> {
+pub(crate) fn validate(schema: &Value, value: &Value) -> Result<(), String> {
     if value.is_null() && accepts_null(schema) {
         return Ok(());
     }

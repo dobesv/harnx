@@ -92,21 +92,39 @@ VM limits, not an OS-level process/RSS limit. VFS, parser and Bash intermediate
 budgets are separate. Python print output is buffered until the invocation
 returns, so cancellation/timeout can lose prints from an unfinished VM slice.
 
-BashKit charges each Python invocation against a shared per-script work budget
-(`max_memory / 64` units per invocation, consuming 1,048,576 units under the default
-64 MiB limit against a 100M unit budget). This caps a single script run at approximately
-95 Python invocations; invoking Python a 96th time aborts the script with a work units
-resource limit. Rather than invoking `python` or `python3` repeatedly inside shell loops,
-batch per-item processing into a single Python invocation.
+The heap is charged by use, not per invocation: at BashKit 0.21.1 a script can
+start Python thousands of times in one run, so there is no small cap on
+invocations. Each invocation still starts a fresh interpreter, so batching
+per-item work into one Python invocation is cheaper than a shell loop that
+re-runs `python3`.
 
 ### Python host functions
 
 Set `ScriptRequest.python_functions` to `Some(ScriptPythonFunctions { names,
-handler })`. Both `python` and `python3` then use BashKit 0.21.1's
+handler, prelude })`. Both `python` and `python3` then use BashKit 0.21.1's
 `python_with_external_handler` with the same Python resource limits. Names are an
 allowlist; an unregistered name raises `NameError` without calling the handler.
 The adapter also checks dispatch names so returned callable values can't bypass
 that allowlist.
+
+`prelude: Some(source)` runs that Python before the script's own, in the same
+interpreter. Tracebacks and syntax errors still show the script's own line
+numbers, and a frame inside the prelude is shown as `File "<harnx tools>"`.
+Only frames of the main script are rewritten; with `python3 -c` an `exec` snippet
+shares the name `<string>` and is rewritten too. BashKit parses the prelude and
+the script as one module, so a script cannot start with a `from __future__`
+import while a prelude is set; its failure carries a one-line hint saying so.
+`prelude: None` registers the builtins exactly as above.
+
+A prelude is how a host gives Python an object built on one host function.
+`harnx-runtime` registers the hidden function `_harnx_call` and a prelude from
+`tools_prelude` that defines `tools`, so `tools.NAME(...)` forwards to it.
+`bind_python_call` binds a call's arguments to the tool's input schema (keywords,
+positional required properties, `TypeError` for a mistake) and `python_value`
+turns a result into what the `bash` tool's Python returns, which is the value
+`-o json` prints: the `structuredContent`, a plain object result as it is, or
+else the text. A caller that doesn't use `tools_prelude` sees only the names it
+registered.
 
 Implement `ScriptPythonHandler` using `async_trait`. Its async `call` receives the
 function name, positional arguments (`Vec<MontyObject>`), keyword arguments
@@ -148,6 +166,7 @@ async fn example() {
         python_functions: Some(ScriptPythonFunctions {
             names: vec!["answer".into()],
             handler: Arc::new(Answer),
+            prelude: None,
         }),
         fs_mounts: vec![],
         cancel: CancellationToken::new(),
@@ -429,9 +448,10 @@ mapping in the tool's `_meta` under `harnx:script_output`. The mapping has these
 The `bash` tool's inner calls send the request capability
 `harnx:structured_result` (`harnx_toolset::CAPABILITY_STRUCTURED_RESULT`), so
 the tool returns script-style fields. Direct model calls don't send it and keep
-their results. A [script tool](../../docs/script-tools.md)'s Bash body sends it
-too, but its Python body doesn't, and neither does a middleware or hook on its
-own `call_tool`. Over MCP the request travels in the call's `_meta` as
+their results. So do the `bash` tool's Python calls, which read the same
+structured result as `-o json`. A [script tool](../../docs/script-tools.md)'s
+Bash body sends it too, but its Python body doesn't, and neither does a
+middleware or hook calling a tool from Python. Over MCP the request travels in the call's `_meta` as
 `"harnx:structured_result": true`, and the mapping stays in the tool listing, so
 a tool behind `harnx-mcp-bridge` or in the k8s sandbox gets its shell form too.
 A middleware or hook that wraps a `bash` script's inner call does see the

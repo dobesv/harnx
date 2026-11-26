@@ -125,7 +125,7 @@ pub(super) fn config(entries: Vec<Value>) -> GlobalConfig {
         .into_iter()
         .map(|name| {
             serde_json::from_value(
-                json!({"name":name,"description":"Probe", "parameters":{"type":"object"}}),
+                json!({"name":name,"description":"Probe", "parameters":{"type":"object","properties":{"value":{"type":"string"},"fatal":{"type":"boolean"}}}}),
             )
             .unwrap()
         })

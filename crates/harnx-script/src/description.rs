@@ -11,7 +11,11 @@ const PURPOSE: &str = "Chain this agent's tool commands and process their result
 
 const DIALECT: &str = "Dialect: Bash-compatible BashKit. Fresh VFS per run, cwd /tmp; /attachments is read-only at /attachments/<full media CID> (keep existing CID encoding). No direct host filesystem, network or subprocess access. Pipes, redirects, variables, loops and background jobs (& / wait) work. set -e is on by default, with POSIX-style exceptions for conditions, ! and non-final &&/|| commands. Pipelines use the last command's status unless you enable set -o pipefail. Use set +e to handle ordinary failures; fatal errors still stop the script.\n\n";
 
-const PYTHON: &str = "Python: python and python3 are the same embedded Monty subset, not CPython. Use -c, a VFS script file or stdin/heredoc. open()/pathlib use the VFS. Simple classes work; inheritance, metaclasses and third-party imports don't. The re module is available. Python cannot call tools or start subprocesses/network requests; call tools in Bash and pass results via /tmp. A shared work budget caps scripts at ~95 Python calls; batch loops into one invocation.\n\n";
+const PYTHON_BASE: &str = "Python: python and python3 are one embedded Monty subset, not CPython. Use -c, a script file or stdin/heredoc; open()/pathlib use the VFS. Simple classes work; inheritance, metaclasses and third-party imports don't.";
+
+const PYTHON_TOOLS: &str = " Tools: tools.NAME(property=value, ...) (required ones may be positional); getattr(tools, \"odd-name\") for names Python can't spell. A call returns what NAME -o json prints: a dict (help NAME lists FIELDS; notes flags a cut-off result; a non-zero exit_code doesn't raise), else the command's text. A tool failure raises RuntimeError. Calls run one at a time within the command call limit.";
+
+const PYTHON_END: &str = " No subprocesses or network requests.\n\n";
 
 const ARGUMENTS_HEAD: &str = "Tool arguments/discovery:\n\
 - Property names become --kebab-case flags; strings/numbers take plain values (optional ones too: --path src, not JSON), booleans use --flag / --no-flag, scalar arrays repeat flags, objects and multi-type values take quoted JSON. No positional arguments.\n\
@@ -46,8 +50,9 @@ pub fn bash_tool_description(
     let mut tools: Vec<_> = tools.iter().collect();
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     let mut text = format!(
-        "{PURPOSE}{DIALECT}Available builtins (tool commands below override same-named builtins):\n{}\n\n{PYTHON}Tool commands:\n",
-        builtin_names()
+        "{PURPOSE}{DIALECT}Available builtins (tool commands below override same-named builtins):\n{}\n\n{}Tool commands:\n",
+        builtin_names(),
+        python_paragraph(!tools.is_empty())
     );
     for tool in &tools {
         text.push_str("- ");
@@ -70,6 +75,13 @@ pub fn bash_tool_description(
         max_inner_calls_per_script,
     ));
     text
+}
+
+/// The Python paragraph; the sentences about `tools` only when the script
+/// has tool commands to call.
+fn python_paragraph(has_tools: bool) -> String {
+    let tools = if has_tools { PYTHON_TOOLS } else { "" };
+    format!("{PYTHON_BASE}{tools}{PYTHON_END}")
 }
 
 fn builtin_names() -> &'static str {

@@ -1,7 +1,8 @@
 use super::{frame::Frame, tools::FrameTools};
 use crate::script_tools::{
     conversion::to_python,
-    python::{bind, required, string, tool_arguments},
+    python::{bind, required, string},
+    python_tools::{with_tools, PythonToolRunner},
 };
 use anyhow::{bail, Result};
 use harnx_script::{
@@ -17,7 +18,6 @@ const FUNCTIONS: &[&str] = &[
     "call_next",
     "respond",
     "deny",
-    "call_tool",
     "confirm",
     "answer",
     "save",
@@ -26,9 +26,40 @@ const FUNCTIONS: &[&str] = &[
 ];
 
 pub(super) fn functions(frame: &Arc<Frame>) -> ScriptPythonFunctions {
-    ScriptPythonFunctions {
+    let base = ScriptPythonFunctions {
         names: FUNCTIONS.iter().map(|name| (*name).to_string()).collect(),
         handler: Arc::new(Handler(frame.clone())),
+        prelude: None,
+    };
+    with_tools(base, &frame.tools, Arc::new(Runner(frame.clone())))
+}
+
+/// A frame failure ends the run, so a failed call raises with the message the
+/// frame recorded.
+fn finish(frame: &Frame, result: Result<Value>, host: &ScriptHostContext) -> ExtFunctionResult {
+    match result.and_then(to_python) {
+        Ok(value) => ExtFunctionResult::Return(value),
+        Err(error) => {
+            let message = frame.fail(format!("{error:#}"), host);
+            ExtFunctionResult::Error(MontyException::new(ExcType::RuntimeError, Some(message)))
+        }
+    }
+}
+
+struct Runner(Arc<Frame>);
+
+#[async_trait::async_trait]
+impl PythonToolRunner for Runner {
+    async fn run_tool(
+        &self,
+        name: String,
+        arguments: Value,
+        host: ScriptHostContext,
+    ) -> ExtFunctionResult {
+        let result = FrameTools(self.0.clone())
+            .execute(&name, arguments, host.cancel.clone())
+            .await;
+        finish(&self.0, result, &host)
     }
 }
 
@@ -43,17 +74,8 @@ impl ScriptPythonHandler for Handler {
         kwargs: Vec<(MontyObject, MontyObject)>,
         host: ScriptHostContext,
     ) -> ExtFunctionResult {
-        match self
-            .execute(&name, args, kwargs, &host)
-            .await
-            .and_then(to_python)
-        {
-            Ok(value) => ExtFunctionResult::Return(value),
-            Err(error) => {
-                let message = self.0.fail(format!("{error:#}"), &host);
-                ExtFunctionResult::Error(MontyException::new(ExcType::RuntimeError, Some(message)))
-            }
-        }
+        let result = self.execute(&name, args, kwargs, &host).await;
+        finish(&self.0, result, &host)
     }
 }
 
@@ -65,12 +87,6 @@ impl Handler {
         kwargs: Vec<(MontyObject, MontyObject)>,
         host: &ScriptHostContext,
     ) -> Result<Value> {
-        if name == "call_tool" {
-            let (name, arguments) = tool_arguments(args, kwargs)?;
-            return FrameTools(self.0.clone())
-                .execute(&name, arguments, host.cancel.clone())
-                .await;
-        }
         let mut values = bind(parameters(name)?, args, kwargs)?;
         match name {
             "tool_input" => Ok(self.0.input.clone()),

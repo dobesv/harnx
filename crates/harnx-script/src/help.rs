@@ -27,11 +27,7 @@ pub fn help(
     output_schema: Option<&Value>,
 ) -> String {
     let properties = properties(schema);
-    let mut text = format!(
-        "NAME\n    {}\n\nSYNOPSIS\n    {}\n\nDESCRIPTION\n",
-        synopsis_name(name, description),
-        syntax(name, schema)
-    );
+    let mut text = header(name, schema, description);
     indent(&mut text, description.trim(), 4);
     text.push_str("\nOPTIONS\n");
     let conflict = flag_table(&properties).is_err();
@@ -81,6 +77,21 @@ pub fn help(
     if let Some(schema) = output_schema {
         fields::fields_section(&mut text, schema);
     }
+    text
+}
+
+/// NAME and SYNOPSIS, with the Python call line under the synopsis, and the
+/// opening of DESCRIPTION.
+fn header(name: &str, schema: &Value, description: &str) -> String {
+    let mut text = format!(
+        "NAME\n    {}\n\nSYNOPSIS\n    {}\n",
+        synopsis_name(name, description),
+        syntax(name, schema)
+    );
+    if let Some(line) = python::call_line(name, schema) {
+        text.push_str(&format!("    PYTHON  {line}\n"));
+    }
+    text.push_str("\nDESCRIPTION\n");
     text
 }
 
@@ -243,5 +254,6 @@ fn first_sentence(description: &str) -> String {
 }
 
 mod fields;
+mod python;
 #[cfg(test)]
 mod tests;

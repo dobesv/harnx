@@ -83,7 +83,7 @@ output: text
 timeout: 60s
 python: |
   args = tool_input()
-  result = call_tool("fs_read", {"path": args["path"]})
+  result = tools.fs_read(path=args["path"])
   # The result is the tool's rendered text, not the file verbatim: an empty
   # file reports "empty file", and long reads may carry pagination or
   # truncation notices. Never count it as file lines.
@@ -222,26 +222,94 @@ search with no match is not a failure of the script.
 
 ### Python bodies
 
-In Python bodies, call allowlisted tools with `call_tool(name, args)`:
-
-- `name` is the string name of the target tool.
-- `args` is a dictionary matching the tool's input schema.
-- Keyword arguments are supported: `call_tool(name="fs_read", args={"path": "file.txt"})`.
-- On success, `call_tool` returns the tool's output value (dict, list, or primitive).
-- On failure (tool error, middleware denial, interaction required, or budget
-  exhaustion), `call_tool` raises a `RuntimeError` naming the tool and describing
-  the error.
-
-Scripts can catch `RuntimeError` to handle inner tool failures:
+In a Python body, each allowlisted tool is a function on `tools`, named as its
+Bash command is: `tools.fs_read(path="file.txt")`. The call returns the tool's
+direct-call result, the same value a model calling the tool gets, so a text
+result is read as `result["content"][0]["text"]`. A tool error raises
+`RuntimeError` with the message `<tool> failed: ...`; so do a middleware denial
+and an exhausted call budget. A call that needs approval is a tool error too:
+the message is `<tool> failed: tool error: interaction not supported here`, and
+the tool has to be called directly. A body can catch these:
 
 ```python
 try:
-    data = call_tool("probe_run", {"value": "test"})
+    data = tools.probe_run(value="test")
 except RuntimeError as err:
     print("inner call failed: " + str(err))
 ```
 
-Uncaught exceptions stop the script and produce a tool error result.
+Uncaught exceptions stop the script and produce a tool error result. The next
+section describes the call syntax, which is the same in every Python context.
+
+## Python
+
+Python in a script calls tools as functions on the `tools` object: in the `bash`
+tool, in a script tool's `python:` body, and in [middleware and hook
+scripts](middleware-guide.md#calling-tools-from-python). A script with no tools
+has no `tools`.
+
+```python
+text = tools.fs_read(path="README.md")                 # keywords
+hits = tools.fs_grep("TODO", path="src")               # required ones may be positional
+tools.copy_range(**{"from": 1, "to": 5})               # a name Python can't spell (a made-up tool)
+result = getattr(tools, "odd-name")(value=1)           # a tool whose name isn't an identifier
+result = getattr(tools, name)(**args)                  # a tool chosen at run time
+```
+
+What a call returns depends on the context. In the `bash` tool, each call above
+returns the tool's structured fields as a dict (`help <tool>` lists them), or
+text as a string for a tool with none. In a script tool's body, middleware or a
+hook, each returns the tool's direct-call result, a dict with a `content` list.
+
+- **Names.** Keyword names are the tool's schema property names as written
+  (`max_results=`, not the Bash flag `--max-results`). Required properties may
+  also be positional, in the order the schema lists its properties. A property
+  whose name Python cannot spell, such as the keyword `from` or a name with a
+  dash, is passed as `**{"from": 1}`. A keyword with value `None` for an optional
+  property is dropped, as an omitted flag is, unless the property's schema
+  accepts null, in which case the tool gets the null. `help <tool>` in the
+  `bash` tool shows the call as its `PYTHON` line.
+- **Argument mistakes.** A keyword the schema doesn't list is a `TypeError`,
+  unless the schema allows additional properties (`additionalProperties: true`
+  or a schema), in which case it is passed through. A missing required property
+  is a `TypeError` too, and so is a value of the wrong type or one outside the
+  property's `enum`. A wrong tool name is an `AttributeError`. Both are raised
+  before the tool is called, in every context, and a script can catch them like
+  any exception it raises. The rest of a schema (`minimum`, `pattern`, a
+  union's branches and the like) is not checked here: the tool gets the value,
+  and what it refuses is a tool error, not a `TypeError`.
+- **No `from __future__` imports.** The `tools` setup runs before the
+  script, and the interpreter wants `from __future__` imports first, so a script
+  that can call tools fails if it starts with one. The error says to remove
+  that line. A script with no tools has no setup and is not affected.
+- **`call_tool` is gone.** A script that still calls it fails with `NameError`.
+  `call_tool("x", {"a": 1})` becomes `tools.x(a=1)`.
+
+### In the `bash` tool
+
+A call returns what the tool's Bash command prints with `-o json`, as a dict,
+when the result has structured fields (`help <tool>` lists them under FIELDS).
+A result that is a plain object with no `content` list, as some native tools
+return, comes back as that object. Otherwise it returns the text the command
+prints, as a string that keeps its final newline. A non-zero `exit_code` in the dict, such as a search that matched
+nothing, does not raise. A cut-off result says so in the dict's `notes`; nothing
+is printed for it, because this Python has no separate stderr
+(`print(..., file=sys.stderr)` goes to stdout).
+
+A tool failure raises `RuntimeError` whose message starts with the tool's name:
+`fs_read: <the tool's message>`. A call that needs approval comes back as a
+tool error, so it raises `RuntimeError` with `fs_write: interaction not supported
+here`. A Bash tool command prints that error and exits 1. In both the tool has to
+be called directly, outside the script. A blocked call raises
+`<tool>: blocked: <reason>` and a rejected one `<tool>: <reason>`. A fatal
+outcome, such as a cancellation or a resource limit, ends the run and cannot be
+caught. Calls run one at a time and count against the same call limit as Bash
+tool commands.
+
+A traceback shows the script's own line numbers. One limit: under `python3 -c`, a
+frame from code run with `exec` or `eval` shares the name `<string>` with the
+script, so its line number may be reported wrongly. A heredoc or a script file is
+exact.
 
 ## Output modes and error handling
 
@@ -355,8 +423,9 @@ Script tools interact with tool confirmation and middleware as follows:
     `needs approval: <tool>; call it directly instead of from bash`. A
     middleware interaction that cannot be answered inside a script exits `4`
     with stderr `interaction required, can't be answered inside a script`.
-  - In Python, `call_tool` raises a `RuntimeError` containing
-    `interaction required for '<tool>': ...`.
+  - In Python, the call raises a `RuntimeError`. In a script tool's body the
+    message is `<tool> failed: tool error: interaction not supported here`; in
+    the `bash` tool it is `<tool>: interaction not supported here`.
 - **Agent middleware**: Configured tool middleware applies to inner calls. A
   middleware denial causes the inner command to exit non-zero (Bash) or raise
   `RuntimeError` (Python).

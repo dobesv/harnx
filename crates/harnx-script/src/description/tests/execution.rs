@@ -7,7 +7,9 @@ use super::{creator, reader};
 use crate::{
     commands::{tool_commands, CallOutcome, InnerExecutor, ToolSpec},
     description::{bash_tool_description, examples, QUOTING},
-    BashKitBackend, CancellationToken, ScriptBackend, ScriptLimits, ScriptRun, ScriptStatus,
+    tools_prelude, BashKitBackend, CancellationToken, ExtFunctionResult, MontyObject,
+    ScriptBackend, ScriptHostContext, ScriptLimits, ScriptPythonFunctions, ScriptPythonHandler,
+    ScriptRun, ScriptStatus, PYTHON_CALL_FUNCTION,
 };
 
 #[derive(Default)]
@@ -219,4 +221,50 @@ async fn documented_json_flags_preserve_nested_wait_through_dispatch() {
         Some((tool.name, json!({"command": "echo ready"})))
     );
     assert_eq!(executor.0.lock().unwrap().len(), 7);
+}
+
+/// Answers every `tools.NAME(...)` call with `{"echo": NAME}`.
+struct EchoTools;
+
+#[async_trait]
+impl ScriptPythonHandler for EchoTools {
+    async fn call(
+        &self,
+        name: String,
+        args: Vec<MontyObject>,
+        _: Vec<(MontyObject, MontyObject)>,
+        _: ScriptHostContext,
+    ) -> ExtFunctionResult {
+        assert_eq!(name, PYTHON_CALL_FUNCTION);
+        let tool = args.into_iter().next().unwrap();
+        ExtFunctionResult::Return(MontyObject::dict(vec![(MontyObject::string("echo"), tool)]))
+    }
+}
+
+/// The call shapes the description's Python paragraph teaches, an attribute
+/// call and `getattr(tools, name)`, both reach the host function with the
+/// tool's name.
+#[tokio::test]
+async fn the_call_shapes_the_description_teaches_reach_the_host_function() {
+    let tools = vec![reader()];
+    let description = bash_tool_description(&tools, 8, 1000);
+    assert!(description.contains("tools.NAME(property=value, ...)"));
+    let names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+    let script = "python3 - <<'EOF'\nr = tools.files_fs_read(path='src/lib.rs')\nprint(r['echo'])\nprint(getattr(tools, 'files_fs_read')(path='x')['echo'])\nEOF\n";
+    let result = BashKitBackend
+        .run(crate::ScriptRequest {
+            script,
+            python_functions: Some(ScriptPythonFunctions {
+                names: vec![PYTHON_CALL_FUNCTION.into()],
+                handler: Arc::new(EchoTools),
+                prelude: Some(tools_prelude(&names)),
+            }),
+            limits: ScriptLimits::default(),
+            commands: vec![],
+            fs_mounts: vec![],
+            cancel: CancellationToken::new(),
+        })
+        .await;
+    assert_eq!(result.status, ScriptStatus::Ok, "{result:?}");
+    assert_eq!(result.stdout, "files_fs_read\nfiles_fs_read\n");
 }

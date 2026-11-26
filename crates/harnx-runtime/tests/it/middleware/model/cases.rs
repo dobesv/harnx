@@ -129,7 +129,7 @@ async fn middleware_mock_model_error_normalization_and_recovery() -> Result<()> 
 async fn middleware_mock_model_allowlist_and_bash_inner_call() -> Result<()> {
     let h = Harness::new().await?;
     let mut allowed = fixture::python(
-        "r = call_tool('probe_aux', {'value':'helper'})\nrespond({'output':r,'is_error':False})",
+        "r = tools.probe_aux(value='helper')\nrespond({'output':r,'is_error':False})",
     );
     allowed["tools"] = json!(["probe_aux"]);
     allowed["match"] = json!("^probe_.*$");
@@ -141,7 +141,7 @@ async fn middleware_mock_model_allowlist_and_bash_inner_call() -> Result<()> {
     );
     assert_eq!(h.count(), 1);
     assert_eq!(h.probe.calls.lock()[0].0, "probe_aux");
-    let denied = fixture::python("call_tool('probe_aux', {})");
+    let denied = fixture::python("tools.probe_aux()");
     assert_eq!(
         h.eval(vec![denied], fixture::call(json!({}))).await?.output["is_error"],
         true

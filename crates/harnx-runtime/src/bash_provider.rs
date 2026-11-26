@@ -31,6 +31,7 @@ use crate::bash_inner::{
 use crate::config::BASH_TOOL_NAME;
 
 pub(crate) mod attachments;
+mod python_tools;
 
 /// Default `timeout_secs` for the `bash` tool, matching `bash_exec`.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 86_400;
@@ -87,6 +88,9 @@ pub struct BashProvider {
     specs: Vec<ToolSpec>,
     executor: InnerCallExecutor,
     slot: Option<Arc<BashEvalContextSlot>>,
+    /// The declarations `specs` come from; Python's `tools` has exactly the
+    /// tools the Bash commands have.
+    declarations: Vec<harnx_core::tool::ToolDeclaration>,
     backend: BashKitBackend,
     attachment_fetcher: Option<Arc<dyn harnx_script::fs_attachments::AttachmentFetcher>>,
     media_store: Option<Arc<dyn crate::bash_inner::media::MediaStore>>,
@@ -181,6 +185,7 @@ impl BashProvider {
         Self {
             active,
             specs,
+            declarations: inner_declarations,
             executor: InnerCallExecutor::new(config),
             slot,
             backend: BashKitBackend,
@@ -217,6 +222,24 @@ impl BashProvider {
             })
     }
 
+    /// Python's `tools`, over the tools the Bash commands have; none when the
+    /// provider has no tools, so Python there stays as it was.
+    fn python_functions(
+        &self,
+        run: &Arc<crate::bash_inner::InnerCallRun>,
+        abort: &AbortSignal,
+        fatal: &Arc<std::sync::OnceLock<String>>,
+    ) -> Option<harnx_script::ScriptPythonFunctions> {
+        (!self.declarations.is_empty()).then(|| {
+            python_tools::python_tools(
+                Arc::clone(run),
+                abort.clone(),
+                &self.declarations,
+                Arc::clone(fatal),
+            )
+        })
+    }
+
     async fn run_script(
         &self,
         arguments: Value,
@@ -246,6 +269,8 @@ impl BashProvider {
             ToolError::Recoverable(anyhow!("bash tool commands failed to register: {error}"))
         })?;
 
+        let fatal = Arc::new(std::sync::OnceLock::new());
+        let python_functions = self.python_functions(&run, abort, &fatal);
         let limits = ScriptLimits {
             timeout_secs: params.timeout_secs.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS),
             ..ScriptLimits::default()
@@ -257,20 +282,21 @@ impl BashProvider {
         let token = CancellationToken::new();
         let run_fut = self.backend.run(harnx_script::ScriptRequest {
             script: &script,
-            python_functions: None,
+            python_functions,
             limits,
             commands,
             fs_mounts: vec![attachments::mount(self.attachment_fetcher.clone())],
             cancel: token.clone(),
         });
         tokio::pin!(run_fut);
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             result = &mut run_fut => result,
             _ = harnx_core::abort::wait_abort_signal(abort) => {
                 token.cancel();
                 (&mut run_fut).await
             }
         };
+        python_tools::report_fatal(&mut result, fatal.get());
 
         let outcome = BashOutcome::new(result, abort, &run, params, self.full_payload);
         outcome.into_provider_result()
