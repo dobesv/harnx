@@ -34,19 +34,61 @@ fn mcp_adapter_preserves_serialized_call_tool_results() {
         "isError": true,
         "_meta": {"private": "value"}
     });
-    let result = call_tool_result_from_value(value.clone());
-    assert_eq!(serde_json::to_value(result).unwrap(), value);
+    // Passthrough holds whether or not the caller asked for a structured
+    // result: a serialized `CallToolResult` is never rewrapped.
+    for requested in [false, true] {
+        let result = call_tool_result_from_value(value.clone(), requested);
+        assert_eq!(serde_json::to_value(result).unwrap(), value);
+    }
 }
 
 #[test]
 fn mcp_adapter_wraps_raw_json_values_as_text() {
-    let result = call_tool_result_from_value(serde_json::json!({"answer": 42}));
+    let result = call_tool_result_from_value(serde_json::json!({"answer": 42}), false);
     assert_eq!(result.is_error, Some(false));
+    assert_eq!(result.structured_content, None);
     assert_eq!(result.content.len(), 1);
     assert!(serde_json::to_value(&result.content[0]).unwrap()["text"]
         .as_str()
         .unwrap()
         .contains("\"answer\": 42"));
+}
+
+#[test]
+fn mcp_adapter_wraps_raw_json_in_structured_content_when_requested() {
+    let value = serde_json::json!({"answer": 42});
+    let result = call_tool_result_from_value(value.clone(), true);
+    assert_eq!(result.structured_content, Some(value.clone()));
+    assert_eq!(result.is_error, Some(false));
+    // The text block carries the compact form, matching what a native
+    // caller's text rendering prints.
+    assert_eq!(
+        serde_json::to_value(&result.content).unwrap(),
+        serde_json::json!([{"type": "text", "text": value.to_string()}])
+    );
+}
+
+/// Raw tool JSON is not always an object; when a structured result is
+/// requested every shape is passed through. Parity with native output is
+/// full for `-o json`, but Python `tools.*` matches only for objects —
+/// a native array or scalar reaches Python as rendered text
+/// (`python_tools::python_value`).
+#[test]
+fn mcp_adapter_structured_wrap_passes_non_object_json() {
+    for value in [
+        serde_json::json!([1, 2, 3]),
+        serde_json::json!("plain text"),
+        serde_json::json!(7),
+        serde_json::Value::Null,
+    ] {
+        let requested = call_tool_result_from_value(value.clone(), true);
+        assert_eq!(requested.structured_content, Some(value.clone()), "{value}");
+        let unrequested = call_tool_result_from_value(value.clone(), false);
+        assert_eq!(
+            unrequested.structured_content, None,
+            "without the request the pretty-text wrap stays: {value}"
+        );
+    }
 }
 
 fn result_with_execution_context() -> Value {
@@ -558,6 +600,74 @@ mod adapter_wire_tests {
             client.peer().call_tool(params).await.expect("probe call");
         }
         assert_eq!(*probe.seen.lock().expect("probe log"), [true, false, false]);
+        client.cancel().await.unwrap();
+    }
+
+    /// Serves one tool whose result is raw business JSON, not a serialized
+    /// `CallToolResult`, like every native toolset behind `run_toolset_main`.
+    struct RawJsonToolset;
+
+    #[async_trait::async_trait]
+    impl Toolset for RawJsonToolset {
+        fn name(&self) -> &str {
+            "raw-json"
+        }
+
+        fn tools(&self) -> Vec<harnx_toolset::ToolSpec> {
+            vec![timeout_policy_spec("raw", None)]
+        }
+
+        async fn invoke(
+            &self,
+            _tool: &str,
+            _args: Value,
+            _cancel: CancellationToken,
+        ) -> Result<Value, ToolInvokeError> {
+            Ok(serde_json::json!({"timezone": "UTC", "is_dst": false}))
+        }
+    }
+
+    /// Over the real rmcp wire: a `_meta` request for a structured result
+    /// wraps the toolset's raw JSON in `structuredContent` (with its compact
+    /// form as text), and the same call without the `_meta` entry keeps the
+    /// pretty-text envelope with no `structuredContent`.
+    #[tokio::test]
+    async fn call_tool_meta_wraps_raw_json_in_structured_content() {
+        let (client, _server) = setup_client_server(Arc::new(RawJsonToolset)).await;
+        let raw = serde_json::json!({"timezone": "UTC", "is_dst": false});
+
+        let mut structured = CallToolRequestParams::new("raw");
+        structured
+            .meta_mut()
+            .get_or_insert_with(rmcp::model::RequestMetaObject::new)
+            .insert(
+                harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_owned(),
+                Value::Bool(true),
+            );
+        let requested = client
+            .peer()
+            .call_tool(structured)
+            .await
+            .expect("structured call");
+        assert_eq!(requested.structured_content, Some(raw.clone()));
+        assert_eq!(requested.is_error, Some(false));
+        assert_eq!(
+            serde_json::to_value(&requested.content).unwrap(),
+            serde_json::json!([{"type": "text", "text": raw.to_string()}])
+        );
+
+        let unrequested = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("raw"))
+            .await
+            .expect("plain call");
+        assert_eq!(unrequested.structured_content, None);
+        assert!(unrequested.content[0]
+            .as_text()
+            .expect("text block")
+            .text
+            .contains("\"timezone\": \"UTC\""));
+
         client.cancel().await.unwrap();
     }
 

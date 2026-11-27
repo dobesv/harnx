@@ -86,6 +86,14 @@ pub(crate) fn time_server_binary() -> Result<PathBuf> {
 
 /// The built binary of a workspace package, built on demand when the test
 /// binary's own target directory does not have it yet.
+///
+/// The on-demand build only runs when the binary is *missing*, so after
+/// editing a library crate, `cargo nextest` rebuilds the test binaries but
+/// leaves a previously built sibling (e.g. `harnx-time-tools`,
+/// `harnx-mcp-bridge`) at its old code — a bridged e2e can then pass
+/// against a stale binary and hide the edit's effect. Rebuild the spawned
+/// packages explicitly (`cargo build -p <pkg>`) before judging local e2e
+/// results; CI is immune because its archive carries fresh bins.
 fn workspace_binary(package: &str) -> Result<PathBuf> {
     let mut path = std::env::current_exe().context("resolve test executable")?;
     path = harnx_core::bin_dir_of_exe(&path);
@@ -410,6 +418,100 @@ async fn python_reads_a_file_through_tools() -> Result<()> {
     assert_eq!(text, "alpha\nbeta\n");
     assert!(notes.contains("offset"), "{notes}");
     Ok(())
+}
+
+/// A raw-JSON toolset answers BashKit identically natively and through the
+/// stdio MCP bridge: `-o json` prints the tool's raw JSON, and Python's
+/// `tools.*` returns the same dict. The bridge forwards the
+/// structured-result request (`#2856`), and the MCP adapter honors it by
+/// wrapping the raw JSON in `structuredContent` instead of a pretty-text
+/// envelope (`#3004`).
+#[tokio::test(flavor = "multi_thread")]
+async fn nats_bridged_time_tool_matches_native_json_output() -> Result<()> {
+    let Some(server) = common::spawn_nats_server_with_options(common::SpawnNatsServerOptions {
+        auth_token: Some(TOKEN.to_string()),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let time = time_server_binary()?;
+    let _env = EnvGuard::install(&[
+        (HARNX_NATS_URL_ENV, server.url()),
+        (HARNX_NATS_TOKEN_ENV, TOKEN),
+    ]);
+
+    let (native_id, _native, native_config) = start_script_server(
+        server.url(),
+        time_server_config(&time.to_string_lossy()),
+        "__time__time",
+        &["time_*"],
+    )
+    .await?;
+
+    let mut bridged = time_server_config(&workspace_binary("harnx-mcp-bridge")?.to_string_lossy());
+    bridged.args = ["--name", "time", "--"]
+        .into_iter()
+        .map(str::to_string)
+        .chain([
+            time.to_string_lossy().into_owned(),
+            "--mcp-stdio".to_string(),
+        ])
+        .collect();
+    let (bridge_id, _bridge, bridge_config) =
+        start_script_server(server.url(), bridged, "__time__time", &["time_*"]).await?;
+
+    // `-o json` prints the raw tool JSON on both wires. The whole object is
+    // compared after dropping the two fields the clock moves between the
+    // calls, so an MCP envelope (`content`/`isError`) on the bridged side
+    // cannot pass as the tool's data.
+    let script = "time_get_current_time --timezone UTC -o json";
+    let native_json = run_bash_script(&native_config, &native_id, script).await?;
+    assert_eq!(native_json["status"], "ok", "{native_json}");
+    let bridged_json = run_bash_script(&bridge_config, &bridge_id, script).await?;
+    assert_eq!(bridged_json["status"], "ok", "{bridged_json}");
+    let native = stable_time_object(&stdout_block(&native_json))?;
+    let bridged = stable_time_object(&stdout_block(&bridged_json))?;
+    assert_eq!(
+        bridged, native,
+        "the bridged `-o json` output must be the raw tool JSON, not an MCP envelope"
+    );
+
+    // Python's `tools.*` returns the same dict on both wires.
+    let script = r#"python3 - <<'EOF'
+import json
+d = tools.time_get_current_time(timezone="UTC")
+print(json.dumps(sorted(d)))
+EOF"#;
+    let native_py = run_bash_script(&native_config, &native_id, script).await?;
+    assert_eq!(native_py["status"], "ok", "{native_py}");
+    let bridged_py = run_bash_script(&bridge_config, &bridge_id, script).await?;
+    assert_eq!(bridged_py["status"], "ok", "{bridged_py}");
+    let (native_keys, bridged_keys) = (stdout_block(&native_py), stdout_block(&bridged_py));
+    assert_eq!(
+        native_keys, bridged_keys,
+        "native and bridged Python dicts must carry the same keys"
+    );
+    assert_eq!(
+        bridged_keys, r#"["datetime", "day_of_week", "is_dst", "timezone"]"#,
+        "the bridged dict must be the tool's raw JSON, not the envelope"
+    );
+    Ok(())
+}
+
+/// The `time_get_current_time` `-o json` output with the two fields the clock
+/// moves between two calls removed. An MCP envelope or a text wrap parses to
+/// an object with the wrong keys, so it fails the comparison, not just the
+/// removed fields.
+fn stable_time_object(stdout: &str) -> Result<serde_json::Value> {
+    let mut value: serde_json::Value = serde_json::from_str(stdout)
+        .with_context(|| format!("`-o json` output is one JSON object: {stdout}"))?;
+    let object = value
+        .as_object_mut()
+        .with_context(|| format!("`-o json` output is one JSON object: {stdout}"))?;
+    object.remove("datetime");
+    object.remove("day_of_week");
+    Ok(value)
 }
 
 /// Recovery: after worker loss the engine replays the call across providers
