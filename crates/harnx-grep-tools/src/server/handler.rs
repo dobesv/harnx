@@ -56,21 +56,26 @@ fn text_result(text: impl Into<String>) -> CallToolResult {
 }
 
 impl GrepServer {
+    /// Runs one search and returns either the whole report document as
+    /// `structuredContent` (`structured`, a script's inner call) or the same
+    /// document pretty-printed as text (a direct model call). Errors are
+    /// unchanged by the request style.
     pub async fn grep_query_impl(
         &self,
         params: GrepQueryParams,
+        structured: bool,
     ) -> Result<CallToolResult, ErrorData> {
         if let Err(message) = params.validate() {
             return Ok(error_result(message));
         }
 
         let query = params.query.trim();
-        let output = match client::search(&self.client, &self.base_url, &params).await {
+        let document = match client::search(&self.client, &self.base_url, &params).await {
             SearchOutcome::Ok(value) => match serde_json::from_value::<SearchResponse>(value) {
-                Ok(response) => format::build_output(query, &response),
+                Ok(response) => format::build_search_document(query, &response),
                 Err(error) => return Ok(error_result(unexpected_response_error(error))),
             },
-            SearchOutcome::NotFound => format::build_not_found_output(query),
+            SearchOutcome::NotFound => format::build_not_found_document(query),
             SearchOutcome::RateLimited => {
                 return Ok(error_result(format!(
                     "{}\n\nRetry guidance: wait 60 seconds before retrying.",
@@ -98,7 +103,11 @@ impl GrepServer {
             }
         };
 
-        Ok(text_result(output))
+        Ok(if structured {
+            CallToolResult::structured(document)
+        } else {
+            text_result(format::render_document(&document))
+        })
     }
 }
 
@@ -117,18 +126,22 @@ impl ServerHandler for GrepServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let grep_query = Tool::new(
-            "grep_query",
-            "Search GitHub code using grep.app API. This tool enables AI assistants to search through GitHub repositories for specific code patterns using grep.app's powerful search index. It returns formatted results with repository information, file paths, and code snippets.",
-            grep_query_schema(),
-        )
-        .annotate(
+        // Built from the same ToolSpec the native toolset publishes, so the
+        // script-output and output-schema `_meta` reaches direct MCP clients
+        // exactly as it reaches them through the MCP adapter.
+        let spec = crate::toolset::grep_query_spec();
+        let input_schema = match spec.input_schema {
+            Value::Object(schema) => schema,
+            _ => Map::new(),
+        };
+        let mut grep_query = Tool::new(spec.name, spec.description, input_schema).annotate(
             ToolAnnotations::new()
                 .read_only(true)
                 .destructive(false)
                 .idempotent(true)
                 .open_world(true),
         );
+        grep_query.meta = spec.meta.map(rmcp::model::MetaObject);
 
         Ok(ListToolsResult::with_all_items(vec![grep_query]))
     }
@@ -159,13 +172,14 @@ impl GrepServer {
     async fn dispatch_call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
             "grep_query" => domain_result(
                 async {
+                    let structured = structured_result_requested(&context);
                     let params = parse_arguments::<GrepQueryParams>(request.arguments)?;
-                    self.grep_query_impl(params).await
+                    self.grep_query_impl(params, structured).await
                 }
                 .await,
             ),
@@ -175,6 +189,17 @@ impl GrepServer {
             )),
         }
     }
+}
+
+/// Whether the caller asked for the result as `structuredContent`, the same
+/// `_meta` signal `McpToolsetAdapter` translates into the structured-result
+/// capability.
+fn structured_result_requested(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .meta
+        .get(harnx_toolset::CAPABILITY_STRUCTURED_RESULT)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn unexpected_response_error(error: impl std::fmt::Display) -> String {
@@ -308,14 +333,23 @@ mod wire_tests {
         setup_client_server_for(GrepServer::new()).await
     }
 
-    async fn setup_client_server_for(server: GrepServer) -> (TestClientService, TestServerService) {
+    /// Generic over the served handler so tests can drive `GrepServer` and the
+    /// MCP adapter through the same in-memory transport.
+    async fn setup_client_server_for<S>(
+        server: S,
+    ) -> (TestClientService, RunningService<RoleServer, S>)
+    where
+        S: rmcp::ServerHandler + 'static,
+    {
         let (client_transport, server_transport) = duplex(65_536);
 
         let server_fut = serve_server(server, server_transport);
         let client_fut = serve_client(TestClientHandler, client_transport);
 
-        let (server_res, client_res): (Result<TestServerService, _>, Result<TestClientService, _>) =
-            tokio::join!(server_fut, client_fut);
+        let (server_res, client_res): (
+            Result<RunningService<RoleServer, S>, _>,
+            Result<TestClientService, _>,
+        ) = tokio::join!(server_fut, client_fut);
 
         let server = server_res.unwrap();
         let client = client_res.unwrap();
@@ -624,5 +658,214 @@ mod wire_tests {
         );
 
         client.cancel().await.unwrap();
+    }
+
+    mod script_results {
+        use super::*;
+        use harnx_toolset_server::McpToolsetAdapter;
+        use std::sync::Arc;
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+        const GOLDEN_RESPONSE: &str =
+            include_str!("../../tests/fixtures/search_golden_single.json");
+        const GOLDEN_OUTPUT: &str =
+            include_str!("../../tests/fixtures/search_golden_single_output.txt");
+
+        /// Normalize CRLF so byte-exact asserts pass on Windows, where git
+        /// checks .txt fixtures out with CRLF.
+        fn golden_output() -> String {
+            GOLDEN_OUTPUT.replace("\r\n", "\n")
+        }
+
+        fn search_url(mock: &MockServer) -> String {
+            format!("{}/api/search", mock.uri())
+        }
+
+        async fn mount_hits(server: &MockServer) {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/api/search"))
+                .and(matchers::query_param("q", "FastAPI"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(GOLDEN_RESPONSE, "application/json"),
+                )
+                .mount(server)
+                .await;
+        }
+
+        async fn mount_not_found(server: &MockServer) {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/api/search"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(server)
+                .await;
+        }
+
+        fn structured_call(query: &str) -> CallToolRequestParams {
+            let mut params = CallToolRequestParams::new("grep_query");
+            params.meta.get_or_insert_default().insert(
+                harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_owned(),
+                Value::Bool(true),
+            );
+            params.arguments = Some(
+                json!({ "query": query })
+                    .as_object()
+                    .expect("arguments object")
+                    .clone(),
+            );
+            params
+        }
+
+        fn plain_call(query: &str) -> CallToolRequestParams {
+            CallToolRequestParams::new("grep_query").with_arguments(
+                json!({ "query": query })
+                    .as_object()
+                    .expect("arguments object")
+                    .clone(),
+            )
+        }
+
+        #[tokio::test]
+        async fn listing_meta_matches_the_native_spec_and_the_mcp_adapter() {
+            let (grep_client, _grep_server) = setup_client_server().await;
+            let listed = grep_client
+                .peer()
+                .list_tools(None)
+                .await
+                .expect("grep listing");
+            let direct_meta = listed.tools.first().expect("one tool").meta.clone();
+            grep_client.cancel().await.unwrap();
+
+            let adapter = McpToolsetAdapter {
+                toolset: Arc::new(crate::GrepToolset::new()),
+            };
+            let (adapter_client, _adapter_server) = setup_client_server_for(adapter).await;
+            let listed = adapter_client
+                .peer()
+                .list_tools(None)
+                .await
+                .expect("adapter listing");
+            let adapter_meta = listed.tools.first().expect("one tool").meta.clone();
+            adapter_client.cancel().await.unwrap();
+
+            let spec = crate::toolset::grep_query_spec();
+            let native = serde_json::to_value(spec.meta).expect("spec meta");
+            let direct = serde_json::to_value(direct_meta).expect("direct meta");
+            let adapted = serde_json::to_value(adapter_meta).expect("adapter meta");
+            assert_eq!(direct, native, "GrepServer listing must match the spec");
+            assert_eq!(
+                adapted, native,
+                "McpToolsetAdapter listing must match the spec"
+            );
+            for key in [
+                harnx_toolset::SCRIPT_OUTPUT_META_KEY,
+                harnx_toolset::OUTPUT_SCHEMA_META_KEY,
+            ] {
+                assert!(direct.get(key).is_some(), "listing lacks {key}");
+            }
+        }
+
+        #[tokio::test]
+        async fn structured_request_returns_the_whole_document_over_mcp() {
+            let mock = MockServer::start().await;
+            mount_hits(&mock).await;
+            let server = GrepServer::with_base_url(search_url(&mock));
+            let (client, _server) = setup_client_server_for(server).await;
+            let result = client
+                .peer()
+                .call_tool(structured_call("FastAPI"))
+                .await
+                .expect("tool call");
+
+            assert_ne!(result.is_error, Some(true));
+            let document = result
+                .structured_content
+                .clone()
+                .expect("structured content");
+            let expected: Value =
+                serde_json::from_str(&golden_output()).expect("golden output is JSON");
+            assert_eq!(document, expected, "{result:?}");
+            let text = result
+                .content
+                .iter()
+                .find_map(|block| block.as_text().map(|text| text.text.clone()))
+                .expect("text block");
+            assert_eq!(text, document.to_string());
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn plain_request_still_prints_the_pretty_document() {
+            let mock = MockServer::start().await;
+            mount_hits(&mock).await;
+            let server = GrepServer::with_base_url(search_url(&mock));
+            let (client, _server) = setup_client_server_for(server).await;
+            let result = client
+                .peer()
+                .call_tool(plain_call("FastAPI"))
+                .await
+                .expect("tool call");
+
+            assert!(result.structured_content.is_none(), "{result:?}");
+            let text = result
+                .content
+                .iter()
+                .find_map(|block| block.as_text().map(|text| text.text.clone()))
+                .expect("text block");
+            let expected = golden_output();
+            assert_eq!(text, expected);
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn structured_request_returns_the_not_found_document_over_mcp() {
+            let mock = MockServer::start().await;
+            mount_not_found(&mock).await;
+            let server = GrepServer::with_base_url(search_url(&mock));
+            let (client, _server) = setup_client_server_for(server).await;
+            let result = client
+                .peer()
+                .call_tool(structured_call("missing"))
+                .await
+                .expect("tool call");
+
+            let document = result.structured_content.expect("structured content");
+            assert_eq!(document["query"], json!("missing"));
+            assert_eq!(
+                document["summary"]["message"],
+                json!("No results found for this query")
+            );
+            assert_eq!(document["results"], json!([]));
+            client.cancel().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn adapter_call_matches_the_direct_server_structured_result() {
+            let mock = MockServer::start().await;
+            mount_hits(&mock).await;
+            let endpoint = search_url(&mock);
+
+            let adapter = McpToolsetAdapter {
+                toolset: Arc::new(crate::GrepToolset::with_base_url(endpoint.clone())),
+            };
+            let (client, _server) = setup_client_server_for(adapter).await;
+            let adapted = client
+                .peer()
+                .call_tool(structured_call("FastAPI"))
+                .await
+                .expect("adapter call");
+            client.cancel().await.unwrap();
+
+            let (direct_client, _direct_server) =
+                setup_client_server_for(GrepServer::with_base_url(endpoint)).await;
+            let direct = direct_client
+                .peer()
+                .call_tool(structured_call("FastAPI"))
+                .await
+                .expect("direct call");
+            direct_client.cancel().await.unwrap();
+
+            assert_eq!(adapted.structured_content, direct.structured_content);
+            assert_eq!(adapted.is_error, direct.is_error);
+        }
     }
 }

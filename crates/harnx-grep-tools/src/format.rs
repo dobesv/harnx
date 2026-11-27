@@ -2,6 +2,7 @@ use std::sync::OnceLock;
 
 use fancy_regex::Regex;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::server::model::{Bucket, Hit, SearchResponse};
 
@@ -131,7 +132,11 @@ fn cap_snippet_lines(text: &str) -> String {
     formatted_lines.join("\n")
 }
 
-pub fn build_output(query: &str, response: &SearchResponse) -> String {
+/// The whole search report as one JSON document.
+///
+/// Hit responses carry `results_by_repository`; the direct-call text is the
+/// same document pretty-printed, byte for byte.
+pub fn build_search_document(query: &str, response: &SearchResponse) -> Value {
     let mut results_by_repository = group_hits_by_repository(&response.hits.hits);
     results_by_repository.sort_by_key(|repository| std::cmp::Reverse(repository.matches_count));
 
@@ -150,7 +155,10 @@ pub fn build_output(query: &str, response: &SearchResponse) -> String {
         results_by_repository,
     };
 
-    serialize_pretty(&output)
+    serde_json::to_value(output).unwrap_or_else(|error| {
+        log::error!("failed to serialize grep output: {error}");
+        Value::Null
+    })
 }
 
 fn top_summaries<'a, T>(
@@ -239,8 +247,9 @@ fn parse_total_matches(raw: &str) -> u64 {
     }
 }
 
-pub fn build_not_found_output(query: &str) -> String {
-    serialize_pretty(&NotFoundOutput {
+/// The no-results document, mirroring grep.app's 404 shape.
+pub fn build_not_found_document(query: &str) -> Value {
+    serde_json::to_value(NotFoundOutput {
         query,
         summary: NotFoundSummary {
             total_results: 0,
@@ -248,16 +257,17 @@ pub fn build_not_found_output(query: &str) -> String {
         },
         results: Vec::new(),
     })
+    .unwrap_or_else(|error| {
+        log::error!("failed to serialize grep output: {error}");
+        Value::Null
+    })
 }
-
-fn serialize_pretty<T: Serialize>(value: &T) -> String {
-    match serde_json::to_string_pretty(value) {
-        Ok(output) => output,
-        Err(error) => {
-            log::error!("failed to serialize grep output: {error}");
-            format!("❌ Error: Failed to serialize grep output: {error}")
-        }
-    }
+/// Pretty-print a report document for a direct call, 2-space indented.
+pub fn render_document(document: &Value) -> String {
+    serde_json::to_string_pretty(document).unwrap_or_else(|error| {
+        log::error!("failed to serialize grep output: {error}");
+        format!("❌ Error: Failed to serialize grep output: {error}")
+    })
 }
 
 #[derive(Serialize)]
@@ -328,8 +338,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        build_not_found_output, build_output, extract_line_numbers, extract_text_from_html,
-        format_code_snippet, language_from_extension,
+        build_not_found_document, build_search_document, extract_line_numbers,
+        extract_text_from_html, format_code_snippet, language_from_extension, render_document,
     };
     use crate::server::model::SearchResponse;
 
@@ -450,7 +460,10 @@ mod tests {
         let response: SearchResponse =
             serde_json::from_str(include_str!("../tests/fixtures/search_golden_single.json"))
                 .expect("golden fixture must deserialize");
-        assert_eq!(build_output("FastAPI", &response), GOLDEN_SUCCESS);
+        assert_eq!(
+            render_document(&build_search_document("FastAPI", &response)),
+            GOLDEN_SUCCESS
+        );
     }
 
     #[test]
@@ -458,8 +471,10 @@ mod tests {
         let response: SearchResponse =
             serde_json::from_str(include_str!("../tests/fixtures/search_basic.json"))
                 .expect("basic fixture must deserialize");
-        let output: Value =
-            serde_json::from_str(&build_output("FastAPI", &response)).expect("valid output JSON");
+        let output: Value = serde_json::from_str(&render_document(&build_search_document(
+            "FastAPI", &response,
+        )))
+        .expect("valid output JSON");
 
         assert_eq!(output["summary"]["total_results"], 1234);
         assert_eq!(output["summary"]["results_shown"], 3);
@@ -498,7 +513,8 @@ mod tests {
         }))
         .expect("response must deserialize");
         let output: Value =
-            serde_json::from_str(&build_output("plain", &response)).expect("valid output JSON");
+            serde_json::from_str(&render_document(&build_search_document("plain", &response)))
+                .expect("valid output JSON");
         let file = &output["results_by_repository"][0]["files"][0];
         assert_eq!(file["language"], "text");
         assert_eq!(file["code_snippet"], "plain text");
@@ -520,7 +536,8 @@ mod tests {
         }))
         .expect("response must deserialize");
         let output: Value =
-            serde_json::from_str(&build_output("query", &response)).expect("valid output JSON");
+            serde_json::from_str(&render_document(&build_search_document("query", &response)))
+                .expect("valid output JSON");
         assert_eq!(
             output["summary"]["top_languages"].as_array().unwrap().len(),
             5
@@ -541,6 +558,33 @@ mod tests {
 
     #[test]
     fn not_found_output_is_byte_exact() {
-        assert_eq!(build_not_found_output("somequery"), GOLDEN_NOT_FOUND);
+        assert_eq!(
+            render_document(&build_not_found_document("somequery")),
+            GOLDEN_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn search_document_is_the_pretty_output_parsed() {
+        let response: SearchResponse =
+            serde_json::from_str(include_str!("../tests/fixtures/search_golden_single.json"))
+                .expect("golden fixture must deserialize");
+        let document = build_search_document("FastAPI", &response);
+        let parsed: Value = serde_json::from_str(&render_document(&build_search_document(
+            "FastAPI", &response,
+        )))
+        .expect("pretty output is JSON");
+        assert_eq!(document, parsed);
+    }
+
+    #[test]
+    fn not_found_document_is_the_pretty_output_parsed() {
+        let document = build_not_found_document("somequery");
+        let parsed: Value =
+            serde_json::from_str(&render_document(&build_not_found_document("somequery")))
+                .expect("pretty output is JSON");
+        assert_eq!(document, parsed);
+        assert_eq!(document["summary"]["total_results"], 0);
+        assert_eq!(document["results"], Value::Array(Vec::new()));
     }
 }
