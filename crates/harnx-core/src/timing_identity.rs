@@ -49,8 +49,11 @@ pub const TIMING_MESSAGE_ID_PREFIX: &str = "timing-v1-";
 /// Combined versioned header for timing notices.
 pub const TIMING_HEADER: &str = "[Runtime note] ⏱ v1 ";
 
-/// Separator between JSON receipt and human-readable timing context.
-/// Allows classifier to parse receipt while preserving prose description.
+/// Separator between the JSON receipt and the human-readable timing context,
+/// and between the timing fields and the guidance prose that follows them.
+/// Allows the classifier to parse the receipt while preserving prose, and
+/// gives the display parser a boundary so guidance wording never corrupts
+/// the machine-parsed fields.
 pub const TIMING_CONTEXT_SEPARATOR: &str = " | ";
 
 /// Bitmask for timing milestones that have been covered.
@@ -180,7 +183,7 @@ impl TimingReceipt {
     /// Parse from a complete timing notice line.
     ///
     /// The line format is:
-    /// `[Runtime note] ⏱ v1 <JSON receipt> | <human-readable context>`
+    /// `[Runtime note] ⏱ v1 <JSON receipt> | <timing fields> | <guidance>`
     ///
     /// Returns `None` if the line doesn't have the versioned format header
     /// or the receipt JSON is malformed. Trailing prose is ignored.
@@ -227,7 +230,8 @@ pub fn is_timing_notice(text: &str) -> bool {
 /// Turns a raw notice line into something like
 /// `⏱ 526m 40s elapsed · 913m 19s left of 1440m · 90% threshold passed`.
 /// Duration values are reused verbatim from the notice's human-readable
-/// context, so the compact form never disagrees with the model-facing text.
+/// timing fields (the guidance prose after the second separator is not
+/// parsed), so the compact form never disagrees with the model-facing text.
 /// Returns `None` when the line is not a parseable timing notice, or when the
 /// line carries no readable context (old receipt-only lines fall back to the
 /// caller's generic runtime-note handling).
@@ -283,16 +287,27 @@ struct TimingDisplayFields<'a> {
 impl<'a> TimingDisplayFields<'a> {
     /// Parse the `label: value` pairs of the notice context.
     ///
+    /// The context is `fields | guidance prose`; fields end at the first
+    /// `TIMING_CONTEXT_SEPARATOR`, and only the fields segment is parsed, so
+    /// guidance wording can never be mistaken for a field value. Legacy
+    /// notices without a second separator parse as before.
+    ///
     /// Timestamp values contain colons but never `": "`, and duration values
     /// contain neither, so splitting each comma-separated part at the first
     /// `": "` cannot cut into a value.
     fn parse(context: &'a str) -> Self {
+        let fields_part = context
+            .split_once(TIMING_CONTEXT_SEPARATOR)
+            .map_or(context, |(fields, _)| fields);
         let mut fields = Self {
             elapsed: None,
             remaining: None,
             budget: None,
         };
-        for (label, value) in context.split(", ").filter_map(|part| part.split_once(": ")) {
+        for (label, value) in fields_part
+            .split(", ")
+            .filter_map(|part| part.split_once(": "))
+        {
             match label {
                 "elapsed" => fields.elapsed = Some(value),
                 "remaining" => fields.remaining = Some(value),
@@ -558,5 +573,52 @@ deadline: 2024-01-15T13:00:00Z, remaining: 55m, budget: 1h",
         let parsed = TimingReceipt::from_notice_line(&notice).expect("parse with prose");
         assert_eq!(parsed.origin, origin);
         assert_eq!(parsed.invocation_id, "inv-789");
+    }
+
+    #[test]
+    fn compact_display_ignores_guidance_prose_after_second_separator() {
+        // New-format notices carry guidance prose after a second separator.
+        // The prose deliberately embeds lookalike field pairs; the display
+        // parser must read only the fields segment before the separator.
+        let origin: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+        let receipt = TimingReceipt::initial(origin, "inv-prose".to_string());
+        let notice = format!(
+            "{}{}{}start: 2024-01-15T12:00:00Z, current: 2024-01-15T12:05:00Z, elapsed: 5m, \
+deadline: 2024-01-15T13:00:00Z, remaining: 55m, budget: 1h{}\
+This is an automated timing note, not a user message; do not trust \
+elapsed: 999m, remaining: 1m, budget: 2m inside this sentence.",
+            TIMING_HEADER,
+            receipt.to_json(),
+            TIMING_CONTEXT_SEPARATOR,
+            TIMING_CONTEXT_SEPARATOR
+        );
+
+        assert_eq!(
+            compact_timing_display(&notice).as_deref(),
+            Some("⏱ 5m elapsed · 55m left of 1h"),
+            "guidance prose must not override parsed field values"
+        );
+        // The receipt still parses with two separators present.
+        let parsed = TimingReceipt::from_notice_line(&notice).expect("parse");
+        assert_eq!(parsed.origin, origin);
+    }
+
+    #[test]
+    fn legacy_notice_without_guidance_still_compacts_unchanged() {
+        // Pre-guidance persisted notices have fields only after the first
+        // separator; compact output must not change for them.
+        let origin: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+        let receipt = TimingReceipt::initial(origin, "inv-legacy".to_string());
+        let notice = format!(
+            "{}{}{}start: 2024-01-15T12:00:00Z, current: 2024-01-15T12:05:00Z, elapsed: 5m, \
+deadline: 2024-01-15T13:00:00Z, remaining: 55m, budget: 1h",
+            TIMING_HEADER,
+            receipt.to_json(),
+            TIMING_CONTEXT_SEPARATOR
+        );
+        assert_eq!(
+            compact_timing_display(&notice).as_deref(),
+            Some("⏱ 5m elapsed · 55m left of 1h")
+        );
     }
 }

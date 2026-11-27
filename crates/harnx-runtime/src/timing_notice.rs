@@ -2,6 +2,9 @@
 //!
 //! Pure evaluation that takes explicit timestamps and produces timing
 //! notices with structured receipts. No clocks, no timers, no side effects.
+//! Each notice line pairs the structured receipt and machine-parsed timing
+//! fields with self-contained guidance prose explaining what the note is,
+//! what the fields mean, and how to act on them (issue #3006).
 //!
 //! # Schedule
 //!
@@ -37,6 +40,10 @@ use harnx_core::timing_identity::{
 };
 
 use crate::nats_session_metadata::{InvocationIdentity, RunLimitsRecord};
+
+mod guidance;
+
+use guidance::build_timing_guidance;
 
 /// Seconds per elapsed bucket (900s = 15 minutes).
 pub const ELAPSED_BUCKET_SECS: u64 = 900;
@@ -272,7 +279,7 @@ pub fn evaluate_timing(input: &TimingInput) -> TimingOutput {
         TIMING_HEADER,
         receipt.to_json(),
         TIMING_CONTEXT_SEPARATOR,
-        build_timing_context(input, origin)
+        build_timing_context(input, origin, milestones.reason, receipt.coverage)
     );
     TimingOutput {
         emit: true,
@@ -362,17 +369,17 @@ fn due_milestones(
     due
 }
 
-/// Build human-readable timing context with wall-clock timestamps.
+/// Build the human-readable timing context: timing fields, then guidance.
 ///
-/// This context is appended after the JSON receipt and separator,
-/// providing readable timing information for the model.
-///
-/// Format:
-/// - `start: <origin timestamp>`
-/// - `current: <now timestamp>`
-/// - `elapsed: <duration>`
-/// - If deadline present: `deadline: <deadline timestamp>`, `remaining: <duration>`, `budget: <duration>`
-fn build_timing_context(input: &TimingInput, origin: DateTime<Utc>) -> String {
+/// Fields are machine-parsed by the compact display helpers; guidance lives
+/// after a second `TIMING_CONTEXT_SEPARATOR`, which the display parser
+/// stops at, so prose wording cannot corrupt the fields.
+fn build_timing_context(
+    input: &TimingInput,
+    origin: DateTime<Utc>,
+    reason: Option<TimingReason>,
+    coverage: MilestoneCoverage,
+) -> String {
     let mut parts = vec![];
 
     // Wall-clock timestamps first
@@ -399,7 +406,9 @@ fn build_timing_context(input: &TimingInput, origin: DateTime<Utc>) -> String {
         }
     }
 
-    parts.join(", ")
+    let fields = parts.join(", ");
+    let guidance = build_timing_guidance(reason, coverage, input.deadline().is_some());
+    format!("{fields}{TIMING_CONTEXT_SEPARATOR}{guidance}")
 }
 
 /// Format a duration for human-readable output.
@@ -1034,5 +1043,411 @@ mod tests {
         );
 
         assert_ne!(key1, key2, "cache key must include session for isolation");
+    }
+
+    #[test]
+    fn initial_notice_carries_self_contained_guidance() {
+        let admitted = fixed_time();
+        let run_limits = make_run_limits(admitted, 3600);
+        let input = make_timing_input(run_limits, admitted, None);
+
+        let notice = evaluate_timing(&input).notice_line.expect("notice line");
+
+        // Initial framing is start-of-run, never the periodic kind.
+        assert!(
+            notice.contains("Timing context at the start of this run"),
+            "initial guidance must carry start-of-run framing: {notice}"
+        );
+        assert!(
+            !notice.contains("Periodic timing update"),
+            "initial guidance must not be framed as periodic: {notice}"
+        );
+        // Guidance identifies itself as harness context, not a user request.
+        assert!(
+            notice.contains("automated timing note from the harness, not a user message"),
+            "guidance must say the note is harness-generated: {notice}"
+        );
+        // Field meanings are restated so the note is understandable alone.
+        assert!(
+            notice.contains("budget is the run's total allowance (deadline minus start)"),
+            "guidance must explain budget: {notice}"
+        );
+        assert!(
+            notice.contains("remaining is time left until the deadline"),
+            "guidance must explain remaining: {notice}"
+        );
+        // Deadline claims stay within verified behavior: the run ends and a
+        // retry cannot extend it; no claim about stopping tools mid-flight.
+        assert!(
+            notice.contains("a retry cannot extend that deadline"),
+            "guidance must state retries cannot extend the deadline: {notice}"
+        );
+        assert!(
+            !notice.contains("forcibly stop"),
+            "guidance must not claim tools are forcibly stopped: {notice}"
+        );
+        // Pre-threshold coverage keeps normal pacing, not wrap-up urgency.
+        assert!(
+            notice.contains("Continue at normal pace"),
+            "initial guidance must permit normal pacing: {notice}"
+        );
+        assert!(
+            !notice.contains("Wrap up now"),
+            "initial guidance must not demand wrap-up: {notice}"
+        );
+        // Structure: receipt | fields | guidance.
+        assert_eq!(
+            notice.matches(TIMING_CONTEXT_SEPARATOR).count(),
+            2,
+            "notice must separate fields from guidance: {notice}"
+        );
+    }
+
+    #[test]
+    fn unbounded_initial_guidance_explains_no_deadline() {
+        let origin = fixed_time();
+        let input = TimingInput::unmanaged(origin, origin, InvocationIdentity::new());
+
+        let notice = evaluate_timing(&input).notice_line.expect("notice line");
+
+        assert!(
+            notice.contains("This run has no deadline"),
+            "unbounded guidance must state there is no deadline: {notice}"
+        );
+        assert!(
+            notice.contains("elapsed is time used since it started"),
+            "unbounded initial guidance must explain elapsed explicitly: {notice}"
+        );
+        assert!(
+            notice.contains("Timing context at the start of this run"),
+            "unbounded initial guidance must carry start-of-run framing: {notice}"
+        );
+        assert!(
+            !notice.contains("Periodic timing update"),
+            "unbounded initial guidance must not be framed as periodic: {notice}"
+        );
+        assert!(
+            notice.contains("every 15 minutes"),
+            "unbounded guidance must mention the periodic cadence: {notice}"
+        );
+        assert!(
+            notice.contains("Continue at normal pace"),
+            "unbounded initial guidance must permit normal pacing: {notice}"
+        );
+    }
+
+    #[test]
+    fn threshold_50_guidance_warns_about_long_operations() {
+        // Committed bucket 2 covers the current bucket so only the 50%
+        // threshold fires and the reason-specific prose is exercised.
+        let output = evaluate_with_progress(3600, 1800, MilestoneCoverage::INITIAL, 2);
+        assert!(output.emit);
+        let notice = output.notice_line.expect("notice line");
+        assert!(
+            notice.contains("crossed the halfway mark of its time budget"),
+            "50% guidance must report the crossed milestone: {notice}"
+        );
+        assert!(
+            notice.contains("At least half the time budget is used"),
+            "50% urgency must reflect a crossed threshold, not an exact figure: {notice}"
+        );
+        assert!(
+            notice.contains("Avoid starting operations that cannot finish before the deadline"),
+            "50% guidance must be actionable about long operations: {notice}"
+        );
+    }
+
+    #[test]
+    fn threshold_75_guidance_finish_and_report_tier() {
+        // Committed bucket 3 covers the current bucket so only the 75%
+        // threshold fires; both the 75% explanation and the 75%-specific
+        // urgency must be selected, distinct from the 50% and 90% tiers.
+        let output = evaluate_with_progress(
+            3600,
+            2700,
+            MilestoneCoverage::INITIAL | MilestoneCoverage::PERCENT_50,
+            3,
+        );
+        assert!(output.emit);
+        assert!(matches!(output.reason, Some(TimingReason::Threshold75)));
+        let notice = output.notice_line.expect("notice line");
+        assert!(
+            notice.contains("crossed the 75% mark of its time budget"),
+            "75% guidance must report the crossed milestone: {notice}"
+        );
+        assert!(
+            notice.contains("At least 75% of the time budget is used"),
+            "75% urgency must reflect the crossed threshold: {notice}"
+        );
+        assert!(
+            notice.contains("report progress now"),
+            "75% urgency must carry the finish-and-report action: {notice}"
+        );
+        // Distinct from neighboring tiers.
+        assert!(
+            !notice.contains("At least half the time budget is used"),
+            "75% must not fall through to 50% urgency: {notice}"
+        );
+        assert!(
+            !notice.contains("At least 90% of the time budget is used"),
+            "75% must not jump to 90% urgency: {notice}"
+        );
+        assert!(
+            !notice.contains("Wrap up now"),
+            "75% must not carry 90% wrap-up urgency: {notice}"
+        );
+    }
+
+    #[test]
+    fn threshold_90_guidance_demands_wrap_up() {
+        let output = evaluate_with_progress(
+            3600,
+            3240,
+            MilestoneCoverage::INITIAL
+                | MilestoneCoverage::PERCENT_50
+                | MilestoneCoverage::PERCENT_75,
+            3,
+        );
+        assert!(output.emit);
+        let notice = output.notice_line.expect("notice line");
+        assert!(
+            notice.contains("crossed the 90% mark of its time budget"),
+            "90% guidance must report the crossed milestone: {notice}"
+        );
+        assert!(
+            notice.contains("At least 90% of the time budget is used and 10% or less remains"),
+            "90% urgency must hold when the threshold fires late: {notice}"
+        );
+        assert!(
+            notice.contains("Wrap up now"),
+            "90% guidance must demand wrapping up: {notice}"
+        );
+    }
+
+    #[test]
+    fn late_threshold_fires_with_at_least_wording() {
+        // A 90% warning can fire at 99% elapsed (long tool, missed boundary):
+        // the prose must stay true, so it reports a crossed mark and uses
+        // "at least"/"or less" instead of exact figures.
+        let output = evaluate_with_progress(
+            3600,
+            3564,
+            MilestoneCoverage::INITIAL
+                | MilestoneCoverage::PERCENT_50
+                | MilestoneCoverage::PERCENT_75,
+            3,
+        );
+        assert!(output.emit);
+        assert!(matches!(output.reason, Some(TimingReason::Threshold90)));
+        let notice = output.notice_line.expect("notice line");
+        assert!(
+            notice.contains("At least 90% of the time budget is used and 10% or less remains"),
+            "late threshold must keep 'at least' wording: {notice}"
+        );
+        assert!(
+            !notice.contains("only 10% remains"),
+            "late threshold must not claim exactly 10% remains: {notice}"
+        );
+    }
+
+    #[test]
+    fn coalesced_above_90_keeps_strongest_urgency() {
+        // Periodic and all three thresholds coalesce into one notice whose
+        // cumulative coverage includes 90%; the guidance must not fall back
+        // to generic progress wording.
+        let output = evaluate_with_progress(3600, 3240, MilestoneCoverage::INITIAL, 0);
+        assert!(output.emit);
+        assert!(matches!(output.reason, Some(TimingReason::Coalesced)));
+        let notice = output.notice_line.expect("notice line");
+        assert!(
+            notice.contains("combines multiple timing updates"),
+            "coalesced guidance must say it combines updates: {notice}"
+        );
+        assert!(
+            !notice.contains("Periodic timing update"),
+            "coalesced guidance must not be framed as periodic: {notice}"
+        );
+        assert!(
+            !notice.contains("Timing context at the start of this run"),
+            "coalesced guidance must not be framed as initial: {notice}"
+        );
+        assert!(
+            notice.contains("At least 90% of the time budget is used"),
+            "coalesced guidance must reflect the strongest covered milestone: {notice}"
+        );
+        assert!(
+            notice.contains("Wrap up now"),
+            "coalesced guidance must deliver wrap-up urgency: {notice}"
+        );
+    }
+
+    #[test]
+    fn post_threshold_periodic_keeps_wrap_up_urgency() {
+        // A periodic bucket notice emitted after 90% is already covered must
+        // not revert to normal-pace wording; coverage is cumulative.
+        let output = evaluate_with_progress(
+            7200,
+            3700,
+            MilestoneCoverage::INITIAL
+                | MilestoneCoverage::PERCENT_50
+                | MilestoneCoverage::PERCENT_75
+                | MilestoneCoverage::PERCENT_90,
+            3,
+        );
+        assert!(output.emit);
+        assert!(matches!(
+            output.reason,
+            Some(TimingReason::PeriodicBucket(4))
+        ));
+        let notice = output.notice_line.expect("notice line");
+        assert!(
+            notice.contains("Periodic timing update"),
+            "kind sentence must report the periodic trigger: {notice}"
+        );
+        assert!(
+            !notice.contains("Timing context at the start of this run"),
+            "periodic guidance must not be framed as initial: {notice}"
+        );
+        assert!(
+            !notice.contains("combines multiple timing updates"),
+            "periodic guidance must not be framed as coalesced: {notice}"
+        );
+        assert!(
+            notice.contains("At least 90% of the time budget is used"),
+            "post-90% periodic urgency must stay at wrap-up level: {notice}"
+        );
+        assert!(
+            notice.contains("Wrap up now"),
+            "post-90% periodic guidance must demand wrapping up: {notice}"
+        );
+        assert!(
+            !notice.contains("Continue at normal pace"),
+            "post-90% periodic guidance must not revert to normal pacing: {notice}"
+        );
+    }
+
+    #[test]
+    fn periodic_bounded_guidance_keeps_fields_machine_parsed() {
+        let admitted = fixed_time();
+        let now = admitted + chrono::Duration::seconds(900);
+        let output = evaluate_with_progress(7200, 900, MilestoneCoverage::INITIAL, 0);
+        assert!(output.emit);
+        let notice = output.notice_line.expect("notice line");
+
+        // Guidance for a bounded periodic notice explains both fields.
+        assert!(
+            notice.contains("Periodic timing update"),
+            "periodic guidance must be framed as periodic, not initial: {notice}"
+        );
+        assert!(
+            !notice.contains("Timing context at the start of this run"),
+            "periodic guidance must not be framed as initial: {notice}"
+        );
+        assert!(
+            notice.contains("elapsed is time used since start"),
+            "periodic guidance must explain elapsed: {notice}"
+        );
+        assert!(
+            notice.contains("remaining is time left until the deadline"),
+            "periodic guidance must explain remaining: {notice}"
+        );
+        // Pre-threshold periodic coverage keeps normal pacing.
+        assert!(
+            notice.contains("Continue at normal pace"),
+            "pre-threshold periodic guidance must permit normal pacing: {notice}"
+        );
+
+        // The fields segment before the second separator stays compact-
+        // display parseable and carries no prose.
+        let after_receipt = notice
+            .strip_prefix(TIMING_HEADER)
+            .and_then(|rest| rest.split_once(TIMING_CONTEXT_SEPARATOR))
+            .map(|(_, fields_and_guidance)| fields_and_guidance)
+            .expect("first separator");
+        let (fields, guidance) = after_receipt
+            .split_once(TIMING_CONTEXT_SEPARATOR)
+            .expect("second separator");
+        assert_eq!(
+            fields,
+            format!(
+                "start: {}, current: {}, elapsed: 15m, deadline: {}, remaining: 105m, budget: 120m",
+                admitted.format("%Y-%m-%dT%H:%M:%SZ"),
+                now.format("%Y-%m-%dT%H:%M:%SZ"),
+                (admitted + chrono::Duration::seconds(7200)).format("%Y-%m-%dT%H:%M:%SZ"),
+            ),
+            "fields segment must stay prose-free: {notice}"
+        );
+        assert!(
+            guidance.starts_with("This is an automated timing note"),
+            "guidance must start with the identity sentence: {notice}"
+        );
+        assert_eq!(
+            notice.matches(TIMING_CONTEXT_SEPARATOR).count(),
+            2,
+            "no stray separators in guidance: {notice}"
+        );
+    }
+
+    #[test]
+    fn unbounded_periodic_guidance_mentions_elapsed_only() {
+        let origin = fixed_time();
+        let mut input = TimingInput::unmanaged(origin, origin, InvocationIdentity::new());
+        input.committed_progress = evaluate_timing(&input).receipt;
+        input.now = origin + chrono::Duration::seconds(900);
+
+        let notice = evaluate_timing(&input).notice_line.expect("notice line");
+        assert!(
+            notice.contains("This run has no deadline"),
+            "unbounded periodic guidance must restate the missing deadline: {notice}"
+        );
+        // Distinguish periodic framing from initial and coalesced unbounded
+        // arms, which share the no-deadline language.
+        assert!(
+            !notice.contains("Timing context at the start of this run"),
+            "unbounded periodic guidance must not be framed as initial: {notice}"
+        );
+        assert!(
+            !notice.contains("combines multiple timing updates"),
+            "unbounded periodic guidance must not be framed as coalesced: {notice}"
+        );
+        assert!(
+            !notice.contains("remaining:"),
+            "unbounded notice must not carry a remaining field: {notice}"
+        );
+    }
+
+    #[test]
+    fn unbounded_coalesced_guidance_combines_updates() {
+        // An unmanaged run first evaluated after 15 minutes coalesces the
+        // initial notice with the first elapsed bucket; the combined-update
+        // framing must hold even though no previous note exists.
+        let origin = fixed_time();
+        let now = origin + chrono::Duration::seconds(900);
+        let input = TimingInput::unmanaged(now, origin, InvocationIdentity::new());
+
+        let output = evaluate_timing(&input);
+        assert!(output.emit);
+        assert!(matches!(output.reason, Some(TimingReason::Coalesced)));
+        let notice = output.notice_line.expect("notice line");
+        assert!(
+            notice.contains("combines multiple timing updates"),
+            "unbounded coalesced guidance must say it combines updates: {notice}"
+        );
+        assert!(
+            !notice.contains("Timing context at the start of this run"),
+            "unbounded coalesced guidance must not be framed as initial: {notice}"
+        );
+        assert!(
+            !notice.contains("Periodic timing update"),
+            "unbounded coalesced guidance must not be framed as periodic: {notice}"
+        );
+        assert!(
+            notice.contains("This run has no deadline"),
+            "unbounded coalesced guidance must restate the missing deadline: {notice}"
+        );
+        assert!(
+            !notice.contains("remaining:"),
+            "unbounded notice must not carry a remaining field: {notice}"
+        );
     }
 }

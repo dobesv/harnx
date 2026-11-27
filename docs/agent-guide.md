@@ -1199,6 +1199,8 @@ Expired admission or pre-dispatch failures also identify the exhausted scope and
 
 The runtime delivers timing notices when due at safe boundaries before model calls. These are informative messages about the current run's elapsed time and deadline progress, not executable prompts. They don't advance the turn cursor, require admissions, or create new invocations.
 
+Each notice line has three segments separated by `|`: the structured JSON receipt (harness bookkeeping used for recovery), machine-parsed timing fields, and guidance prose. The prose is self-contained on every notice: it identifies the note as harness-generated rather than a user message, explains what `elapsed`, `deadline`, `remaining`, and `budget` mean, and gives pacing guidance. Urgency follows the run's current position (the strongest covered 50%/75%/90% milestone in the receipt's cumulative coverage), not just why this notice fired, so a threshold that fires late or coalesces with a periodic bucket still gets the right wrap-up instruction, and later notices after 90% never revert to normal-pace wording. Runs without a deadline get elapsed-only context. The guidance stays within verified behavior: an expired deadline ends the run with a result a retry cannot renew, and it never claims in-flight tools are forcibly stopped at the deadline instant. Compact display helpers (TUI and CLI rendering) parse only the fields segment, so the prose never corrupts their one-line form, and legacy notices without guidance prose render unchanged.
+
 The clock measures the current run, not the conversation's lifetime. Admitted runs start at the saved admission timestamp, including setup time before execution. A child run uses its own admission timestamp and its effective deadline, clamped to its ancestor's deadline. Retries and worker recovery don't reset or extend these saved limits.
 
 **What gets delivered:**
@@ -1215,7 +1217,7 @@ The clock measures the current run, not the conversation's lifetime. Admitted ru
 
 **What this doesn't guarantee:** Timing notices inform the model about remaining budget, but they don't guarantee the model can finish before the deadline. Long tools may still run beyond the boundary where a warning would be delivered.
 
-**Deployment compatibility:** Pre-receipt workers treat durable timing rows as executable prompts and can refuse activation for missing admission. Writers are always on, so use the [hard-cutover and retained-reader rollback procedure](kubernetes-deployment.md#timing-receipt-compatibility-cutover-and-rollback). Draining sessions alone does not permit an old-reader rollback; completed histories still contain receipts.
+**Deployment compatibility:** Pre-receipt workers treat durable timing rows as executable prompts and can refuse activation for missing admission. Writers are always on, so use the [hard-cutover and retained-reader rollback procedure](kubernetes-deployment.md#timing-receipt-compatibility-cutover-and-rollback). Draining sessions alone does not permit an old-reader rollback; completed histories still contain receipts. Readers older than the guidance prose also render it imperfectly: the JSON receipt still parses (it ends at the first `|`), but their compact one-line form doesn't know the second separator, so the prose is appended to the last timing field's value (`budget` on bounded runs, `elapsed` on unmanaged ones). The artifact is display-only.
 
 ### Live Event Streaming for User Interfaces
 
