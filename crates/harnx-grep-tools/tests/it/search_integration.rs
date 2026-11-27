@@ -1,5 +1,5 @@
 use harnx_grep_tools::client::{self, SearchOutcome};
-use harnx_grep_tools::format::{build_not_found_output, build_output};
+use harnx_grep_tools::format::{build_not_found_document, build_search_document, render_document};
 use harnx_grep_tools::server::model::SearchResponse;
 use harnx_grep_tools::server::{GrepQueryParams, GrepServer};
 use rmcp::handler::client::ClientHandler;
@@ -67,7 +67,10 @@ async fn client_sends_all_filters_and_formats_success_response() {
         panic!("expected successful search outcome");
     };
     let response: SearchResponse = serde_json::from_value(value).expect("fixture must deserialize");
-    assert_eq!(build_output("FastAPI", &response), golden_output());
+    assert_eq!(
+        render_document(&build_search_document("FastAPI", &response)),
+        golden_output()
+    );
 }
 
 #[tokio::test]
@@ -122,7 +125,7 @@ async fn client_maps_404_429_and_500_to_exact_contract_outputs() {
         )
         .await;
         let output = match outcome {
-            SearchOutcome::NotFound => build_not_found_output("somequery"),
+            SearchOutcome::NotFound => render_document(&build_not_found_document("somequery")),
             SearchOutcome::RateLimited => {
                 "❌ Error: Rate limit exceeded. Please wait before making another request.".into()
             }
