@@ -27,7 +27,7 @@ pub use keys::{
 pub use listing::{SessionSnapshot, SnapshotEntry};
 pub use lookup::metadata_belongs_to_agent;
 pub use mutation::is_cas_conflict;
-pub(in crate::nats_session_metadata) use mutation::PatchGuard;
+pub(in crate::nats_session_metadata) use mutation::{is_wrong_last_revision, PatchGuard};
 
 #[derive(Clone, Debug)]
 pub struct SessionMetadataStore {

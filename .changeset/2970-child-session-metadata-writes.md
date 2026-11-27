@@ -1,0 +1,5 @@
+---
+harnx: minor
+---
+
+Parent agents can now set a sub-agent session's title, stored variables, and session properties through the `metadata` argument of `session_new`, `session_prompt`, and `session_send`. On a created session the requested state lands in the first canonical metadata record; on an existing session title, variables, and properties apply together in one revision-guarded update before the prompt is dispatched. The argument is strict — execution overrides, raw extensions, unknown fields, and read-only identity properties are rejected before anything is reserved or mutated, and an invalid or conflicting update dispatches no prompt. Updates are replay-safe rather than transactional: a retried call never resets metadata the child edited after the original update, a revision conflict returns a recoverable error, and a dispatch failure after a successful update leaves the update in place. Stored variables are replaced wholesale when supplied (including an empty map, which clears them) and are not reloaded by a turn that is already running. (issue #2970)

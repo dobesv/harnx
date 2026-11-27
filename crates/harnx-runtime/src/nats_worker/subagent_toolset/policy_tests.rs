@@ -87,39 +87,59 @@ async fn generated_prompt_schema_preserves_strict_and_non_strict_null_semantics(
 }
 
 async fn assert_schema(spec: ToolSpec) {
+    let declaration =
+        |parameters: harnx_core::tool::JsonSchema| harnx_core::tool::ToolDeclaration {
+            name: spec.name.clone(),
+            description: spec.description.clone(),
+            parameters,
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
+            kind: None,
+        };
     let canonical =
         harnx_core::tool::JsonSchema::from_tool_schema(spec.input_schema.clone()).unwrap();
-    let declaration = harnx_core::tool::ToolDeclaration {
-        name: spec.name.clone(),
-        description: spec.description.clone(),
-        parameters: canonical.clone(),
-        mcp_tool_name: None,
-        mcp_server_name: None,
-        call_template: None,
-        result_template: None,
-        idempotent_hint: None,
-        read_only_hint: None,
-        kind: None,
-    };
-    let data = || harnx_client::client::ChatCompletionsData {
-        messages: vec![harnx_core::message::Message::new(
-            harnx_core::message::MessageRole::User,
-            harnx_core::message::MessageContent::Text("work".into()),
-        )],
-        temperature: None,
-        top_p: None,
-        functions: Some(vec![declaration.clone()]),
-        stream: false,
-        attachments_dir: None,
-    };
+    let data =
+        |parameters: harnx_core::tool::JsonSchema| harnx_client::client::ChatCompletionsData {
+            messages: vec![harnx_core::message::Message::new(
+                harnx_core::message::MessageRole::User,
+                harnx_core::message::MessageContent::Text("work".into()),
+            )],
+            temperature: None,
+            top_p: None,
+            functions: Some(vec![declaration(parameters)]),
+            stream: false,
+            attachments_dir: None,
+        };
     let model = harnx_core::model::Model::new("openai", "gpt-4o");
-    let non_strict = harnx_client::openai::openai_build_chat_completions_body(data(), &model);
+    let non_strict =
+        harnx_client::openai::openai_build_chat_completions_body(data(canonical.clone()), &model);
     assert_eq!(
         non_strict["tools"][0]["function"]["parameters"],
         spec.input_schema
     );
-    let body = responses_request_body(data()).await;
-    let strict = &body["tools"][0];
+    // The metadata object advertises a free-form string-to-string variables
+    // map — the map contract the tool accepts — which strict mode cannot
+    // express. The Responses provider intentionally sends these tools without
+    // strict mode (keeping the map in the schema) instead of dropping it.
+    let body = responses_request_body(data(canonical.clone())).await;
+    let tool = &body["tools"][0];
+    assert_eq!(tool["strict"], false);
+    assert_eq!(tool["parameters"], spec.input_schema);
+
+    // Everything outside that map still strict-converts, so the null
+    // semantics of optional scalar arguments stay protected.
+    let mut without_map = spec.input_schema.clone();
+    without_map["properties"]
+        .as_object_mut()
+        .expect("tool schema properties")
+        .remove("metadata");
+    let strict_body =
+        responses_request_body(data(harnx_core::tool::JsonSchema::new(without_map))).await;
+    let strict = &strict_body["tools"][0];
     assert_eq!(strict["strict"], true);
     assert_eq!(strict["description"], spec.description);
     assert_eq!(

@@ -144,7 +144,8 @@ files by including cid: attachment URLs in their reply. {}",
                     "type": "integer",
                     "description": super::super::policy_description(policy)
                 },
-                "wait": json!({"anyOf": [wait_object_schema(), {"type": "null"}]})
+                "wait": json!({"anyOf": [wait_object_schema(), {"type": "null"}]}),
+                "metadata": super::super::child_metadata::metadata_object_schema()
             },
             "required": ["message"],
             "additionalProperties": false

@@ -174,7 +174,9 @@ impl SessionMetadata {
             schema_version: SESSION_METADATA_SCHEMA_VERSION,
             session_id: session_id.into(),
             created_at: Utc::now(),
-            creation_invocation: None,
+            // Trusted creation identity (sub-agent tool creation) or the
+            // reservation stamp; see SessionInitializer::creation_invocation.
+            creation_invocation: initializer.creation_invocation.clone(),
             parent: initializer.parent,
             agent: initializer.agent,
             variables: initializer.variables,
