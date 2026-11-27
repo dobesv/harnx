@@ -3,11 +3,16 @@
 //! NATS log at call time. Pure query core lives in the parent module.
 
 use super::{query_entries_with_jaq, HistoryQuery, TOOL_NAME};
-use crate::config::GlobalConfig;
+use crate::{config::GlobalConfig, tool::session_json_output, ScriptShape};
 use async_trait::async_trait;
 use harnx_core::abort::AbortSignal;
-use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider, ToolProviderOutput};
+use harnx_core::session::SessionLogEntry;
+use harnx_core::tool::{
+    JsonSchema, NoopToolProgress, ToolCallOrigin, ToolDeclaration, ToolError, ToolProgress,
+    ToolProvider, ToolProviderOutput,
+};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 // qual:api — re-exported as crate::session_history::tool_declaration for callers building the tool's declaration (tests and the tool wiring).
 /// Build the tool declaration (name, description, JSON-schema parameters).
@@ -77,24 +82,26 @@ impl SessionHistoryProvider {
     pub fn new(config: GlobalConfig) -> Self {
         Self { config }
     }
-}
 
-#[async_trait]
-impl ToolProvider for SessionHistoryProvider {
-    fn name(&self) -> &str {
-        "session_history"
+    pub(crate) fn script_shape() -> ScriptShape {
+        // A jaq projection can return any JSON value, not just an array.
+        ScriptShape {
+            output: Some(harnx_toolset::ScriptOutput {
+                summary: Some(
+                    "JSON array of matching entries (seq, type, optional text, tool_names, role), \
+                     or the JSON value produced by --jaq."
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+            output_schema: None,
+        }
     }
 
-    fn has_tool(&self, tool_name: &str) -> bool {
-        tool_name == TOOL_NAME
-    }
-
-    async fn call_tool(
+    async fn load_entries(
         &self,
-        _tool_name: &str,
-        arguments: Value,
         abort: &AbortSignal,
-    ) -> Result<ToolProviderOutput, ToolError> {
+    ) -> Result<Vec<(u64, SessionLogEntry)>, ToolError> {
         let (config, name, cluster) = {
             let guard = self.config.read();
             let session = guard
@@ -114,22 +121,64 @@ impl ToolProvider for SessionHistoryProvider {
                 .load_events_async()
                 .await
         };
-        let entries = tokio::select! {
+        tokio::select! {
             _ = harnx_core::abort::wait_abort_signal(abort) => {
-                return Err(ToolError::Recoverable(anyhow::anyhow!("session history request aborted")));
+                Err(ToolError::Recoverable(anyhow::anyhow!("session history request aborted")))
             }
             result = tokio::time::timeout(std::time::Duration::from_secs(30), operation) => {
                 result
                     .map_err(|_| ToolError::Recoverable(anyhow::anyhow!("session history request timed out")))?
-                    .map_err(ToolError::Recoverable)?
+                    .map_err(ToolError::Recoverable)
             }
-        };
-        let query = parse_query(&arguments);
-        let entries: Vec<_> = entries
+        }
+    }
+}
+
+#[async_trait]
+impl ToolProvider for SessionHistoryProvider {
+    fn name(&self) -> &str {
+        "session_history"
+    }
+
+    fn has_tool(&self, tool_name: &str) -> bool {
+        tool_name == TOOL_NAME
+    }
+
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        abort: &AbortSignal,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        self.call_tool_with_progress(
+            tool_name,
+            arguments,
+            ToolCallOrigin::default(),
+            abort,
+            Arc::new(NoopToolProgress),
+        )
+        .await
+    }
+
+    async fn call_tool_with_progress(
+        &self,
+        _tool_name: &str,
+        arguments: Value,
+        origin: ToolCallOrigin<'_>,
+        abort: &AbortSignal,
+        _progress: Arc<dyn ToolProgress>,
+    ) -> Result<ToolProviderOutput, ToolError> {
+        let entries: Vec<_> = self
+            .load_entries(abort)
+            .await?
             .into_iter()
             .map(|(seq, entry)| (seq as usize, entry))
             .collect();
-        let rows = query_entries_with_jaq(&entries, &query).map_err(ToolError::Recoverable)?;
-        Ok(json!({ "content": [{ "type": "text", "text": rows.to_string() }] }).into())
+        let rows = query_entries_with_jaq(&entries, &parse_query(&arguments))
+            .map_err(ToolError::Recoverable)?;
+        Ok(session_json_output(rows, origin.structured_result))
     }
 }
+
+#[cfg(test)]
+mod tests;

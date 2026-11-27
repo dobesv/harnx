@@ -1,6 +1,6 @@
-//! What a tool server declares about how its result reads in a script.
+//! How a tool's result reads in a script.
 
-/// A tool's script-facing declarations, from its spec `_meta`.
+/// Script-only declarations supplied by a built-in tool or a server spec's `_meta`.
 #[derive(Clone, Debug, Default)]
 pub struct ScriptShape {
     /// Which result field is stdout, stderr and the exit status.
