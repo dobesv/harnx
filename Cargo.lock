@@ -4940,6 +4940,7 @@ dependencies = [
  "harnx-healthz",
  "harnx-metrics",
  "harnx-nats-common",
+ "harnx-script",
  "harnx-telemetry",
  "harnx-test-bins",
  "harnx-toolset",
@@ -4947,6 +4948,8 @@ dependencies = [
  "ipnet",
  "log",
  "oauth2",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest",
  "rmcp",
  "schemars 1.2.3",
@@ -4957,6 +4960,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "url",
 ]
 
