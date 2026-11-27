@@ -106,7 +106,7 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
     (items.len(), bytes)
 }
 
-// qual:allow(complexity, max_function_lines=63) reason: "the App field list grows one line per frontend concern (interaction focus here)"
+// qual:allow(complexity, max_function_lines=64) reason: "the App initializer lists each frontend field, including pending attachment focus"
 fn build_initial_app(
     config: &GlobalConfig,
     initial_transcript: Vec<TranscriptItem>,
@@ -136,6 +136,7 @@ fn build_initial_app(
         history_draft: String::new(),
         history_preview: false,
         attachments: vec![],
+        pending_attachment_view: Default::default(),
         attachment_dir: None,
         paste_count: 0,
         last_known_input_width: 1,

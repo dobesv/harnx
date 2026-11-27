@@ -2459,3 +2459,30 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+.aui-attachment-view {
+  background: transparent;
+  border: none;
+  color: var(--text-h);
+  cursor: pointer;
+  padding: 0.25rem;
+}
+
+.attachment-preview-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.attachment-preview-image {
+  display: block;
+  max-width: 100%;
+  max-height: 65vh;
+  object-fit: contain;
+  margin: auto;
+}
+
+.attachment-preview-pdf {
+  width: 100%;
+  min-height: 65vh;
+  border: none;
+}

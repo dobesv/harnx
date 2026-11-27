@@ -148,7 +148,7 @@ impl Tui {
         Ok(())
     }
 
-    fn handle_detail_scroll_key(&mut self, key: KeyEvent) -> bool {
+    pub(super) fn handle_detail_scroll_key(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             (KeyCode::Up, KeyModifiers::NONE) => {
                 self.app.detail_view_scroll.scroll_up();
@@ -249,6 +249,9 @@ pub(super) fn detail_view_content(app: &App) -> (Vec<Vec<Line<'static>>>, String
 }
 
 pub(super) fn detail_view_footer_text(app: &App) -> String {
+    if app.pending_attachment_view.focus.is_some() {
+        return " ↑↓/scroll  d/delete  Esc/back".into();
+    }
     if app.doc_view.is_some() {
         // An active notice outranks the link legend for its short lifetime;
         // otherwise reading feedback is invisible in the document viewer
