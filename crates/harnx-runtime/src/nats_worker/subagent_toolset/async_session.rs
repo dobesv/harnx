@@ -205,6 +205,12 @@ pub(crate) struct SendArgs {
     pub(crate) timeout_secs: Option<u64>,
     #[serde(default)]
     pub(crate) wait: Option<WaitOptions>,
+    /// Optional child-session metadata update; on an existing session it
+    /// applies in one revision-guarded update before dispatch, on a new one
+    /// it lands in the first canonical record. Strict: execution overrides,
+    /// raw extensions and unknown fields fail deserialization.
+    #[serde(default)]
+    pub(crate) metadata: Option<crate::nats_session_metadata::ChildSessionMetadataPatch>,
     #[serde(default, rename = "__harnx_parent_session_id")]
     pub(crate) parent_session_id: Option<String>,
     #[serde(default, rename = "__harnx_tool_call_id")]

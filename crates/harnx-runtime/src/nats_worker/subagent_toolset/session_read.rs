@@ -24,7 +24,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 mod page;
-pub(crate) use page::{read_window_events, EventWindow};
+#[cfg(test)]
+pub(crate) use page::read_window_events;
+pub(crate) use page::{read_window_events_outcome, EventWindow, PageOutcome};
 
 // Physical scan caps live with the physical reader (nats_session_log) so the
 // bounded JetStream scan and every in-memory simulation share one source of
@@ -370,7 +372,7 @@ fn entry_matches(read: &SequentialRead, index: u64, entry: &SessionLogEntry) -> 
 /// serde_json string content length of `c` (without quotes), matching
 /// serde_json's escape table exactly. Parity is asserted in tests so this
 /// can never drift from the serializer that produces the real payload.
-fn escaped_char_len(c: char) -> usize {
+pub(in crate::nats_worker::subagent_toolset) fn escaped_char_len(c: char) -> usize {
     match c {
         '"' | '\\' => 2,
         '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
@@ -382,7 +384,10 @@ fn escaped_char_len(c: char) -> usize {
 /// Longest prefix of `text` whose serde_json string-content length fits in
 /// `max_json_len`. Returns the byte offset (a char boundary) where delivery
 /// must stop and the exact JSON length used.
-fn fit_text_prefix(text: &str, max_json_len: usize) -> (usize, usize) {
+pub(in crate::nats_worker::subagent_toolset) fn fit_text_prefix(
+    text: &str,
+    max_json_len: usize,
+) -> (usize, usize) {
     let mut used = 0usize;
     for (pos, c) in text.char_indices() {
         let cost = escaped_char_len(c);
@@ -547,6 +552,38 @@ pub(crate) fn read_continuation(
     read_window_continuation(entries, read, 0)
 }
 
+/// Continuation-mode request validation, independent of any reserve: an
+/// entry that is not present, an out-of-range offset or one that would split
+/// a character is a request error, not an over-budget page a refit ladder
+/// could shrink into shape (plan #2970 T3). Returns the validated entry and
+/// the byte offset within it, so the fit path reuses the same check.
+pub(crate) fn validated_continuation(
+    entries: &[(u64, SessionLogEntry)],
+    entry_index: u64,
+    byte_offset: u64,
+) -> Result<(&SessionLogEntry, usize), String> {
+    let entry = entries
+        .iter()
+        .find(|(index, _)| *index == entry_index)
+        .map(|(_, entry)| entry)
+        .ok_or_else(|| {
+            format!("read.entry_index {entry_index} is not present in the session log")
+        })?;
+    let text = render_event_text(entry);
+    let total = text.len();
+    if byte_offset > total as u64 {
+        return Err(format!(
+            "read.byte_offset {byte_offset} is out of range for entry {entry_index} (rendered length {total})"
+        ));
+    }
+    if !text.is_char_boundary(byte_offset as usize) {
+        return Err(format!(
+            "read.byte_offset {byte_offset} is not on a UTF-8 character boundary in entry {entry_index}"
+        ));
+    }
+    Ok((entry, byte_offset as usize))
+}
+
 /// Continuation mode with an enclosing-metadata reserve (Task 4 foundation):
 /// `outer_reserve_bytes` is subtracted before fitting, so the enclosing
 /// result as a whole still respects `max_output_bytes`.
@@ -562,26 +599,9 @@ pub(crate) fn read_window_continuation(
     else {
         return Err("read_window_continuation requires a continuation read".to_string());
     };
-    let entry = entries
-        .iter()
-        .find(|(index, _)| *index == entry_index)
-        .map(|(_, entry)| entry)
-        .ok_or_else(|| {
-            format!("read.entry_index {entry_index} is not present in the session log")
-        })?;
+    let (entry, start) = validated_continuation(entries, entry_index, byte_offset)?;
     let text = render_event_text(entry);
     let total = text.len();
-    if byte_offset > total as u64 {
-        return Err(format!(
-            "read.byte_offset {byte_offset} is out of range for entry {entry_index} (rendered length {total})"
-        ));
-    }
-    let start = byte_offset as usize;
-    if !text.is_char_boundary(start) {
-        return Err(format!(
-            "read.byte_offset {byte_offset} is not on a UTF-8 character boundary in entry {entry_index}"
-        ));
-    }
     // Worst-case metadata (continuation present with a maximal offset) is
     // reserved before fitting text so the delivered slice can never push the
     // serialized result over budget.
@@ -652,44 +672,126 @@ pub(crate) fn scope_read_to_prompt(
     Ok(())
 }
 
-/// Shared backend seam for the Task 3 observer and the Task 4b session_load
-/// wiring: run a resolved read against the durable NATS session log with the
-/// physical scan caps. Pure read — never appends, activates or repairs; a
-/// missing log reads as an empty page. `outer_reserve_bytes` is the
-/// serialized size of the metadata the caller will wrap around the returned
-/// page, so the whole tool-owned result respects `max_output_bytes`.
-pub(crate) async fn read_session_log_window(
+/// One durable read window loaded from the broker, before any budget
+/// fitting. Loading and fitting are separate so a caller can refit the SAME
+/// original window under different optional-data reserves without re-reading
+/// the log — a pure re-read that consumes no cursor state (plan #2970 T3).
+pub(crate) enum LoadedWindow {
+    Sequential {
+        entries: Vec<(u64, SessionLogEntry)>,
+        capped: bool,
+        scanned_through: Option<u64>,
+    },
+    Continuation {
+        entries: Vec<(u64, SessionLogEntry)>,
+    },
+}
+
+/// Load the durable window a resolved read addresses. Pure read — never
+/// appends, activates or repairs; a missing log reads as an empty window.
+pub(crate) async fn load_read_window(
     log: &crate::nats_session_log::NatsSessionLog,
     read: &ResolvedRead,
-    outer_reserve_bytes: usize,
-) -> Result<Value, String> {
+) -> Result<LoadedWindow, String> {
     match &read.mode {
         ReadMode::Sequential(seq) => {
             let window = log
                 .load_window_async(seq.index_min, seq.index_max)
                 .await
                 .map_err(|error| format!("read session log: {error:#}"))?;
-            read_window_events(
-                EventWindow {
-                    entries: &window.entries,
-                    capped: window.capped,
-                    scanned_through: window.scanned_through,
-                },
-                read,
-                outer_reserve_bytes,
-            )
+            Ok(LoadedWindow::Sequential {
+                entries: window.entries,
+                capped: window.capped,
+                scanned_through: window.scanned_through,
+            })
         }
         ReadMode::Continuation { entry_index, .. } => {
             let entry = log
                 .load_entry_async(*entry_index)
                 .await
                 .map_err(|error| format!("read session log entry {entry_index}: {error:#}"))?;
-            let entries: Vec<(u64, SessionLogEntry)> = entry
-                .map(|entry| vec![(*entry_index, entry)])
-                .unwrap_or_default();
-            read_window_continuation(&entries, read, outer_reserve_bytes)
+            Ok(LoadedWindow::Continuation {
+                entries: entry
+                    .map(|entry| vec![(*entry_index, entry)])
+                    .unwrap_or_default(),
+            })
         }
     }
+}
+
+/// Whether a continuation page made no progress: it reported truncated content
+/// but its next byte offset is the one the caller asked for, so the next call
+/// would deliver the same empty slice. A page that reached the end of the
+/// entry (no continuation, or an advanced offset) is never stalled.
+pub(crate) fn continuation_stalled(page: &Value, read: &ResolvedRead) -> bool {
+    let ReadMode::Continuation { byte_offset, .. } = read.mode else {
+        return false;
+    };
+    page["truncated"].as_bool().unwrap_or(false)
+        && page["continuation"]["byte_offset"].as_u64() == Some(byte_offset)
+}
+
+/// Request-level validation of a loaded window, independent of any reserve
+/// (plan #2970 T3): errors here must surface to the caller instead of being
+/// retried down a refit ladder, which can only shrink optional data.
+pub(crate) fn validate_read_window(
+    window: &LoadedWindow,
+    read: &ResolvedRead,
+) -> Result<(), String> {
+    match (window, &read.mode) {
+        (
+            LoadedWindow::Continuation { entries },
+            ReadMode::Continuation {
+                entry_index,
+                byte_offset,
+            },
+        ) => validated_continuation(entries, *entry_index, *byte_offset).map(|_| ()),
+        _ => Ok(()),
+    }
+}
+
+/// Fit a loaded window to `read` under `outer_reserve_bytes`, the serialized
+/// size of the metadata the caller will wrap around the returned page. Both
+/// cursor modes report whether the page stalled.
+pub(crate) fn fit_read_window(
+    window: &LoadedWindow,
+    read: &ResolvedRead,
+    outer_reserve_bytes: usize,
+) -> Result<PageOutcome, String> {
+    match window {
+        LoadedWindow::Sequential {
+            entries,
+            capped,
+            scanned_through,
+        } => read_window_events_outcome(
+            EventWindow {
+                entries,
+                capped: *capped,
+                scanned_through: *scanned_through,
+            },
+            read,
+            outer_reserve_bytes,
+        ),
+        LoadedWindow::Continuation { entries } => {
+            let value = read_window_continuation(entries, read, outer_reserve_bytes)?;
+            let stalled = continuation_stalled(&value, read);
+            Ok(PageOutcome { value, stalled })
+        }
+    }
+}
+
+/// Shared backend seam for the in-crate window tests (plan #1550): load and
+/// fit in one call with the physical scan caps. `outer_reserve_bytes` is the
+/// serialized size of the metadata the caller will wrap around the returned
+/// page, so the whole tool-owned result respects `max_output_bytes`.
+#[cfg(test)]
+pub(crate) async fn read_session_log_window(
+    log: &crate::nats_session_log::NatsSessionLog,
+    read: &ResolvedRead,
+    outer_reserve_bytes: usize,
+) -> Result<Value, String> {
+    let window = load_read_window(log, read).await?;
+    fit_read_window(&window, read, outer_reserve_bytes).map(|outcome| outcome.value)
 }
 
 #[cfg(test)]

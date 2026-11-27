@@ -17,6 +17,7 @@ pub use admission::{
     AdmissionAuthority, AdmissionOrigin, InvocationAdmission, JoinedDispatch, SessionBusy,
     VoidJoinRelease,
 };
+mod child_patch;
 mod execution_context;
 mod initializer;
 mod model;
@@ -34,6 +35,9 @@ pub const EXTENSIONS_TOTAL_MAX_BYTES: usize = 256 * 1024;
 pub const CAS_RETRY_LIMIT: usize = 8;
 
 pub use activity::SessionActivity;
+pub use child_patch::{
+    already_holds, apply_to_initializer, ChildPatchOutcome, ChildSessionMetadataPatch,
+};
 pub use execution_context::execution_contexts;
 pub use initializer::SessionInitializer;
 pub use model::{

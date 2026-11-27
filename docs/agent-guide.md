@@ -817,11 +817,11 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
 
 - **Markdown-only agent definitions**: Agents are defined solely by Markdown files with YAML front-matter in `<config-dir>/agents/*.md` (or package agents). ACP server configuration (`acp_servers/*.yaml`) and ACP stdio child processes no longer exist.
 - **Auto-registered toolsets**: For every configured agent, the worker daemon registers a NATS-backed 6-tool toolset. Each registration advertises the raw names `session_new`, `session_prompt`, `session_send`, `session_wait`, `session_load`, and `session_cancel`; the provider exposes them to agents with an agent-relative prefix:
-  - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata.
-  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. `attachments` is a list of `cid:` attachment URLs passed to the sub-agent; repeated URLs are ignored. The parent session ID is propagated internally.
-  - `{agent}_session_send`: Asynchronously dispatches a prompt (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `wait`) and returns a durable `{session_id, prompt_id}` handle immediately instead of waiting for the child to finish. Omit `wait` (or pass `null`) for dispatch-only; pass `wait: {}` (240 seconds) or `wait: {seconds: N}` or `wait: {forever: true}` for a soft observation window.
+  - `{agent}_session_new`: Creates a new sub-agent session and returns its initial response along with session metadata. Accepts an optional `metadata` object (see [Child-Session Metadata Writes](#child-session-metadata-writes)) that lands in the session's first canonical metadata record.
+  - `{agent}_session_prompt`: Sends a prompt message (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `metadata`) to a sub-agent session, returning the sub-agent's final response text or a synthesized termination result. `attachments` is a list of `cid:` attachment URLs passed to the sub-agent; repeated URLs are ignored. The parent session ID is propagated internally.
+  - `{agent}_session_send`: Asynchronously dispatches a prompt (`message`, optional `attachments`, optional `session_id`, optional `timeout_secs`, optional `wait`, optional `metadata`) and returns a durable `{session_id, prompt_id}` handle immediately instead of waiting for the child to finish. Omit `wait` (or pass `null`) for dispatch-only; pass `wait: {}` (240 seconds) or `wait: {seconds: N}` or `wait: {forever: true}` for a soft observation window.
   - `{agent}_session_wait`: Soft-waits on a previously dispatched prompt (`session_id`, `prompt_id`, and top-level `seconds` (1 to 240, default 240) or `forever: true`, plus optional `include_partial`). A settled prompt returns the child's final reply as `response`; a running one returns a short `activity` sample. Repeated waits recover the same result and never consume it. The wait never cancels the child or extends its execution deadline.
-  - `{agent}_session_load`: Reads a bounded, filterable page of prior event history for an existing sub-agent session log. Omitted or truncated material can be recovered with continuation metadata; loading never resumes, activates, or repairs a session.
+  - `{agent}_session_load`: Reads a bounded, filterable page of prior event history for an existing sub-agent session log. Also returns the child's current safe metadata projection (`metadata`) and accepts `include_variables: true` for opt-in bounded stored-variable previews (see [Child-Session Metadata Reads](#child-session-metadata-reads)). Omitted or truncated material can be recovered with continuation metadata; loading never resumes, activates, or repairs a session.
   - `{agent}_session_cancel`: Cancels an in-flight prompt on a sub-agent session.
 - **Route-aware execution**: On persistent clusters, sub-agent turns use the
   cluster-shared JetStream work queue (`WORK_NOTIFY_<cluster>`) and may run on
@@ -836,6 +836,111 @@ Sub-agents in Harnx execute as standard NATS agent sessions (`NatsSession`). ACP
   and explicit `session_cancel` calls still cancel the child turn. TUI child
   rows also refresh durable history and sample the same lease, so a lost worker
   becomes failed instead of displaying a running spinner indefinitely.
+
+### Child-Session Metadata Writes
+
+`session_new`, `session_prompt`, and `session_send` accept an optional `metadata` object that
+updates the child session's title, stored variables, and session properties. On a session being
+created, all requested state lands in the first canonical metadata record. On an existing session,
+title, variables, and properties apply together in one revision-guarded update **before** the
+prompt is dispatched.
+
+```json
+{
+  "message": "research the topic and report findings",
+  "metadata": {
+    "title": { "value": "Research: rust async", "manual": true },
+    "variables": { "topic": "rust", "phase": "draft" },
+    "properties": { "set": [{ "name": "customer", "value": "acme" }] }
+  }
+}
+```
+
+Semantics and limits:
+
+- **Strict object.** Only `title`, `variables`, and `properties` are accepted. Execution
+  overrides, raw extensions, unknown fields, and read-only identity properties (such as
+  `user_id` and `user_principals`) are rejected before anything is reserved, created, or
+  mutated — an invalid update dispatches no prompt.
+- **Title.** `value` is stored trimmed; a null or blank value clears the title and its manual
+  flag. `manual` defaults to false; pass `true` to stop a later automatic title replacement from
+  overwriting it.
+- **Variables are stored overrides, replaced wholesale.** An omitted `variables` field preserves
+  the stored map; a supplied map — including `{}` — replaces it entirely. Values are stored as
+  given, never truncated. These are the stored overrides, not worker-resolved defaults; a child
+  that is already running a turn does not reload them mid-turn (no live-reload guarantee).
+- **Properties** follow the same names, values, inheritance flags, and limits as the child's own
+  property write. `clear` runs first, then `set`, then `remove_labels`, then `add_labels`.
+  `web_session_url` is writable under the existing rules and is never inherited.
+- **Replay safety, not transactions.** The metadata update and the prompt admission are not
+  transactional: a dispatch failure after a successful update leaves the update in place.
+  Retries are idempotent — an update that already holds is not re-applied, and a replayed call
+  never resets metadata the child edited after the original update. If the session moved on and
+  the requested update conflicts, the call returns a recoverable conflict and dispatches nothing.
+  A call that cannot write its durable invocation checkpoint (no durable invocation identity)
+  fails before any mutation. The caller's trusted context and the saved checkpoint's scope are
+  validated first as well: a call with a missing or malformed inherited run context, or one
+  replaying a checkpoint whose storage/cluster scope no longer matches this worker's route,
+  fails before any metadata write or guard pin. (Issue #2970)
+
+### Child-Session Metadata Reads
+
+`session_load` returns the child's **current** metadata as a safe `metadata` field next to the
+transcript page: identity (`session_id`, `agent`, `created_at`), `title`, session `properties`
+(including the recorded `web_session_url`, returned whole or omitted — never clipped into a
+misleading link), and `observed_repositories`. Raw execution extensions, overrides, and
+worker-resolved defaults are never disclosed. The read happens only after namespace and
+prompt-binding validation, and it is pure: loading never creates, activates, resumes, or repairs
+the child, and a child edit made after the prompt being inspected still shows up — metadata is
+current session state, not a snapshot of that prompt's turn.
+
+Variables are **opt-in**: by default no variable values or previews appear. Pass
+`include_variables: true` to get `metadata.variables`, a key-sorted object of bounded previews
+(at most eight entries; entries whose names cannot fit are omitted whole):
+
+```json
+{
+  "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
+  "metadata": {
+    "session_id": "01948a3f-7b1c-7123-8901-abcdef123456",
+    "agent": "researcher",
+    "title": "Research: rust async",
+    "created_at": "2026-11-26T18:20:12Z",
+    "properties": { "customer": { "value": "acme" } },
+    "observed_repositories": [],
+    "variables": {
+      "research_notes": {
+        "head": "…first bytes…",
+        "tail": "…last bytes…",
+        "total_bytes": 51000,
+        "omitted_bytes": 50748
+      }
+    },
+    "variables_summary": { "total": 12, "returned": 8, "omitted": 4 },
+    "truncated": true
+  }
+}
+```
+
+Semantics and limits:
+
+- **A missing record is `metadata: null`**, distinct from a broker failure, which is an error.
+- **Previews, not values.** Each preview reports the original UTF-8 `total_bytes`/`omitted_bytes`;
+  the combined `head`/`tail` content is capped at 256 escaped JSON bytes. A complete value has
+  `omitted_bytes: 0` and an empty `tail`. Previews are display-only and are not a write-back map.
+- **Budget discipline.** The whole `metadata` field is capped at `min(4096 bytes, total read
+  budget / 4)`. Fitting measures the actual compact serialized JSON; when the projection cannot
+  fit it degrades to `metadata: {"truncated": true}` and is finally omitted entirely. A
+  progressing page is preferred over optional metadata: metadata and optional progress are
+  reduced or dropped before the page stalls or overflows `read.max_output_bytes`, and the same
+  read window is refitted without consuming a cursor. Only when the mandatory identity alone
+  leaves no room for usable content does the load return a recoverable error asking for a larger
+  `read.max_output_bytes`. `truncated` here is the metadata's own indicator and is independent of
+  the transcript page's `truncated`/`omitted_ranges`.
+- **Stored overrides only.** The previews show the stored variables (the map written through the
+  `metadata` argument), not worker-resolved defaults or `path:` values. `include_variables`
+  controls exposure and output size, not authorization: any caller with namespace access to
+  `session_load` may request it. (Issue #2970)
 
 ### Sub-Agent Tool Result Marker
 

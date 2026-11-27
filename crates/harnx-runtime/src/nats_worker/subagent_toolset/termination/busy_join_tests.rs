@@ -27,11 +27,17 @@ fn prompt_params(call_id: &str, message: &str, parent: &str) -> PromptParams {
             run_context: Some(crate::nats_session::test_support::inherited_tool_context()),
             ..Default::default()
         },
+        metadata: super::PromptMetadata::None,
     }
 }
 
 /// Hold the model call until the test confirms the joined message is durable.
-fn held_reply_model(entered: Arc<Notify>, release: Arc<Notify>) -> crate::agent_loop::AgentCallFn {
+/// Shared with the child-metadata prompt e2e tests, which exercise the same
+/// busy-join binding through the real handlers.
+pub(in crate::nats_worker::subagent_toolset) fn held_reply_model(
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+) -> crate::agent_loop::AgentCallFn {
     let first_call = Arc::new(AtomicBool::new(true));
     Arc::new(move |_, _, _| {
         let entered = entered.clone();

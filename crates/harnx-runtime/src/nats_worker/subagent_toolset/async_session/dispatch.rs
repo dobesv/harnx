@@ -1,4 +1,5 @@
 //! Send admission and delivery only. Observation and discovery are separate.
+use super::super::child_metadata::{self, MetadataPlan};
 use super::super::{normalize_session_id, parse_attachment_urls, SubagentToolset};
 use super::{
     parse_send_args, DispatchConfirmation, PromptHandle, ResolvedWait, SessionPromptResult,
@@ -45,6 +46,100 @@ pub(in crate::nats_worker::subagent_toolset) fn trusted_parent_scope(
         })
 }
 
+/// The metadata gate for a send, with its fresh-content validation. The
+/// gate runs before the checkpointed create and before any fresh
+/// attachment composition: a recoverable conflict or a failed guard must
+/// dispatch nothing, and an admitted replay must not reapply its patch
+/// over later child edits.
+// qual:allow(iosp) — the gate interleaves guard-state logic with broker calls by design: the fresh-compose check, the composition and the settle step share one target/call context, and each depends on the previous step's durable outcome.
+async fn send_metadata_plan(
+    toolset: &SubagentToolset,
+    args: &super::SendArgs,
+    context: &ToolInvocationContext,
+    inherited: &InheritedDispatch,
+    patch: Option<crate::nats_session_metadata::ChildSessionMetadataPatch>,
+) -> Result<MetadataPlan, ToolInvokeError> {
+    let Some(patch) = patch else {
+        return Ok(MetadataPlan::Settled);
+    };
+    // The saved checkpoint's scope is validated before the gate can pin a
+    // guard or CAS (review F03): a same-broker route/cluster change can keep
+    // the journaled request, the child record and its revision valid while
+    // the saved scope is stale. Patchless sends keep their existing later
+    // validation in `checkpointed_session`.
+    if let Some(saved) = context.checkpoint.as_ref() {
+        validate_checkpoint(saved, toolset, &inherited.parent_key, &context.call_id)?;
+    }
+    let target = child_metadata::checkpoint_session_id(context)
+        .or_else(|| normalize_session_id(args.session_id.clone()));
+    // Fresh or candidate-only calls validate their original content BEFORE
+    // the gate can mutate or create: a missing attachment must fail without
+    // touching the child. Admitted replays deliver durable content and
+    // skip this re-fetch.
+    if child_metadata::fresh_send_composes_content(toolset, target.as_deref(), &context.call_id)
+        .await?
+    {
+        toolset
+            .compose_prompt_content(
+                args.message.clone(),
+                args.attachments.clone().unwrap_or_default(),
+            )
+            .await?;
+    }
+    child_metadata::prepare_send(
+        toolset,
+        context,
+        target.as_deref(),
+        &inherited.parent_key,
+        patch,
+    )
+    .await
+}
+
+/// Resolve the content a dispatched send delivers. Replayed delivery never
+/// re-fetches attachments or replaces original content, even if the
+/// referenced resource disappeared after admission. A joined-dispatch
+/// record is authoritative here, including over a leftover candidate
+/// intent from an earlier busy reserve (issue #2672).
+// qual:allow(iosp) — the joined/admission/fresh fallback chain is ordered broker lookups whose branch conditions are the lookups' results; splitting the logic from the calls would re-fetch or reorder admission state.
+async fn replayed_or_fresh_content(
+    toolset: &SubagentToolset,
+    session: &NatsSession,
+    args: &super::SendArgs,
+    inherited: &InheritedDispatch,
+    call_id: &str,
+) -> Result<harnx_core::message::MessageContent, ToolInvokeError> {
+    match session
+        .metadata_store()
+        .joined_dispatch(session.storage_key(), call_id)
+        .await
+        .map_err(recoverable)?
+    {
+        Some(joined) => {
+            ensure_joined_caller(&joined, &inherited.parent_key, &inherited.parent)?;
+            Ok(joined.prompt_content)
+        }
+        None => match toolset
+            .session_metadata
+            .admission(session.storage_key(), call_id)
+            .await
+            .map_err(recoverable)?
+        {
+            Some(saved) => saved.prompt_content.ok_or_else(|| {
+                ToolInvokeError::Fatal("dispatch admission has no original content".into())
+            }),
+            None => {
+                toolset
+                    .compose_prompt_content(
+                        args.message.clone(),
+                        args.attachments.clone().unwrap_or_default(),
+                    )
+                    .await
+            }
+        },
+    }
+}
+
 /// Returns after durable append and one bounded activation publication. No
 /// follower, detached future, progress supervisor or cancellation-on-drop.
 pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
@@ -55,6 +150,7 @@ pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
 ) -> Result<(DispatchedPrompt, Option<ResolvedWait>), ToolInvokeError> {
     let (args, wait) = parse_send_args(arguments).map_err(ToolInvokeError::Recoverable)?;
     let inherited = validate_send_context(&args, &context)?;
+    let patch = child_metadata::extract(args.metadata.clone())?;
     let budget = super::RESULT_MAX_BYTES;
     let requested_id = normalize_session_id(args.session_id.clone());
     // New IDs are six ASCII bytes. Include the diagnostic invocation identity
@@ -65,39 +161,19 @@ pub(in crate::nats_worker::subagent_toolset) async fn dispatch_send(
         budget,
     )?;
     check_cancel(&cancel)?;
-    let session = checkpointed_session(toolset, &args, &inherited.parent_key, &context).await?;
+    let plan = send_metadata_plan(toolset, &args, &context, &inherited, patch).await?;
+    let session = checkpointed_session(
+        toolset,
+        &args,
+        &inherited.parent_key,
+        &context,
+        plan.creation(),
+    )
+    .await?;
     ensure_receipt_fits(session.session_id(), &context.call_id, budget)?;
     let session = inherited.admit_detached(session, &context, args.timeout_secs);
-    // Replayed delivery never re-fetches attachments or replaces original
-    // content, even if the referenced resource disappeared after admission.
-    // A joined-dispatch record is authoritative here, including over a
-    // leftover candidate intent from an earlier busy reserve (issue #2672).
-    let content = match session
-        .metadata_store()
-        .joined_dispatch(session.storage_key(), &context.call_id)
-        .await
-        .map_err(recoverable)?
-    {
-        Some(joined) => {
-            ensure_joined_caller(&joined, &inherited.parent_key, &inherited.parent)?;
-            joined.prompt_content
-        }
-        None => match toolset
-            .session_metadata
-            .admission(session.storage_key(), &context.call_id)
-            .await
-            .map_err(recoverable)?
-        {
-            Some(saved) => saved.prompt_content.ok_or_else(|| {
-                ToolInvokeError::Fatal("dispatch admission has no original content".into())
-            })?,
-            None => {
-                toolset
-                    .compose_prompt_content(args.message, args.attachments.unwrap_or_default())
-                    .await?
-            }
-        },
-    };
+    let content =
+        replayed_or_fresh_content(toolset, &session, &args, &inherited, &context.call_id).await?;
     check_cancel(&cancel)?;
     record_child(toolset, &context, session.session_id()).await?;
     // Parent interruption and observer cancellation do not stop detached work.
@@ -207,21 +283,14 @@ fn validate_send_context(
         ToolInvokeError::Fatal("async dispatch requires durable partial-result store".into())
     })?;
     parse_attachment_urls(args.attachments.clone().unwrap_or_default())?;
-    let lineage = context.run_context.as_ref().ok_or_else(|| {
-        ToolInvokeError::Fatal("sub-agent execution requires inherited run context".into())
-    })?;
-    let parent = serde_json::from_value(lineage.snapshot.clone()).map_err(|error| {
-        ToolInvokeError::Fatal(format!("invalid inherited run context: {error}"))
-    })?;
-    let admitted_at = chrono::DateTime::from_timestamp_millis(
-        i64::try_from(lineage.started_at_ms)
-            .map_err(|error| ToolInvokeError::Fatal(error.to_string()))?,
-    )
-    .ok_or_else(|| ToolInvokeError::Fatal("invalid original invocation time".into()))?;
+    // Same trusted-lineage validation the synchronous path runs up front
+    // (review F02); one implementation, so a direct/MCP dispatch can never
+    // drift from what `run_prompt` accepts.
+    let inherited = child_metadata::InheritedPrompt::validate(context)?;
     Ok(InheritedDispatch {
         parent_key,
-        parent,
-        admitted_at,
+        parent: inherited.parent,
+        admitted_at: inherited.admitted_at,
     })
 }
 
@@ -256,6 +325,7 @@ async fn checkpointed_session(
     args: &super::SendArgs,
     parent: &str,
     context: &ToolInvocationContext,
+    creation: Option<&child_metadata::ChildCreation>,
 ) -> Result<NatsSession, ToolInvokeError> {
     let requested_id = normalize_session_id(args.session_id.clone());
     let tool_call_id = args.tool_call_id.as_deref();
@@ -264,8 +334,11 @@ async fn checkpointed_session(
         None => match requested_id {
             Some(id) => id,
             None => {
+                // A patch-bearing create folds its metadata into the
+                // reservation initializer, so the reservation's atomic
+                // `creation_invocation` stamp is the creation guard.
                 let config = toolset
-                    .session_config(None, Some(parent), tool_call_id)
+                    .session_config_with_creation(None, Some(parent), tool_call_id, creation)
                     .await?;
                 crate::utils::session_name::reserve_invocation_session_id(
                     &toolset.session_metadata,
@@ -292,8 +365,9 @@ async fn checkpointed_session(
         session_id
     };
     toolset
-        .create_session(Some(session_id), Some(parent), tool_call_id)
+        .create_session_with_claim(Some(session_id), Some(parent), tool_call_id, creation)
         .await
+        .map(|(session, _)| session)
 }
 
 fn checkpoint_value(
@@ -312,24 +386,27 @@ fn validate_checkpoint(
     parent: &str,
     prompt_id: &str,
 ) -> Result<String, ToolInvokeError> {
-    let id = saved["session_id"]
-        .as_str()
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| {
-            ToolInvokeError::Fatal("invalid sub-agent dispatch checkpoint session_id".into())
-        })?;
-    let expected = checkpoint_value(toolset, id, parent, prompt_id);
-    if !expected
-        .as_object()
-        .expect("checkpoint object")
-        .iter()
-        .all(|(key, value)| saved.get(key) == Some(value))
-    {
-        return Err(ToolInvokeError::Fatal(
-            "sub-agent dispatch checkpoint scope mismatch".into(),
-        ));
-    }
-    Ok(id.into())
+    // The dispatch checkpoint pins the same core scope (session id, storage
+    // key, cluster) plus its prompt and parent identity (review F03); the
+    // shared core owns the comparison.
+    child_metadata::saved_checkpoint_scope(
+        toolset,
+        saved,
+        &[("prompt_id", prompt_id), ("parent_storage_key", parent)],
+    )
+    .map_err(|mismatch| {
+        ToolInvokeError::Fatal(
+            match mismatch {
+                child_metadata::ScopeMismatch::MissingId => {
+                    "invalid sub-agent dispatch checkpoint session_id"
+                }
+                child_metadata::ScopeMismatch::Scope => {
+                    "sub-agent dispatch checkpoint scope mismatch"
+                }
+            }
+            .into(),
+        )
+    })
 }
 
 async fn record_child(
