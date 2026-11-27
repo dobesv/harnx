@@ -12,6 +12,8 @@ use rmcp::model::{CallToolResult, ContentBlock, Role};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::script_result::{script_byte_page, script_create_result, script_line_page, ResultStyle};
+
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024; // 5 MiB
 
 /// Default byte limit when byte_offset is provided without byte_limit.
@@ -100,6 +102,7 @@ pub struct AttachmentCreateParams {
 pub async fn attachment_read(
     jetstream: &async_nats::jetstream::Context,
     params: AttachmentReadParams,
+    style: ResultStyle,
 ) -> Result<CallToolResult> {
     // Check for conflicting selectors
     let has_line = has_line_selectors(&params);
@@ -134,9 +137,14 @@ pub async fn attachment_read(
     if is_text_mime(&normalized_mime) {
         // Dispatch to byte paging if byte selectors present, else line-based
         if has_byte {
-            return byte_text_attachment_result(resolved.bytes, params);
+            return byte_text_attachment_result(
+                resolved.bytes,
+                params,
+                resolved.mime_type.clone(),
+                style,
+            );
         }
-        return text_attachment_result(resolved.bytes, params);
+        return text_attachment_result(resolved.bytes, params, resolved.mime_type.clone(), style);
     }
     Ok(binary_attachment_error(
         &resolved.mime_type,
@@ -161,14 +169,14 @@ fn binary_attachment_error(mime_type: &str, byte_count: usize) -> CallToolResult
 }
 
 /// Byte offsets and metadata for a single contiguous text page.
-struct BytePage {
-    start: usize,
-    end: usize,
-    total: usize,
+pub(crate) struct BytePage {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) total: usize,
 }
 
 impl BytePage {
-    fn new(bytes: &[u8], params: &AttachmentReadParams) -> Result<Self, String> {
+    pub(crate) fn new(bytes: &[u8], params: &AttachmentReadParams) -> Result<Self, String> {
         let total = bytes.len();
         let start = params.byte_offset.unwrap_or(0).min(total);
         if !is_char_start(bytes, start) {
@@ -190,22 +198,14 @@ impl BytePage {
         Ok(Self { start, end, total })
     }
 
-    fn result(&self, bytes: &[u8], url: &str) -> Result<CallToolResult, String> {
-        // Boundary scans don't validate stored bytes. Both normal and tiny pages
-        // must decode here so malformed blobs return tool errors, not panics.
-        let text = std::str::from_utf8(&bytes[self.start..self.end]).map_err(|error| {
-            format!(
-                "invalid UTF-8 sequence at byte boundaries {}..{}: {}",
-                self.start, self.end, error
-            )
-        })?;
-        Ok(CallToolResult::success(vec![
+    fn result(&self, text: &str, url: &str) -> CallToolResult {
+        CallToolResult::success(vec![
             ContentBlock::text(text).with_audience(vec![Role::Assistant]),
             ContentBlock::text(self.summary(url)).with_audience(vec![Role::User]),
-        ]))
+        ])
     }
 
-    fn summary(&self, url: &str) -> String {
+    pub(crate) fn summary(&self, url: &str) -> String {
         let continuation = if self.end < self.total {
             format!("next_byte_offset: {}", self.end)
         } else {
@@ -226,8 +226,23 @@ impl BytePage {
 fn byte_text_attachment_result(
     bytes: Vec<u8>,
     params: AttachmentReadParams,
+    mime_type: String,
+    style: ResultStyle,
 ) -> Result<CallToolResult> {
-    let result = BytePage::new(&bytes, &params).and_then(|page| page.result(&bytes, &params.url));
+    let result = BytePage::new(&bytes, &params).and_then(|page| {
+        // Boundary scans don't validate stored bytes. Both normal and tiny pages
+        // must decode here so malformed blobs return tool errors, not panics.
+        let text = std::str::from_utf8(&bytes[page.start..page.end]).map_err(|error| {
+            format!(
+                "invalid UTF-8 sequence at byte boundaries {}..{}: {}",
+                page.start, page.end, error
+            )
+        })?;
+        Ok(match style {
+            ResultStyle::Model => page.result(text, &params.url),
+            ResultStyle::Script => script_byte_page(&page, text, &params.url, &mime_type),
+        })
+    });
     Ok(result.unwrap_or_else(|error| CallToolResult::error(vec![ContentBlock::text(error)])))
 }
 
@@ -253,9 +268,31 @@ fn is_char_start(bytes: &[u8], pos: usize) -> bool {
         .is_none_or(|byte| !(0x80..0xC0).contains(byte))
 }
 
-fn text_attachment_result(bytes: Vec<u8>, params: AttachmentReadParams) -> Result<CallToolResult> {
+fn text_attachment_result(
+    bytes: Vec<u8>,
+    params: AttachmentReadParams,
+    mime_type: String,
+    style: ResultStyle,
+) -> Result<CallToolResult> {
     let byte_count = bytes.len();
     let text = String::from_utf8(bytes).context("decode text content as UTF-8")?;
+    let summary = format!("Read {} bytes from {}", format_size(byte_count), params.url);
+    match style {
+        ResultStyle::Model => model_line_result(text, &params, summary),
+        // A script gets clean text: no in-band truncation markers, no silent
+        // head/tail window defaults. Cut-off output becomes stderr notes with
+        // the continuation to pass next.
+        ResultStyle::Script => Ok(script_line_page(&text, &params, &mime_type, summary)),
+    }
+}
+
+/// The model-facing line result: control characters sanitized, truncation
+/// notices embedded in the text, and a summary the model does not see.
+fn model_line_result(
+    text: String,
+    params: &AttachmentReadParams,
+    summary: String,
+) -> Result<CallToolResult> {
     let default = TruncateOpts::default();
     let opts = TruncateOpts {
         offset: params.offset.or(default.offset),
@@ -265,12 +302,11 @@ fn text_attachment_result(bytes: Vec<u8>, params: AttachmentReadParams) -> Resul
         max_output_bytes: params.max_output_bytes.unwrap_or(default.max_output_bytes),
         ..default
     };
-    let truncated = if let Some(pattern) = params.grep {
-        filter_and_truncate(&text, &pattern, &opts)
+    let truncated = if let Some(ref pattern) = params.grep {
+        filter_and_truncate(&text, pattern, &opts)
     } else {
         truncate_output(&text, &opts)
     };
-    let summary = format!("Read {} bytes from {}", format_size(byte_count), params.url);
     Ok(CallToolResult::success(vec![
         ContentBlock::text(truncated).with_audience(vec![Role::Assistant]),
         ContentBlock::text(summary).with_audience(vec![Role::User]),
@@ -303,6 +339,7 @@ pub async fn attachment_create(
     store: &AttachmentsBucket,
     caller_session: Option<&harnx_toolset::SessionRef>,
     params: AttachmentCreateParams,
+    style: ResultStyle,
 ) -> Result<CallToolResult> {
     let bytes = match decode_attachment_content(params.content, params.encoding.as_deref()) {
         Ok(bytes) => bytes,
@@ -326,22 +363,10 @@ pub async fn attachment_create(
         }
     };
 
-    // UTF-8 mode preserves the original text-only MIME restriction.
-    if params.encoding.as_deref().unwrap_or("utf-8") == "utf-8" && !is_text_mime(&params.mime_type)
+    if let Some(error) =
+        attachment_mime_error(params.encoding.as_deref(), &params.mime_type, &bytes)
     {
-        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-            "attachment_create only accepts text MIME types; got {}",
-            params.mime_type
-        ))]));
-    }
-
-    // attachment_read decodes text MIME types as UTF-8, regardless of charset parameters.
-    if is_text_mime(&normalize_mime_base(&params.mime_type)) && std::str::from_utf8(&bytes).is_err()
-    {
-        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-            "attachment_create text MIME types require UTF-8 content; got {}",
-            params.mime_type
-        ))]));
+        return Ok(error);
     }
 
     // Compute SHA256 hash
@@ -363,14 +388,50 @@ pub async fn attachment_create(
         .await
         .context("store attachment")?;
 
-    // Return success with resource_link
-    let url_str = url.to_string();
-    let resource =
-        rmcp::model::Resource::new(&url_str, "attachment").with_mime_type(&params.mime_type);
-    Ok(CallToolResult::success(vec![
-        ContentBlock::text(format!("Created attachment: {}", url_str)),
-        ContentBlock::resource_link(resource),
-    ]))
+    Ok(create_success_result(
+        &url.to_string(),
+        &params.mime_type,
+        style,
+    ))
+}
+
+/// Reject content the store must not hold: non-text MIME types in utf-8
+/// mode, and text MIME types whose bytes are not valid UTF-8
+/// (`attachment_read` decodes text as UTF-8, whatever the charset says).
+fn attachment_mime_error(
+    encoding: Option<&str>,
+    mime_type: &str,
+    bytes: &[u8],
+) -> Option<CallToolResult> {
+    if encoding.unwrap_or("utf-8") == "utf-8" && !is_text_mime(mime_type) {
+        return Some(CallToolResult::error(vec![ContentBlock::text(format!(
+            "attachment_create only accepts text MIME types; got {}",
+            mime_type
+        ))]));
+    }
+    if is_text_mime(&normalize_mime_base(mime_type)) && std::str::from_utf8(bytes).is_err() {
+        return Some(CallToolResult::error(vec![ContentBlock::text(format!(
+            "attachment_create text MIME types require UTF-8 content; got {}",
+            mime_type
+        ))]));
+    }
+    None
+}
+
+/// The create success result: a model round gets the confirmation text plus
+/// a resource link; a script gets the URL as structured fields so it never
+/// parses the line.
+fn create_success_result(url: &str, mime_type: &str, style: ResultStyle) -> CallToolResult {
+    match style {
+        ResultStyle::Script => script_create_result(url, mime_type),
+        ResultStyle::Model => {
+            let resource = rmcp::model::Resource::new(url, "attachment").with_mime_type(mime_type);
+            CallToolResult::success(vec![
+                ContentBlock::text(format!("Created attachment: {}", url)),
+                ContentBlock::resource_link(resource),
+            ])
+        }
+    }
 }
 
 /// Check if a MIME type is text-like (suitable for text/block output).
@@ -577,14 +638,23 @@ mod tests {
             vec![0xC0, 0x80],
         ] {
             for limit in [1, 2, 4] {
-                let params =
-                    serde_json::from_value(json!({"url": "test", "byte_limit": limit})).unwrap();
-                let result = byte_text_attachment_result(bytes.clone(), params).unwrap();
-                assert_eq!(
-                    result.is_error,
-                    Some(true),
-                    "bytes {bytes:?}, limit {limit}"
-                );
+                for style in [ResultStyle::Model, ResultStyle::Script] {
+                    let params: AttachmentReadParams =
+                        serde_json::from_value(json!({"url": "test", "byte_limit": limit}))
+                            .unwrap();
+                    let result = byte_text_attachment_result(
+                        bytes.clone(),
+                        params,
+                        "text/plain".into(),
+                        style,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        result.is_error,
+                        Some(true),
+                        "bytes {bytes:?}, limit {limit}, style {style:?}"
+                    );
+                }
             }
         }
     }

@@ -18,6 +18,8 @@ mod base64_bounds;
 mod base64_text;
 #[path = "integration/paging_fixture.rs"]
 mod paging_fixture;
+#[path = "integration/script_results.rs"]
+mod script_results;
 use paging_fixture::{assert_page, metadata, StoredAttachment};
 
 const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -67,6 +69,31 @@ impl TestContext {
             })
             .await
             .expect("tool invocation should return a result")
+    }
+
+    /// The call a `bash` script's inner tool call makes: it asks for a
+    /// structured result, so the toolset answers in script style.
+    async fn invoke_structured(
+        &self,
+        tool: &str,
+        args: Value,
+        invoking_session: Option<ToolSessionRef>,
+    ) -> Value {
+        self.toolset
+            .invoke_with_context(ToolInvocation {
+                tool: tool.to_string(),
+                args,
+                context: ToolInvocationContext {
+                    invoking_session,
+                    capabilities: [harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_string()]
+                        .into_iter()
+                        .collect(),
+                    ..ToolInvocationContext::default()
+                },
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .expect("structured invocation should return a result")
     }
 }
 
