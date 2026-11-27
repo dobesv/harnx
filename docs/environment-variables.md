@@ -6,6 +6,7 @@ Harnx can load environment variables from a `.env` file located in the data dire
 
 ## Config-Related Envs
 
+- **HARNX_ATTACHMENT_PICKER**: Shell command used by the TUI's `Ctrl+A` file picker (default: `fzf --multi`). The command runs with the TUI suspended and prints one selected path per line. Spaces in paths are preserved; filenames containing newlines are unsupported. `fzf` exit codes 1 and 130 mean no selection or cancellation.
 - **HARNX_MODEL**: The default model to use.
 - **HARNX_TEMPERATURE**: The temperature setting for the model.
 - **HARNX_TOP_P**: The top_p setting for the model.

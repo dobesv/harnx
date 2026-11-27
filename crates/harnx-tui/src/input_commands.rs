@@ -98,6 +98,7 @@ impl Tui {
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
         self.app.transcript_browsing = false;
+        self.reset_pending_attachment_view();
         self.app.detail_view_open = false;
         self.app.detail_view_entry = None;
         self.app.doc_view = None;

@@ -98,6 +98,7 @@ mod handoff_session_tests;
 mod markdown_link_accessibility_tests;
 mod operator_tool_completion;
 mod operator_tool_execution;
+mod pending_attachment_tests;
 mod runtime_note_rendering_tests;
 mod shared_session_event_tests;
 mod subagent_session_tests;

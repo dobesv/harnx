@@ -3,7 +3,6 @@ import {
   ThreadPrimitive,
   MessagePrimitive,
   ComposerPrimitive,
-  AttachmentPrimitive,
   type Attachment,
   useAui,
   useAuiState,
@@ -42,6 +41,7 @@ import { createPendingPrompt, pendingUserMessageIds, reconcilePendingPrompts, ty
 import { usePendingSessionPrompts } from './usePendingSessionPrompts';
 import { SessionCard, compareSessionsUnreadFirst } from './SessionCard';
 import { SessionLoadMore } from './SessionLoadMore';
+import { PendingAttachment as MyAttachment } from './PendingAttachment';
 import './chat.css';
 
 // Activate a click-like handler from keyboard (Enter / Space) so div-based
@@ -176,17 +176,7 @@ export const CancelButton = () => {
   return <CancellationActions {...cancellation} />;
 };
 
-export const MyAttachment = () => (
-  <AttachmentPrimitive.Root className="aui-attachment">
-    <AttachmentPrimitive.unstable_Thumb className="aui-attachment-thumb" />
-    <div className="aui-attachment-info">
-      <span className="aui-attachment-name"><AttachmentPrimitive.Name /></span>
-    </div>
-    <AttachmentPrimitive.Remove className="aui-attachment-remove" aria-label="Remove attachment" title="Remove attachment">
-      ✖
-    </AttachmentPrimitive.Remove>
-  </AttachmentPrimitive.Root>
-);
+export { PendingAttachment as MyAttachment } from "./PendingAttachment";
 
 async function resolveOutofBandAttachmentRefs(
   attachments: readonly Attachment[],
@@ -459,7 +449,7 @@ export const MyComposer = ({
 
   return (
     <ComposerPrimitive.Root className="aui-composer" onSubmit={handleSubmit}>
-      <div className="aui-composer-attachments">
+      <div className="aui-composer-attachments" role="group" aria-label="Pending attachments">
         <ComposerPrimitive.Attachments components={{ Attachment: MyAttachment }} />
       </div>
       <ComposerPrimitive.Input

@@ -19,27 +19,6 @@ mod runtime_note;
 
 use runtime_note::TranscriptDisplay;
 
-fn render_bottom_attachments(
-    frame: &mut Frame<'_>,
-    area: ratatui::layout::Rect,
-    y: u16,
-    attachments: &[crate::types::Attachment],
-) {
-    let names: Vec<&str> = attachments
-        .iter()
-        .map(|attachment| attachment.display_name.as_str())
-        .collect();
-    let footer_text = format!("  Attached: {}   [.detach to remove]", names.join(", "));
-    let footer_area = ratatui::layout::Rect::new(area.x, y, area.width, 1);
-    let footer = Paragraph::new(Line::from(Span::styled(
-        footer_text,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::DIM),
-    )));
-    frame.render_widget(footer, footer_area);
-}
-
 fn render_bottom_notice(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
@@ -679,7 +658,9 @@ impl Tui {
         let input_height = self
             .input_height(input_width)
             .clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
-        let attachment_height = u16::from(!self.app.attachments.is_empty());
+        let attachment_height = self
+            .pending_attachment_height()
+            .min(screen_height.saturating_sub(input_height + 1));
         let status_height =
             u16::from(self.has_root_cancellation() && self.cancellation_editor_restored());
         let notice_height = u16::from(self.app.footer_notice_text().is_some());
@@ -731,11 +712,12 @@ impl Tui {
         }
 
         let show_status = self.has_root_cancellation() && self.cancellation_editor_restored();
-        let show_attachments = !self.app.attachments.is_empty();
         let notice = self.app.footer_notice_text().map(str::to_string);
 
         let status_height = u16::from(show_status);
-        let attachment_height = u16::from(show_attachments);
+        let attachment_height = self
+            .pending_attachment_height()
+            .min(area.height.saturating_sub(MIN_INPUT_HEIGHT));
         let notice_height = u16::from(notice.is_some());
 
         let input_area_height = area
@@ -743,7 +725,12 @@ impl Tui {
             .saturating_sub(status_height + attachment_height + notice_height)
             .max(1);
 
-        let input_area = ratatui::layout::Rect::new(area.x, area.y, area.width, input_area_height);
+        let input_area = ratatui::layout::Rect::new(
+            area.x,
+            area.y + attachment_height,
+            area.width,
+            input_area_height,
+        );
 
         let title = self.build_input_title();
         self.app.input.set_block(
@@ -758,10 +745,10 @@ impl Tui {
         );
         frame.render_widget(&self.app.input, input_area);
 
-        if show_attachments {
-            let y = area.y + input_area_height;
-            render_bottom_attachments(frame, area, y, &self.app.attachments);
-        }
+        self.render_pending_attachments(
+            frame,
+            Rect::new(area.x, area.y, area.width, attachment_height),
+        );
 
         if show_status {
             let y = area.y + input_area_height + attachment_height;
@@ -774,6 +761,10 @@ impl Tui {
     }
 
     fn render_overlay_modal(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        if self.app.modal.is_none() && self.app.pending_attachment_view.confirming_delete {
+            self.render_simple_modal(frame, area, "Remove pending attachment? [y/N]");
+            return;
+        }
         if let Some(modal) = &self.app.modal {
             if !matches!(
                 modal,
@@ -1746,6 +1737,11 @@ impl Tui {
             .position
             .min(self.app.detail_view_scroll.last_max_position);
 
+        self.render_detail_footer(frame, chunks[1]);
+        self.render_pending_attachment_confirmation(frame, size);
+    }
+
+    fn render_detail_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         // Render footer. The notice (shown only for the root-transcript
         // footer) uses a brighter color than the dim hint legend.
         let footer_text = crate::detail_view::detail_view_footer_text(&self.app);
@@ -1758,7 +1754,13 @@ impl Tui {
             Color::DarkGray
         };
         let footer = Paragraph::new(footer_text).style(Style::default().fg(footer_color));
-        frame.render_widget(footer, chunks[1]);
+        frame.render_widget(footer, area);
+    }
+
+    fn render_pending_attachment_confirmation(&self, frame: &mut Frame<'_>, size: Rect) {
+        if self.app.pending_attachment_view.confirming_delete {
+            self.render_simple_modal(frame, size, "Remove pending attachment? [y/N]");
+        }
     }
 
     /// Build the rendered transcript entries for the given viewport width, applying

@@ -1601,6 +1601,9 @@ describe('MyComposer', () => {
   });
 
   it('renders attachment chip with horizontal layout, thumbnail, filename, and remove button', () => {
+    vi.mocked(aui.useAuiState).mockImplementation((selector: any) => selector({
+      attachment: { name: 'diagram.png', file: new File(['image'], 'diagram.png', { type: 'image/png' }) },
+    }));
     const { container } = render(<MyAttachment />);
     const chip = container.querySelector('.aui-attachment');
     expect(chip).toBeInTheDocument();
@@ -1610,7 +1613,7 @@ describe('MyComposer', () => {
     expect(screen.getByText('diagram.png')).toBeInTheDocument();
     const removeBtn = container.querySelector('.aui-attachment-remove');
     expect(removeBtn).toBeInTheDocument();
-    expect(removeBtn).toHaveAttribute('aria-label', 'Remove attachment');
+    expect(removeBtn).toHaveAttribute('aria-label', 'Remove diagram.png');
   });
 });
 

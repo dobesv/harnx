@@ -56,6 +56,7 @@ The proxy is configured to be **SSE-safe**. It disables buffering for `text/even
 - **Included**:
   - Streaming text, thinking, and tool-call rendering.
   - Session switching.
+  - File attachments with local pending previews and confirmed removal.
   - Turn cancellation.
   - Tool approval and session handoff confirmations (approve/deny responses and reconnect replay).
   - Middleware interactions: `confirm` approve/deny dialogs and `a2ui` modal forms (Text, Button, ChoicePicker, TextField, Card, Column) with interactive editing, canonical response mapping, server rejection display, and deny dismissal.
@@ -95,7 +96,6 @@ The proxy is configured to be **SSE-safe**. It disables buffering for `text/even
       matching web assets alongside the server (server-first for cross-origin).
 - **Out of Scope** (Deferred to `harnx-webui-parity` backlog):
   - General transcript message editing and history rewinding.
-  - File attachments.
   - Model switching.
   - NATS single-owner-route fanout redesign for multi-client tool approvals.
 
@@ -234,3 +234,11 @@ In development mode (`import.meta.env.DEV`), `window.__harnxConnection = { initi
 `toMessagePartStatus` passes `message.status` through to the part, so `reason` is available.
 
 In this app, HITL approvals render via a separate path (`web/src/App.tsx` `useAgUiInterrupts()` → `BatchInterruptUI`) — not via `ToolCallCard`. See `toolCallPresentation.ts` (`getToolCallPresentation`) for the `isPending`/`isActionRequired` derivation. Issue #1827.
+
+### Attachments
+
+Use **Attach file** to select an image, PDF, or plain-text file. Pending files
+appear above the message input, with **View** and **Remove attachment** controls.
+View opens an accessible preview dialog; removing a file requires confirmation.
+Text previews are limited to 256 KiB, while sending includes the complete file.
+Unsent files belong to the local composer and are uploaded when sending.

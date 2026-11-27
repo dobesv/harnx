@@ -220,6 +220,7 @@ impl Tui {
         &mut self,
         pending: crate::types::PendingMessage,
     ) -> Result<()> {
+        self.reset_pending_attachment_view();
         self.app.input = Self::new_input();
         self.app.transcript.push(TranscriptItem::UserText {
             text: pending.text.clone(),
