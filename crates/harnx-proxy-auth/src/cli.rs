@@ -25,6 +25,12 @@ pub struct Args {
     /// Enable only matching tools in tool-server mode (repeatable glob).
     #[arg(long)]
     pub enable_tool: Vec<String>,
+    /// Print the advertised tools and exit. Starts nothing and needs no broker.
+    #[arg(long, conflicts_with_all = ["mcp_stdio", "mcp_http"])]
+    pub list_tools: bool,
+    /// Output shape for `--list-tools`.
+    #[arg(long, requires = "list_tools", value_parser = ["text", "json"])]
+    pub format: Option<String>,
     /// Server name assigned by the supervisor.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
@@ -175,6 +181,25 @@ mod tests {
             vec!["proxy", "--mcp-stdio", "--mcp-http"],
             vec!["proxy", "--tool-server", "--mcp-stdio", "--mcp-http"],
             vec!["proxy", "--tool-server", "--mcp-typo"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn list_tools_flags_parse_and_stay_strict() {
+        for args in [
+            vec!["x", "--list-tools"],
+            vec!["x", "--list-tools", "--format", "json"],
+            vec!["x", "--list-tools", "--format=json"],
+        ] {
+            assert!(Args::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["x", "--format", "json"],
+            vec!["x", "--list-tools", "--format", "yaml"],
+            vec!["x", "--list-tools", "--mcp-stdio"],
+            vec!["x", "--list-tools", "--formatt", "json"],
         ] {
             assert!(Args::try_parse_from(args).is_err());
         }

@@ -40,6 +40,7 @@ fn is_value_option(arg: &str) -> bool {
         "--host",
         "--port",
         "--name",
+        "--format",
     ]
     .iter()
     .any(|flag| arg == *flag || arg.strip_prefix(&format!("{flag}=")).is_some())
@@ -57,7 +58,7 @@ fn parse_args_from(args: &[String]) -> anyhow::Result<bool> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => help = true,
-            "--mcp-stdio" | "--mcp-http" => {}
+            "--mcp-stdio" | "--mcp-http" | "--list-tools" => {}
             arg if is_value_option(arg) => consume_value(arg, &mut args),
             arg if arg == "--enable-tool" || arg.strip_prefix("--enable-tool=").is_some() => {
                 handle_enable_tool_arg(arg, &mut args)?;
@@ -79,6 +80,8 @@ fn print_help() {
     eprintln!("  --host <HOST>           MCP HTTP bind host (default: 0.0.0.0)");
     eprintln!("  --port <PORT>           MCP HTTP bind port (default: 3004)");
     eprintln!("  --name <NAME>           Override the registered toolset name");
+    eprintln!("  --list-tools            Print the advertised tools and exit");
+    eprintln!("  --format <text|json>    Output shape for --list-tools");
     eprintln!(
         "  --enable-tool <glob>    Enable only tools matching the glob pattern (repeatable)."
     );
@@ -163,5 +166,18 @@ mod tests {
     fn accepts_name_override_forms() {
         assert!(!parse(&["--name", "review"]).unwrap());
         assert!(!parse(&["--name=review"]).unwrap());
+    }
+
+    #[test]
+    fn accepts_list_tools_flags() {
+        assert!(!parse(&["--list-tools"]).unwrap());
+        assert!(!parse(&["--list-tools", "--format", "json"]).unwrap());
+        assert!(!parse(&["--list-tools", "--format=json"]).unwrap());
+    }
+
+    #[test]
+    fn rejects_format_typo() {
+        assert!(parse(&["--list-tools", "--formatt", "json"]).is_err());
+        assert!(parse(&["--list-tools", "--formatt=json"]).is_err());
     }
 }

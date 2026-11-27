@@ -11,6 +11,7 @@ mod credentials_args;
 mod delete_args;
 mod interact_args;
 mod surface_args;
+mod validate_args;
 pub use credentials_args::{CredentialsArgs, CredentialsSubcommands};
 pub use delete_args::{
     DeleteArgs, DeleteExpiredSessionsArgs, DeleteOrphanStreamsArgs, DeleteSessionArgs,
@@ -18,6 +19,7 @@ pub use delete_args::{
 };
 pub use interact_args::*;
 pub use surface_args::*;
+pub use validate_args::{OutputFormat, ToolsMode, ValidateArgs};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -145,6 +147,11 @@ pub enum Commands {
     /// Blocks until compaction finishes and streams progress. A "nothing to compact"
     /// result is normal and reported as success (exit 0).
     Compact(CompactArgs),
+    /// Check a config directory or package without starting harnx
+    ///
+    /// Exits 0 when nothing is wrong (warnings allowed unless --strict), 1
+    /// when errors were found, and 2 when the check couldn't run.
+    Validate(ValidateArgs),
 }
 
 /// Compact session logs to reduce history size.

@@ -33,6 +33,7 @@ The start and end times make every wait's result different, so loop protection d
 | `--host <ADDR>` | Bind address for HTTP mode (default: `0.0.0.0`). |
 | `--port <N>` | Bind port for HTTP mode (default: `3001`). |
 | `--mcp-stdio` | Run in stdio MCP mode instead of NATS. Required when launching behind `harnx-mcp-bridge`. |
+| `--list-tools [--format text\|json]` | Print the tools this server publishes and exit without connecting to NATS. See [Listing a Server's Tools](../../docs/configuration-guide.md#listing-a-servers-tools---list-tools). |
 | `--metrics-addr <ADDR>` | Serve Prometheus metrics at http://ADDR/metrics. |
 | `--healthz-addr <ADDR>` | Serve readiness checks at http://ADDR/healthz. |
 | `--help`, `-h` | Show help. |

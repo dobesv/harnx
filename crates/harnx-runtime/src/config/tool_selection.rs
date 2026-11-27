@@ -232,12 +232,7 @@ impl Config {
             declarations.iter().map(|v| v.name.to_string()).collect();
         let mut tool_names: HashSet<String> = HashSet::new();
         for item in use_tools.iter().map(|s| s.trim()) {
-            let sanitized_item = harnx_core::package_namespace::sanitize_for_tool_name(item);
-            if let Some(values) = self.toolsets.get(item).or_else(|| {
-                (sanitized_item != item)
-                    .then(|| self.toolsets.get(&sanitized_item))
-                    .flatten()
-            }) {
+            if let Some(values) = self.toolset_members(item) {
                 tool_names.extend(
                     values
                         .iter()
@@ -245,23 +240,27 @@ impl Config {
                         .cloned(),
                 );
             } else {
-                let selector = tool_name_selector(item);
-                let sanitized_selector =
-                    (sanitized_item != item).then(|| tool_name_selector(&sanitized_item));
+                let matches = selector_matcher(item);
                 tool_names.extend(
                     declaration_names
                         .iter()
-                        .filter(|name| {
-                            selector.is_match(name)
-                                || sanitized_selector
-                                    .as_ref()
-                                    .is_some_and(|sanitized| sanitized.is_match(name))
-                        })
+                        .filter(|name| matches(name))
                         .cloned(),
                 );
             }
         }
         tool_names
+    }
+
+    /// The members of the toolset `selector` names, as written or in its
+    /// tool-name-sanitized spelling; `None` when it names no toolset.
+    pub(crate) fn toolset_members(&self, selector: &str) -> Option<&Vec<String>> {
+        let sanitized = harnx_core::package_namespace::sanitize_for_tool_name(selector);
+        self.toolsets.get(selector).or_else(|| {
+            (sanitized != selector)
+                .then(|| self.toolsets.get(&sanitized))
+                .flatten()
+        })
     }
 
     /// Merge in any agent-owned tool declarations (e.g. handoff tools, builtins)
@@ -285,6 +284,21 @@ impl Config {
                 .into_iter()
                 .filter(|v| tool_names.contains(&v.name) && !existing_names.contains(&v.name)),
         );
+    }
+}
+
+/// Whether a tool name is selected by `selector`, a `use_tools` entry that
+/// isn't a toolset name: the entry as written, or its tool-name-sanitized
+/// spelling, so `issue.brief` also selects `issue_brief`.
+pub(crate) fn selector_matcher(selector: &str) -> impl Fn(&str) -> bool {
+    let sanitized = harnx_core::package_namespace::sanitize_for_tool_name(selector);
+    let sanitized_selector = (sanitized != selector).then(|| tool_name_selector(&sanitized));
+    let selector = tool_name_selector(selector);
+    move |name| {
+        selector.is_match(name)
+            || sanitized_selector
+                .as_ref()
+                .is_some_and(|sanitized| sanitized.is_match(name))
     }
 }
 

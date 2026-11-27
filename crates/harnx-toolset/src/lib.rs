@@ -47,6 +47,7 @@ pub use script_output::*;
 mod output_schema;
 pub use output_schema::*;
 pub mod cleanup;
+pub mod listing;
 
 /// Schema and execution hints for one tool.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

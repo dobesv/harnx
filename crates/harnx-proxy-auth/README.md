@@ -32,6 +32,7 @@ cargo install --path crates/harnx-proxy-auth
 | `--tool-server` | Optional compatibility flag; tool server mode is now the default. |
 | `--mcp-stdio` | Use MCP stdio transport for the tool service (conflicts with `--mcp-http`). |
 | `--mcp-http` | Use MCP Streamable HTTP transport for the tool service. |
+| `--list-tools [--format text\|json]` | Print the tools this server publishes and exit without connecting to NATS. See [Listing a Server's Tools](../../docs/configuration-guide.md#listing-a-servers-tools---list-tools). |
 | `--host <HOST>` | MCP HTTP bind host (default: `0.0.0.0`; requires `--mcp-http`). |
 | `--port <PORT>` | MCP HTTP port (default: `3009`; requires `--mcp-http`). |
 | `--enable-tool <GLOB>` | Enable only matching tools in tool-server mode (repeatable). |

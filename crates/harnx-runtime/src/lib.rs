@@ -25,6 +25,7 @@ pub mod bootstrap;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod config_check;
 mod event_hook_operations;
 pub mod event_hooks;
 pub mod fault_injection;

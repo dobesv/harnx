@@ -17,6 +17,7 @@ mod session_stats_render;
 mod streaming_think_segmenter;
 mod surface;
 mod tool_cmd;
+mod validate_cmd;
 
 /// Heap-usage guard installed as the process allocator: aborts with a backtrace
 /// if live heap exceeds `HARNX_HEAP_LIMIT_MB`. Disarmed (plain passthrough to
@@ -192,7 +193,8 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
             | Commands::Interact(_)
             | Commands::Surface(_)
             | Commands::Credentials(_)
-            | Commands::Compact(_)),
+            | Commands::Compact(_)
+            | Commands::Validate(_)),
         ) => {
             let exit_code = run_command(command, &cli).await?;
             return Ok((None, exit_code));
@@ -246,6 +248,8 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
             credentials_cmd::run(cli, credentials_args).await
         }
         Commands::Compact(compact_args) => compact::run_compact_command(compact_args, cli).await,
+        // Reads files only: never initializes Config or reaches a broker.
+        Commands::Validate(validate_args) => Ok(validate_cmd::run(validate_args).await),
     }
 }
 

@@ -21,7 +21,7 @@ The service retains its listener and capability until shutdown. `/creds` asks th
 
 Use the opt-in [credential-tools package](../../example_config/credential-tools/README.md): copy `aws_creds.yaml` and `aws-creds.py` into your package's `tool_servers/` and `middleware/` directories. Its middleware matches exec/spawn, replaces exactly the three AWS keys above, preserves unrelated caller env, then calls next. No new legacy hook configuration is needed. AWS and bash need the same loopback network namespace; the worker may be remote.
 
-NATS is the default tool transport. `--mcp-stdio` or `--mcp-http` selects MCP; HTTP defaults to port `3010`. Shared `--name`, `--enable-tool`, metrics and healthz flags are supported. `--profile <NAME>` selects a host AWS profile.
+NATS is the default tool transport. `--mcp-stdio` or `--mcp-http` selects MCP; HTTP defaults to port `3010`. Shared `--name`, `--enable-tool`, metrics and healthz flags are supported. `--list-tools [--format text|json]` prints the tools the server publishes and exits without connecting to NATS; see [Listing a Server's Tools](../../docs/configuration-guide.md#listing-a-servers-tools---list-tools). `--profile <NAME>` selects a host AWS profile.
 
 ## Standalone sandbox-run usage
 

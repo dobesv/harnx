@@ -32,6 +32,30 @@ macro_rules! register_client {
                     ClientConfig::Unknown => "",
                 }
             }
+
+            /// Every `type` a client file may name.
+            pub const TYPE_NAMES: &'static [&'static str] = &[$($name,)+];
+
+            /// Deserialize the config of the client type `type_name` straight
+            /// into its provider struct. The tagged enum buffers a file's keys
+            /// before picking a variant, so a deserializer wrapping it never
+            /// sees them; this one does. The provider structs have no `type`
+            /// field, so a wrapper that reports ignored keys reports `type`
+            /// too. `None` for a type no client has.
+            pub fn deserialize_as<'de, D: serde::Deserializer<'de>>(
+                type_name: &str,
+                deserializer: D,
+            ) -> Option<Result<Self, D::Error>> {
+                match type_name {
+                    $(
+                        $name => Some(
+                            <$config as serde::Deserialize>::deserialize(deserializer)
+                                .map(ClientConfig::$config),
+                        ),
+                    )+
+                    _ => None,
+                }
+            }
         }
 
         $(

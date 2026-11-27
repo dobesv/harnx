@@ -400,7 +400,9 @@ impl Drop for ToolServerSupervisor {
     }
 }
 
-fn resolve_tool_binary(server: &ToolServerConfig) -> Result<PathBuf> {
+/// The executable a tool server's `command` runs: the file of that name next
+/// to this executable, else the one on `PATH`.
+pub(crate) fn resolve_tool_binary(server: &ToolServerConfig) -> Result<PathBuf> {
     let current = std::env::current_exe().context("resolve current worker executable")?;
     let directory = harnx_core::bin_dir_of_exe(&current);
     let next_to_worker = directory.join(&server.command);
@@ -429,6 +431,20 @@ fn tool_server_package_dir(server: &ToolServerConfig) -> PathBuf {
         .as_deref()
         .map(harnx_core::config_paths::package_dir)
         .unwrap_or_else(harnx_core::config_paths::config_dir)
+}
+
+/// The environment that tells a tool server which config it runs as: its
+/// package directory, its configured `env`, and its package and config
+/// names. Broker settings are added separately, only when it serves.
+pub(crate) fn apply_server_env(command: &mut Command, server: &ToolServerConfig) {
+    command
+        .env(HARNX_PACKAGE_DIR_ENV, tool_server_package_dir(server))
+        .envs(&server.env)
+        .env(
+            HARNX_SERVER_PACKAGE,
+            server.package.as_deref().unwrap_or_default(),
+        )
+        .env(HARNX_SERVER_CONFIG, &server.name);
 }
 
 fn child_output_sink(config: &ToolServerStartConfig) -> Stdio {
@@ -467,15 +483,9 @@ async fn spawn_tool_server(
 ) -> Result<Child> {
     let binary = resolve_tool_binary(server)?;
     let mut command = Command::new(&binary);
+    command.args(&server.args);
+    apply_server_env(&mut command, server);
     command
-        .args(&server.args)
-        .env(HARNX_PACKAGE_DIR_ENV, tool_server_package_dir(server))
-        .envs(&server.env)
-        .env(
-            HARNX_SERVER_PACKAGE,
-            server.package.as_deref().unwrap_or_default(),
-        )
-        .env(HARNX_SERVER_CONFIG, &server.name)
         .env(HARNX_SERVER_SCOPE, config.instance_id.as_str())
         .env(HARNX_NATS_URL_ENV, &config.nats_url)
         .env(HARNX_NATS_TOKEN_ENV, &config.token)

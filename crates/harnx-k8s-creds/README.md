@@ -21,7 +21,7 @@ The token endpoint resolves static tokens, token files or host exec plugins on d
 
 Use the opt-in [credential-tools package](../../example_config/credential-tools/README.md): copy `k8s_creds.yaml` and `k8s-creds.py` into your package's `tool_servers/` and `middleware/` directories, then set your context. Its middleware matches exec/spawn, replaces caller `KUBECONFIG`, preserves unrelated env, then calls next. Keep your existing `bash.yaml`; no new legacy hook configuration is needed.
 
-NATS is the default tool transport. `--mcp-stdio` or `--mcp-http` selects MCP; HTTP defaults to port `3011`. Shared `--name`, `--enable-tool`, metrics and healthz flags are supported.
+NATS is the default tool transport. `--mcp-stdio` or `--mcp-http` selects MCP; HTTP defaults to port `3011`. Shared `--name`, `--enable-tool`, metrics and healthz flags are supported. `--list-tools [--format text|json]` prints the tools the server publishes and exits without connecting to NATS; see [Listing a Server's Tools](../../docs/configuration-guide.md#listing-a-servers-tools---list-tools).
 
 ## Standalone sandbox-run usage
 

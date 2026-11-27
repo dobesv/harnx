@@ -44,7 +44,7 @@ pub(super) fn load_package_patch(pkg_name: &str) -> Option<harnx_core::package::
 }
 
 /// Apply a list of jq-style patch expressions to a client config.
-pub(super) fn apply_client_patch(client: &mut ClientConfig, patches: &[String]) -> Result<()> {
+pub(crate) fn apply_client_patch(client: &mut ClientConfig, patches: &[String]) -> Result<()> {
     if patches.is_empty() {
         return Ok(());
     }

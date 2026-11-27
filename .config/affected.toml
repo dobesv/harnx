@@ -74,6 +74,8 @@ mark-changed = []
 on-affected = ["harnx-worker"]
 test = ["harnx-runtime", "harnx", "harnx-tui", "harnx-serve", "harnx-acp-server"]
 
+# Runtime tests run the time server, and config_check::tool_names reads its
+# `--list-tools` output to check tool names.
 [[test-edge]]
 on-affected = ["harnx-time-tools"]
 test = ["harnx-runtime", "harnx"]
@@ -202,3 +204,30 @@ test = ["harnx-runtime"]
 [[test-path]]
 globs = ["crates/harnx-toolset-server/tests/support/mcp_stdio.rs"]
 test = ["harnx-proxy-auth", "harnx-aws-creds", "harnx-k8s-creds"]
+
+# config_check::shipped validates the shipped packages and example config
+# with every tool server they configure started for `--list-tools`
+# (packages/** is already covered above), and
+# config_check::tool_names::known_binaries_register_their_default_names lists
+# every native tool server to check the names the check assumes.
+[[test-path]]
+globs = ["example_config/**"]
+test = ["harnx-runtime"]
+
+[[test-edge]]
+on-affected = [
+    "harnx-attachment-tools",
+    "harnx-aws-creds",
+    "harnx-bash-tools",
+    "harnx-claude-hook-tools",
+    "harnx-exa-tools",
+    "harnx-fetch-tools",
+    "harnx-fs-tools",
+    "harnx-grep-tools",
+    "harnx-k8s-creds",
+    "harnx-mcp-bridge",
+    "harnx-plans-tools",
+    "harnx-proxy-auth",
+    "harnx-time-tools",
+]
+test = ["harnx-runtime"]

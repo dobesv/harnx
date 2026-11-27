@@ -10,10 +10,12 @@ use anyhow::{Context, Result};
 use harnx_core::instance::ServerScope;
 use harnx_healthz::Readiness;
 use harnx_nats_common::connect::{NatsConnection, NatsEndpoint};
+use harnx_toolset::listing::{ListingFormat, ToolListing, LIST_FORMAT_FLAG, LIST_TOOLS_FLAG};
 use harnx_toolset::Toolset;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::ServiceExt;
+use std::ffi::OsString;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -61,6 +63,52 @@ pub(crate) fn resolve_mcp_mode(
     } else {
         Ok(None)
     }
+}
+
+/// Read `--list-tools` and its `--format` from the command line.
+///
+/// `--format` only means something next to `--list-tools`, and listing never
+/// serves, so combining it with a transport flag is a mistake worth reporting.
+pub(crate) fn resolve_list_tools(args: &[OsString]) -> Result<Option<ListingFormat>> {
+    let args = args
+        .iter()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let format = mcp_http_arg_value(&args, LIST_FORMAT_FLAG)?;
+    if !args.iter().any(|arg| arg == LIST_TOOLS_FLAG) {
+        anyhow::ensure!(
+            format.is_none(),
+            "{LIST_FORMAT_FLAG} requires {LIST_TOOLS_FLAG}"
+        );
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        !args
+            .iter()
+            .any(|arg| arg == "--mcp-stdio" || arg == "--mcp-http"),
+        "{LIST_TOOLS_FLAG} cannot be combined with --mcp-stdio or --mcp-http"
+    );
+    match format.as_deref() {
+        None | Some("text") => Ok(Some(ListingFormat::Text)),
+        Some("json") => Ok(Some(ListingFormat::Json)),
+        Some(other) => {
+            anyhow::bail!("invalid {LIST_FORMAT_FLAG} value '{other}': use text or json")
+        }
+    }
+}
+
+/// Print what `toolset` advertises to stdout, without connecting to anything.
+pub fn print_tool_listing(toolset: &dyn Toolset, format: ListingFormat) -> Result<()> {
+    let listing = ToolListing {
+        server: toolset.name().to_string(),
+        tools: toolset.tools(),
+    };
+    match format {
+        ListingFormat::Text => print!("{}", listing.render_text()),
+        ListingFormat::Json => println!("{}", serde_json::to_string_pretty(&listing)?),
+    }
+    Ok(())
 }
 
 fn mcp_http_arg_value(args: &[String], flag: &str) -> Result<Option<String>> {
@@ -144,6 +192,8 @@ fn print_toolset_help() {
     eprintln!("  --host <HOST>             MCP HTTP bind host (default: 0.0.0.0)");
     eprintln!("  --port <PORT>             MCP HTTP bind port (toolset-specific default)");
     eprintln!("  --name <NAME>             Override the registered toolset name");
+    eprintln!("  --list-tools              Print the advertised tools and exit (no NATS needed)");
+    eprintln!("  --format <text|json>      Output shape for --list-tools (default: text)");
     eprintln!("  --enable-tool <glob>      Enable only tools matching the glob pattern.");
     eprintln!("                            Repeatable. If set, only enabled tools are");
     eprintln!("                            registered and invocable on this server.");
@@ -334,6 +384,9 @@ where
         return Ok(());
     }
     let filter_set = compile_enable_globs(&enable_tools_from_args(&args)?)?;
+    if let Some(format) = resolve_list_tools(&args)? {
+        return list_tools_and_exit(factory, name, filter_set, format);
+    }
     let mode = resolve_mcp_mode(&args)?;
     let (toolset, transport) = prepare_toolset(mode, factory).await?;
     let toolset: Arc<dyn Toolset> = match name {
@@ -341,6 +394,27 @@ where
         None => Arc::new(toolset),
     };
     run_prepared_toolset(toolset, transport, filter_set, http_options).await
+}
+
+/// Build the toolset without a broker and print it the way serving would
+/// advertise it: after the `--name` override and the `--enable-tool` filter.
+fn list_tools_and_exit<T, F>(
+    factory: F,
+    name: Option<String>,
+    filter_set: Option<globset::GlobSet>,
+    format: ListingFormat,
+) -> Result<()>
+where
+    T: Toolset + 'static,
+    F: FnOnce(Option<async_nats::Client>) -> Result<T>,
+{
+    let toolset = factory(None)?;
+    let toolset: Arc<dyn Toolset> = match name {
+        Some(name) => Arc::new(NamedToolset::new(toolset, name)?),
+        None => Arc::new(toolset),
+    };
+    let (toolset, _) = wrap_toolset_if_filtered(toolset, filter_set);
+    print_tool_listing(toolset.as_ref(), format)
 }
 
 async fn run_prepared_toolset(

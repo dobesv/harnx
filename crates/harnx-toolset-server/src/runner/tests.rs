@@ -146,3 +146,51 @@ fn http_options_preserve_default_limit_unless_overridden() {
         default,
     );
 }
+
+fn os_args(args: &[&str]) -> Vec<std::ffi::OsString> {
+    args.iter().map(std::ffi::OsString::from).collect()
+}
+
+#[test]
+fn list_tools_absent_is_none() {
+    assert_eq!(resolve_list_tools(&os_args(&["srv"])).unwrap(), None);
+}
+
+#[test]
+fn list_tools_defaults_to_text() {
+    assert_eq!(
+        resolve_list_tools(&os_args(&["srv", "--list-tools"])).unwrap(),
+        Some(ListingFormat::Text)
+    );
+}
+
+#[test]
+fn list_tools_json_both_forms() {
+    for args in [
+        &["srv", "--list-tools", "--format", "json"][..],
+        &["srv", "--list-tools", "--format=json"][..],
+    ] {
+        assert_eq!(
+            resolve_list_tools(&os_args(args)).unwrap(),
+            Some(ListingFormat::Json)
+        );
+    }
+}
+
+#[test]
+fn format_without_list_tools_is_error() {
+    assert!(resolve_list_tools(&os_args(&["srv", "--format", "json"])).is_err());
+}
+
+#[test]
+fn list_tools_with_mcp_transport_is_error() {
+    for transport in ["--mcp-stdio", "--mcp-http"] {
+        assert!(resolve_list_tools(&os_args(&["srv", "--list-tools", transport])).is_err());
+    }
+}
+
+#[test]
+fn unknown_format_value_is_error() {
+    assert!(resolve_list_tools(&os_args(&["srv", "--list-tools", "--format", "yaml"])).is_err());
+    assert!(resolve_list_tools(&os_args(&["srv", "--list-tools", "--format"])).is_err());
+}

@@ -454,6 +454,46 @@ async fn existing_list_mode_keeps_human_output_filters_and_child_cleanup() -> Re
     Ok(())
 }
 
+fn listed_tool_names(output: &Output) -> Result<(String, Vec<String>)> {
+    assert!(output.status.success(), "{output:?}");
+    let listing: harnx_toolset::listing::ToolListing = serde_json::from_slice(&output.stdout)?;
+    Ok((
+        listing.server,
+        listing.tools.into_iter().map(|tool| tool.name).collect(),
+    ))
+}
+
+#[tokio::test]
+async fn list_tools_json_matches_tool_listing() -> Result<()> {
+    let fixture = Fixture::new(json!({}))?;
+    let output = fixture
+        .run(&["--list-tools", "--format", "json", "--name", "fixture"])
+        .await?;
+    let (server, names) = listed_tool_names(&output)?;
+    assert_eq!(server, "fixture");
+    assert_eq!(names, ["mixed_tool"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tools_json_honours_enable_tool() -> Result<()> {
+    let fixture = Fixture::new(json!({}))?;
+    let output = fixture
+        .run(&["--list-tools", "--format=json", "--enable-tool", "other*"])
+        .await?;
+    let (server, names) = listed_tool_names(&output)?;
+    assert_eq!(server, "mcp-diagnostic");
+    assert!(names.is_empty(), "{names:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn format_requires_list_tools() -> Result<()> {
+    Fixture::new(json!({}))?
+        .rejected_before_spawn(&["--format", "json"], "--list-tools")
+        .await
+}
+
 #[tokio::test]
 async fn default_result_limit_preserves_results_above_old_cap() -> Result<()> {
     let expected = json!({"content": [{"type": "text", "text": "x".repeat(100_000)}]});
