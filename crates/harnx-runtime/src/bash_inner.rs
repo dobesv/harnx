@@ -716,7 +716,9 @@ fn serialized_size(value: &Value) -> u64 {
 /// pipes or stdin — content the model has never seen — and these surfaces
 /// persist in the outer transcript, so lengths are safe to show but values
 /// are not (PR3 review F17). Empty arguments render as `null` / `{}` and
-/// are omitted from trace lines.
+/// are omitted from trace lines. Keys are the caller's text, so their line
+/// breaks are escaped: a summary must stay on the one line of its trace row,
+/// which is what lets a reader of the report tell rows apart.
 fn summarize_args(args: &Value) -> String {
     let summary = match args {
         Value::Null => "null".to_string(),
@@ -724,7 +726,7 @@ fn summarize_args(args: &Value) -> String {
         Value::Object(map) => {
             let fields: Vec<String> = map
                 .iter()
-                .map(|(key, value)| format!("{key}: {}", value_shape(value)))
+                .map(|(key, value)| format!("{}: {}", key.escape_debug(), value_shape(value)))
                 .collect();
             format!("{{{}}}", fields.join(", "))
         }
@@ -1847,6 +1849,12 @@ mod tests {
         assert_eq!(summarize_args(&json!({"a": 1})), "{a: number}");
         assert_eq!(summarize_args(&json!("raw")), "str(3)");
         assert_eq!(summarize_args(&json!([1, 2, 3])), "array(3)");
+    }
+
+    #[test]
+    fn args_summary_keeps_a_key_with_line_breaks_on_one_line() {
+        let summary = summarize_args(&json!({"a\n- fake ok 1B 1ms\r\nb": 1}));
+        assert_eq!(summary, r"{a\n- fake ok 1B 1ms\r\nb: number}");
     }
 
     /// PR3 review F27: an MCP domain error arrives as a successful transport

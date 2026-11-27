@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::report::{CallsPerScript, ToolShare, TurnGroup, UsageTotals};
 use super::session::{FailureKind, ScriptRun, SessionScriptUsage, TurnFacts};
+use super::trace::TraceRow;
+use crate::bash_inner::InnerTraceStatus;
 
 /// Per-tool counters while sessions merge.
 pub(super) type ToolMap = BTreeMap<String, ToolShare>;
@@ -73,6 +75,16 @@ fn add_bucket(buckets: &mut CallsPerScript, calls: u64) {
     *slot += 1;
 }
 
+/// Bytes a row's calls returned to the script. A rejected call returned
+/// nothing: the trace gives it the size of a request over the payload limit.
+fn row_result_bytes(row: &TraceRow) -> u64 {
+    if row.status == InnerTraceStatus::Rejected.as_str() {
+        0
+    } else {
+        row.bytes
+    }
+}
+
 fn add_script(totals: &mut UsageTotals, tools: &mut ToolMap, script: &ScriptRun) {
     totals.scripts += 1;
     match script.failure {
@@ -94,10 +106,11 @@ fn add_script(totals: &mut UsageTotals, tools: &mut ToolMap, script: &ScriptRun)
         add(&mut row_calls, row.count);
         let status = totals.inner_calls_by_status.entry(row.status.clone());
         add(status.or_default(), row.count);
-        add(&mut totals.inner_result_bytes, row.bytes);
+        let result_bytes = row_result_bytes(row);
+        add(&mut totals.inner_result_bytes, result_bytes);
         let tool = tool_entry(tools, &row.name);
         add(&mut tool.inner_calls, row.count);
-        add(&mut tool.inner_result_bytes, row.bytes);
+        add(&mut tool.inner_result_bytes, result_bytes);
     }
     add(&mut totals.inner_calls, row_calls);
     for name in script_tools(script) {

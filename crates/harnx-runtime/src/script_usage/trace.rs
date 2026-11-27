@@ -18,6 +18,8 @@ pub struct TraceRow {
     pub name: String,
     pub status: String,
     pub count: u64,
+    /// The trace's own figure: result bytes for calls that ran, and for a
+    /// `rejected` call the size of a request over the payload limit, or zero.
     pub bytes: u64,
     pub duration_ms: u64,
 }
@@ -36,7 +38,7 @@ pub struct ParsedReport {
 
 pub fn parse_report(text: &str) -> ParsedReport {
     let mut report = ParsedReport::default();
-    let Some(end) = text.rfind(END_STDERR) else {
+    let Some(end) = stderr_end(text) else {
         return report;
     };
     let before = &text[..end];
@@ -56,6 +58,22 @@ pub fn parse_report(text: &str) -> ParsedReport {
         }
     }
     report
+}
+
+/// Offset of the marker that closes the stderr block: the last one that is a
+/// whole line. A trace row can carry the marker's text in its argument
+/// summary, where it follows the row's own text on the same line.
+fn stderr_end(text: &str) -> Option<usize> {
+    let mut search = text;
+    loop {
+        let at = search.rfind(END_STDERR)?;
+        let after = &text[at + END_STDERR.len()..];
+        let line_start = at == 0 || text[..at].ends_with('\n');
+        if line_start && (after.is_empty() || after.starts_with('\n')) {
+            return Some(at);
+        }
+        search = &text[..at];
+    }
 }
 
 enum Line {
@@ -168,6 +186,24 @@ mod tests {
             "\n## inner call trace\n- real ok 5B 3ms\n",
         );
         assert_eq!(parse_report(&text).rows, vec![row("real", "ok", 1, 5, 3)]);
+    }
+
+    #[test]
+    fn a_marker_in_a_rows_argument_summary_is_not_the_boundary() {
+        let text = report(
+            "",
+            "Traceback (most recent call last)",
+            "\n## inner call trace\n- fs_read ok 42B 7ms {<!-- end stderr -->: number}\n- fs_grep ok 5B 3ms\n",
+        );
+        let parsed = parse_report(&text);
+        assert_eq!(
+            parsed.rows,
+            vec![
+                row("fs_read", "ok", 1, 42, 7),
+                row("fs_grep", "ok", 1, 5, 3)
+            ]
+        );
+        assert!(parsed.python_traceback);
     }
 
     #[test]

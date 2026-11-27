@@ -163,6 +163,20 @@ fn calls_per_script_bucket_edges() {
 }
 
 #[test]
+fn a_rejected_calls_request_size_is_not_bytes_read() {
+    let mut builder = builder();
+    let rows = vec![row("t", "ok", 2, 100), row("t", "rejected", 1, 5000)];
+    builder.add_session("a", "s", usage_of(vec![script(1, rows, 0)]));
+    let report = builder.finish();
+    assert_eq!(report.totals.inner_calls, 3);
+    assert_eq!(report.totals.inner_calls_by_status["rejected"], 1);
+    assert_eq!(report.totals.inner_result_bytes, 100);
+    assert_eq!(report.by_agent["a"].inner_result_bytes, 100);
+    assert_eq!(report.tools[0].inner_calls, 3);
+    assert_eq!(report.tools[0].inner_result_bytes, 100);
+}
+
+#[test]
 fn dropped_calls_count_toward_the_bucket_not_inner_calls() {
     let mut builder = builder();
     builder.add_session(
