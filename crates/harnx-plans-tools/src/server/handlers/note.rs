@@ -32,7 +32,7 @@ pub(crate) async fn list(
         .map(|(_, stored)| parse_note(&stored.content).map(|note| listed_note_json(&note)))
         .collect::<anyhow::Result<Vec<_>>>()
         .map_err(map_internal)?;
-    result_json(json!({"items": notes, "next_cursor": page.next_cursor}))
+    result_page(notes, page.next_cursor, context.structured_result)
 }
 
 fn resolve_requested_note_id(plan: &CidUrl, id: Option<&str>) -> Result<Option<String>, ErrorData> {
@@ -124,9 +124,10 @@ pub(crate) async fn get(
         .map_err(map_internal)?
         .ok_or_else(|| ErrorData::invalid_params(format!("note not found: {url}"), None))?;
     let note = parse_note(&stored.content).map_err(map_internal)?;
-    result_json_with_resources(
+    result_document(
         note_json(&note),
         item_resources(&plan, &url, "note", &note_label(&note, &url)),
+        context.structured_result,
     )
 }
 

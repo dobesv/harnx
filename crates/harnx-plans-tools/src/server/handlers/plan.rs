@@ -47,7 +47,7 @@ pub(crate) async fn list(
         let note_count = count_children(&keys, plan_prefix, "notes");
         plans.push(plan_json(&document, task_count, note_count));
     }
-    result_json(json!({"items": plans, "next_cursor": page.next_cursor}))
+    result_page(plans, page.next_cursor, context.structured_result)
 }
 
 fn validate_owner(owner: Option<&String>) -> Result<String, ErrorData> {
@@ -232,7 +232,11 @@ pub(crate) async fn get(
         "task_ids": task_ids,
         "note_ids": note_ids,
     });
-    result_json_with_resources(value, vec![ResponseResource::new(&url, "plan", label)])
+    result_document(
+        value,
+        vec![ResponseResource::new(&url, "plan", label)],
+        context.structured_result,
+    )
 }
 
 fn child_ids<F>(
