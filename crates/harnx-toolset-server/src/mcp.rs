@@ -139,7 +139,11 @@ impl McpToolsetAdapter {
         if let Ok(value) = &mut result {
             finalize_execution_context_value("mcp", self.toolset.name(), &attestation, value);
         }
-        Ok(call_tool_response(result, mrtr_capable))
+        Ok(call_tool_response(
+            result,
+            mrtr_capable,
+            invocation_context.wants_structured_result(),
+        ))
     }
 }
 
@@ -151,9 +155,10 @@ impl McpToolsetAdapter {
 fn call_tool_response(
     result: Result<Value, ToolInvokeError>,
     mrtr_capable: bool,
+    wants_structured_result: bool,
 ) -> CallToolResponse {
     match result {
-        Ok(value) => call_tool_result_from_value(value).into(),
+        Ok(value) => call_tool_result_from_value(value, wants_structured_result).into(),
         Err(ToolInvokeError::InputRequired(input)) => {
             if !mrtr_capable {
                 return CallToolResult::error(vec![ContentBlock::text(
@@ -232,9 +237,25 @@ fn mcp_invocation_context(
     })
 }
 
-pub(super) fn call_tool_result_from_value(value: Value) -> CallToolResult {
+pub(super) fn call_tool_result_from_value(
+    value: Value,
+    wants_structured_result: bool,
+) -> CallToolResult {
     if let Ok(result) = serde_json::from_value::<CallToolResult>(value.clone()) {
         return result;
+    }
+    // A caller that asked for a structured result gets the raw tool JSON
+    // itself in `structuredContent`, with its compact form as text, so `-o
+    // json` through a bridge prints what a native caller sees (Python
+    // `tools.*` matches for object results; native non-object results still
+    // reach Python as rendered text — `python_tools::python_value`).
+    // Every JSON shape is passed, not only objects: rmcp moves non-object
+    // `structuredContent` into a text block for peers on pre-2026-07-28
+    // negotiated versions (`ServerResult::strip_non_object_output_for_legacy_peer`),
+    // and any client that sends the harnx-private meta key explicitly asked
+    // for the raw value.
+    if wants_structured_result {
+        return CallToolResult::structured(value);
     }
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     CallToolResult::success(vec![ContentBlock::text(text)])
