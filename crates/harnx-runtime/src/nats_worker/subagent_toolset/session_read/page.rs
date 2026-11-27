@@ -179,36 +179,72 @@ impl PageRows {
         }
         Some(())
     }
+}
 
-    fn fit(mut self, selection: &PageSelection<'_>, budget: usize) -> Result<Value, String> {
+/// A fitted page plus its progress verdict.
+#[derive(Debug)]
+pub(crate) struct PageOutcome {
+    pub(crate) value: Value,
+    /// The page delivered no events although matches existed: a caller
+    /// resuming from this page's `next_index` would repeat it instead of
+    /// advancing. End of data (no matches at all) is never a stall.
+    pub(crate) stalled: bool,
+}
+
+impl PageRows {
+    // qual:allow(iosp) — the tail-pop budget fit: every iteration must
+    // re-serialize and re-shape the page so its omission metadata and
+    // next_index stay consistent, so the loop's calls are the fitting
+    // algorithm itself, not dispatch.
+    fn fit_outcome(
+        mut self,
+        selection: &PageSelection<'_>,
+        budget: usize,
+    ) -> Result<PageOutcome, String> {
         let mut value = self.value(&selection.shape(self.events.len()));
         // Recompute next_index after each tail removal so budget cuts cannot
         // skip a matched event or retain omission ranges for an absent row.
-        while serde_json::to_string(&value)
-            .expect("read page serializes")
-            .len()
-            > budget
-        {
-            self.pop().ok_or_else(|| {
-                format!("read result metadata exceeds max_output_bytes budget {budget}")
-            })?;
+        while serialized_len(&value) > budget {
+            if self.pop().is_none() {
+                return Err(format!(
+                    "read result metadata exceeds max_output_bytes budget {budget}"
+                ));
+            }
             value = self.value(&selection.shape(self.events.len()));
         }
-        Ok(value)
+        let stalled = self.events.is_empty() && !selection.matched.is_empty();
+        Ok(PageOutcome { value, stalled })
     }
+}
+
+fn serialized_len(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .expect("read page serializes")
+        .len()
 }
 
 /// Filter and budget-fit one physical window. The reserve covers metadata
 /// added around this page; impossible reserves fail before selection/rendering.
-pub(crate) fn read_window_events(
+pub(crate) fn read_window_events_outcome(
     window: EventWindow<'_>,
     read: &ResolvedRead,
     outer_reserve_bytes: usize,
-) -> Result<Value, String> {
+) -> Result<PageOutcome, String> {
     let ReadMode::Sequential(seq) = &read.mode else {
         return Err("read_window_events requires a sequential read".to_string());
     };
     let budget = effective_budget(read.max_output_bytes, outer_reserve_bytes)?;
     let selection = PageSelection::new(window, seq);
-    PageRows::render(&selection, seq, budget).fit(&selection, budget)
+    PageRows::render(&selection, seq, budget).fit_outcome(&selection, budget)
+}
+
+/// Sequential mode: filter, limit, render and budget-fit a page of events.
+/// Even an empty filtered page reports physical scan progress.
+#[cfg(test)]
+pub(crate) fn read_window_events(
+    window: EventWindow<'_>,
+    read: &ResolvedRead,
+    outer_reserve_bytes: usize,
+) -> Result<Value, String> {
+    read_window_events_outcome(window, read, outer_reserve_bytes).map(|outcome| outcome.value)
 }

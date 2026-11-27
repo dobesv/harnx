@@ -199,7 +199,7 @@ impl SessionMetadataStore {
         unreachable!("bounded CAS loop always returns")
     }
 
-    async fn record_for_patch(
+    pub(in crate::nats_session_metadata) async fn record_for_patch(
         &self,
         session_id: &str,
         guard: PatchGuard<'_>,
@@ -214,7 +214,11 @@ impl SessionMetadataStore {
         Ok(record)
     }
 
-    async fn update_metadata(&self, metadata: &SessionMetadata, revision: u64) -> Result<u64> {
+    pub(in crate::nats_session_metadata) async fn update_metadata(
+        &self,
+        metadata: &SessionMetadata,
+        revision: u64,
+    ) -> Result<u64> {
         let key = metadata_key(&metadata.storage_key());
         let payload = serde_json::to_vec(metadata).with_context(|| {
             format!(
@@ -230,7 +234,11 @@ impl SessionMetadataStore {
             })
     }
 
-    async fn publish_invalidation(&self, session_id: &str, revision: u64) {
+    pub(in crate::nats_session_metadata) async fn publish_invalidation(
+        &self,
+        session_id: &str,
+        revision: u64,
+    ) {
         let subject = invalidation_subject(session_id);
         let payload = serde_json::json!({
             "session_id": session_id,
@@ -260,7 +268,7 @@ fn immutable_identity(
 }
 
 /// Returns true if the error is a revision mismatch error from KV update.
-pub(super) fn is_wrong_last_revision(error: &anyhow::Error) -> bool {
+pub(in crate::nats_session_metadata) fn is_wrong_last_revision(error: &anyhow::Error) -> bool {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<kv::UpdateError>())

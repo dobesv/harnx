@@ -68,7 +68,7 @@ mod metadata;
 pub use hitl::{
     ApprovalRef, HitlDecisionOutcome, HitlDecisionReceipt, PendingHitlApproval, PromptProgress,
 };
-use metadata::ensure_session_metadata;
+use metadata::ensure_session_metadata_claim;
 pub use metadata::{create_or_read_session_metadata, SessionMetadataClaim};
 pub mod interrupt;
 mod prompt_append;
@@ -615,6 +615,79 @@ impl PartialEq for AppendedPrompt {
 
 impl Eq for AppendedPrompt {}
 
+/// Resolved broker connections and replica settings for opening a session.
+/// Bundled so session-opening constructors stay within a small parameter
+/// set.
+pub(crate) struct NatsSessionConnections {
+    pub(crate) replicas: usize,
+    pub(crate) client: async_nats::Client,
+    pub(crate) jetstream: jetstream::Context,
+    pub(crate) abort_signal: AbortSignal,
+    pub(crate) lease_acquisition_timeout: std::time::Duration,
+}
+
+/// Enforce a resolved metadata claim: an existing record keeps its reserved
+/// activity, and orphaned or vanished outcomes are inconsistencies a
+/// caller cannot recover from.
+async fn enforce_claim(
+    metadata_store: &SessionMetadataStore,
+    session_id: &str,
+    claim: &SessionMetadataClaim,
+) -> Result<()> {
+    match claim {
+        SessionMetadataClaim::Created(_) => {}
+        SessionMetadataClaim::Existing(record) => {
+            metadata_store
+                .ensure_reserved_activity(&record.metadata.storage_key())
+                .await?;
+        }
+        SessionMetadataClaim::Orphaned => anyhow::bail!(
+            "session '{session_id}' has transcript entries but no canonical metadata; legacy or inconsistent sessions are not supported"
+        ),
+        SessionMetadataClaim::Vanished => {
+            anyhow::bail!("session metadata creation race for '{session_id}' had no winner")
+        }
+    }
+    Ok(())
+}
+
+/// The session id to open: the caller's explicit id, or a fresh short
+/// reservation from the metadata store.
+async fn resolved_session_id(
+    config: &NatsSessionConfig,
+    metadata_store: &SessionMetadataStore,
+) -> Result<String> {
+    match config.session_id.as_ref() {
+        Some(id) if !id.trim().is_empty() => Ok(id.clone()),
+        _ => Ok(crate::utils::session_name::reserve_short_session_id(
+            metadata_store,
+            &config.initializer,
+        )
+        .await?),
+    }
+}
+
+/// Explicit-ID callers can use an idle session as a tool caller, so its
+/// transcript must exist before tools append progress to it.
+async fn open_explicit_transcript(
+    config: &NatsSessionConfig,
+    metadata_transcript: NatsSessionLog,
+    replicas: usize,
+) -> Result<()> {
+    if config
+        .session_id
+        .as_ref()
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        metadata_transcript
+            .with_replicas(replicas)
+            .last_entry_async()
+            .await
+            .context("failed to open session transcript after reserving metadata")?;
+    }
+    Ok(())
+}
+
 impl NatsSession {
     /// Create a new NATS session.
     ///
@@ -674,65 +747,77 @@ impl NatsSession {
         abort_signal: AbortSignal,
         lease_acquisition_timeout: std::time::Duration,
     ) -> Result<Self> {
+        Ok(Self::new_with_resolved_options_claim(
+            config,
+            NatsSessionConnections {
+                replicas,
+                client,
+                jetstream,
+                abort_signal,
+                lease_acquisition_timeout,
+            },
+        )
+        .await?
+        .0)
+    }
+
+    /// The claim-bearing variant of [`Self::new_with_resolved_options`]:
+    /// returns whether this call created the canonical record or found an
+    /// existing one, so a creation path can verify its own provenance instead
+    /// of the collapsed `()` outcome.
+    pub(crate) async fn new_with_resolved_options_claim(
+        config: NatsSessionConfig,
+        connections: NatsSessionConnections,
+    ) -> Result<(Self, SessionMetadataClaim)> {
+        let NatsSessionConnections {
+            replicas,
+            client,
+            jetstream,
+            abort_signal,
+            lease_acquisition_timeout,
+        } = connections;
         let metadata_store = SessionMetadataStore::ensure(&jetstream, replicas)
             .await
             .context("failed to open canonical session metadata store")?;
-        let session_id = match config.session_id.as_ref() {
-            Some(id) if !id.trim().is_empty() => id.clone(),
-            _ => {
-                crate::utils::session_name::reserve_short_session_id(
-                    &metadata_store,
-                    &config.initializer,
-                )
-                .await?
-            }
-        };
+        let session_id = resolved_session_id(&config, &metadata_store).await?;
         let metadata_transcript = NatsSessionLog::new(
             jetstream.clone(),
             config.initializer.session_key(&session_id),
         );
-        ensure_session_metadata(
+        let claim = ensure_session_metadata_claim(
             &metadata_store,
             &metadata_transcript,
             &session_id,
             &config.initializer,
         )
         .await?;
+        enforce_claim(&metadata_store, &session_id, &claim).await?;
 
-        if config
-            .session_id
-            .as_ref()
-            .is_some_and(|id| !id.trim().is_empty())
-        {
-            // Explicit-ID callers can use an idle session as a tool caller, so
-            // its transcript must exist before tools append progress to it.
-            metadata_transcript
-                .with_replicas(replicas)
-                .last_entry_async()
-                .await
-                .context("failed to open session transcript after reserving metadata")?;
-        }
+        open_explicit_transcript(&config, metadata_transcript, replicas).await?;
 
-        Ok(Self {
-            storage_key: config.initializer.session_key(&session_id),
-            config,
-            session_id,
-            jetstream: jetstream.clone(),
-            client,
-            abort_signal,
-            metadata_store,
-            attachment_replicas: replicas,
-            lease_acquisition_timeout,
-            parent_session_id: None,
-            parent_cancel: None,
-            admission_authority: None,
-            admission_timeout: None,
-            admission_token_budget: None,
-            steering_admission: false,
-            #[cfg(feature = "fault-injection")]
-            fixed_admission_faults: None,
-            invocation_id: None,
-        })
+        Ok((
+            Self {
+                storage_key: config.initializer.session_key(&session_id),
+                config,
+                session_id,
+                jetstream: jetstream.clone(),
+                client,
+                abort_signal,
+                metadata_store,
+                attachment_replicas: replicas,
+                lease_acquisition_timeout,
+                parent_session_id: None,
+                parent_cancel: None,
+                admission_authority: None,
+                admission_timeout: None,
+                admission_token_budget: None,
+                steering_admission: false,
+                #[cfg(feature = "fault-injection")]
+                fixed_admission_faults: None,
+                invocation_id: None,
+            },
+            claim,
+        ))
     }
 
     /// Convenience constructor that builds NATS connections from GlobalConfig.

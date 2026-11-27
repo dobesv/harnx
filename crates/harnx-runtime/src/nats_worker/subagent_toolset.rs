@@ -2,6 +2,20 @@
 
 mod termination;
 
+// Child-session metadata admission: the strict `metadata` argument, the
+// durable replay gate and the first-writer checkpoint guards shared by the
+// sync and async paths.
+pub(super) mod child_metadata;
+
+// Child-session metadata: end-to-end new/prompt coverage against a real
+// worker.
+#[cfg(test)]
+mod child_metadata_prompt_tests;
+
+// Broker-backed coverage for the metadata argument across new/prompt/send.
+#[cfg(test)]
+mod child_metadata_tests;
+
 // Durable async dispatch (session_send) and prompt-specific bounded
 // observation (session_wait), plus the shared bounded read contract used by
 // both wait and session_load.
@@ -18,6 +32,21 @@ mod policy_tests;
 #[cfg(test)]
 #[path = "subagent_toolset/session_load_tests.rs"]
 mod session_load_tests;
+
+// Broker-backed coverage for session_load's current-metadata reads (plan
+// #2970 T3): the safe projection, variable previews, missing-vs-broker
+// distinction, prompt-scoped current state and child-edit/replay survival.
+#[cfg(test)]
+#[path = "subagent_toolset/session_load_metadata_tests.rs"]
+mod session_load_metadata_tests;
+
+// Broker-backed coverage for session_load's budget contract (plan #2970 T3):
+// optional metadata/progress can neither stall nor overflow a page in either
+// cursor mode, pending identity survives, and transcript paging is
+// identical with and without variable previews.
+#[cfg(test)]
+#[path = "subagent_toolset/session_load_budget_tests.rs"]
+mod session_load_budget_tests;
 
 #[cfg(test)]
 #[path = "subagent_toolset/session_async_wiring_tests.rs"]
@@ -47,8 +76,9 @@ use serde_json::{json, Value};
 use std::{collections::HashSet, time::Duration};
 use tokio_util::sync::CancellationToken;
 
-// `_session_new` has no arguments, so a fixed bootstrap message creates the
-// durable session and preserves blocking call-and-return semantics.
+// `_session_new` takes no prompt content — only the optional metadata
+// update — so a fixed bootstrap message creates the durable session and
+// preserves blocking call-and-return semantics.
 const SESSION_NEW_INITIAL_PROMPT: &str = "Start a new session.";
 const SUBAGENT_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
 /// How often a dispatched prompt's progress watcher re-reads the child's
@@ -93,6 +123,7 @@ impl SubagentSessionRoute {
 }
 
 /// Four-tool NATS adapter for one configured agent.
+// qual:allow(srp, god_struct) reason: "SubagentToolset is the single NATS adapter facade for the subagent session tools: every method shares the same connections, metadata store and routing state (LCOM4=1), and splitting it would scatter one adapter's wiring across modules."
 pub(crate) struct SubagentToolset {
     agent: String,
     route: SubagentSessionRoute,
@@ -204,27 +235,56 @@ impl SubagentToolset {
         self
     }
 
+    /// Test-facing wrapper; production paths use the claim-bearing variant.
+    #[cfg(test)]
     async fn create_session(
         &self,
         session_id: Option<String>,
         parent_session_id: Option<&str>,
         tool_call_id: Option<&str>,
     ) -> Result<NatsSession, ToolInvokeError> {
+        Ok(self
+            .create_session_with_claim(session_id, parent_session_id, tool_call_id, None)
+            .await?
+            .0)
+    }
+
+    /// The claim-bearing create: a patch-bearing creation both carries the
+    /// requested state in the first canonical record and verifies the real
+    /// Created/Existing outcome, so a competing creator can never be
+    /// silently mutated or dispatched against.
+    async fn create_session_with_claim(
+        &self,
+        session_id: Option<String>,
+        parent_session_id: Option<&str>,
+        tool_call_id: Option<&str>,
+        creation: Option<&child_metadata::ChildCreation>,
+    ) -> Result<(NatsSession, crate::nats_session::SessionMetadataClaim), ToolInvokeError> {
         let config = self
-            .session_config(session_id, parent_session_id, tool_call_id)
+            .session_config_with_creation(session_id, parent_session_id, tool_call_id, creation)
             .await?;
-        NatsSession::new_with_resolved_options(
+        let (session, claim) = NatsSession::new_with_resolved_options_claim(
             config,
-            self.replicas,
-            self.client.clone(),
-            self.jetstream.clone(),
-            harnx_core::abort::create_abort_signal(),
-            self.lease_acquisition_timeout,
+            crate::nats_session::NatsSessionConnections {
+                replicas: self.replicas,
+                client: self.client.clone(),
+                jetstream: self.jetstream.clone(),
+                abort_signal: harnx_core::abort::create_abort_signal(),
+                lease_acquisition_timeout: self.lease_acquisition_timeout,
+            },
         )
         .await
         .map_err(|error| {
             ToolInvokeError::Recoverable(format!("create sub-agent session: {error:#}"))
-        })
+        })?;
+        if let Some(creation) = creation {
+            child_metadata::verify_creation_claim(
+                &claim,
+                &creation.invocation,
+                session.session_id(),
+            )?;
+        }
+        Ok((session, claim))
     }
 
     /// `tool_call_id` is the id the PARENT's transcript gave this call, not
@@ -268,6 +328,35 @@ impl SubagentToolset {
         config.initializer = config
             .initializer
             .with_default_user_id(self.default_user_id.clone());
+        Ok(config)
+    }
+
+    /// The creation variant of [`Self::session_config`]: a patch-bearing
+    /// creation folds the requested title, variables and properties into the
+    /// initializer after inheritance is resolved — so the first canonical
+    /// record carries them — and stamps the trusted creation identity.
+    async fn session_config_with_creation(
+        &self,
+        session_id: Option<String>,
+        parent_session_id: Option<&str>,
+        tool_call_id: Option<&str>,
+        creation: Option<&child_metadata::ChildCreation>,
+    ) -> Result<crate::NatsSessionConfig, ToolInvokeError> {
+        let mut config = self
+            .session_config(session_id, parent_session_id, tool_call_id)
+            .await?;
+        if let Some(creation) = creation {
+            crate::nats_session_metadata::apply_to_initializer(
+                &mut config.initializer,
+                &creation.patch,
+            )
+            .map_err(|error| {
+                ToolInvokeError::Recoverable(format!("invalid child creation metadata: {error:#}"))
+            })?;
+            config.initializer = config
+                .initializer
+                .with_creation_invocation(creation.invocation.clone());
+        }
         Ok(config)
     }
 
@@ -378,6 +467,12 @@ impl SubagentToolset {
         context: ToolInvocationContext,
     ) -> Result<Value, ToolInvokeError> {
         let args: NewSessionArgs = parse_args(SUBAGENT_SESSION_NEW_TOOL, args)?;
+        // A patch-bearing create has no replay target to check before this
+        // point; the durable plan inside `run_prompt` owns the guard. The
+        // empty patch behaves exactly like an absent one.
+        let metadata = child_metadata::extract(args.metadata)?
+            .map(termination::PromptMetadata::Apply)
+            .unwrap_or(termination::PromptMetadata::None);
         let result = self
             .run_prompt(termination::PromptParams {
                 content: MessageContent::Text(SESSION_NEW_INITIAL_PROMPT.to_string()),
@@ -387,6 +482,7 @@ impl SubagentToolset {
                 timeout_secs: None,
                 cancel,
                 context,
+                metadata,
             })
             .await?;
         self.turn_result_value(&result)
@@ -404,9 +500,36 @@ impl SubagentToolset {
                 "message must not be empty".to_string(),
             ));
         }
-        let content = self
-            .compose_prompt_content(args.message, args.attachments.unwrap_or_default())
-            .await?;
+        let patch = child_metadata::extract(args.metadata)?;
+        // Admission proof comes before fresh attachment composition: an
+        // admitted replay must survive its original attachments having
+        // disappeared, and must not reapply its patch over later child
+        // edits. The saved checkpoint names the durable first-writer
+        // target, so it takes precedence over the request's session_id —
+        // the same order `run_prompt`'s checkpointed session uses.
+        let target = child_metadata::checkpoint_session_id(&context)
+            .or_else(|| normalize_session_id(args.session_id.clone()));
+        let replay = match (&patch, &target) {
+            (Some(_), Some(session_id)) => {
+                let storage =
+                    harnx_core::session_identity::session_key(Some(&self.agent), session_id);
+                child_metadata::sync_replay_check(self, &storage, &context.call_id).await?
+            }
+            _ => child_metadata::ReplayCheck::Fresh,
+        };
+        let content = if replay.skips_fresh_compose() {
+            // Durable content covers delivery; the fresh composition (which
+            // re-fetches attachments) must not gate the replay.
+            MessageContent::Text(args.message.clone())
+        } else {
+            self.compose_prompt_content(args.message.clone(), args.attachments.unwrap_or_default())
+                .await?
+        };
+        let metadata = match patch {
+            None => termination::PromptMetadata::None,
+            Some(_) if replay.admitted() => termination::PromptMetadata::Admitted,
+            Some(patch) => termination::PromptMetadata::Apply(patch),
+        };
         let result = self
             .run_prompt(termination::PromptParams {
                 content,
@@ -416,6 +539,7 @@ impl SubagentToolset {
                 timeout_secs: args.timeout_secs,
                 cancel,
                 context,
+                metadata,
             })
             .await?;
         self.turn_result_value(&result)
@@ -439,7 +563,8 @@ impl SubagentToolset {
         let storage = harnx_core::session_identity::session_key(Some(&self.agent), &session_id);
         // Prompt scope is a pure read: it validates the target binding and
         // bounds the page to that prompt's turn. Load never resumes,
-        // activates, repairs or waits on the session.
+        // activates, repairs or waits on the session — and current metadata
+        // is disclosed only after this namespace/binding validation.
         let mut status = None;
         let mut pending = None;
         if let Some(prompt_id) = args.prompt_id.as_deref() {
@@ -456,36 +581,29 @@ impl SubagentToolset {
             status = Some(scope.status);
             pending = scope.pending_interaction;
         }
-        let log = crate::nats_session_log::NatsSessionLog::new(self.jetstream.clone(), &storage);
-        // The page is merged into the wrapper below, so the wrapper's own
-        // serialized bytes are reserved first and the whole result respects
-        // max_output_bytes instead of only the inner page.
-        let wrapper = match (args.prompt_id, status) {
-            (Some(prompt_id), Some(status)) => json!({
-                "session_id": session_id,
-                "prompt_id": prompt_id,
-                "status": status,
-                "terminal": status.is_terminal(),
-            }),
-            _ => json!({ "session_id": session_id }),
-        };
-        let reserve = serde_json::to_vec(&wrapper)
-            .map_err(|error| ToolInvokeError::Recoverable(error.to_string()))?
-            .len()
-            .saturating_sub(1);
-        let page = session_read::read_session_log_window(&log, &read, reserve)
+        // Current canonical metadata: an authoritative missing record reads
+        // as `metadata: null`; a broker failure is an error, never a missing
+        // record. The read is pure — no creation, activation or mutation.
+        let record = self
+            .session_metadata
+            .get_for_agent(&session_id, &self.agent)
             .await
-            .map_err(ToolInvokeError::Recoverable)?;
-        let mut result = merge_page_into_wrapper(wrapper, page)?;
-        if let Some(pending) = pending {
-            async_session::observation::attach_pending_progress(
-                &mut result,
-                pending,
-                None,
-                read.max_output_bytes,
-            );
-        }
-        Ok(result)
+            .map_err(|error| {
+                ToolInvokeError::Recoverable(format!("session metadata unavailable: {error:#}"))
+            })?;
+        let metadata = child_metadata::load_metadata(
+            record.as_ref().map(|record| &record.metadata),
+            args.include_variables,
+            child_metadata::metadata_allowance(read.max_output_bytes),
+        )?;
+        let log = crate::nats_session_log::NatsSessionLog::new(self.jetstream.clone(), &storage);
+        let scope = child_metadata::LoadScope {
+            session_id,
+            prompt_id: args.prompt_id.clone(),
+            status,
+            pending,
+        };
+        child_metadata::compose_load_page(&log, &read, &scope, &metadata).await
     }
 
     async fn prompt_load_scope(
@@ -734,6 +852,11 @@ struct NewSessionArgs {
     parent_session_id: Option<String>,
     #[serde(default, rename = "__harnx_tool_call_id")]
     tool_call_id: Option<String>,
+    /// Optional child-session metadata carried into the first canonical
+    /// record of the created session. Strict: execution overrides, raw
+    /// extensions and unknown fields fail deserialization.
+    #[serde(default)]
+    metadata: Option<crate::nats_session_metadata::ChildSessionMetadataPatch>,
 }
 
 #[derive(Deserialize)]
@@ -749,6 +872,12 @@ struct PromptArgs {
         deserialize_with = "harnx_core::config_data::deserialize_timeout_override"
     )]
     timeout_secs: Option<u64>,
+    /// Optional child-session metadata update; on an existing session it
+    /// applies before the prompt is dispatched, on a new one it lands in the
+    /// first canonical record. Strict: execution overrides, raw extensions
+    /// and unknown fields fail deserialization.
+    #[serde(default)]
+    metadata: Option<crate::nats_session_metadata::ChildSessionMetadataPatch>,
     #[serde(default, rename = "__harnx_parent_session_id")]
     parent_session_id: Option<String>,
     #[serde(default, rename = "__harnx_tool_call_id")]
@@ -772,6 +901,11 @@ struct LoadArgs {
     prompt_id: Option<String>,
     #[serde(default)]
     read: Option<session_read::ReadOptions>,
+    /// Opt-in: also return bounded previews of the child's stored session
+    /// variables under `metadata.variables`. Default false — no variable
+    /// values or preview objects appear.
+    #[serde(default)]
+    include_variables: bool,
 }
 
 #[async_trait]
@@ -1067,6 +1201,8 @@ fn policy_description(policy: Option<&TargetRunPolicy>) -> String {
 const SHORT_SESSION_ID: &str = "{{ args.session_id | truncate(8, '') }}";
 
 fn session_new_spec(agent: &str, policy: Option<&TargetRunPolicy>) -> ToolSpec {
+    let mut properties = serde_json::Map::new();
+    properties.insert("metadata".into(), child_metadata::metadata_object_schema());
     ToolSpec {
         cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_NEW_TOOL.to_string(),
@@ -1074,7 +1210,11 @@ fn session_new_spec(agent: &str, policy: Option<&TargetRunPolicy>) -> ToolSpec {
             "Create a new session on the '{agent}' agent. {}",
             allowance_description(policy) + " Uses target policy and the inherited deadline, which can shorten the allowance."
         ),
-        input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        input_schema: json!({
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": false
+        }),
         idempotent_hint: false,
         read_only_hint: false,
         timeout_secs: None,
@@ -1111,7 +1251,8 @@ fn session_prompt_spec(agent: &str, policy: Option<&TargetRunPolicy>) -> ToolSpe
                 "timeout_secs": {
                     "type": "integer",
                     "description": policy_description(policy)
-                }
+                },
+                "metadata": child_metadata::metadata_object_schema()
             },
             "required": ["message"],
             "additionalProperties": false
@@ -1225,19 +1366,30 @@ fn session_id_tool_spec(agent: &str, tool: SessionIdTool) -> ToolSpec {
 /// Task 4b: session_load is a bounded, read-only inspection page, and the one
 /// tool that reads a child's transcript (waits return only the final reply);
 /// `prompt_id` restricts the page to one dispatched prompt's durable turn.
+/// Plan #2970: every load also reports the child's current canonical metadata
+/// under `metadata` (title, agent, created time, properties including the
+/// recorded web URL, observed repositories), and `include_variables` adds
+/// bounded previews of the stored session variables.
 fn session_load_spec(agent: &str) -> ToolSpec {
     ToolSpec {
         cancellation_guarantee: Default::default(),
         name: SUBAGENT_SESSION_LOAD_TOOL.to_string(),
         description: format!(
             "Load one bounded, read-only page of events from an existing session on the \
-             '{agent}' agent. Never resumes, activates or repairs the session. Events carry \
-             their source index; page by passing the returned next_index as read.index_min on \
-             the next call, and recover omitted content with \
-             read.entry_index and read.byte_offset. An omitted read applies safe bounded \
-             defaults. With prompt_id the page is restricted to one dispatched prompt's turn \
-             and the result reports its status and terminal flag: this is how to check a \
-             prompt without waiting. To wait for it, use session_wait."
+             '{agent}' agent, plus the session's current metadata: its title, agent, \
+             creation time, session properties (including web_session_url) and observed \
+             repositories, under the result's 'metadata' field. metadata is null when the \
+             session has no canonical metadata record. Pass include_variables to also get \
+             bounded head/tail previews of the stored session variables with exact \
+             omission counts; by default no variable values are returned. Never resumes, \
+             activates, repairs or mutates the session. Events carry their source index; \
+             page by passing the returned next_index as read.index_min on the next call, and \
+             recover omitted content with read.entry_index and read.byte_offset. An \
+             omitted read applies safe bounded defaults. With prompt_id the page is \
+             restricted to one dispatched prompt's turn and the result reports its status \
+             and terminal flag: this is how to check a prompt without waiting. The metadata \
+             stays current even when the page is restricted to an older prompt. To wait for \
+             it, use session_wait."
         ),
         input_schema: json!({
             "type": "object",
@@ -1251,6 +1403,14 @@ fn session_load_spec(agent: &str) -> ToolSpec {
                     "description": "Optional: restrict the page to one dispatched prompt's turn \
                                     (its original prompt through its first terminal). Validated \
                                     against the durable admission; later turns are excluded."
+                },
+                "include_variables": {
+                    "type": "boolean",
+                    "description": "Optional: also return bounded previews of the child's stored \
+                                    session variables under metadata.variables. Each preview has \
+                                    head, tail, total_bytes and omitted_bytes; at most eight \
+                                    entries are returned, sorted by name, whole names only. Default \
+                                    false: no variable values are returned."
                 },
                 "read": session_read::read_object_schema(),
             },
@@ -1338,7 +1498,11 @@ mod tests {
         );
         assert_eq!(
             tools[0].input_schema,
-            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+            json!({
+                "type": "object",
+                "properties": { "metadata": tool_specs_metadata_schema() },
+                "additionalProperties": false
+            })
         );
         assert_eq!(tools[1].input_schema["required"], json!(["message"]));
         assert_eq!(
@@ -1377,6 +1541,69 @@ mod tests {
         assert_eq!(tools[1].timeout_secs, Some(0));
         assert_eq!(tools[2].timeout_secs, Some(0));
         assert_eq!(tools[3].timeout_secs, Some(0));
+    }
+
+    /// The strict `metadata` object schema all three write tools advertise.
+    fn tool_specs_metadata_schema() -> Value {
+        child_metadata::metadata_object_schema()
+    }
+
+    /// `session_new`, `session_prompt` and `session_send` all advertise the
+    /// same strict metadata object: only title/variables/properties, no
+    /// unknown fields.
+    #[test]
+    fn write_tools_advertise_the_strict_metadata_object() {
+        let tools = tool_specs("pkg/helper");
+        let expected = tool_specs_metadata_schema();
+        for tool in tools.iter().take(3) {
+            assert_eq!(tool.input_schema["properties"]["metadata"], expected);
+        }
+    }
+
+    /// Execution overrides, raw extensions, unknown fields and read-only
+    /// identity properties are rejected at the tool boundary, before any
+    /// reservation or mutation; an empty metadata object behaves exactly
+    /// like an absent one.
+    #[test]
+    fn metadata_argument_is_strict_and_empty_metadata_behaves_like_absence() {
+        for bad in [
+            json!({"message": "hi", "metadata": {"overrides": {"model": "gpt"}}}),
+            json!({"message": "hi", "metadata": {"extensions": {"ns": {}}}}),
+            json!({"message": "hi", "metadata": {"unknown_field": 1}}),
+            json!({"message": "hi", "metadata": {"title": {"value": "t", "surprise": true}}}),
+            json!({"message": "hi", "metadata": {"variables": {"a": {"nested": 1}}}}),
+            json!({"message": "hi", "metadata": {"properties": {"unknown top": 1}}}),
+        ] {
+            assert!(parse_prompt_args(bad.clone()).is_err(), "{bad}");
+        }
+
+        // Read-only identity properties deserialize fine but fail the
+        // validated patch extraction, which the handlers run before any
+        // reservation or mutation.
+        let readonly = json!({"message": "hi", "metadata": {"properties": {"set": [{"name": "user_id", "value": "x"}]}}});
+        let parsed = parse_prompt_args(readonly).unwrap();
+        assert!(
+            child_metadata::extract(parsed.metadata).is_err(),
+            "read-only identity property must be rejected before mutation"
+        );
+        let parsed = parse_prompt_args(json!({"message": "hi", "metadata": {}})).unwrap();
+        assert!(
+            child_metadata::extract(parsed.metadata).unwrap().is_none(),
+            "empty metadata behaves like an absent one"
+        );
+        let absent = parse_prompt_args(json!({"message": "hi"})).unwrap();
+        assert!(child_metadata::extract(absent.metadata).unwrap().is_none());
+        let valid = parse_prompt_args(json!({
+            "message": "hi",
+            "metadata": {
+                "title": {"value": "  Plan review  ", "manual": true},
+                "variables": {"topic": "rust", "empty": ""},
+                "properties": {"set": [{"name": "customer", "value": "acme", "inherit": true}]}
+            }
+        }))
+        .unwrap();
+        let patch = child_metadata::extract(valid.metadata).unwrap().unwrap();
+        assert!(patch.validate().is_ok());
     }
 
     /// The `session_prompt` descriptions must steer models toward omitting

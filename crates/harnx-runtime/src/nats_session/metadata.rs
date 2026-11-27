@@ -61,12 +61,17 @@ async fn transcript_exists(jetstream: &jetstream::Context, key: &str) -> Result<
     }
 }
 
-pub(super) async fn ensure_session_metadata(
+/// The claim-bearing metadata open: callers that must know whether this call
+/// created the record (sub-agent creation metadata) get the real
+/// [`SessionMetadataClaim`] instead of a collapsed `()` outcome. Existing
+/// records repair activity before use; legacy or inconsistent sessions and
+/// create races without a winner stay errors.
+pub(super) async fn ensure_session_metadata_claim(
     store: &SessionMetadataStore,
     transcript: &NatsSessionLog,
     session_id: &str,
     initializer: &SessionInitializer,
-) -> Result<()> {
+) -> Result<SessionMetadataClaim> {
     let key = initializer.session_key(session_id);
     // Legacy opens reject only a nonempty transcript without metadata, and
     // repair activity before use. Keep both behaviors out of the claim path.
@@ -79,24 +84,14 @@ pub(super) async fn ensure_session_metadata(
     };
     // This constructor runs inside deep TUI futures. Keep the nested probe
     // and KV futures off their stack.
-    let outcome = Box::pin(create_or_read_metadata(
+    Box::pin(create_or_read_metadata(
         store,
         &key,
         session_id,
         initializer,
         has_entries,
     ))
-    .await?;
-    match outcome {
-        SessionMetadataClaim::Created(_) => Ok(()),
-        SessionMetadataClaim::Existing(_) => store.ensure_reserved_activity(&key).await,
-        SessionMetadataClaim::Orphaned => anyhow::bail!(
-            "session '{session_id}' has transcript entries but no canonical metadata; legacy or inconsistent sessions are not supported"
-        ),
-        SessionMetadataClaim::Vanished => {
-            anyhow::bail!("session metadata creation race for '{session_id}' had no winner")
-        }
-    }
+    .await
 }
 
 async fn create_or_read_metadata(

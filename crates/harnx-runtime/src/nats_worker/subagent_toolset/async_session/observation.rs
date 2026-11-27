@@ -6,7 +6,10 @@ mod output;
 mod pending;
 #[cfg(test)]
 mod pending_tests;
-pub(in crate::nats_worker::subagent_toolset) use pending::attach_pending_progress;
+pub(in crate::nats_worker::subagent_toolset) use pending::{
+    attach_pending_identity, attach_pending_progress, pending_identity_reserve,
+    pending_progress_fields, progress_fields_reserve,
+};
 mod repair;
 mod scope;
 mod snapshot;

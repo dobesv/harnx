@@ -116,8 +116,11 @@ async fn target_initializer(
         properties: Default::default(),
         parent: metadata.parent.clone(),
         // The target already exists; creation metadata was applied when its
-        // record was first written, so a reload adds no new patch.
+        // record was first written, so a reload adds no new patch. Its
+        // creation provenance stays on the canonical record, not the
+        // reconstructed initializer.
         metadata_patch: None,
+        creation_invocation: None,
     };
     Ok((metadata.session_id, initializer))
 }

@@ -24,6 +24,13 @@ impl NatsServerHandle {
     pub fn url(&self) -> &str {
         &self.url
     }
+
+    /// Kill the server now instead of at drop, for tests that need a later
+    /// read to surface a transport failure.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for NatsServerHandle {
