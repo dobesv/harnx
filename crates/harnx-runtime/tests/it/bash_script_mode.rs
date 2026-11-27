@@ -5,6 +5,8 @@
 // Keep imports and fixtures under the same Unix gate as the e2e tests.
 #![cfg(unix)]
 
+mod session_tools;
+
 use std::{
     ffi::OsString,
     path::PathBuf,

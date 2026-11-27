@@ -166,10 +166,14 @@ impl InnerMedia {
         };
         let path = attachment_path(&attachment.cid)?;
         let text = format!("{} path={}", attachment.marker(), path.display());
+        let annotations = value.get("annotations").cloned();
         *value = json!({
             "type": "text", "text": text, "uri": attachment.cid,
             "mimeType": attachment.mime_type, "size": attachment.size, "path": path,
         });
+        if let Some(annotations) = annotations {
+            value["annotations"] = annotations;
+        }
         Ok(true)
     }
 

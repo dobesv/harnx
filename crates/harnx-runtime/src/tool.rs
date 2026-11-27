@@ -854,7 +854,7 @@ fn script_mode_bash_provider(params: ScriptModeBashParams<'_>) -> Arc<dyn ToolPr
 
 /// The base provider stack shared by the script-tool and `bash` providers:
 /// every provider except `bash` and the round's script-tool provider, plus
-/// the NATS-derived inputs both of them need.
+/// the script metadata and NATS handles both of them need.
 struct BaseProviderStack {
     base_providers: Vec<Arc<dyn ToolProvider>>,
     payload_limit: Option<crate::bash_inner::PayloadLimit>,
@@ -877,10 +877,7 @@ fn base_provider_stack(
     let payload_limit = nats_provider
         .as_ref()
         .map(|nats| nats.script_payload_limit());
-    let script_shapes = nats_provider
-        .as_ref()
-        .map(|nats| nats.script_shapes())
-        .unwrap_or_default();
+    let script_shapes = base_script_shapes(nats_provider.as_deref());
     let attachment_fetcher = nats_provider
         .as_ref()
         .map(|nats| nats.script_attachment_fetcher());
@@ -905,6 +902,45 @@ fn base_provider_stack(
         attachment_fetcher,
         media_store,
     }
+}
+
+fn base_script_shapes(
+    nats_provider: Option<&NatsToolProvider>,
+) -> std::collections::BTreeMap<String, crate::ScriptShape> {
+    use crate::session_history::{SessionHistoryProvider, TOOL_NAME};
+    use crate::session_meta_tool::{SessionMetaProvider, READ_TOOL_NAME, WRITE_TOOL_NAME};
+
+    let mut shapes = nats_provider
+        .map(NatsToolProvider::script_shapes)
+        .unwrap_or_default();
+    let meta = SessionMetaProvider::script_shape();
+    let builtins = [
+        (TOOL_NAME, SessionHistoryProvider::script_shape()),
+        (READ_TOOL_NAME, meta.clone()),
+        (WRITE_TOOL_NAME, meta),
+    ];
+    // NATS dispatch precedes built-in dispatch, even for routes with no shape.
+    shapes.extend(
+        builtins
+            .into_iter()
+            .filter(|(name, _)| !nats_provider.is_some_and(|nats| nats.has_tool(name)))
+            .map(|(name, shape)| (name.to_string(), shape)),
+    );
+    shapes
+}
+
+/// Keep the model-facing JSON text even when scripts also request the value.
+pub(crate) fn session_json_output(
+    payload: Value,
+    structured_result: bool,
+) -> harnx_core::tool::ToolProviderOutput {
+    let mut result = serde_json::json!({
+        "content": [{"type": "text", "text": payload.to_string()}],
+    });
+    if structured_result {
+        result["structuredContent"] = payload;
+    }
+    result.into()
 }
 
 /// Drop declarations whose names belong to script tools, for contexts whose
@@ -2039,6 +2075,43 @@ mod tests {
                 .all(|tool| tool.definition().name != "wrap_probe"),
             "a provider-served name must drop the colliding script tool"
         );
+    }
+
+    #[tokio::test]
+    async fn shapeless_nats_routes_do_not_inherit_builtin_script_shapes() -> anyhow::Result<()> {
+        use crate::session_history::TOOL_NAME as HISTORY_TOOL;
+        use crate::session_meta_tool::{READ_TOOL_NAME, WRITE_TOOL_NAME};
+        use anyhow::Context;
+
+        let broker = crate::nats_test_common::spawn_nats_server()
+            .await?
+            .context("nats-server required for script shape collision")?;
+        let client = async_nats::connect(broker.url()).await?;
+        let collisions = [HISTORY_TOOL, READ_TOOL_NAME];
+        let provider = NatsToolProvider::snapshot_test_provider(
+            &client,
+            collisions.map(|name| (name, "fixture", name)).to_vec(),
+            collisions
+                .map(|name| make_decl_with_templates(name, None, None))
+                .to_vec(),
+            Vec::new(),
+        )
+        .await?;
+
+        assert!(provider.script_shapes().is_empty());
+        let shapes = base_script_shapes(Some(&provider));
+        for name in collisions {
+            assert!(provider.has_tool(name), "{name} must be routable via NATS");
+            assert!(
+                !shapes.contains_key(name),
+                "shapeless NATS route {name} acquired built-in script metadata"
+            );
+        }
+        assert!(!provider.has_tool(WRITE_TOOL_NAME));
+        assert!(shapes
+            .get(WRITE_TOOL_NAME)
+            .is_some_and(|shape| shape.output.is_some() && shape.output_schema.is_some()));
+        Ok(())
     }
 
     /// 4659980786 follow-up: `has_tool` keeps raw aliases routable through
