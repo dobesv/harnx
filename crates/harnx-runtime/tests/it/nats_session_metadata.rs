@@ -931,3 +931,6 @@ async fn seed_metadata(store: &SessionMetadataStore, local_id: &str) -> Result<S
 }
 
 mod a2a_store;
+mod child_patch;
+mod child_patch_limits;
+mod child_patch_race;

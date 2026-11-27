@@ -18,6 +18,12 @@ pub struct SessionInitializer {
     /// Set when this session is being created as a sub-agent child, so its
     /// metadata records the parent invocation that created it.
     pub parent: Option<ParentLink>,
+    /// Trusted creation identity stamped on the first canonical record's
+    /// `creation_invocation` field. Set only by creation paths that own a
+    /// durable invocation identity (sub-agent session tools), so a retry of
+    /// the same invocation can recognize its own creation. Like the whole
+    /// initializer, this is never serialized.
+    pub creation_invocation: Option<String>,
     /// Metadata a client supplied with the session-creation request, applied
     /// to the initial canonical record before it is first persisted. The
     /// initializer is not serialized, so this never reaches the wire schema.
@@ -47,6 +53,7 @@ impl SessionInitializer {
             tool_context: ToolContext::default(),
             properties: SessionProperties::default(),
             parent: None,
+            creation_invocation: None,
             metadata_patch: None,
         }
     }
@@ -65,6 +72,7 @@ impl SessionInitializer {
             tool_context: ToolContext::default(),
             properties: SessionProperties::default(),
             parent: None,
+            creation_invocation: None,
             metadata_patch: None,
         }
     }
@@ -77,6 +85,14 @@ impl SessionInitializer {
     #[must_use]
     pub fn with_metadata_patch(mut self, patch: SessionMetadataPatch) -> Self {
         self.metadata_patch = Some(patch);
+        self
+    }
+
+    /// Stamp the trusted creation identity on the first canonical record.
+    /// Only creation paths that own a durable invocation identity call this.
+    #[must_use]
+    pub fn with_creation_invocation(mut self, invocation: impl Into<String>) -> Self {
+        self.creation_invocation = Some(invocation.into());
         self
     }
 

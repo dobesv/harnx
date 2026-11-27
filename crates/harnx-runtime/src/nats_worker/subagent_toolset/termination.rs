@@ -1,3 +1,4 @@
+use super::child_metadata;
 use super::{CompletedSubagentTurn, ProgressReporterStart, SubagentToolset};
 use crate::nats_session::{NatsSession, NatsTurnResult};
 use crate::{
@@ -12,12 +13,14 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+// qual:allow(srp, max_independent_clusters=3) reason: "The synchronous prompt pipeline has three cohesive phases that meet only in run_prompt: guarded session construction (checkpointed_session), turn await (await_prompt_turn) and terminal reporting (finish_completed_turn). The F02 move of shared lineage validation into child_metadata/context.rs made the phase split visible; merging the phases would hide the ordering the metadata guards depend on."
+
 #[cfg(test)]
 #[path = "expired_replay_tests.rs"]
 mod expired_replay_tests;
 
 #[cfg(test)]
-mod busy_join_tests;
+pub(in crate::nats_worker::subagent_toolset) mod busy_join_tests;
 
 #[cfg(test)]
 mod historical_terminal_tests;
@@ -37,6 +40,51 @@ pub(super) struct PromptParams {
     pub timeout_secs: Option<u64>,
     pub cancel: CancellationToken,
     pub context: harnx_toolset::ToolInvocationContext,
+    /// The child-session metadata update this call carries, if any.
+    pub metadata: PromptMetadata,
+}
+
+/// What a sync call's `metadata` argument resolved to.
+pub enum PromptMetadata {
+    /// No patch requested; existing behavior unchanged.
+    None,
+    /// Durable admission proof was established before composition: the
+    /// patch was applied by an earlier attempt of this invocation and must
+    /// never be reapplied over later child edits.
+    Admitted,
+    /// Fresh or candidate-only: establish the guard and apply before the
+    /// executable append.
+    Apply(crate::nats_session_metadata::ChildSessionMetadataPatch),
+}
+
+/// Publish terminal progress and hand a finished turn back to the parent:
+/// a completed turn streams its buffered events, a failed or aborted one
+/// surfaces the error after a best-effort failure publication.
+async fn finish_turn(
+    toolset: &SubagentToolset,
+    child_session_id: String,
+    reporter: super::SubagentProgressReporter,
+    buffering_sink: Arc<InvocationBufferingSink>,
+    turn: PromptTurn,
+) -> Result<CompletedSubagentTurn, ToolInvokeError> {
+    match turn {
+        PromptTurn::Completed(Ok(result)) => {
+            finish_completed_turn(CompletedTurnParams {
+                toolset,
+                child_session_id,
+                reporter,
+                buffering_sink,
+                result,
+            })
+            .await
+        }
+        PromptTurn::Completed(Err(error)) | PromptTurn::Aborted(error) => {
+            if let Err(report_error) = reporter.finish(SubAgentProgressStatus::Failed).await {
+                log::debug!("failed to publish terminal sub-agent progress: {report_error:#}");
+            }
+            Err(error)
+        }
+    }
 }
 
 pub(super) async fn run_prompt(
@@ -47,7 +95,24 @@ pub(super) async fn run_prompt(
         return Err(ToolInvokeError::Fatal("sub-agent tool call aborted".into()));
     }
     let cancel = params.cancel.clone();
-    let session = inherited_prompt_session(toolset, &params).await?;
+    // Trusted context is validated BEFORE the metadata gate can pin a guard
+    // or mutate: a direct/MCP client can carry a real durable journal while
+    // its inherited run context is missing or malformed, and such a call
+    // must fail without touching the child (review F02). Admitted replay
+    // keeps its precedence over patch reapplication; it does not skip
+    // context validation. The saved-checkpoint scope check runs inside
+    // `prepare_sync` (review F03).
+    let inherited = child_metadata::InheritedPrompt::validate(&params.context)?;
+    let plan = match &params.metadata {
+        PromptMetadata::None | PromptMetadata::Admitted => child_metadata::MetadataPlan::Settled,
+        PromptMetadata::Apply(patch) => {
+            let target = child_metadata::checkpoint_session_id(&params.context)
+                .or_else(|| params.session_id.clone());
+            child_metadata::prepare_sync(toolset, &params.context, target.as_deref(), patch.clone())
+                .await?
+        }
+    };
+    let session = inherited_prompt_session(toolset, &params, plan.creation(), inherited).await?;
     record_child(toolset, &params.context, session.session_id()).await;
     // Replay of an already-answered invocation keys off
     // `NatsSession::invocation_id`, so every child needs one bound here. The
@@ -83,47 +148,20 @@ pub(super) async fn run_prompt(
         let _ = reporter.finish(SubAgentProgressStatus::Cancelled).await;
         return Err(ToolInvokeError::Fatal("sub-agent tool call aborted".into()));
     }
-    match turn {
-        PromptTurn::Completed(Ok(result)) => {
-            finish_completed_turn(CompletedTurnParams {
-                toolset,
-                child_session_id,
-                reporter,
-                buffering_sink,
-                result,
-            })
-            .await
-        }
-        PromptTurn::Completed(Err(error)) | PromptTurn::Aborted(error) => {
-            if let Err(report_error) = reporter.finish(SubAgentProgressStatus::Failed).await {
-                log::debug!("failed to publish terminal sub-agent progress: {report_error:#}");
-            }
-            Err(error)
-        }
-    }
+    finish_turn(toolset, child_session_id, reporter, buffering_sink, turn).await
 }
 
 async fn inherited_prompt_session(
     toolset: &SubagentToolset,
     params: &PromptParams,
+    creation: Option<&child_metadata::ChildCreation>,
+    inherited: child_metadata::InheritedPrompt,
 ) -> Result<NatsSession, ToolInvokeError> {
-    let lineage = params.context.run_context.as_ref().ok_or_else(|| {
-        ToolInvokeError::Fatal("sub-agent execution requires inherited run context".into())
-    })?;
-    let parent: crate::nats_session_metadata::RunLimitsRecord =
-        serde_json::from_value(lineage.snapshot.clone()).map_err(|error| {
-            ToolInvokeError::Fatal(format!("invalid inherited run context: {error}"))
-        })?;
-    let admitted_at = chrono::DateTime::from_timestamp_millis(
-        i64::try_from(lineage.started_at_ms)
-            .map_err(|error| ToolInvokeError::Fatal(error.to_string()))?,
-    )
-    .ok_or_else(|| ToolInvokeError::Fatal("invalid original invocation time".into()))?;
-    let session = checkpointed_session(toolset, params).await?;
+    let session = checkpointed_session(toolset, params, creation).await?;
     let session = session.with_inherited_admission(
-        parent,
+        inherited.parent,
         params.context.call_id.clone(),
-        admitted_at,
+        inherited.admitted_at,
         crate::nats_session_metadata::InvocationEdgeKind::Delegation,
         params.timeout_secs,
     );
@@ -134,9 +172,36 @@ async fn inherited_prompt_session(
     Ok(session.with_steering_admission())
 }
 
+/// Reserve a generated child id through the invocation's atomic
+/// reservation. A patch-bearing create folds its metadata into the
+/// reservation initializer, so the `creation_invocation` stamp the
+/// reservation writes is the creation guard: no second protocol.
+async fn reserve_child_id(
+    toolset: &SubagentToolset,
+    params: &PromptParams,
+    creation: Option<&child_metadata::ChildCreation>,
+) -> Result<String, ToolInvokeError> {
+    let context = params.context.run_context.as_ref().ok_or_else(|| {
+        ToolInvokeError::Fatal("child allocation requires inherited context".into())
+    })?;
+    let parent = params.parent_session_id.as_deref();
+    let config = toolset
+        .session_config_with_creation(None, parent, params.tool_call_id.as_deref(), creation)
+        .await?;
+    crate::utils::session_name::reserve_invocation_session_id(
+        &toolset.session_metadata,
+        &config.initializer,
+        &params.context.call_id,
+        context.started_at_ms,
+    )
+    .await
+    .map_err(|error| ToolInvokeError::Recoverable(format!("reserve child admission: {error:#}")))
+}
+
 async fn checkpointed_session(
     toolset: &SubagentToolset,
     params: &PromptParams,
+    creation: Option<&child_metadata::ChildCreation>,
 ) -> Result<NatsSession, ToolInvokeError> {
     let parent = params.parent_session_id.as_deref();
     let mut session_id = params
@@ -147,28 +212,12 @@ async fn checkpointed_session(
         .map(str::to_string)
         .or_else(|| params.session_id.clone());
     if session_id.is_none() {
-        let context = params.context.run_context.as_ref().ok_or_else(|| {
-            ToolInvokeError::Fatal("child allocation requires inherited context".into())
-        })?;
-        let config = toolset
-            .session_config(None, parent, params.tool_call_id.as_deref())
-            .await?;
-        session_id = Some(
-            crate::utils::session_name::reserve_invocation_session_id(
-                &toolset.session_metadata,
-                &config.initializer,
-                &params.context.call_id,
-                context.started_at_ms,
-            )
-            .await
-            .map_err(|error| {
-                ToolInvokeError::Recoverable(format!("reserve child admission: {error:#}"))
-            })?,
-        );
+        session_id = Some(reserve_child_id(toolset, params, creation).await?);
     }
     let session = toolset
-        .create_session(session_id, parent, params.tool_call_id.as_deref())
-        .await?;
+        .create_session_with_claim(session_id, parent, params.tool_call_id.as_deref(), creation)
+        .await?
+        .0;
     let Some(parent) = parent else {
         return Ok(session);
     };
@@ -190,12 +239,14 @@ async fn checkpointed_session(
         return Ok(session);
     }
     toolset
-        .create_session(
+        .create_session_with_claim(
             Some(id.into()),
             Some(parent),
             params.tool_call_id.as_deref(),
+            creation,
         )
         .await
+        .map(|(session, _)| session)
 }
 
 /// Name the child as the call's partial result, so a call that fails, times

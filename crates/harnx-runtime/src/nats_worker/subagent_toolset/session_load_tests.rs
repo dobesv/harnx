@@ -13,7 +13,7 @@ use harnx_toolset::{ToolInvokeError, ToolRequest};
 use harnx_toolset_server::invocation_journal::InvocationJournal;
 use std::sync::Arc;
 
-fn user(text: &str) -> SessionLogEntry {
+pub(super) fn user(text: &str) -> SessionLogEntry {
     SessionLogEntry::Message {
         id: None,
         role: MessageRole::User,
@@ -23,7 +23,7 @@ fn user(text: &str) -> SessionLogEntry {
     }
 }
 
-fn turn_end(through_seq: u64) -> SessionLogEntry {
+pub(super) fn turn_end(through_seq: u64) -> SessionLogEntry {
     SessionLogEntry::TurnEnd {
         through_seq,
         fence_token: 0,
@@ -32,23 +32,26 @@ fn turn_end(through_seq: u64) -> SessionLogEntry {
     }
 }
 
-fn serialized(value: &Value) -> usize {
+pub(super) fn serialized(value: &Value) -> usize {
     serde_json::to_vec(value).expect("serialize result").len()
 }
 
-struct LoadFixture {
+pub(super) struct LoadFixture {
     /// Owns the nats-server child; dropping it kills the broker, so it stays
     /// bound for the whole test.
-    _server: crate::nats_test_common::NatsServerHandle,
+    pub(super) server: crate::nats_test_common::NatsServerHandle,
     js: async_nats::jetstream::Context,
     toolset: SubagentToolset,
     log: NatsSessionLog,
+    /// One stable parent run context: a replayed dispatch must present the
+    /// SAME parent invocation as the original admission it replays.
+    run_context: harnx_toolset::AutonomousRunContext,
 }
 
 impl LoadFixture {
-    const SESSION: &'static str = "load-child";
+    pub(super) const SESSION: &'static str = "load-child";
 
-    async fn new() -> anyhow::Result<Self> {
+    pub(super) async fn new() -> anyhow::Result<Self> {
         let Some(server) = spawn_nats_server().await? else {
             anyhow::bail!("nats-server required for session_load tests")
         };
@@ -61,17 +64,36 @@ impl LoadFixture {
         );
         let storage = harnx_core::session_identity::session_key(Some("helper"), Self::SESSION);
         let log = NatsSessionLog::new_with_replicas(js.clone(), storage, 1);
+        let run_context = crate::nats_session::test_support::inherited_tool_context();
         Ok(Self {
-            _server: server,
+            server,
             js,
             toolset,
             log,
+            run_context,
         })
+    }
+
+    /// Kill the broker this fixture spawned, so a later read must surface a
+    /// transport failure instead of a result.
+    pub(super) fn kill_broker(&mut self) {
+        self.server.kill();
+    }
+
+    /// The fixture's agent-scoped JetStream context, for tests that seed
+    /// metadata records or extra logs.
+    pub(super) fn js(&self) -> &async_nats::jetstream::Context {
+        &self.js
+    }
+
+    /// The fixture's session log for [`LoadFixture::SESSION`].
+    pub(super) fn log(&self) -> &NatsSessionLog {
+        &self.log
     }
 
     /// Dispatch one prompt the way Task 2 does, so the prompt has a durable
     /// admission and a logged original for prompt-scoped loads.
-    async fn dispatch_prompt(&self) -> anyhow::Result<(String, u64)> {
+    pub(super) async fn dispatch_prompt(&self) -> anyhow::Result<(String, u64)> {
         let request = ToolRequest {
             user_id: None,
             input_responses: None,
@@ -80,7 +102,7 @@ impl LoadFixture {
             call_id: "original-prompt".into(),
             tool: "session_send".into(),
             args: json!({"message": "original", "session_id": Self::SESSION}),
-            run_context: Some(crate::nats_session::test_support::inherited_tool_context()),
+            run_context: Some(self.run_context.clone()),
             parent_session_id: Some("trusted-parent".into()),
             parent_agent: None,
             parent_local_session_id: None,
@@ -90,9 +112,14 @@ impl LoadFixture {
             capabilities: Default::default(),
         };
         let journal = InvocationJournal::ensure(&self.js, 1).await?;
-        journal
-            .record(&request, ("session_send", "helper", "server"))
-            .await?;
+        // A re-dispatch of a journaled call is its replay: the production
+        // wrapper validates against the durable row instead of re-recording
+        // it, so skip the record when the row already exists.
+        if journal.get(&request).await?.is_none() {
+            journal
+                .record(&request, ("session_send", "helper", "server"))
+                .await?;
+        }
         let context = ToolInvocationContext {
             call_id: request.call_id.clone(),
             invoking_session_id: request.parent_session_id.clone(),
@@ -116,12 +143,16 @@ impl LoadFixture {
         ))
     }
 
-    async fn activation_count(&self) -> anyhow::Result<u64> {
-        let mut stream = self.js.get_stream("WORK_NOTIFY_observe").await?;
-        Ok(stream.info().await?.state.messages)
+    pub(super) async fn activation_count(&self) -> anyhow::Result<u64> {
+        // A session that was never activated has no notify stream: the pure
+        // read tests count zero activations before any dispatch.
+        match self.js.get_stream("WORK_NOTIFY_observe").await {
+            Ok(mut stream) => Ok(stream.info().await?.state.messages),
+            Err(_) => Ok(0),
+        }
     }
 
-    async fn load(&self, args: Value) -> Result<Value, ToolInvokeError> {
+    pub(super) async fn load(&self, args: Value) -> Result<Value, ToolInvokeError> {
         self.toolset.session_load(args).await
     }
 }
@@ -180,6 +211,9 @@ async fn default_load_returns_bounded_source_indexed_page_without_side_effects(
         .load(json!({ "session_id": LoadFixture::SESSION }))
         .await?;
     assert_eq!(page["session_id"], json!(LoadFixture::SESSION));
+    // The fixture seeds no canonical metadata record: an authoritative
+    // missing record reads as null, never as an error.
+    assert_eq!(page["metadata"], json!(null));
     assert!(serialized(&page) <= session_read::DEFAULT_MAX_OUTPUT_BYTES as usize);
     let events = page["events"].as_array().expect("events");
     assert_eq!(events.len(), 5);
@@ -201,6 +235,11 @@ async fn load_missing_session_reads_empty_page() -> anyhow::Result<()> {
     let f = LoadFixture::new().await?;
     let page = f.load(json!({ "session_id": "absent-session" })).await?;
     assert_eq!(page["session_id"], json!("absent-session"));
+    assert_eq!(
+        page["metadata"],
+        json!(null),
+        "an absent record is null, not an error"
+    );
     assert_eq!(page["events"], json!([]));
     assert_eq!(page["truncated"], json!(false));
     assert_eq!(page["next_index"], json!(null));
