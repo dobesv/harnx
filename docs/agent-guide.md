@@ -464,7 +464,7 @@ bash_tools:
 The `harnx-attachment-tools` server provides tools for reading and storing NATS-backed media and plan documents:
 
 - **`attachment_read(url, ...)`**: Read an attachment or rendered plan by its `cid:` URL (`cid:media:` or `cid:plan:`).
-  - Returns image blocks for images, formatted text with line numbers for text media and rendered plans, and errors for unsupported binary formats.
+  - Returns image blocks for images, truncated text for text media and rendered plans, and errors for unsupported binary formats.
   - Parameters:
     - `url` (string, required): The canonical `cid:` URL to read.
     - `offset` (integer, optional): Line number to start reading from (1-indexed).
@@ -473,6 +473,7 @@ The `harnx-attachment-tools` server provides tools for reading and storing NATS-
     - `tail_lines` (integer, optional): Return only the last N lines.
     - `max_output_bytes` (integer, optional): Maximum output size in bytes.
     - `grep` (string, optional): Regex pattern to filter lines before truncation.
+  - In a `bash` script (`bash_tools`), the command prints the text on stdout and paging or cut-off notices on stderr, with no truncation markers in the data. Byte mode reports `next_byte_offset` and `end_of_content` as fields (see [the crate README](../crates/harnx-attachment-tools/README.md#output-in-bash-scripts)); line mode names the `offset` that continues in a stderr note, and a cap-cut note without `Use offset=` means the byte cap stopped inside a two-sided head/tail cut — no single continuation line exists, and that is not proof the content ended. An invalid `grep` pattern leaves the text unfiltered with a stderr note. Behind the MCP bridge, a full default 128 KiB page still exceeds the bridge's result limit (#2984): pass a smaller `--byte-limit` or `--max-output-bytes`.
 - **`attachment_create(content, mime_type, encoding?)`**: Create a text or binary attachment in NATS Object Storage (`harnx_attachments`) owned by the invoking session.
   - Returns the canonical `cid:media:` URL for the stored attachment. The handler accepts up to 5 MiB decoded, but the complete JSON request must fit NATS `max_payload` (default 1 MiB). Base64 expands bytes by about 4/3, so the default broker permits less than 768 KiB of binary content after request/header overhead; script mode also reserves 1 KiB for the envelope. Requests are not chunked. Larger attachments require a higher broker limit.
   - Text MIME types require UTF-8 decoded bytes, even with base64 encoding or a different charset parameter. Use `application/octet-stream` to retain arbitrary bytes unchanged; `attachment_read` cannot display that binary type.

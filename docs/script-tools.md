@@ -170,9 +170,11 @@ same CLI flags, output and exit codes as in the `bash` tool's script mode:
   prints the tool's fields instead. See
   [Output in `bash` scripts](../crates/harnx-fs-tools/README.md#output-in-bash-scripts)
   for the file tools in detail, and the same section of the
-  [bash tools](../crates/harnx-bash-tools/README.md#output-in-bash-scripts) and
-  [fetch tools](../crates/harnx-fetch-tools/README.md#output-in-bash-scripts) READMEs
-  for `bash_exec` and the fetchers. Bash bodies get these shell forms too.
+  [bash tools](../crates/harnx-bash-tools/README.md#output-in-bash-scripts),
+  [fetch tools](../crates/harnx-fetch-tools/README.md#output-in-bash-scripts) and
+  [attachment tools](../crates/harnx-attachment-tools/README.md#output-in-bash-scripts)
+  READMEs for `bash_exec`, the fetchers, and `attachment_read`/`attachment_create`.
+  Bash bodies get these shell forms too.
 - A tool without a shell form prints JSON from `structuredContent` when present,
   or text otherwise. Use `-o json` or `-o text` to override: `-o text` prints a
   mapped tool's `stdout` field, or the JSON again when the mapping has no

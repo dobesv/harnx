@@ -95,6 +95,48 @@ attachments_attachment_create --mime-type image/png --encoding base64 --content 
 
 `/tmp/x.png` must already exist in the script VFS. The command uses the agent-visible tool name; custom server names or cross-package tools can have different prefixes.
 
+## Output in bash scripts
+
+When an agent selects this toolset's tools in `bash_tools`, the inner calls ask
+for structured results and the commands behave like file tools:
+
+- `attachments_attachment_read` prints the selected text on stdout byte for
+  byte, without truncation markers or paging notices. What was cut off is a
+  note on stderr, and `-o json` (or Python's `tools.attachments_attachment_read(...)`)
+  returns the fields:
+  - Byte mode: `text`, `notes`, `url`, `content_type`, `byte_offset`,
+    `next_byte_offset` (the offset to pass next; `null` at the end),
+    `end_of_content`, `total_bytes`. The stderr note names the next
+    `byte_offset` while content remains.
+  - Line mode: `text`, `notes`, `url`, `content_type`. The byte cap keeps
+    whole lines from the start and the note names the `offset` that
+    continues; `head_lines`/`tail_lines` are honored as explicit caps and
+    drop the middle with an "N lines left out" note instead of the model
+    mode's silent 250/750-line window. `grep` matches the line without its
+    LF/CRLF terminator and reports how many lines it left out; an invalid
+    pattern leaves the text unfiltered with a stderr note saying so. A
+    cap-cut note without `Use offset=` means the byte cap stopped inside a
+    two-sided head/tail cut, whose kept blocks are disjoint, so no single
+    continuation line exists — not that the content ended. Grep and
+    window-omission notes never carry a cursor. `limit` truncates without
+    a note, since the caller chose it.
+  - A single line longer than `max_output_bytes` is cut at a character
+    boundary, and the note names the `offset` that skips past it.
+- Images still return image blocks (the script layer externalizes them to
+  `/attachments/<cid>`), and non-displayable binary content is still a tool
+  error that exits 1.
+- `attachments_attachment_create` prints its confirmation line
+  (`Created attachment: <cid>`, newline-terminated) on stdout; `-o json` and
+  Python return `message`, `url` and `mime_type`, so a script never parses
+  the line for the URL.
+
+**MCP bridge limit**: the bridge counts the serialized envelope, not just the
+page text, against its `--max-result-bytes` (default 128 KiB). A full default
+128 KiB page from `attachment_read` is therefore rejected with an explicit
+error until #2984 is fixed; scripts behind a bridge must pass a smaller
+`--byte-limit` or `--max-output-bytes`, or the operator raises the bridge's
+limit. Direct NATS tool servers have no such cap.
+
 ## NATS Object Store usage
 
 Attachments are stored in the `harnx_attachments` JetStream Object Store bucket under keys named:

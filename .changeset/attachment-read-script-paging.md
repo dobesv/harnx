@@ -1,0 +1,4 @@
+---
+harnx: minor
+---
+`attachment_read` answers scripts with structured paging results: clean text on stdout, cut-off and continuation notices on stderr, and `next_byte_offset`/`end_of_content` fields in byte mode (plus `url`, `content_type`, `byte_offset`, `total_bytes`). Line mode in a script drops the silent 250/750-line window and the in-band truncation markers: explicit `head_lines`/`tail_lines` keep their caps with an "N lines left out" note, the byte cap keeps whole lines and names the continuing `offset`, and grep reports the lines it dropped. `attachment_create` in a script keeps its confirmation line on stdout and adds `url` and `mime_type` fields for `-o json` and Python. Images, binary errors and direct model calls are unchanged. A full 128 KiB page behind the MCP bridge still exceeds its result limit (#2984); scripts there must page smaller.

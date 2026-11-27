@@ -32,6 +32,9 @@ mod plans;
 
 const TOKEN: &str = "bash-script-mode-test-token";
 
+#[path = "bash_script_mode/attachments.rs"]
+mod attachments;
+
 pub(crate) struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
 impl EnvGuard {
