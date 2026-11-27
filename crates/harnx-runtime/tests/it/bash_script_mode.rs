@@ -30,6 +30,7 @@ use harnx_runtime::nats_worker::{ToolServerStartConfig, ToolServerSupervisor};
 use harnx_runtime::tool::BuildToolEvalContextParams;
 use serde_json::json;
 
+mod grep;
 mod plans;
 
 const TOKEN: &str = "bash-script-mode-test-token";
@@ -160,7 +161,7 @@ async fn start_tool_servers(
 }
 
 /// Bash-only agent: `bash_tools` set to `patterns` and no `use_tools`.
-fn script_mode_config(patterns: &[&str]) -> Arc<ConfigLock> {
+pub(crate) fn script_mode_config(patterns: &[&str]) -> Arc<ConfigLock> {
     let mut agent = AgentConfig::from_prompt("test");
     agent.set_bash_tools(Some(patterns.iter().map(|p| p.to_string()).collect()));
     let config = Config {
@@ -223,7 +224,7 @@ async fn start_script_server(
 
 /// Run one `bash` call for `script` through the runtime's real wiring and
 /// return its output.
-async fn run_bash_script(
+pub(crate) async fn run_bash_script(
     config: &Arc<ConfigLock>,
     instance_id: &ServerScope,
     script: &str,
@@ -312,7 +313,7 @@ async fn bash_runs_nats_tool_pipeline_e2e() -> Result<()> {
 }
 
 /// The stdout block of a `bash` result's report.
-fn stdout_block(output: &serde_json::Value) -> String {
+pub(crate) fn stdout_block(output: &serde_json::Value) -> String {
     let text = output["content"][0]["text"].as_str().unwrap_or_default();
     text.split("<!-- start stdout -->")
         .nth(1)

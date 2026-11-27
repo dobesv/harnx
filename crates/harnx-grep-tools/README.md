@@ -80,3 +80,20 @@ Expected output shape (formatted as 2-space-indented JSON):
 ```
 
 This is expected behavior — the server correctly surfaces the rate limit. The tool behavior is correct; it's grep.app rate-limiting requests from certain environments.
+
+## Output in `bash` scripts
+
+Inside the `bash` tool, a script's inner call asks for the structured result,
+and `grep_query` returns the whole report as one JSON document in
+`structuredContent`: the default call, `-o text` and `-o json` all print it as
+one compact JSON line, so it pipes into `jq`. A direct model call keeps the
+2-space pretty-printed text above, byte for byte. Python calls such as
+`tools.grep_grep_query(query="FastAPI")` return the document as a dict (the
+runtime prefixes the `grep` server name onto the raw `grep_query` tool).
+Errors keep their text form and exit status in every format.
+
+The document has two shapes: hits carry `results_by_repository`, and a
+no-results (404) response carries `summary.message` and an empty `results`
+array. `harnx:script_output` and `harnx:output_schema` in the tool listing
+declare the union of both, so `help grep_grep_query` shows an `OUTPUT` section
+and a `FIELDS (-o json)` list covering both.

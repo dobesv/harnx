@@ -94,6 +94,7 @@ arboard = { workspace = true }
 crc32fast = "1"
 harnx-claude-hook-tools = { path = "../harnx-claude-hook-tools" }
 harnx-attachment-tools = { path = "../harnx-attachment-tools" }
+harnx-grep-tools = { path = "../harnx-grep-tools" }
 harnx-test-bins = { path = "../harnx-test-bins" }
 harnx-telemetry = { workspace = true, features = ["testing"] }
 harnx-time-tools = { path = "../harnx-time-tools" }
