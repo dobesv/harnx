@@ -5197,6 +5197,7 @@ dependencies = [
  "harnx-core",
  "harnx-engine",
  "harnx-fetch",
+ "harnx-grep-tools",
  "harnx-healthz",
  "harnx-metrics",
  "harnx-nats-common",
