@@ -396,8 +396,8 @@ fn validate_attachment_digest(expected: &str, bytes: &[u8], mime_type: &str) -> 
     Ok(())
 }
 
-/// Upload locally-created session attachments, such as image content returned
-/// by tools, before the worker publishes the durable turn boundary.
+/// Ensure every referenced attachment is durable before the worker publishes
+/// the turn boundary. Only attachments missing from JetStream need a local copy.
 pub async fn sync_session_attachments(
     jetstream: &jetstream::Context,
     config: &crate::config::GlobalConfig,
@@ -418,9 +418,21 @@ pub async fn sync_session_attachments(
     }
     let store = ensure_attachments_bucket(jetstream, replicas).await?;
     for cid in refs {
-        let cid_url = parse_media_url(&cid)?;
-        let (bytes, mime_type) = read_attachment_async(&dir, &local_cid(&cid_url)?).await?;
-        put_media(&store, &cid_url, &bytes, &mime_type).await?;
+        sync_attachment_ref(&store, &dir, &cid).await?;
+    }
+    Ok(())
+}
+
+// qual:allow(iosp) — Keep the leader presence check and local upload fallback in one place.
+async fn sync_attachment_ref(store: &AttachmentsBucket, dir: &Path, cid: &str) -> Result<()> {
+    let cid_url = parse_media_url(cid)?;
+    // Middleware can upload an image before this worker has hydrated it. Use
+    // leader metadata so a lagging follower cannot turn that upload into a miss.
+    if leader_live_attachment_info(store, &cid_url)
+        .await?
+        .is_none()
+    {
+        read_and_upload_local_attachment(store, Some(dir), cid, &cid_url).await?;
     }
     Ok(())
 }

@@ -142,6 +142,11 @@ impl Toolset for ProbeToolset {
         if let Some(notify) = blocker {
             notify.notified().await;
         }
+        if let Some(data) = args["inline_image_data"].as_str() {
+            return Ok(
+                json!({"content": [{"type": "image", "mimeType": "image/png", "data": data}]}),
+            );
+        }
         let mut out = json!({
             "value": args.get("value").cloned().unwrap_or(json!("ok")),
             "branch": args.get("branch").cloned().unwrap_or(json!("none")),
