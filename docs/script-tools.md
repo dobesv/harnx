@@ -174,8 +174,10 @@ same CLI flags, output and exit codes as in the `bash` tool's script mode:
   [fetch tools](../crates/harnx-fetch-tools/README.md#output-in-bash-scripts) READMEs
   for `bash_exec` and the fetchers. Bash bodies get these shell forms too.
 - A tool without a shell form prints JSON from `structuredContent` when present,
-  or text otherwise. Use `-o json` or `-o text` to override. Text output omits
-  content blocks not addressed to the assistant.
+  or text otherwise. Use `-o json` or `-o text` to override: `-o text` prints a
+  mapped tool's `stdout` field, or the JSON again when the mapping has no
+  `stdout` field (for example, the plans getters and list tools). Text output
+  omits content blocks not addressed to the assistant.
 - Commands exit `0` on success; `1` on a tool error; `2` on a usage or flag
   error, or when a tool reports its own error status; `126` when the call needs
   approval (stderr reads `needs approval: <tool>; call it directly instead of

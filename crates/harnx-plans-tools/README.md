@@ -91,6 +91,19 @@ Deleted and purged keys are excluded; concurrent deletions can shorten a page.
 - Tasks: `list_tasks`, `add_task`, `get_task`, `update_task`, `delete_task`
 - Notes: `list_notes`, `add_note`, `get_note`, `update_note`, `delete_note`
 
-Tool responses include markdown cross-links (`[title](url)`) and MCP `ContentBlock::resource_link` entries with MIME `text/markdown; charset=utf-8` for the plan index and affected item, while preserving diff blocks for mutations.
+Direct list calls return one pretty-printed JSON block. The getters return
+pretty-printed JSON plus Markdown cross-links (`[title](url)`) and MCP
+`ContentBlock::resource_link` entries for the plan index and affected item, with
+MIME `text/markdown; charset=utf-8`. Mutation responses retain their links and
+diff blocks.
+
+Inside the `bash` tool, `plans_get_*` print the document as JSON without extra
+link blocks, and `plans_list_*` print a page as `{items, next_cursor}` JSON. Both
+`-o text` and `-o json` print the same JSON as the default mode. Pipe the result
+to `jq`, or use `help plans_list_plans` (or `help` for the corresponding
+command) to see the top-level page fields. Plan list items are summaries with
+`task_count` and `note_count`, not the body and child IDs returned by
+`plans_get_plan`. Python calls such as `tools.plans_list_plans()` return a dict.
+Use `next_cursor` as `cursor` to read the next page.
 
 Writes use revision compare-and-set and retry conflicts up to five times. Writes touch owner session activity so active plans follow session retention instead of a separate filesystem cleanup policy. Reads don't, so a session whose plans are only read still expires.

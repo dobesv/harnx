@@ -466,9 +466,12 @@ fs_find --pattern '*.rs' --path src | head -1       # src/lib.rs, usable as fs_r
 fs_grep --pattern TODO --path src -o json | jq -r '.matches[0].path'
 ```
 
-`-o json` prints the whole `structuredContent` on one line. Stderr and the exit
-status are the same in both formats. A mapped tool exits with its `exit_code` field
-on success. `help <tool>` shows an OUTPUT section built from the mapping.
+`-o json` prints the whole `structuredContent` on one line. `-o text` prints the
+mapping's `stdout` field, or the whole JSON again when the mapping has no
+`stdout` field, as for the plans tools that return a document or list page.
+Stderr and the exit status are the same in every format. A mapped tool
+exits with its `exit_code` field on success. `help <tool>` shows an OUTPUT
+section built from the mapping.
 
 A tool with a shell form also declares its result fields with
 `ToolSpec::with_output_schema(schema)`, stored under `harnx:output_schema`. The

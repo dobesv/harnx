@@ -232,7 +232,20 @@ fn apply_replace_in(body: &str, edit: &ReplaceInContent) -> Result<String, Error
     }
 }
 
-pub(crate) fn result_json(value: Value) -> Result<CallToolResult, ErrorData> {
+pub(crate) fn result_page(
+    items: Vec<Value>,
+    next_cursor: Option<String>,
+    structured_result: bool,
+) -> Result<CallToolResult, ErrorData> {
+    let value = serde_json::json!({"items": items, "next_cursor": next_cursor});
+    if structured_result {
+        Ok(CallToolResult::structured(value))
+    } else {
+        result_json(value)
+    }
+}
+
+fn result_json(value: Value) -> Result<CallToolResult, ErrorData> {
     let text = serde_json::to_string_pretty(&value)
         .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
     result_text(text)
@@ -274,7 +287,19 @@ pub(crate) fn item_resources(
     ]
 }
 
-pub(crate) fn result_json_with_resources(
+pub(crate) fn result_document(
+    value: Value,
+    resources: Vec<ResponseResource>,
+    structured_result: bool,
+) -> Result<CallToolResult, ErrorData> {
+    if structured_result {
+        Ok(CallToolResult::structured(value))
+    } else {
+        result_json_with_resources(value, resources)
+    }
+}
+
+fn result_json_with_resources(
     value: Value,
     resources: Vec<ResponseResource>,
 ) -> Result<CallToolResult, ErrorData> {
