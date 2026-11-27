@@ -145,6 +145,7 @@ impl UpstreamUsers {
     }
 }
 
+// qual:allow(srp, god_struct) reason: "test fixture: one mock server whose per-user tools and handshake bookkeeping share all its state"
 #[derive(Clone)]
 struct PerUserUpstream {
     users: UpstreamUsers,
@@ -164,6 +165,10 @@ struct PerUserUpstream {
     /// the client must fall back to the sessionful `initialize` handshake
     /// (live server-side sessions).
     legacy_sessions: bool,
+    /// The raw `harnx:structured_result` `_meta` value of each
+    /// `structured_echo` call — `None` when the key is absent — in call
+    /// order, separate from the response-shape decision.
+    structured_requests: Arc<Mutex<Vec<Option<Value>>>>,
 }
 
 /// A deterministic handshake stall: once armed, the next upstream handshake
@@ -258,6 +263,41 @@ impl PerUserUpstream {
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "echo:{token}"
         ))]))
+    }
+
+    /// An upstream that keys its result shape on the structured-result
+    /// request: a script-style `structuredContent` when asked, model-style
+    /// text otherwise.
+    #[tool(description = "Report script-style streams when the structured result is requested")]
+    async fn structured_echo(
+        &self,
+        _args: Parameters<UpstreamArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let requested = context
+            .meta
+            .get(harnx_toolset::CAPABILITY_STRUCTURED_RESULT)
+            .cloned();
+        self.structured_requests
+            .lock()
+            .expect("structured request log lock")
+            .push(requested.clone());
+        if requested.as_ref().and_then(Value::as_bool).unwrap_or(false) {
+            let mut result =
+                CallToolResult::success(vec![ContentBlock::text("structured mode content")]);
+            result.structured_content = Some(json!({
+                "stdout": "upstream stdout\n",
+                "stderr": "upstream stderr",
+                "exit_code": 3,
+                "items": ["alpha", "beta"],
+                "count": 2,
+            }));
+            Ok(result)
+        } else {
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                "model-style text",
+            )]))
+        }
     }
 
     fn label(&self, context: &RequestContext<RoleServer>) -> Option<String> {
@@ -361,11 +401,30 @@ impl ServerHandler for PerUserUpstream {
         let tools = tools
             .into_iter()
             .map(|name| {
-                rmcp::model::Tool::new(
+                // The script-output mapping rides in `_meta`, the way a
+                // script-capable upstream advertises it.
+                let meta = (name == "structured_echo").then(|| {
+                    let output = harnx_toolset::ScriptOutput {
+                        stdout: Some("stdout".to_string()),
+                        stderr: Some("stderr".to_string()),
+                        exit_code: Some("exit_code".to_string()),
+                        summary: Some("mapped stdout/stderr/exit_code, like a command".to_string()),
+                        ..Default::default()
+                    };
+                    let mut meta = rmcp::model::MetaObject::default();
+                    meta.0.insert(
+                        harnx_toolset::SCRIPT_OUTPUT_META_KEY.to_string(),
+                        serde_json::to_value(output).expect("script output serializes"),
+                    );
+                    meta
+                });
+                let mut tool = rmcp::model::Tool::new(
                     name,
                     "per-user upstream tool",
                     Arc::new(serde_json::Map::new()),
-                )
+                );
+                tool.meta = meta;
+                tool
             })
             .collect();
         Ok(ListToolsResult {
@@ -392,12 +451,27 @@ pub struct UpstreamHandle {
     pub initialize_count: Arc<AtomicUsize>,
     fail_list_tools: Arc<AtomicBool>,
     fail_handshake: Arc<AtomicBool>,
+    /// The raw `harnx:structured_result` `_meta` value of each
+    /// `structured_echo` call — `None` when the key is absent — in call
+    /// order.
+    structured_requests: Arc<Mutex<Vec<Option<Value>>>>,
     /// The in-memory session table of a session-mode upstream.
     pub session_manager:
         Option<Arc<rmcp::transport::streamable_http_server::session::local::LocalSessionManager>>,
     shutdown: CancellationToken,
     join: tokio::task::JoinHandle<()>,
     peers: Arc<Mutex<Vec<Peer<RoleServer>>>>,
+}
+
+impl UpstreamHandle {
+    /// The raw `harnx:structured_result` `_meta` value of each
+    /// `structured_echo` call (`None` when absent), in call order.
+    pub fn structured_requests(&self) -> Vec<Option<Value>> {
+        self.structured_requests
+            .lock()
+            .expect("structured request log lock")
+            .clone()
+    }
 }
 
 impl UpstreamHandle {
@@ -436,6 +510,8 @@ struct UpstreamOptions<'a> {
     /// Serve real `Mcp-Session-Id` sessions with an observable in-memory
     /// session table, so a client's shutdown DELETE is visible.
     session_mode: bool,
+    /// Give alice the shape-switching `structured_echo` tool.
+    structured_tools: bool,
 }
 
 /// Spawn the per-user mock upstream. `token_header` is the HTTP header the
@@ -450,6 +526,7 @@ pub async fn spawn_per_user_upstream(
         gate: None,
         leak_tools: false,
         session_mode: false,
+        structured_tools: false,
     })
     .await
 }
@@ -465,6 +542,7 @@ pub async fn spawn_gated_upstream(
         gate: Some(gate),
         leak_tools: false,
         session_mode: false,
+        structured_tools: false,
     })
     .await
 }
@@ -477,6 +555,22 @@ pub async fn spawn_leaky_upstream(token_header: &str) -> Result<UpstreamHandle> 
         gate: None,
         leak_tools: true,
         session_mode: false,
+        structured_tools: false,
+    })
+    .await
+}
+
+/// A mock upstream whose alice sees the shape-switching `structured_echo`
+/// tool: script-style `structuredContent` when the structured result is
+/// requested, model-style text otherwise.
+pub async fn spawn_structured_upstream(token_header: &str) -> Result<UpstreamHandle> {
+    spawn_upstream_with(UpstreamOptions {
+        token_header,
+        reserved_collision: false,
+        gate: None,
+        leak_tools: false,
+        session_mode: false,
+        structured_tools: true,
     })
     .await
 }
@@ -496,6 +590,7 @@ pub async fn spawn_session_upstream(
         gate: None,
         leak_tools: false,
         session_mode: true,
+        structured_tools: false,
     })
     .await?;
     let manager = handle
@@ -522,6 +617,7 @@ pub async fn spawn_gated_session_upstream(
         gate: Some(gate),
         leak_tools: false,
         session_mode: true,
+        structured_tools: false,
     })
     .await?;
     let manager = handle
@@ -539,19 +635,21 @@ async fn spawn_upstream_with(options: UpstreamOptions<'_>) -> Result<UpstreamHan
         gate,
         leak_tools,
         session_mode,
+        structured_tools,
     } = options;
     let users = UpstreamUsers::default();
     {
         let mut map = users.map.lock().expect("users lock");
-        let alice_tools = match (reserved_collision, leak_tools) {
-            (_, true) => vec![
+        let alice_tools = match (reserved_collision, leak_tools, structured_tools) {
+            (_, true, _) => vec![
                 "whoami".to_string(),
                 "search".to_string(),
                 "leak_error".to_string(),
                 "leak_result".to_string(),
             ],
-            (true, false) => default_user_tools(true),
-            (false, false) => default_user_tools(false),
+            (true, false, _) => default_user_tools(true),
+            (false, false, true) => vec!["structured_echo".to_string()],
+            (false, false, false) => default_user_tools(false),
         };
         map.insert(
             ALICE_TOKEN.to_string(),
@@ -571,6 +669,7 @@ async fn spawn_upstream_with(options: UpstreamOptions<'_>) -> Result<UpstreamHan
     let peers = Arc::new(Mutex::new(Vec::new()));
     let fail_list_tools = Arc::new(AtomicBool::new(false));
     let fail_handshake = Arc::new(AtomicBool::new(false));
+    let structured_requests = Arc::new(Mutex::new(Vec::new()));
     let server = PerUserUpstream {
         users: users.clone(),
         initialize_count: Arc::clone(&initialize_count),
@@ -579,6 +678,7 @@ async fn spawn_upstream_with(options: UpstreamOptions<'_>) -> Result<UpstreamHan
         fail_list_tools: Arc::clone(&fail_list_tools),
         fail_handshake: Arc::clone(&fail_handshake),
         legacy_sessions: session_mode,
+        structured_requests: Arc::clone(&structured_requests),
     };
     let shutdown = CancellationToken::new();
     let mut config = StreamableHttpServerConfig::default()
@@ -621,6 +721,7 @@ async fn spawn_upstream_with(options: UpstreamOptions<'_>) -> Result<UpstreamHan
         initialize_count,
         fail_list_tools,
         fail_handshake,
+        structured_requests,
         shutdown,
         join,
         peers,
@@ -754,6 +855,28 @@ pub async fn invoke(
         user_id: user_id.map(str::to_string),
         input_responses: responses.iter().cloned().collect(),
         request_state,
+        ..Default::default()
+    };
+    let invocation = harnx_toolset::ToolInvocation {
+        tool: tool.to_string(),
+        args: json!({}),
+        context,
+        cancel: CancellationToken::new(),
+    };
+    toolset.invoke_with_context(invocation).await
+}
+
+/// Invoke one tool with explicit invocation capabilities — the shape a
+/// script-mode inner call sends when it asks for a structured result.
+pub async fn invoke_with_capabilities(
+    toolset: &harnx_mcp_remote::native::toolset::RemoteCredentialsToolset,
+    tool: &str,
+    user_id: Option<&str>,
+    capabilities: &[&str],
+) -> Result<Value, harnx_toolset::ToolInvokeError> {
+    let context = harnx_toolset::ToolInvocationContext {
+        user_id: user_id.map(str::to_string),
+        capabilities: capabilities.iter().map(|name| name.to_string()).collect(),
         ..Default::default()
     };
     let invocation = harnx_toolset::ToolInvocation {
