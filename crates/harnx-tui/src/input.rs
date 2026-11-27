@@ -55,7 +55,7 @@ impl Tui {
         });
     }
 
-    async fn handle_ctrl_d(&mut self) {
+    pub(super) async fn handle_ctrl_d(&mut self) {
         // Preserve Ctrl+D's existing idle abort; busy exit defers it to modal confirmation.
         let idle_exit = !self.app.llm_busy;
         if idle_exit {
@@ -260,6 +260,7 @@ impl Tui {
         }
 
         match (key.code, key.modifiers) {
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => self.pick_attachment_files().await,
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => self.handle_ctrl_d().await,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.handle_ctrl_c().await,
             (KeyCode::Up, KeyModifiers::NONE) => {
@@ -274,30 +275,8 @@ impl Tui {
             (KeyCode::Down, KeyModifiers::SHIFT) => {
                 self.handle_down_key_shift();
             }
-            (KeyCode::PageUp, KeyModifiers::NONE) => {
-                self.clear_footer_notice();
-                if self.app.detail_view_open {
-                    for _ in 0..10 {
-                        self.app.detail_view_scroll.scroll_up();
-                    }
-                    return Ok(());
-                }
-                for _ in 0..10 {
-                    self.app.scroll_state.scroll_up();
-                }
-            }
-            (KeyCode::PageDown, KeyModifiers::NONE) => {
-                self.clear_footer_notice();
-                if self.app.detail_view_open {
-                    for _ in 0..10 {
-                        self.app.detail_view_scroll.scroll_down();
-                    }
-                    return Ok(());
-                }
-                for _ in 0..10 {
-                    self.app.scroll_state.scroll_down();
-                }
-            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => self.scroll_input_page(true),
+            (KeyCode::PageDown, KeyModifiers::NONE) => self.scroll_input_page(false),
             (KeyCode::Tab, KeyModifiers::NONE) => {
                 self.handle_tab(false).await;
             }
@@ -426,6 +405,7 @@ impl Tui {
             .await;
         self.pin_transcript_to_bottom();
         self.app.input = Self::new_input();
+        self.reset_pending_attachment_view();
         let msg = crate::types::PendingMessage {
             text: text.clone(),
             attachments: std::mem::take(&mut self.app.attachments),
@@ -453,6 +433,14 @@ impl Tui {
         }
         if self.app.modal.is_some() {
             return Some(self.handle_modal_key(key).await);
+        }
+        self.handle_editor_view_key(key).await
+    }
+
+    // qual:allow(iosp) — Keyboard routing selects the exclusive view and delegates its handler.
+    async fn handle_editor_view_key(&mut self, key: KeyEvent) -> Option<Result<()>> {
+        if self.handle_pending_attachment_key(key).await {
+            return Some(Ok(()));
         }
         if self.app.detail_view_open {
             Some(self.handle_detail_view_key(key).await)
@@ -501,6 +489,24 @@ impl Tui {
             &mut self.app.scroll_state
         };
         scroll_mouse_state(state, up);
+    }
+
+    /// Preserve detail-view routing even when a page key reaches the composer
+    /// fallback; exclusive overlays normally handle these keys first.
+    pub(super) fn scroll_input_page(&mut self, up: bool) {
+        self.clear_footer_notice();
+        let scroll = if self.app.detail_view_open {
+            &mut self.app.detail_view_scroll
+        } else {
+            &mut self.app.scroll_state
+        };
+        for _ in 0..BROWSE_PAGE_LINES {
+            if up {
+                scroll.scroll_up();
+            } else {
+                scroll.scroll_down();
+            }
+        }
     }
 
     /// Clear the shared pending message so the prompt task does not consume a
@@ -558,27 +564,14 @@ impl Tui {
             return;
         }
 
+        if self.focus_pending_from_input() {
+            return;
+        }
+
         if !self.app.completions.is_empty() {
             self.app.scroll_state.scroll_up();
         } else if let Some(focus) = self.app.transcript_focus {
-            if let Some(prev) = self.find_prev_navigable(focus) {
-                self.app.transcript_focus = Some(prev);
-                self.app.transcript_browsing = true;
-                self.app.scroll_state.follow = false;
-                self.app.scroll_to_focused_item = true;
-                self.app.transcript_selection_anchor = None;
-            } else if self.interaction_pending() {
-                // Clamped at the first item: no composer-history fallback
-                // while a confirmation is pending (plan decision 5).
-            } else {
-                self.app.transcript_focus = None;
-                self.app.transcript_selection_anchor = None;
-                self.app.transcript_browsing = false;
-                // Do NOT restore follow here — user is entering history preview
-                // and the transcript position should stay where it is.
-                // follow is restored by Esc or when a new message is submitted.
-                self.preview_history_prev();
-            }
+            self.up_from_focused_transcript_row(focus);
         } else if self.input_is_blank() && self.enter_transcript_browsing() {
             // Entered transcript browsing at the last navigable item.
         } else if self.interaction_reading() {
@@ -590,6 +583,27 @@ impl Tui {
             self.preview_history_prev();
         } else {
             self.app.input.input(TextInput::from(key));
+        }
+    }
+
+    fn up_from_focused_transcript_row(&mut self, focus: usize) {
+        if let Some(prev) = self.find_prev_navigable(focus) {
+            self.app.transcript_focus = Some(prev);
+            self.app.transcript_browsing = true;
+            self.app.scroll_state.follow = false;
+            self.app.scroll_to_focused_item = true;
+            self.app.transcript_selection_anchor = None;
+        } else if self.interaction_pending() {
+            // Clamped at the first item: no composer-history fallback
+            // while a confirmation is pending (plan decision 5).
+        } else {
+            self.app.transcript_focus = None;
+            self.app.transcript_selection_anchor = None;
+            self.app.transcript_browsing = false;
+            // Do NOT restore follow here — user is entering history preview
+            // and the transcript position should stay where it is.
+            // follow is restored by Esc or when a new message is submitted.
+            self.preview_history_prev();
         }
     }
 
@@ -625,6 +639,8 @@ impl Tui {
             self.app.scroll_state.follow = false;
             self.app.scroll_to_focused_item = true;
             self.app.transcript_selection_anchor = None;
+        } else if !self.app.attachments.is_empty() && !self.interaction_pending() {
+            self.focus_pending_attachment(0);
         } else {
             self.exit_browse_to_tray();
         }

@@ -215,6 +215,8 @@ impl ToolConfirmationRouteHandle {
 #[derive(Clone, Debug)]
 pub(super) struct Attachment {
     pub(super) path: PathBuf,
+    /// Presentation label; explicit files and pastes can share a name. Target
+    /// a selected attachment by its index or storage path when removing it.
     pub(super) display_name: String,
 }
 
@@ -271,6 +273,7 @@ pub(super) struct App {
     pub(super) history_draft: String,
     pub(super) history_preview: bool,
     pub(super) attachments: Vec<Attachment>,
+    pub(super) pending_attachment_view: crate::pending_attachments::PendingAttachmentView,
     /// Temp directory holding copies of all current attachments. Created on
     /// first attach, removed recursively on submit or full detach.
     pub(super) attachment_dir: Option<PathBuf>,
@@ -1164,6 +1167,7 @@ impl Default for App {
             history_draft: String::new(),
             history_preview: false,
             attachments: Vec::new(),
+            pending_attachment_view: Default::default(),
             attachment_dir: None,
             paste_count: 0,
             last_known_input_width: 0,
