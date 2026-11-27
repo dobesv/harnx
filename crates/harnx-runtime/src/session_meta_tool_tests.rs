@@ -168,6 +168,9 @@ async fn read_returns_identity_properties_and_observed_repositories() {
         })
     );
     assert!(!view.to_string().contains("/private/workspace"));
+    meta_output_validator()
+        .validate(&view)
+        .expect("populated view must match help schema");
 }
 
 #[tokio::test]
@@ -238,4 +241,59 @@ async fn sessions_without_canonical_metadata_fail_recoverably() {
     crate::config::session::attach_memory_log(&mut session);
     let message = call_error(&provider(Some(session)), WRITE_TOOL_NAME, json!({})).await;
     assert!(message.contains("no canonical metadata"), "{message}");
+}
+
+fn meta_output_validator() -> jsonschema::Validator {
+    let shape = SessionMetaProvider::script_shape();
+    jsonschema::validator_for(&shape.output_schema.expect("meta output schema"))
+        .expect("valid meta output schema")
+}
+
+#[tokio::test]
+async fn metadata_providers_preserve_text_and_opt_into_schema_matching_objects() {
+    let provider = provider_for(SessionMetadata::new(
+        "abc123",
+        SessionInitializer::inline("test", Default::default(), Default::default()),
+    ));
+    let schema = meta_output_validator();
+    let abort = harnx_core::abort::create_abort_signal();
+    for (tool, args) in [
+        (READ_TOOL_NAME, json!({})),
+        (WRITE_TOOL_NAME, json!({"add_labels": ["checked"]})),
+    ] {
+        let mut text_only = None;
+        for structured_result in [false, true] {
+            let output = provider
+                .call_tool_with_progress(
+                    tool,
+                    args.clone(),
+                    ToolCallOrigin {
+                        structured_result,
+                        ..Default::default()
+                    },
+                    &abort,
+                    Arc::new(NoopToolProgress),
+                )
+                .await
+                .ok()
+                .expect("metadata tool succeeded")
+                .value;
+            let text = output["content"][0]["text"].as_str().expect("JSON text");
+            let view: Value = serde_json::from_str(text).expect("valid JSON view");
+            schema.validate(&view).expect("view must match help schema");
+            assert_eq!(view["session_id"], "abc123");
+            assert_eq!(view["agent"], Value::Null);
+            assert_eq!(view["title"], Value::Null);
+            if tool == WRITE_TOOL_NAME {
+                assert_eq!(view["properties"]["labels"]["value"], json!(["checked"]));
+            }
+            if structured_result {
+                assert_eq!(output.get("structuredContent"), Some(&view));
+                assert_eq!(text_only.as_deref(), Some(text));
+            } else {
+                assert_eq!(output, json!({"content": [{"type": "text", "text": text}]}));
+                text_only = Some(text.to_string());
+            }
+        }
+    }
 }

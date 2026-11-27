@@ -259,8 +259,8 @@ result = getattr(tools, name)(**args)                  # a tool chosen at run ti
 ```
 
 What a call returns depends on the context. In the `bash` tool, each call above
-returns the tool's structured fields as a dict (`help <tool>` lists them), or
-text as a string for a tool with none. In a script tool's body, middleware or a
+returns the tool's structured JSON as a Python value, or text as a string for a
+tool with no structured result. In a script tool's Python body, middleware or a
 hook, each returns the tool's direct-call result, a dict with a `content` list.
 
 - **Names.** Keyword names are the tool's schema property names as written
@@ -289,14 +289,20 @@ hook, each returns the tool's direct-call result, a dict with a `content` list.
 
 ### In the `bash` tool
 
-A call returns what the tool's Bash command prints with `-o json`, as a dict,
-when the result has structured fields (`help <tool>` lists them under FIELDS).
+For a structured result, a call returns what the tool's Bash command prints
+with `-o json` as a Python value. For example,
+`tools.harnx_agent_session_history_read()` returns a list of rows, or the
+value selected by `jaq` when supplied. `tools.harnx_read_session_meta()` and
+`tools.harnx_write_session_meta(...)` return dicts. Run `help <tool>` to see
+the declared fields under `FIELDS (-o json)`.
+
 A result that is a plain object with no `content` list, as some native tools
-return, comes back as that object. Otherwise it returns the text the command
-prints, as a string that keeps its final newline. A non-zero `exit_code` in the dict, such as a search that matched
-nothing, does not raise. A cut-off result says so in the dict's `notes`; nothing
-is printed for it, because this Python has no separate stderr
-(`print(..., file=sys.stderr)` goes to stdout).
+return, comes back as that object. Otherwise the call returns the text the
+command prints, as a string that keeps its final newline. A non-zero
+`exit_code` in a dict, such as a search that matched nothing, does not raise.
+A cut-off result says so in the dict's `notes`; nothing is printed for it,
+because this Python has no separate stderr (`print(..., file=sys.stderr)` goes
+to stdout).
 
 A tool failure raises `RuntimeError` whose message starts with the tool's name:
 `fs_read: <the tool's message>`. A call that needs approval comes back as a

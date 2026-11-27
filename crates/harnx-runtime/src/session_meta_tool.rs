@@ -9,13 +9,19 @@ use crate::nats_session_metadata::{
     repository_contexts, session_properties, Inheritance, SessionMetadata, SessionPropertiesUpdate,
     PROPERTY_DEFINITIONS,
 };
+use crate::{tool::session_json_output, ScriptShape};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use harnx_core::abort::AbortSignal;
 use harnx_core::event::ToolKind;
-use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider, ToolProviderOutput};
+use harnx_core::tool::{
+    JsonSchema, NoopToolProgress, ToolCallOrigin, ToolDeclaration, ToolError, ToolProgress,
+    ToolProvider, ToolProviderOutput,
+};
+use harnx_toolset::{output_field, output_nullable_field, ScriptOutput};
 use serde_json::{json, Value};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const READ_TOOL_NAME: &str = "harnx_read_session_meta";
@@ -167,6 +173,36 @@ impl SessionMetaProvider {
     pub fn new(config: GlobalConfig) -> Self {
         Self { config }
     }
+
+    pub(crate) fn script_shape() -> ScriptShape {
+        ScriptShape {
+            output: Some(ScriptOutput {
+                summary: Some("Session metadata as a JSON object.".to_string()),
+                ..Default::default()
+            }),
+            output_schema: Some(session_meta_output_schema()),
+        }
+    }
+}
+
+fn session_meta_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": output_field("string", "Local session ID."),
+            "agent": output_nullable_field("string", "Agent name, or null for an inline agent."),
+            "title": output_nullable_field("string", "Session title, or null if unset."),
+            "created_at": output_field("string", "Session creation time."),
+            "properties": output_field("object", "Properties by name, each with a value and an inherit flag."),
+            "observed_repositories": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": "Repositories and branches observed by session tool calls, without private paths."
+            },
+        },
+        "required": ["session_id", "agent", "title", "created_at", "properties", "observed_repositories"],
+        "additionalProperties": false,
+    })
 }
 
 fn recoverable(error: anyhow::Error) -> ToolError {
@@ -205,6 +241,24 @@ impl ToolProvider for SessionMetaProvider {
         arguments: Value,
         abort: &AbortSignal,
     ) -> Result<ToolProviderOutput, ToolError> {
+        self.call_tool_with_progress(
+            tool_name,
+            arguments,
+            ToolCallOrigin::default(),
+            abort,
+            Arc::new(NoopToolProgress),
+        )
+        .await
+    }
+
+    async fn call_tool_with_progress(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        origin: ToolCallOrigin<'_>,
+        abort: &AbortSignal,
+        _progress: Arc<dyn ToolProgress>,
+    ) -> Result<ToolProviderOutput, ToolError> {
         let no_metadata = || recoverable(anyhow!("this session has no canonical metadata"));
         // Taken under a short guard: the sink's methods are NATS round trips,
         // and the config lock must never be held across one.
@@ -220,7 +274,7 @@ impl ToolProvider for SessionMetaProvider {
         }
         .ok_or_else(no_metadata)?;
         let view = session_meta_view(&metadata).map_err(recoverable)?;
-        Ok(json!({ "content": [{ "type": "text", "text": view.to_string() }] }).into())
+        Ok(session_json_output(view, origin.structured_result))
     }
 }
 

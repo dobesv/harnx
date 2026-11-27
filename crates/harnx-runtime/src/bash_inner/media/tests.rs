@@ -693,3 +693,67 @@ async fn structured_unwrapped_media_bodies_are_replaced_without_guessing_busines
     assert!(document["resource"]["path"].is_string());
     assert_eq!(document["ordinary"]["data"], "business value");
 }
+
+#[tokio::test]
+async fn rewrite_preserves_user_only_annotations_for_all_media_blocks() {
+    let store = Arc::new(MemoryStore::default());
+    let annotations = json!({"audience":["user"]});
+    let mut value = json!({"content":[
+        {"type":"image", "mimeType":"image/png", "data":PNG, "annotations":annotations},
+        {"type":"audio", "mimeType":"audio/wav", "data":"AP8B", "annotations":annotations},
+        {"type":"resource", "resource":{"uri":"file:///image.png", "mimeType":"image/png", "blob":PNG}, "annotations":annotations},
+        {"type":"resource_link", "uri":format!("data:image/png;base64,{PNG}"), "mimeType":"image/png", "annotations":annotations}
+    ]});
+
+    InnerMedia::new(Some(store.clone()))
+        .prepare(&mut value)
+        .await
+        .unwrap();
+
+    for block in value["content"].as_array().unwrap() {
+        assert_eq!(block["type"], "text");
+        assert_eq!(block["annotations"], annotations);
+    }
+    assert_no_inline_png(&value);
+    assert_eq!(store.0.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn user_only_media_annotations_are_filtered_from_default_and_text_pipes() {
+    let value = json!({"content":[
+        {"type":"image", "mimeType":"image/png", "data":PNG, "annotations":{"audience":["user"]}},
+        {"type":"audio", "mimeType":"audio/wav", "data":"AP8B", "annotations":{"audience":["user"]}},
+        {"type":"resource", "resource":{"uri":"file:///image.png", "mimeType":"image/png", "blob":PNG}, "annotations":{"audience":["user"]}},
+        {"type":"resource_link", "uri":format!("data:image/png;base64,{PNG}"), "mimeType":"image/png", "annotations":{"audience":["user"]}},
+        {"type":"text", "text":"assistant-visible", "annotations":{"audience":["assistant"]}}
+    ]});
+
+    for option in ["", "-o text"] {
+        let store = Arc::new(MemoryStore::default());
+        let (provider, _ctx) = harness(value.clone(), Some(store.clone()), Some(store), false);
+        let result = run(&provider, &format!("screenshot {option}")).await;
+        assert_exit_code(&result, 0);
+        assert_eq!(result["stdout"], "assistant-visible\n");
+        assert!(!result["stdout"].as_str().unwrap().contains("[attachment:"));
+    }
+}
+
+#[tokio::test]
+async fn rewrite_keeps_missing_annotations_absent_for_all_media_blocks() {
+    let store = Arc::new(MemoryStore::default());
+    let mut value = json!({"content":[
+        {"type":"image", "mimeType":"image/png", "data":PNG},
+        {"type":"audio", "mimeType":"audio/wav", "data":"AP8B"},
+        {"type":"resource", "resource":{"uri":"file:///image.png", "mimeType":"image/png", "blob":PNG}},
+        {"type":"resource_link", "uri":format!("data:image/png;base64,{PNG}"), "mimeType":"image/png"}
+    ]});
+
+    InnerMedia::new(Some(store))
+        .prepare(&mut value)
+        .await
+        .unwrap();
+
+    for block in value["content"].as_array().unwrap() {
+        assert!(block.get("annotations").is_none());
+    }
+}
