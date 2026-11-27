@@ -29,6 +29,15 @@ fn call_params(
         params.request_state = mrtr::request_state_from_value(&invocation.context.request_state)
             .map_err(ToolInvokeError::Recoverable)?;
     }
+    // The structured-result request rides in `_meta` beside the arguments, the
+    // bridge's pattern: present only when the caller asked, so an upstream
+    // that keys on it serves model-style results by default.
+    if invocation.context.wants_structured_result() {
+        params.meta.get_or_insert_default().insert(
+            harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_owned(),
+            Value::Bool(true),
+        );
+    }
     harnx_telemetry::propagate::inject_current_into_mcp(&mut params);
     Ok(params)
 }
@@ -130,4 +139,74 @@ fn upstream_error(
         "upstream call failed: {}",
         client.redact(&error.to_string())
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_toolset::{ToolInvocation, ToolInvocationContext};
+    use opentelemetry::global;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use rmcp::model::RequestParamsMeta as _;
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    fn invocation(capabilities: &[&str]) -> ToolInvocation {
+        ToolInvocation {
+            tool: "search".into(),
+            args: json!({ "q": "needle" }),
+            context: ToolInvocationContext {
+                capabilities: capabilities.iter().map(|name| name.to_string()).collect(),
+                ..Default::default()
+            },
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn structured_result_capability_is_forwarded_when_requested() {
+        harnx_core::require_nextest();
+        let key = harnx_toolset::CAPABILITY_STRUCTURED_RESULT;
+        let params = call_params(&invocation(&[key])).expect("params");
+        assert_eq!(params.name, "search");
+        let meta = params.meta.as_ref().expect("request _meta");
+        assert_eq!(meta.get(key), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn structured_result_capability_is_omitted_when_not_requested() {
+        harnx_core::require_nextest();
+        let key = harnx_toolset::CAPABILITY_STRUCTURED_RESULT;
+        let params = call_params(&invocation(&[])).expect("params");
+        let present = params
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta.get(key).is_some());
+        assert!(!present, "capability must not be sent unasked: {params:?}");
+    }
+
+    #[test]
+    fn structured_result_trace_context_stays_beside_the_capability() {
+        harnx_core::require_nextest();
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("mcp-remote-structured-result-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("mcp_remote_structured_result_test");
+            let _entered = span.enter();
+            let key = harnx_toolset::CAPABILITY_STRUCTURED_RESULT;
+            let params = call_params(&invocation(&[key])).expect("params");
+            let meta = params.meta.as_ref().expect("request _meta");
+            assert_eq!(meta.get(key), Some(&Value::Bool(true)));
+            assert!(
+                params.traceparent().is_some(),
+                "traceparent stays beside it"
+            );
+        });
+    }
 }

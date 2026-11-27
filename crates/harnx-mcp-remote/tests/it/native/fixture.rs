@@ -57,6 +57,21 @@ pub async fn fixture_on(upstream: &UpstreamHandle) -> (tempfile::TempDir, Native
     (keys, fixture)
 }
 
+/// `fixture_on` plus a connected alice: the preamble every per-user native
+/// test against a custom upstream starts with.
+pub async fn alice_fixture(upstream: &UpstreamHandle) -> (tempfile::TempDir, NativeFixture) {
+    let (keys, fixture) = fixture_on(upstream).await;
+    connect_user(
+        &fixture.server.toolset,
+        &fixture.http_base,
+        Some("alice"),
+        ALICE_TOKEN,
+    )
+    .await
+    .expect("connect alice");
+    (keys, fixture)
+}
+
 pub struct Instance {
     pub server: NativeServer,
     pub http_base: String,

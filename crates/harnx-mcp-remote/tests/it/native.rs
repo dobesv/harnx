@@ -9,5 +9,6 @@ mod fencing;
 pub mod fixture;
 mod http;
 mod lifecycle;
+mod nats_structured_result;
 mod pool;
 mod security;
