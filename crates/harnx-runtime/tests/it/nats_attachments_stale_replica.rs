@@ -1,6 +1,7 @@
 //! A lagging follower misses the upload's metadata and may also host the
 //! consumer. Divert both paths while leaving raw message gets on the leader.
 
+use super::nats_attachments::{sync_config, DataDirGuard};
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, consumer::push::OrderedConfig, stream};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
@@ -16,8 +17,12 @@ use harnx_core::{
     require_nextest,
     safety::format_size,
 };
-use harnx_runtime::nats_attachments::{
-    externalize_message_attachments, hydrate_attachment_refs, AttachmentLocation,
+use harnx_runtime::{
+    config::{Config, SessionAttachmentPath},
+    nats_attachments::{
+        externalize_message_attachments, hydrate_attachment_refs, sync_session_attachments,
+        AttachmentLocation,
+    },
 };
 use harnx_test_bins::{spawn_configured_nats_server, NatsServerHandle};
 
@@ -142,6 +147,30 @@ fn image_ref(cid: &str) -> MessageContent {
     MessageContent::Array(vec![MessageContentPart::ImageUrl {
         image_url: ImageUrl { url: cid.into() },
     }])
+}
+
+#[tokio::test]
+async fn session_attachment_sync_accepts_leader_only_ref_while_replicas_lag() -> Result<()> {
+    let broker = LaggingBroker::start()
+        .await?
+        .context("NATS server required")?;
+    let bytes = base64_decode(PNG_BASE64)?;
+    broker.seed_chunked(&bytes).await?;
+
+    let data_root = tempfile::tempdir()?;
+    let _data_dir = DataDirGuard::isolated(data_root.path());
+    let agent = "sync-agent";
+    let session_id = &broker.session.session_id;
+    let cache = Config::session_attachments_dir(SessionAttachmentPath {
+        agent_name: agent,
+        session_id,
+    })
+    .context("valid cache path")?;
+    let config = sync_config(agent, session_id, image_ref(&broker.url.to_string()));
+    assert!(!cache.exists());
+    sync_session_attachments(&broker.jetstream, &config, 1).await?;
+    assert!(!cache.exists(), "sync only needs leader metadata");
+    Ok(())
 }
 
 #[tokio::test]
