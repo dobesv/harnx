@@ -7,6 +7,9 @@
 //! Both tools operate only over NATS JetStream. No filesystem or HTTP access.
 
 pub mod handlers;
+mod script_result;
+mod script_schema;
 mod toolset;
 
+pub use script_result::ResultStyle;
 pub use toolset::AttachmentToolset;

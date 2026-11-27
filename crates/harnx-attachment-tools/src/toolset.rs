@@ -10,11 +10,12 @@ use harnx_toolset::{ToolInvocation, ToolInvokeError, ToolProgressKind, ToolSpec,
 use crate::handlers::{
     attachment_create, attachment_read, AttachmentCreateParams, AttachmentReadParams,
 };
+use crate::script_result::ResultStyle;
 
 const ATTACHMENT_READ_DESCRIPTION: &str = "Read an attachment or plan by its cid: URL.
 
 Returns image content as image blocks, text and rendered plans as truncated
-text with line numbers, and errors for non-displayable binary content.
+text, and errors for non-displayable binary content.
 
 Two paging modes are available - line-based (default) or byte-based:
 
@@ -101,7 +102,7 @@ impl Toolset for AttachmentToolset {
 
     fn tools(&self) -> Vec<ToolSpec> {
         vec![
-            ToolSpec {
+            crate::script_schema::read_tool(ToolSpec {
                 name: "attachment_read".to_string(),
                 description: ATTACHMENT_READ_DESCRIPTION.to_string(),
                 input_schema: attachment_read_schema(),
@@ -110,9 +111,9 @@ impl Toolset for AttachmentToolset {
                 read_only_hint: true,
                 timeout_secs: None,
                 meta: None,
-            }
+            })
             .with_kind(ToolProgressKind::Read),
-            ToolSpec {
+            crate::script_schema::create_tool(ToolSpec {
                 name: "attachment_create".to_string(),
                 description: ATTACHMENT_CREATE_DESCRIPTION.to_string(),
                 input_schema: attachment_create_schema(),
@@ -121,7 +122,7 @@ impl Toolset for AttachmentToolset {
                 read_only_hint: false,
                 timeout_secs: None,
                 meta: None,
-            }
+            })
             .with_kind(ToolProgressKind::Edit),
         ]
     }
@@ -170,15 +171,26 @@ async fn touch_for_session(
     }
 }
 
+/// A script's inner call asks for a structured result; a model round gets
+/// the original text blocks.
+fn requested_style(context: &harnx_toolset::ToolInvocationContext) -> ResultStyle {
+    if context.wants_structured_result() {
+        ResultStyle::Script
+    } else {
+        ResultStyle::Model
+    }
+}
+
 async fn invoke_with_context_tool(
     invocation: ToolInvocation,
     jetstream: &async_nats::jetstream::Context,
 ) -> Result<serde_json::Value, ToolInvokeError> {
+    let style = requested_style(&invocation.context);
     match invocation.tool.as_str() {
         "attachment_read" => {
             let params: AttachmentReadParams = serde_json::from_value(invocation.args)
                 .map_err(|e| ToolInvokeError::Recoverable(format!("invalid parameters: {}", e)))?;
-            let result = attachment_read(jetstream, params)
+            let result = attachment_read(jetstream, params, style)
                 .await
                 .map_err(|e| ToolInvokeError::Recoverable(e.to_string()))?;
             serde_json::to_value(result).map_err(|e| ToolInvokeError::Recoverable(e.to_string()))
@@ -190,7 +202,7 @@ async fn invoke_with_context_tool(
                 .await
                 .map_err(|e| ToolInvokeError::Recoverable(e.to_string()))?;
             let caller_session = invocation.context.invoking_session.as_ref();
-            let result = attachment_create(&store, caller_session, params)
+            let result = attachment_create(&store, caller_session, params, style)
                 .await
                 .map_err(|e| ToolInvokeError::Recoverable(e.to_string()))?;
             touch_for_session(jetstream, caller_session).await;
