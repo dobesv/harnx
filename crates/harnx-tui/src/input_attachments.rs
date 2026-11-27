@@ -106,7 +106,9 @@ impl Tui {
             || self.app.detail_view_open
             || self.app.transcript_browsing
             || !self.app.subagent_view_stack.is_empty();
-        !overlay_open && (!self.has_root_cancellation() || self.cancellation_editor_restored())
+        !overlay_open
+            && self.app.pending_attachment_view.focus.is_none()
+            && (!self.has_root_cancellation() || self.cancellation_editor_restored())
     }
 
     /// Ensure the attachment temp directory exists, creating it via mkdtemp if needed.
@@ -122,6 +124,7 @@ impl Tui {
 
     /// Clean up the attachment temp directory and reset attachment state.
     pub(super) fn cleanup_attachments(&mut self) {
+        self.reset_pending_attachment_view();
         self.app.attachments.clear();
         if let Some(dir) = self.app.attachment_dir.take() {
             crate::types::cleanup_attachment_dir(&dir);
@@ -152,7 +155,7 @@ impl Tui {
         true
     }
 
-    async fn attach_input_file(&mut self, src: &Path) {
+    pub(super) async fn attach_input_file(&mut self, src: &Path) {
         if !src.exists() {
             self.app.transcript.push(TranscriptItem::ErrorText(format!(
                 "File not found: {}",
@@ -160,6 +163,7 @@ impl Tui {
             )));
             return;
         }
+        let created_dir = self.app.attachment_dir.is_none();
         let dir = match self.ensure_attachment_dir().await {
             Ok(dir) => dir,
             Err(error) => {
@@ -180,9 +184,29 @@ impl Tui {
                 path: dest,
                 display_name,
             }),
-            Err(error) => self.app.transcript.push(TranscriptItem::ErrorText(format!(
-                "Failed to copy attachment: {error}"
-            ))),
+            Err(error) => {
+                if created_dir {
+                    if let Some(dir) = self.app.attachment_dir.take() {
+                        crate::types::cleanup_attachment_dir(&dir);
+                    }
+                }
+                self.app.transcript.push(TranscriptItem::ErrorText(format!(
+                    "Failed to copy attachment: {error}"
+                )));
+            }
+        }
+    }
+
+    pub(super) fn detach_input_attachment(&mut self, index: usize) {
+        let attachment = self.app.attachments.remove(index);
+        if let Err(error) = std::fs::remove_file(&attachment.path) {
+            self.app.transcript.push(TranscriptItem::ErrorText(format!(
+                "Failed to remove detached attachment file {}: {error}",
+                attachment.display_name
+            )));
+        }
+        if self.app.attachments.is_empty() {
+            self.cleanup_attachments();
         }
     }
 

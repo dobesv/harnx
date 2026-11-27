@@ -17,7 +17,10 @@ There is no readline-based REPL.
   - `.set key <tab>` to complete config values.
 - **Multi-line input** via paste (bracketed-paste terminals) or `Shift+Enter` / `Ctrl+J` to insert a newline.
 - **History:** `↑` / `↓` to navigate prior submissions.
-- **Attachments:** `.attach <path>` to attach a file to the next message; `.detach` to remove.
+- **Attachments:** `Ctrl+A` opens a file picker (`fzf --multi` by default) to attach files to the next message. Install `fzf` or set `HARNX_ATTACHMENT_PICKER` to another picker command that prints one selected file path per line. Paths are relative to the TUI's working directory; spaces are preserved. Picker cancellation leaves your draft intact.
+  - Pending attachments appear above the input. Press `↑` from the first input line to select the last attachment, then use `↑` / `↓` to navigate. `↑` past the first attachment enters the transcript; `↓` past the last attachment or `Esc` returns to your draft.
+  - Press `Enter` to preview the selected file (text, or metadata for binary files). Press `d` or `Delete` while selected or previewing to remove it, then `y` to confirm. `Enter`, `n`, or `Esc` cancels removal.
+  - Sending the message includes the pending files. Pending attachments stay local to this client until sent. `.attach <path>`, `.detach`, and `.detach <name>` remain available.
   - **Large pastes** (more than 8 lines or more than 512 characters) are automatically saved as a text attachment instead of being inserted inline. Smaller multi-line pastes are inserted directly into the input.
 - **Sub-agent monitoring:** Delegated child sessions appear as compact rows with
   running, done, or failed status, elapsed time, input/output/cached tokens, and
