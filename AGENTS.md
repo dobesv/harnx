@@ -1277,6 +1277,18 @@ A script that runs to a non-zero `exit` comes back as status `error` with no
 itself (a resource limit, a timeout, a cancel, a fatal inner call) carries
 `error` text (`crates/harnx-script/src/bashkit_backend/outcome.rs`).
 
+`harnx info script-usage` (`crates/harnx-runtime/src/script_usage/`) reads
+stored `bash` results back out of session logs. Status, exit code and
+`failed_call` come from the payload, which sits under `partial_result` when the
+script failed. The inner calls come from the `## inner call trace` section of
+the rendered report, the only place a model round keeps them:
+`script_usage/trace.rs` parses the lines `trace_lines` writes. Two tests in
+`bash_provider/tests.rs` (`script_usage_parser_*`) render a report through the
+provider and parse it back, so a change to the trace's line format fails there
+until the parser follows. A worker that restarts mid-script stores
+`status: "interrupted"` with no exit code (`replay_tool_call`), a status the
+live path never produces.
+
 ### Loop protection
 
 Models, Gemini in particular, fall into loops. Two guards in
@@ -1501,6 +1513,14 @@ changes but should be audited for correctness. `message_role_for_assignment`
 (`config/remote_session_ops.rs`) is one such site: omitting `ToolCalls` made
 `renumber_remote_messages_for_window` wipe every reloaded tool message's `log_seq`,
 silently disabling TUI transcript actions on tool rows (#2557).
+
+Compaction appends the messages it keeps to the log again, after its marker
+(`relog_entries` in `config/session.rs`). A kept tool round becomes a second
+`ToolCalls` + `ToolResults` pair with the original call ids and the original
+timestamp. Code that counts rounds or calls over raw entries has to skip a
+`ToolCalls` whose call ids were all seen earlier, as `analyze_session` in
+`script_usage/session.rs` does; counting the copies doubles the figures for
+exactly the long sessions that get compacted.
 
 Tool rounds are "open" only through `interactions::pending::open_rounds`
 (`harnx-runtime/src/interactions/pending.rs`); any new derivation of open or
@@ -2505,6 +2525,13 @@ sums every model completion in that turn's tool loop. Session cumulative totals 
 metrics use a **separate mechanism**: `record_completion_usage` in `config/mod.rs:1082-1085` writes to
 `Session.completion_usage` per model call. These mechanisms are independent. Anyone modifying usage
 display must keep them separate or they'll double-count.
+
+The durable `SessionLogEntry::TurnEnd.usage` is the in-memory session's `completion_usage` when the
+turn ends (`record_turn_end` in `nats_worker/session_turn.rs`). It is a per-turn figure only because
+each agent-loop run loads a fresh `Session` from the log (`run_agent_loop_with_nats_outcome`), and
+`completion_usage` is never restored from earlier entries, so it starts at zero. `harnx info
+script-usage` reports tokens per turn from this field. Keeping a session in memory across turns
+would make the entry cumulative and that report wrong without any test failing.
 
 Per-tool-call display usage in `ToolEvent::Update.usage` is also display-only and non-cumulative; it
 replaces on each update and is stored in ACP `_meta.harnx:usage` (`harnx-acp-server/src/event_map.rs:254`,

@@ -392,6 +392,18 @@ pub enum InnerTraceStatus {
 }
 
 impl InnerTraceStatus {
+    /// Every status, so a reader of the rendered trace can recognise each one
+    /// without keeping a second list.
+    pub(crate) const ALL: [InnerTraceStatus; 7] = [
+        Self::Ok,
+        Self::ToolError,
+        Self::Blocked,
+        Self::ApprovalRequired,
+        Self::Rejected,
+        Self::Fatal,
+        Self::Cancelled,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",

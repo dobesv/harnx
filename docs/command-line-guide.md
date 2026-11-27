@@ -628,6 +628,9 @@ there is no `local` alias. The built-in local key is `__local__` (the managed
 broker), and these commands use named-cluster routing the same way
 `harnx delete session --cluster` does.
 
+`harnx info script-usage`, described between them, reads session logs instead of
+storage statistics and takes `--cluster` the same way.
+
 ### `harnx info sessions --cluster <cluster> [--json]`
 
 Cluster-wide storage report: metadata-backed session count (inline and
@@ -669,6 +672,127 @@ retention GC (activity record, falling back to metadata creation time). The
 retention block is a snapshot estimate of what a real GC pass might delete, not
 a guarantee: new leases, activity, revisions and cascade failures all change the
 outcome.
+
+### `harnx info script-usage --cluster <cluster> [--agent <pattern>] [--since <when>] [--until <when>] [--json]`
+
+Reports how agents use the script-mode `bash` tool, built from the stored
+session logs of one cluster. It answers questions such as how many tool calls
+run inside scripts rather than directly, how often scripts fail and why, and how
+much data scripts read compared with what reaches the model. The command is
+read-only: it creates no bucket or stream, refreshes no activity and writes no
+log entry. Only an agent pattern, `--since` and `--until` reduce what is read:
+sessions last active before `--since` or created at or after `--until` are
+skipped, and every other matching session's whole log is read, one broker
+request per entry, so these options keep the command quick on a large cluster.
+Once the sessions are chosen, a line such as `reading 1,234 session logs...`
+goes to stderr before the first read (`log` in the singular for one); stdout
+carries the report alone, with or without `--json`. A session whose log cannot be
+read is counted as unreadable and skipped.
+
+`--agent` is a glob over agent names (`pantheon/*`); `*` also crosses `/`, and an
+invalid pattern is an error. Without it every session counts, inline sessions
+included under the agent label `(inline)`. `--since` and `--until` each take an
+RFC 3339 timestamp (`2026-11-20T10:00:00Z`), a date (`2026-11-20`, UTC midnight)
+or a duration ago (`7d`, `36h`, anything `humantime` accepts). The window applies
+per turn, with `since <= t < until`: a turn counts, with all its rounds and
+scripts, when its first tool round falls in the window, and a turn with no tool
+round counts by its end time. `--json` prints the typed report and nothing else.
+
+What the figures count:
+
+- A model round is a model response that called tools; a final text reply is not
+  a round. A direct call is every tool call that is not `bash`, including
+  sub-agent, plan and handoff tools.
+- A script with one inner call costs a round just like a direct call; that is the
+  `1` bucket of the per-script table. A script with no stored result or payload
+  stays in the `0` bucket.
+- Inner result bytes are the size of the result the script received (the
+  script-style shape), which can differ from the same tool's direct-call result.
+- Calls dropped beyond the retained-trace cap are left out of inner calls, the
+  mean, the share, inner bytes and the per-tool figures; they are counted only in
+  the per-script buckets.
+- Rounds that a compaction logged again are counted once.
+- `bash` results stored before the result was slimmed (they also carried
+  `stdout`, `stderr` and `trace` fields) are larger for the same script, so
+  script result bytes are not comparable across that change.
+
+The text report has these sections:
+
+- **Sessions**: sessions scanned, how many ran at least one script, and how many
+  could not be read.
+- **Tool work**: model rounds, direct tool calls and their errors, scripts with
+  their ok and failed counts, and inner calls (tool calls made from inside
+  scripts) with the mean per script and their share of all tool calls,
+  `inner / (inner + direct)`. A note appears when the stored traces were capped
+  or contained lines that could not be parsed.
+- With no `bash` script in scope, the line `No bash scripts in scope.` takes the
+  place of the three script-only sections below, and `Bytes` and `Recent failures`
+  lose their script lines.
+- **Inner calls per script**: scripts with 0, 1, 2 to 5, 6 to 20 and more than 20
+  inner calls.
+- **Script failures**: one line per failure kind, most frequent first (see below).
+  Exit 126 means an inner call needed approval, was blocked or was rejected; exit
+  127 means a command was not found. The `non_zero_exit` line also lists the exit
+  codes behind it, most frequent first, at most five and then `other` for the
+  rest: `non_zero_exit: 568 (exit 5: 300, exit 1: 200, exit 2: 60)`. Only plain
+  failures with a known exit code are counted there; the other kinds already say
+  what happened. In the script interpreter `jq` exits 5 for input that is not
+  JSON and for indexing errors, so a large `exit 5` count usually points at a
+  script piping something other than JSON into `jq`, or indexing into a value of
+  the wrong shape.
+- **Tools in failed scripts**: the ten tools called by the most failed scripts,
+  each as `<tool>: <failed> of <scripts> scripts failed (<percent>%)`, ordered by
+  failed scripts and then name, with a closing `... N more in --json` line when
+  more tools qualify. A script counts once per tool however many times it called
+  it, so the figures are scripts, not calls. A tool listed here was called by a
+  script that failed, which does not by itself mean the tool caused the failure.
+  Left out when no failed script called a tool. `--json` carries `scripts` and
+  `failed_scripts` on every tool, and `Recent failures` lines end with the
+  script's distinct tool names (`, tools: a, b`, at most five and then `...`).
+- **Bytes**: script source, inner results (what scripts read) and script results
+  (what reached the model), all three only when scripts exist, and direct
+  results, in KiB. These are sizes of the stored JSON, not tokens.
+- **Tools (direct / in scripts)**: the busiest 20 tools with their direct and
+  in-script call counts. Left out when no tool was called.
+- **Turns (finished)**: turns that ran scripts, turns that used only direct
+  tools and turns that used no tools, each with rounds per turn and the input and
+  output tokens per turn, averaged over the turns that recorded usage (`-` when
+  none did); then the number of unfinished turns, which are left out of the
+  groups. Left out when no turn is in scope. A turn that never started, such as a
+  cancel written while the session was idle, is not counted.
+- **By agent**: scripts, failures, inner calls and direct calls per agent, shown
+  when more than one agent is in scope.
+- **Recent failures**: the ten latest failed scripts with agent, session, log
+  sequence, time, exit code, kind and the inner call that failed. `--json` lists
+  up to 200 and reports how many more there were. A failure listed under
+  `(inline)` cannot be opened with the session form below, which takes a named
+  agent.
+
+Failure kinds. A script that exits 0 is never a failure, whatever it printed.
+For any other script the first matching kind in this order wins:
+
+- `timed_out`, `cancelled`, `stopped`: the script's status says so.
+- `interrupted`: the worker restarted while the script ran.
+- `limit_hit`: a resource limit ended the script.
+- `exit_126`, `exit_127`: the exit status, as described above.
+- `inner_call_failed`: some inner call failed, even if the script then failed for
+  another reason.
+- `python_type_error`, `python_error`: read from the script's stderr text (a
+  `TypeError:` line or a traceback), so they are a guide rather than proof.
+- `non_zero_exit`: any other failure, including an error result with no payload.
+- `no_result`: the round has no stored result, which means an interrupted turn.
+
+The log does not record which model served a round, so the breakdown is by agent
+and not by model. Two periods, or two agent sets, usually run different work, so
+a difference between their reports is not evidence that one setup is better.
+
+### `harnx info script-usage --cluster <cluster> --agent <agent> <session-id> [--json]`
+
+The same figures for one session: `Tool work`, `Bytes` and `Tools`, then one line
+per script in log order with its sequence number, time, status, exit code,
+failure kind, inner call count, script size and result size. `--agent` must be
+the exact agent name here (a `*`, `?` or `[` is rejected), and `--since` and
+`--until` are not accepted.
 
 ### `harnx delete expired-sessions --cluster <cluster> [--days <n>] [--agent <agent>] [--max <n>] [--dry-run]`
 
