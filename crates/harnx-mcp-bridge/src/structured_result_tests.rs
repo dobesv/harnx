@@ -114,3 +114,30 @@ async fn bridged_script_result_over_the_limit_is_a_clear_error() {
         assert!(text.contains(way_out), "{way_out} missing from: {text}");
     }
 }
+
+/// A full default 128 KiB page is already over the bridge's limit, because
+/// the limit counts the serialized envelope, not just the page text (#2984
+/// is still open): a script must pass a page size under the cap, which the
+/// error's advice names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_default_128_kib_page_is_over_the_bridge_limit() {
+    let (bridge, requested) = bridge_with_child(131_072).await;
+    let result = bridge
+        .invoke_with_context(ToolInvocation {
+            tool: "cat".into(),
+            args: serde_json::json!({}),
+            context: ToolInvocationContext {
+                capabilities: [harnx_toolset::CAPABILITY_STRUCTURED_RESULT.to_owned()].into(),
+                ..Default::default()
+            },
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .expect("the call itself succeeds");
+    assert_eq!(*requested.lock().expect("child state"), [true]);
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(result.get("structuredContent").is_none());
+    let text = result["content"][0]["text"].as_str().expect("error text");
+    assert!(text.contains("exceeds max-result-bytes"), "{text}");
+    assert!(text.contains("--max-output-bytes"), "{text}");
+}
