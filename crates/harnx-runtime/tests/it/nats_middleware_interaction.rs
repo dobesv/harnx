@@ -3,6 +3,9 @@
 #[path = "nats_middleware_interaction/harness.rs"]
 pub(crate) mod harness;
 
+#[path = "nats_middleware_interaction/inline_image.rs"]
+mod inline_image;
+
 #[path = "nats_middleware_interaction/suspension_cases.rs"]
 mod suspension_cases;
 
