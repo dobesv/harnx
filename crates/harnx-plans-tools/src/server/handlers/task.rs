@@ -42,7 +42,7 @@ pub(crate) async fn list(
         }
         tasks.push(task_json(&task));
     }
-    result_json(json!({"items": tasks, "next_cursor": page.next_cursor}))
+    result_page(tasks, page.next_cursor, context.structured_result)
 }
 
 pub(crate) async fn get(
@@ -55,9 +55,10 @@ pub(crate) async fn get(
         .map_err(map_internal)?
         .ok_or_else(|| ErrorData::invalid_params(format!("task not found: {url}"), None))?;
     let task = parse_task(&stored.content).map_err(map_internal)?;
-    result_json_with_resources(
+    result_document(
         task_json(&task),
         item_resources(&plan, &url, "task", &task_label(&task, &url)),
+        context.structured_result,
     )
 }
 

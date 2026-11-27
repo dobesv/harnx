@@ -28,6 +28,8 @@ use harnx_runtime::nats_worker::{ToolServerStartConfig, ToolServerSupervisor};
 use harnx_runtime::tool::BuildToolEvalContextParams;
 use serde_json::json;
 
+mod plans;
+
 const TOKEN: &str = "bash-script-mode-test-token";
 
 pub(crate) struct EnvGuard(Vec<(&'static str, Option<OsString>)>);

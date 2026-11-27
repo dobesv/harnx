@@ -1,3 +1,4 @@
+use crate::script_schema;
 use crate::server::handlers::{self, OperationContext};
 use crate::server::params::*;
 use crate::tool_templates;
@@ -97,14 +98,17 @@ fn spec<T: JsonSchema + 'static>(definition: SpecDef<'_>) -> ToolSpec {
 }
 
 macro_rules! plan_tool_specs {
-    ($( $params:ty : $name:literal, $read_only:literal, $template:ident, $description:literal; )+) => {
+    ($( $params:ty : $name:literal, $read_only:literal, $template:ident, $description:literal $(, $output:path, $schema:path)?; )+) => {
         vec![$(
             spec::<$params>(SpecDef {
                 name: $name,
                 description: $description,
                 read_only: $read_only,
                 template: tool_templates::$template,
-            }),
+            })$(
+                .with_script_output($output())
+                .with_output_schema($schema())
+            )?,
         )+]
     };
 }
@@ -122,31 +126,31 @@ impl Toolset for PlansToolset {
     fn tools(&self) -> Vec<ToolSpec> {
         plan_tool_specs![
             ListPlansParams: "list_plans", true, LIST_PLANS_CALL,
-                "List NATS-backed plans sorted by key. Defaults to the caller's session, or every session without a caller. Set owner to a session key or all_sessions: true for every session; owner and all_sessions: true conflict. limit defaults to 20, clamped to 1..100. Returns {items, next_cursor}; pass next_cursor as cursor with the same scope until null.";
+                "List NATS-backed plans sorted by key. Defaults to the caller's session, or every session without a caller. Set owner to a session key or all_sessions: true for every session; owner and all_sessions: true conflict. limit defaults to 20, clamped to 1..100. Returns {items, next_cursor}; pass next_cursor as cursor with the same scope until null.", script_schema::list_output, script_schema::list_plans_schema;
             AddPlanParams: "add_plan", false, ADD_PLAN_CALL,
                 "Create a plan owned by the caller session. Returns its cid:plan URL.";
             GetPlanParams: "get_plan", true, GET_PLAN_CALL,
-                "Read a plan by full cid:plan URL.";
+                "Read a plan by full cid:plan URL.", script_schema::document_output, script_schema::plan_schema;
             UpdatePlanParams: "update_plan", false, UPDATE_PLAN_CALL,
                 "Update a plan by full cid:plan URL. Body edits use revision CAS.";
             DeletePlanParams: "delete_plan", false, DELETE_PLAN_CALL,
                 "Delete a plan and all task/note documents by full cid:plan URL.";
             ListTasksParams: "list_tasks", true, LIST_TASKS_CALL,
-                "List tasks for a full cid:plan URL sorted by key. limit defaults to 20, clamped to 1..100 task keys per page. Status (default open; all disables) and tag filters apply within each key page, so items may be empty even with more pages. Returns {items, next_cursor}; pass next_cursor as cursor with the same plan and filters until null.";
+                "List tasks for a full cid:plan URL sorted by key. limit defaults to 20, clamped to 1..100 task keys per page. Status (default open; all disables) and tag filters apply within each key page, so items may be empty even with more pages. Returns {items, next_cursor}; pass next_cursor as cursor with the same plan and filters until null.", script_schema::list_output, script_schema::list_tasks_schema;
             AddTaskParams: "add_task", false, ADD_TASK_CALL,
                 "Create a task in a plan. Dependencies must be task URLs.";
             GetTaskParams: "get_task", true, GET_TASK_CALL,
-                "Read a task. Plan and task ID parameters are full cid:plan URLs.";
+                "Read a task. Plan and task ID parameters are full cid:plan URLs.", script_schema::document_output, script_schema::task_schema;
             UpdateTaskParams: "update_task", false, UPDATE_TASK_CALL,
                 "Update a task by full item URL using revision CAS.";
             DeleteTaskParams: "delete_task", false, DELETE_TASK_CALL,
                 "Delete a task by full item URL.";
             ListNotesParams: "list_notes", true, LIST_NOTES_CALL,
-                "List notes for a full cid:plan URL sorted by key. Bodies are previews capped at 200 characters; use get_note with the note URL to read the full body. limit defaults to 20, clamped to 1..100. Returns {items, next_cursor}; pass next_cursor as cursor with the same plan until null.";
+                "List notes for a full cid:plan URL sorted by key. Bodies are previews capped at 200 characters; use get_note with the note URL to read the full body. limit defaults to 20, clamped to 1..100. Returns {items, next_cursor}; pass next_cursor as cursor with the same plan until null.", script_schema::list_output, script_schema::list_notes_schema;
             AddNoteParams: "add_note", false, ADD_NOTE_CALL,
                 "Create a note in a plan using an optional bare note ID or full note URL belonging to the plan, and return its full item URL.";
             GetNoteParams: "get_note", true, GET_NOTE_CALL,
-                "Read a note using a bare note ID or full note URL belonging to the supplied plan.";
+                "Read a note using a bare note ID or full note URL belonging to the supplied plan.", script_schema::document_output, script_schema::note_schema;
             UpdateNoteParams: "update_note", false, UPDATE_NOTE_CALL,
                 "Update a note using a bare note ID or full note URL belonging to the supplied plan, using revision CAS.";
             DeleteNoteParams: "delete_note", false, DELETE_NOTE_CALL,
@@ -193,6 +197,7 @@ impl Toolset for PlansToolset {
                 store: &store,
                 jetstream: &jetstream,
                 caller: invocation.context.invoking_session.as_ref(),
+                structured_result: invocation.context.wants_structured_result(),
             },
             &invocation.tool,
             invocation.args,
@@ -229,6 +234,15 @@ mod tests {
                 description.contains("full note URL"),
                 "{name}: {description}"
             );
+        }
+    }
+
+    #[test]
+    fn only_read_tools_declare_script_output() {
+        for tool in PlansToolset::new().tools() {
+            let read_tool = tool.name.starts_with("get_") || tool.name.starts_with("list_");
+            assert_eq!(tool.script_output().is_some(), read_tool, "{}", tool.name);
+            assert_eq!(tool.output_schema().is_some(), read_tool, "{}", tool.name);
         }
     }
 

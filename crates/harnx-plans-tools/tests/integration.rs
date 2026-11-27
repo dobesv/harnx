@@ -1037,3 +1037,6 @@ async fn invalid_external_task_urls_do_not_write_plan_metadata() {
 
 #[path = "pagination/mod.rs"]
 mod pagination;
+
+#[path = "it/read_output.rs"]
+mod read_output;

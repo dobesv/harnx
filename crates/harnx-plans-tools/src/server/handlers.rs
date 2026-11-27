@@ -20,6 +20,7 @@ pub(crate) struct OperationContext<'a> {
     pub(crate) store: &'a kv::Store,
     pub(crate) jetstream: &'a jetstream::Context,
     pub(crate) caller: Option<&'a SessionRef>,
+    pub(crate) structured_result: bool,
 }
 
 impl OperationContext<'_> {
