@@ -177,12 +177,11 @@ impl Tui {
     async fn confirm_pending_attachment_key(&mut self, key: KeyEvent, index: usize) {
         match (key.code, key.modifiers) {
             (KeyCode::Char('y' | 'Y'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                let name = self.app.attachments[index].display_name.clone();
                 self.close_pending_attachment_preview();
                 // Editing a locally queued draft must update its shared copy too.
                 self.app.pending_message = None;
                 self.clear_shared_pending_message().await;
-                self.detach_named_attachment(&name);
+                self.detach_input_attachment(index);
                 self.app.pending_attachment_view.focus = self
                     .app
                     .attachments

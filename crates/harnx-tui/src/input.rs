@@ -275,18 +275,8 @@ impl Tui {
             (KeyCode::Down, KeyModifiers::SHIFT) => {
                 self.handle_down_key_shift();
             }
-            (KeyCode::PageUp, KeyModifiers::NONE) => {
-                self.clear_footer_notice();
-                for _ in 0..10 {
-                    self.app.scroll_state.scroll_up();
-                }
-            }
-            (KeyCode::PageDown, KeyModifiers::NONE) => {
-                self.clear_footer_notice();
-                for _ in 0..10 {
-                    self.app.scroll_state.scroll_down();
-                }
-            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => self.scroll_input_page(true),
+            (KeyCode::PageDown, KeyModifiers::NONE) => self.scroll_input_page(false),
             (KeyCode::Tab, KeyModifiers::NONE) => {
                 self.handle_tab(false).await;
             }
@@ -499,6 +489,24 @@ impl Tui {
             &mut self.app.scroll_state
         };
         scroll_mouse_state(state, up);
+    }
+
+    /// Preserve detail-view routing even when a page key reaches the composer
+    /// fallback; exclusive overlays normally handle these keys first.
+    pub(super) fn scroll_input_page(&mut self, up: bool) {
+        self.clear_footer_notice();
+        let scroll = if self.app.detail_view_open {
+            &mut self.app.detail_view_scroll
+        } else {
+            &mut self.app.scroll_state
+        };
+        for _ in 0..BROWSE_PAGE_LINES {
+            if up {
+                scroll.scroll_up();
+            } else {
+                scroll.scroll_down();
+            }
+        }
     }
 
     /// Clear the shared pending message so the prompt task does not consume a

@@ -64,6 +64,86 @@ async fn pending_attachment_preview_removal_requires_confirmation() {
 }
 
 #[tokio::test]
+async fn confirmed_removal_keeps_same_name_unselected_attachment() {
+    for selected in 0..2 {
+        for preview in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let original = root.path().join("paste-1.txt");
+            tokio::fs::write(&original, "explicit attachment")
+                .await
+                .unwrap();
+            let config = test_config();
+            let mut tui = Tui::init(&config).await.unwrap();
+            tui.set_input_text(&format!(".attach {}", original.display()));
+            press(&mut tui, KeyCode::Enter).await;
+            tui.handle_paste("pasted attachment\n".repeat(40)).await;
+            assert_eq!(tui.app.attachments.len(), 2);
+            assert_eq!(
+                tui.app.attachments[0].display_name,
+                tui.app.attachments[1].display_name
+            );
+            let removed = tui.app.attachments[selected].path.clone();
+            let retained = tui.app.attachments[1 - selected].path.clone();
+            assert_ne!(removed, retained);
+            let retained_bytes = tokio::fs::read(&retained).await.unwrap();
+            tui.set_input_text("keep this draft");
+            press(&mut tui, KeyCode::Up).await;
+            if selected == 0 {
+                press(&mut tui, KeyCode::Up).await;
+            }
+            if preview {
+                press(&mut tui, KeyCode::Enter).await;
+            }
+            press(&mut tui, KeyCode::Delete).await;
+            press(&mut tui, KeyCode::Char('y')).await;
+            assert_eq!(tui.app.attachments.len(), 1);
+            assert_eq!(tui.app.attachments[0].path, retained);
+            assert_eq!(tokio::fs::read(&retained).await.unwrap(), retained_bytes);
+            assert!(!removed.exists());
+            assert!(!tui.app.detail_view_open);
+            assert_eq!(tui.app.pending_attachment_view.focus, Some(0));
+            assert_eq!(tui.app.input.lines().join("\n"), "keep this draft");
+            assert_eq!(
+                tokio::fs::read_to_string(&original).await.unwrap(),
+                "explicit attachment"
+            );
+            tui.cleanup_attachments();
+        }
+    }
+}
+
+#[tokio::test]
+async fn page_keys_scroll_pending_preview_without_moving_transcript() {
+    let config = test_config();
+    let mut tui = Tui::init(&config).await.unwrap();
+    tui.handle_paste("preview line\n".repeat(100)).await;
+    press(&mut tui, KeyCode::Up).await;
+    press(&mut tui, KeyCode::Enter).await;
+    tui.app.scroll_state.position = 12;
+    tui.app.scroll_state.last_max_position = 100;
+    tui.app.detail_view_scroll.position = 20;
+    tui.app.detail_view_scroll.last_max_position = 100;
+    press(&mut tui, KeyCode::PageDown).await;
+    assert_eq!(tui.app.detail_view_scroll.position, 30);
+    assert_eq!(tui.app.scroll_state.position, 12);
+    press(&mut tui, KeyCode::PageUp).await;
+    assert_eq!(tui.app.detail_view_scroll.position, 20);
+    assert_eq!(tui.app.scroll_state.position, 12);
+    // The composer fallback preserves the same routing if reached directly.
+    tui.scroll_input_page(false);
+    assert_eq!(tui.app.detail_view_scroll.position, 30);
+    assert_eq!(tui.app.scroll_state.position, 12);
+    press(&mut tui, KeyCode::Esc).await;
+    press(&mut tui, KeyCode::Esc).await;
+    press(&mut tui, KeyCode::PageDown).await;
+    assert_eq!(tui.app.scroll_state.position, 22);
+    assert_eq!(tui.app.detail_view_scroll.position, 30);
+    press(&mut tui, KeyCode::PageUp).await;
+    assert_eq!(tui.app.scroll_state.position, 12);
+    tui.cleanup_attachments();
+}
+
+#[tokio::test]
 async fn pending_attachment_list_is_above_input_and_scrolls_with_selection() {
     let mut harness = TuiTestHarness::with_size(80, 18).await;
     for index in 0..9 {

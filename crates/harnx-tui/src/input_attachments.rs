@@ -197,7 +197,20 @@ impl Tui {
         }
     }
 
-    pub(super) fn detach_named_attachment(&mut self, name: &str) {
+    pub(super) fn detach_input_attachment(&mut self, index: usize) {
+        let attachment = self.app.attachments.remove(index);
+        if let Err(error) = std::fs::remove_file(&attachment.path) {
+            self.app.transcript.push(TranscriptItem::ErrorText(format!(
+                "Failed to remove detached attachment file {}: {error}",
+                attachment.display_name
+            )));
+        }
+        if self.app.attachments.is_empty() {
+            self.cleanup_attachments();
+        }
+    }
+
+    fn detach_named_attachment(&mut self, name: &str) {
         for attachment in self
             .app
             .attachments

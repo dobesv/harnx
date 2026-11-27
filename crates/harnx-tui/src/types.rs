@@ -215,6 +215,8 @@ impl ToolConfirmationRouteHandle {
 #[derive(Clone, Debug)]
 pub(super) struct Attachment {
     pub(super) path: PathBuf,
+    /// Presentation label; explicit files and pastes can share a name. Target
+    /// a selected attachment by its index or storage path when removing it.
     pub(super) display_name: String,
 }
 
