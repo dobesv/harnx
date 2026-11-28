@@ -102,6 +102,12 @@ impl Tui {
             Some(TranscriptItem::CompactionMarker { summary_text, .. }) => summary_text.clone(),
             _ => return false,
         };
+        if self.transcript_view_ownership.active_binding.is_none() {
+            self.show_archive_error(&anyhow::anyhow!(
+                "Session changed — waiting for current transcript to load"
+            ));
+            return true;
+        }
         if let Err(error) = self.load_compaction_archive(&summary).await {
             self.show_archive_error(&error);
         }

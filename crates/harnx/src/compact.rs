@@ -1,13 +1,18 @@
-use crate::cli::{Cli, CompactArgs, CompactCommands, CompactSessionArgs};
+use crate::cli::{CompactArgs, CompactCommands, CompactSessionArgs};
 use crate::config::WorkingMode;
 use crate::init_frontend_config;
+use crate::main_runtime::CommandInterrupt;
 use anyhow::Result;
+use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::event::{AgentEvent, SessionEvent};
 use harnx_core::session::{CompactOutcome, SessionLogEntry, UnchangedReason};
 
-pub(crate) async fn run_compact_command(compact_args: &CompactArgs, _cli: &Cli) -> Result<u8> {
+pub(crate) async fn run_compact_command(
+    compact_args: &CompactArgs,
+    interrupt: &CommandInterrupt,
+) -> Result<u8> {
     match &compact_args.command {
-        CompactCommands::Session(args) => run_compact_session(args).await,
+        CompactCommands::Session(args) => run_compact_session(args, interrupt).await,
     }
 }
 
@@ -125,6 +130,7 @@ async fn follow_compaction(
     stream: &mut harnx_runtime::nats_event_sink::SessionEventStream,
     target_id: &str,
     timeout_secs: u64,
+    abort: &AbortSignal,
 ) -> Result<u8> {
     let timeout_deadline = (timeout_secs > 0)
         .then(|| tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs));
@@ -146,7 +152,7 @@ async fn follow_compaction(
             }
             _ = durable_poll.tick() => refresh_compact_result(stream, target_id).await,
             _ = &mut timeout => process_compact_timeout(stream, target_id).await,
-            _ = tokio::signal::ctrl_c() => {
+            _ = wait_abort_signal(abort) => {
                 println!("Interrupted. Compaction still pending (request id: {target_id}).");
                 FollowAction::Done(130)
             }
@@ -157,7 +163,7 @@ async fn follow_compaction(
     }
 }
 
-async fn run_compact_session(args: &CompactSessionArgs) -> Result<u8> {
+async fn run_compact_session(args: &CompactSessionArgs, stop: &CommandInterrupt) -> Result<u8> {
     use harnx_runtime::nats_session::{
         request_compaction_session, CompactSubmit, CompactionRequest,
     };
@@ -178,7 +184,6 @@ async fn run_compact_session(args: &CompactSessionArgs) -> Result<u8> {
     )
     .await?;
 
-    // Build compaction request
     let compaction_id = uuid::Uuid::new_v4().to_string();
     let request = CompactionRequest {
         session_id: metadata.storage_key(),
@@ -197,6 +202,7 @@ async fn run_compact_session(args: &CompactSessionArgs) -> Result<u8> {
     )
     .await?;
 
+    let abort = stop.handle_in_command();
     // Determine target compaction_id and initial message
     let target_id: String = match submit_result {
         CompactSubmit::Submitted { ref compaction_id } => {
@@ -229,7 +235,7 @@ async fn run_compact_session(args: &CompactSessionArgs) -> Result<u8> {
         }
     };
 
-    follow_compaction(&mut stream, &target_id, args.timeout).await
+    follow_compaction(&mut stream, &target_id, args.timeout, abort).await
 }
 
 #[cfg(test)]

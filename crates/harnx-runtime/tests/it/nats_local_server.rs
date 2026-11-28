@@ -6,6 +6,9 @@ use tempfile::TempDir;
 
 #[path = "nats_local_server/failover.rs"]
 mod failover;
+#[cfg(unix)]
+#[path = "nats_local_server/patient.rs"]
+mod patient;
 
 struct DataDirGuard {
     previous: Option<OsString>,

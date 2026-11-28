@@ -6,16 +6,22 @@
 //! hand the connect link to the browser flow on the tool server's own page.
 
 use crate::cli::{Cli, CredentialsArgs, CredentialsSubcommands};
+use crate::main_runtime::CommandInterrupt;
 use anyhow::Result;
+use harnx_core::abort::{create_abort_signal, wait_abort_signal, AbortSignal};
+use harnx_core::tool::ToolInputRequired;
 use harnx_runtime::operator_tools::credentials::{
     run_credentials_command, CredentialsAction, CredentialsProgress,
 };
 use harnx_runtime::operator_tools::OperatorToolCommand;
-use harnx_runtime::utils::create_abort_signal;
 use is_terminal::IsTerminal;
 use std::io::stdout;
 
-pub(crate) async fn run(cli: &Cli, args: &CredentialsArgs) -> Result<u8> {
+pub(crate) async fn run(
+    cli: &Cli,
+    args: &CredentialsArgs,
+    interrupt: &CommandInterrupt,
+) -> Result<u8> {
     let action = match &args.command {
         CredentialsSubcommands::List => CredentialsAction::List,
         CredentialsSubcommands::Connect { server } => CredentialsAction::Connect {
@@ -25,21 +31,12 @@ pub(crate) async fn run(cli: &Cli, args: &CredentialsArgs) -> Result<u8> {
             server: server.clone(),
         },
     };
-    let abort = create_abort_signal();
-    let signal_abort = abort.clone();
-    let signal_task = scopeguard::guard(
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                signal_abort.set_ctrlc();
-            }
-        }),
-        |task| task.abort(),
-    );
     println!("{}", operator_identity_note(cli).await);
+    let abort = interrupt.handle_in_command();
     let mut first_url = true;
     let result = run_credentials_command(
         action,
-        &abort,
+        abort,
         &mut |progress| match progress {
             CredentialsProgress::ConnectUrl { url, message } => {
                 if !message.is_empty() {
@@ -53,10 +50,9 @@ pub(crate) async fn run(cli: &Cli, args: &CredentialsArgs) -> Result<u8> {
                 }
             }
         },
-        |command| dispatch(cli, command),
+        |command| dispatch(cli, command, abort),
     )
     .await;
-    drop(signal_task);
     match result {
         Ok(outcome) => {
             if !outcome.output.is_empty() {
@@ -77,8 +73,34 @@ pub(crate) async fn run(cli: &Cli, args: &CredentialsArgs) -> Result<u8> {
 async fn dispatch(
     cli: &Cli,
     command: OperatorToolCommand,
+    abort: &AbortSignal,
 ) -> Result<harnx_runtime::operator_tools::OperatorToolReply> {
-    crate::tool_cmd::execute(cli, command, true).await
+    // The best-effort browser cancellation is itself a tool call, made after
+    // Ctrl-C. Give it a fresh signal so a second Ctrl-C can stop its admission.
+    if matches!(&command, OperatorToolCommand::Call { tool_input: Some(input), .. }
+        if input.responses.values().any(|reply| reply.action == ToolInputRequired::URL_ACTION_CANCEL))
+    {
+        let interrupt = CommandInterrupt::new();
+        return interrupt
+            .run(Box::pin(crate::tool_cmd::execute(
+                cli,
+                command,
+                true,
+                interrupt.handle_in_command(),
+            )))
+            .await;
+    }
+
+    // A single tool call's timeout must not cancel the entire credentials flow.
+    let call_abort = create_abort_signal();
+    // Keep the tool future off the stack inside the credentials state machine.
+    let mut call = Box::pin(crate::tool_cmd::execute(cli, command, true, &call_abort));
+    tokio::select! {
+        biased;
+        _ = wait_abort_signal(abort) => call_abort.set_ctrlc(),
+        result = &mut call => return result,
+    }
+    call.await
 }
 
 /// Whose credentials these commands manage: the same default the CLI stamps

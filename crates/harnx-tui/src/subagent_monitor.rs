@@ -366,6 +366,7 @@ async fn load_subagent_transcript(
         key.agent.clone(),
         key.cluster.clone(),
         key.session_id.clone(),
+        None,
     )
     .await
     {
