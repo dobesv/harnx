@@ -7,7 +7,9 @@
 use crate::cli::{DeleteOrphanStreamsArgs, ListOrphanStreamsArgs};
 use crate::config::WorkingMode;
 use crate::init_frontend_config;
+use crate::main_runtime::CommandInterrupt;
 use anyhow::{bail, ensure, Result};
+use harnx_core::abort::wait_abort_signal;
 use harnx_runtime::session_stream_gc::OrphanStreamCleanupStats;
 use harnx_runtime::session_stream_orphans::OrphanStreamInventory;
 
@@ -30,7 +32,10 @@ pub async fn run_list_orphan_streams_command(args: &ListOrphanStreamsArgs) -> Re
     Ok(())
 }
 
-pub async fn run_orphan_stream_delete_command(args: &DeleteOrphanStreamsArgs) -> Result<()> {
+pub(crate) async fn run_orphan_stream_delete_command(
+    args: &DeleteOrphanStreamsArgs,
+    interrupt: &CommandInterrupt,
+) -> Result<()> {
     let config = init_frontend_config(WorkingMode::Cmd, true).await?;
     // Grace and batch bounds are validated (positivity enforced) before any
     // lease is taken or any stream is read; the pass re-validates defensively.
@@ -55,13 +60,14 @@ pub async fn run_orphan_stream_delete_command(args: &DeleteOrphanStreamsArgs) ->
         );
     };
 
-    let cleanup = harnx_runtime::session_stream_gc::cleanup_orphan_session_streams(
-        &config,
-        &args.cluster,
-        wall_clock_secs(),
-        &options,
-    )
-    .await;
+    // After admission, keep the lease release on the awaited exit path.
+    let abort = interrupt.handle_in_command();
+    let cleanup = tokio::select! {
+        result = harnx_runtime::session_stream_gc::cleanup_orphan_session_streams(
+            &config, &args.cluster, wall_clock_secs(), &options,
+        ) => result,
+        _ = wait_abort_signal(abort) => Err(anyhow::anyhow!("interrupted by user")),
+    };
     if let Err(error) = lease.release().await {
         log::warn!(
             "orphan stream cleanup lease release failed: cluster='{}' err={error:#}",

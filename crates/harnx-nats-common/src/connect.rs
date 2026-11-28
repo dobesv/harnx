@@ -276,11 +276,7 @@ impl NatsEndpoint {
         // Every production role uses this policy. Preserve the Client across
         // outages so async-nats restores its Core subscriptions. Application
         // operations still need their own deadlines and replay semantics.
-        let mut options = ConnectOptions::new()
-            .max_reconnects(None)
-            .ping_interval(Duration::from_secs(5))
-            .connection_timeout(Duration::from_secs(2))
-            .reconnect_delay_callback(reconnect_delay);
+        let mut options = reconnecting_options();
         let transport = self.transport();
         options = self.apply_auth_options(options);
         options = self.apply_tls_options(options, transport)?;
@@ -575,6 +571,22 @@ impl NatsEndpoint {
         }
         Ok(path)
     }
+}
+
+/// Options for the elected plaintext loopback broker only. Its owner handles
+/// initial acquisition; keep the same reconnect policy after connecting.
+pub fn managed_local_connect_options(token: String) -> ConnectOptions {
+    reconnecting_options()
+        .token(token)
+        .ignore_discovered_servers()
+}
+
+fn reconnecting_options() -> ConnectOptions {
+    ConnectOptions::new()
+        .max_reconnects(None)
+        .ping_interval(Duration::from_secs(5))
+        .connection_timeout(Duration::from_secs(2))
+        .reconnect_delay_callback(reconnect_delay)
 }
 
 /// The wait before the first retry, doubled for each one after it.

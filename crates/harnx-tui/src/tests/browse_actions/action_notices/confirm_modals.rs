@@ -3,9 +3,21 @@
 
 use super::*;
 
+#[derive(Clone)]
+enum ConfirmModalKind {
+    Delete {
+        from: usize,
+        to: usize,
+    },
+    Rewind {
+        seq: usize,
+        user_text: Option<String>,
+    },
+}
+
 struct ModalConfirmCase {
     description: &'static str,
-    modal: crate::types::ModalState,
+    modal: ConfirmModalKind,
     agent_busy: bool,
     expected_commands: Vec<&'static str>,
     expected_notice: Option<&'static str>,
@@ -16,7 +28,7 @@ impl ModalConfirmCase {
     /// Chain `busy()` for the refusal variants.
     fn new(
         description: &'static str,
-        modal: crate::types::ModalState,
+        modal: ConfirmModalKind,
         expected_commands: Vec<&'static str>,
     ) -> Self {
         ModalConfirmCase {
@@ -45,12 +57,12 @@ fn confirm_cases() -> Vec<ModalConfirmCase> {
     vec![
         ModalConfirmCase::new(
             "idle delete confirmation dispatches .delete message",
-            crate::types::ModalState::ConfirmDelete { from: 1, to: 1 },
+            ConfirmModalKind::Delete { from: 1, to: 1 },
             vec![".delete message 1"],
         ),
         ModalConfirmCase::new(
             "idle rewind confirmation dispatches .rewind",
-            crate::types::ModalState::ConfirmRewind {
+            ConfirmModalKind::Rewind {
                 seq: 1,
                 user_text: Some("done".to_string()),
             },
@@ -58,14 +70,14 @@ fn confirm_cases() -> Vec<ModalConfirmCase> {
         ),
         ModalConfirmCase::new(
             "busy delete confirmation closes without dispatching",
-            crate::types::ModalState::ConfirmDelete { from: 1, to: 1 },
+            ConfirmModalKind::Delete { from: 1, to: 1 },
             vec![],
         )
         .busy()
         .notice(BUSY_NOTICE),
         ModalConfirmCase::new(
             "busy rewind confirmation closes without dispatching",
-            crate::types::ModalState::ConfirmRewind {
+            ConfirmModalKind::Rewind {
                 seq: 1,
                 user_text: Some("done".to_string()),
             },
@@ -97,7 +109,19 @@ async fn confirm_modal_case(case: &ModalConfirmCase) {
     )
     .await;
     let commands = record_commands(&mut harness);
-    harness.tui().app.modal = Some(case.modal.clone());
+    let target = harness.tui().current_transcript_action_target();
+    harness.tui().app.modal = Some(match &case.modal {
+        ConfirmModalKind::Delete { from, to } => crate::types::ModalState::ConfirmDelete {
+            from: *from,
+            to: *to,
+            target,
+        },
+        ConfirmModalKind::Rewind { seq, user_text } => crate::types::ModalState::ConfirmRewind {
+            seq: *seq,
+            user_text: user_text.clone(),
+            target,
+        },
+    });
     harness.tui().app.llm_busy = case.agent_busy;
 
     harness

@@ -1,8 +1,6 @@
 //! Navigation and transcript state for detached handoffs and nested sessions.
 
-use crate::lifecycle::{
-    session_history_transcript_items, subagent_key_from_output, subagent_progress_from_output,
-};
+use crate::lifecycle::{subagent_key_from_output, subagent_progress_from_output};
 use crate::subagent_transcript::{apply_child_event, flatten_subagent_event};
 use crate::types::{
     CidDocView, MonitoredSessionKey, MonitoredSessionState, SubAgentStatus, SubAgentView,
@@ -176,6 +174,7 @@ impl Tui {
             self.pin_transcript_to_bottom();
             return true;
         }
+        self.retire_pending_title_rename();
 
         // Opening a saved link is navigation, not a new live handoff. Keep turn
         // ownership intact and let the activity monitor discover the child's state.
@@ -407,7 +406,9 @@ impl Tui {
         );
         match event {
             AgentEvent::Turn(TurnEvent::SubAgentProgress(progress)) => {
-                self.record_subagent_progress(parent, progress.clone());
+                if self.record_subagent_progress(parent, progress.clone()) && parent.is_none() {
+                    self.note_live_transcript_mutation();
+                }
                 true
             }
             AgentEvent::Tool(ToolEvent::Completed { id, output, .. }) => {
@@ -419,15 +420,20 @@ impl Tui {
                 });
                 let Some(key) = subagent_key_from_output(output, &cluster) else {
                     if let Some(progress) = progress {
-                        self.record_subagent_progress(parent, progress);
+                        if self.record_subagent_progress(parent, progress) && parent.is_none() {
+                            self.note_live_transcript_mutation();
+                        }
                         return true;
                     }
                     return false;
                 };
 
-                match progress {
+                let mutated = match progress {
                     Some(progress) => self.record_subagent_progress(parent, progress),
                     None => self.record_subagent_completed(parent, key.clone()),
+                };
+                if mutated && parent.is_none() {
+                    self.note_live_transcript_mutation();
                 }
                 self.insert_subagent_reply(parent, &key, output);
                 true
@@ -445,23 +451,14 @@ impl Tui {
     }
 
     async fn reset_for_handoff_target(&mut self) {
+        self.retire_prior_target_transcript_actions();
         self.app.llm_busy = true;
-        self.app.streaming_open = false;
-        self.app.main_streamed_text_idx = None;
-        self.app.streamed_text_idx = None;
-        self.app.last_ui_output_source = None;
-        self.app.transcript_focus = None;
-        self.app.transcript_selection_anchor = None;
-        self.app.transcript_browsing = false;
-        self.app.detail_view_open = false;
-        self.app.doc_view = None;
-        self.app.doc_history.clear();
-        self.app.detail_view_entry = None;
-        self.app.transcript = session_history_transcript_items(&self.config).await;
+        self.app.transcript.clear();
         self.subagent_rows_dirty = true;
         self.pin_transcript_to_bottom();
         self.refresh_input_chrome();
         self.sync_session_activity_monitor();
+        self.schedule_handoff_history_rebuild();
     }
     /// Insert the sub-agent's final reply (from the tool result `response`
     /// field) as a `ToolResultMarkdown` row immediately before its
@@ -486,6 +483,9 @@ impl Tui {
             parent,
             crate::subagent_rows::TranscriptEdit::Splice { replaced, added },
         );
+        if parent.is_none() {
+            self.note_live_transcript_mutation();
+        }
     }
 
     /// The transcript that owns `parent`'s sub-agent rows: the monitored

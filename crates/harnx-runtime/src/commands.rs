@@ -721,7 +721,16 @@ pub fn run_command_with_output_and_local_worker<'a>(
             },
             ".set" => match args {
                 Some(args) => {
-                    Config::update(config, args)?;
+                    // `title` (and only it) may need to reach the broker
+                    // before the first local turn installs a session sink;
+                    // that explicit write gets its own cancellable, fenced
+                    // persistence path (B5). Other keys stay sync.
+                    Box::pin(Config::update_setting_durably(
+                        config,
+                        args,
+                        Some(&abort_signal),
+                    ))
+                    .await?;
                 }
                 _ => writeln!(output, "Usage: .set <key> <value>...")?,
             },

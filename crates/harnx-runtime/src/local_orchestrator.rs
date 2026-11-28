@@ -6,13 +6,16 @@
 use crate::config::{
     HARNX_NATS_TOKEN_ENV, HARNX_NATS_URL_ENV, HARNX_WORKER_BIN_ENV, LOCAL_CLUSTER_KEY,
 };
-use crate::nats_local_server::{LocalBroker, LocalBrokerStatus};
+use crate::nats_local_server::{
+    cancel_broker_wait, connect_local_broker, BrokerWatch, LocalBroker, LocalBrokerStatus,
+};
 use crate::nats_worker::{
     targeted_worker_ready_subject, validate_worker_id, LocalWorkerTarget, SessionActivationRoute,
 };
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
+use harnx_core::child_process::ChildProcessManager;
 use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::sink::emit_agent_event;
 use harnx_nats_common::connect::{
@@ -105,30 +108,50 @@ pub fn resolve_worker_binary() -> Result<PathBuf> {
 
 /// Keeps the shared broker alive and owns one frontend-affine worker process.
 pub struct LocalWorkerSupervisor {
-    server: LocalBroker,
+    broker: WorkerBroker,
     worker_binary: PathBuf,
     config_dir: Option<PathBuf>,
     route: LocalWorkerRoute,
     child: Option<Child>,
+    processes: ChildProcessManager,
     output: WorkerOutput,
     /// How the workers owned during the current readiness wait ended.
     exits: Vec<ExitStatus>,
 }
 
-/// Lazily start or re-check a frontend's process-lifetime local worker and
-/// return its stable activation route.
-pub async fn ensure_local_worker(
-    supervisor: &mut Option<LocalWorkerSupervisor>,
-    abort_signal: AbortSignal,
-) -> Result<LocalWorkerRoute> {
-    match supervisor {
-        Some(supervisor) => supervisor.ensure(abort_signal).await,
-        slot @ None => {
-            let started = LocalWorkerSupervisor::start(abort_signal).await?;
-            let route = started.route().clone();
-            *slot = Some(started);
-            Ok(route)
-        }
+// Production routes borrow the process-owned broker. An explicitly scoped
+// worker (e.g. two test frontends in one process) may elect independently.
+struct WorkerBroker {
+    watch: BrokerWatch,
+    _owner: Option<LocalBroker>,
+}
+
+impl WorkerBroker {
+    async fn managed(abort: &AbortSignal) -> Result<(Self, async_nats::Client)> {
+        let (watch, _, client) = connect_local_broker(Some(abort)).await?;
+        Ok((
+            Self {
+                watch,
+                _owner: None,
+            },
+            client,
+        ))
+    }
+
+    async fn standalone(abort: &AbortSignal) -> Result<(Self, async_nats::Client)> {
+        cancel_broker_wait(Some(abort), async {
+            let owner = LocalBroker::start().await?;
+            let watch = owner.observer();
+            let (_, client) = watch.clone().connect().await?;
+            Ok((
+                Self {
+                    watch,
+                    _owner: Some(owner),
+                },
+                client,
+            ))
+        })
+        .await
     }
 }
 
@@ -153,61 +176,99 @@ pub async fn activation_route_for_cluster_with_config_dir(
     if cluster != LOCAL_CLUSTER_KEY {
         return Ok(SessionActivationRoute::ClusterShared);
     }
-    let mut supervisor = supervisor.lock().await;
-    if let (None, Some(config_dir)) = (&*supervisor, config_dir) {
-        let started = LocalWorkerSupervisor::start_with_config_dir(config_dir, abort_signal)
+    let prepared = WorkerBroker::managed(&abort_signal).await?;
+    activate_local_worker(supervisor, abort_signal, config_dir, prepared).await
+}
+
+/// Like `activation_route_for_cluster`, but limit the worker operation only.
+/// Broker acquisition is patient and cancellable, and passes its authenticated
+/// client into the bounded operation rather than connecting again inside it.
+pub async fn activation_route_for_cluster_with_timeout(
+    cluster: &str,
+    supervisor: &tokio::sync::Mutex<Option<LocalWorkerSupervisor>>,
+    abort_signal: AbortSignal,
+    timeout: Duration,
+) -> Result<SessionActivationRoute> {
+    if cluster != LOCAL_CLUSTER_KEY {
+        return Ok(SessionActivationRoute::ClusterShared);
+    }
+    let prepared = WorkerBroker::managed(&abort_signal).await?;
+    tokio::time::timeout(
+        timeout,
+        activate_local_worker(supervisor, abort_signal, None, prepared),
+    )
+    .await
+    .context("Tool worker startup timed out")?
+}
+
+async fn activate_local_worker(
+    supervisor: &tokio::sync::Mutex<Option<LocalWorkerSupervisor>>,
+    abort_signal: AbortSignal,
+    config_dir: Option<&Path>,
+    prepared: (WorkerBroker, async_nats::Client),
+) -> Result<SessionActivationRoute> {
+    // Inside the activation budget: only the test stall seam runs before the
+    // worker startup handoff, so a stalled activation proves the budget
+    // enforces after broker readiness.
+    crate::utils::test_env_sleep_ms("HARNX_TEST_WORKER_ACTIVATION_STALL_MS").await;
+    let mut supervisor =
+        cancel_broker_wait(Some(&abort_signal), async { Ok(supervisor.lock().await) }).await?;
+    let route = match supervisor.as_mut() {
+        Some(worker) => worker.ensure_connected(prepared.1, abort_signal).await?,
+        None => {
+            let binary = resolve_worker_binary().context("failed to ensure local NATS worker")?;
+            let worker = LocalWorkerSupervisor::start_with_options(
+                &binary,
+                config_dir,
+                prepared,
+                abort_signal,
+            )
             .await
             .context("failed to ensure local NATS worker")?;
-        let route = started.route().activation_route();
-        *supervisor = Some(started);
-        return Ok(route);
-    }
-    ensure_local_worker(&mut supervisor, abort_signal)
-        .await
-        .context("failed to ensure local NATS worker")
-        .map(|route| route.activation_route())
+            let route = worker.route().clone();
+            *supervisor = Some(worker);
+            route
+        }
+    };
+    Ok(route.activation_route())
 }
 
 impl LocalWorkerSupervisor {
-    pub async fn start(abort_signal: AbortSignal) -> Result<Self> {
-        Self::start_with_worker_binary(resolve_worker_binary()?, abort_signal).await
-    }
-
+    /// Start an independent worker and broker supervision scope for an
+    /// explicitly supplied binary. Normal frontend activation uses its shared
+    /// manager instead.
+    // qual:test_helper
     pub async fn start_with_worker_binary(
         binary: impl AsRef<Path>,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        Self::start_with_options(binary.as_ref(), None, abort_signal).await
-    }
-
-    pub async fn start_with_config_dir(
-        config_dir: &Path,
-        abort_signal: AbortSignal,
-    ) -> Result<Self> {
-        Self::start_with_options(&resolve_worker_binary()?, Some(config_dir), abort_signal).await
+        let prepared = WorkerBroker::standalone(&abort_signal).await?;
+        Self::start_with_options(binary.as_ref(), None, prepared, abort_signal).await
     }
 
     async fn start_with_options(
         binary: &Path,
         config_dir: Option<&Path>,
+        prepared: (WorkerBroker, async_nats::Client),
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let server = LocalBroker::start().await?;
+        let (broker, client) = prepared;
         let worker_binary = binary
             .canonicalize()
             .with_context(|| format!("resolve worker binary {}", binary.display()))?;
         let route = LocalWorkerRoute::new();
         validate_worker_id(route.worker_id())?;
         let mut supervisor = Self {
-            server,
+            broker,
             worker_binary,
             config_dir: config_dir.map(Path::to_path_buf),
             route,
             child: None,
+            processes: ChildProcessManager::new(),
             output: WorkerOutput::new(),
             exits: Vec::new(),
         };
-        supervisor.ensure(abort_signal).await?;
+        supervisor.ensure_connected(client, abort_signal).await?;
         Ok(supervisor)
     }
 
@@ -215,12 +276,22 @@ impl LocalWorkerSupervisor {
     /// event-loop stall.
     /// Running workers are never restarted for binary or configuration changes.
     pub async fn ensure(&mut self, abort_signal: AbortSignal) -> Result<LocalWorkerRoute> {
+        let (_, client) =
+            cancel_broker_wait(Some(&abort_signal), self.broker.watch.clone().connect()).await?;
+        self.ensure_connected(client, abort_signal).await
+    }
+
+    async fn ensure_connected(
+        &mut self,
+        client: async_nats::Client,
+        abort_signal: AbortSignal,
+    ) -> Result<LocalWorkerRoute> {
         // Subscribe before checking or spawning. Core NATS does not replay old
         // readiness markers, so a marker received below proves the existing
         // worker's event loop is currently making progress. The same
         // subscription then admits a replacement without a spawn/subscribe
         // race.
-        let mut readiness = self.subscribe_to_readiness().await?;
+        let mut readiness = self.subscribe_to_readiness(client).await?;
         if self.child_is_running()? {
             let expected_pid = self
                 .worker_pid()
@@ -240,7 +311,7 @@ impl LocalWorkerSupervisor {
         }
 
         self.exits.clear();
-        let expected_pid = self.spawn_worker()?;
+        let expected_pid = self.spawn_worker().await?;
         self.wait_for_readiness(&mut readiness, expected_pid, abort_signal)
             .await
     }
@@ -312,7 +383,7 @@ impl LocalWorkerSupervisor {
             Ok(Some(message)) => self.accept_readiness(&message.payload, *expected_pid),
             Ok(None) => bail!("local worker readiness subscription closed"),
             Err(_) => {
-                self.respawn_if_needed(expected_pid)?;
+                self.respawn_if_needed(expected_pid).await?;
                 Ok(None)
             }
         }
@@ -354,7 +425,7 @@ impl LocalWorkerSupervisor {
         Ok(Some(self.route.clone()))
     }
 
-    fn respawn_if_needed(&mut self, expected_pid: &mut u32) -> Result<()> {
+    async fn respawn_if_needed(&mut self, expected_pid: &mut u32) -> Result<()> {
         if self.child_is_running()? {
             return Ok(());
         }
@@ -366,7 +437,7 @@ impl LocalWorkerSupervisor {
                 self.output.tail()
             );
         }
-        *expected_pid = self.spawn_worker()?;
+        *expected_pid = self.spawn_worker().await?;
         Ok(())
     }
 
@@ -381,16 +452,10 @@ impl LocalWorkerSupervisor {
             .join(", ")
     }
 
-    async fn subscribe_to_readiness(&self) -> Result<async_nats::Subscriber> {
-        let server = self.server.status();
-        let client = harnx_nats_common::connect::NatsEndpoint {
-            url: server.url,
-            token: Some(server.token),
-            ..Default::default()
-        }
-        .connect()
-        .await
-        .context("connect local worker readiness client")?;
+    async fn subscribe_to_readiness(
+        &self,
+        client: async_nats::Client,
+    ) -> Result<async_nats::Subscriber> {
         let subject = targeted_worker_ready_subject(LocalWorkerTarget::new(
             self.route.session_scope(),
             self.route.worker_id(),
@@ -424,13 +489,14 @@ impl LocalWorkerSupervisor {
         }
     }
 
-    fn spawn_worker(&mut self) -> Result<u32> {
+    async fn spawn_worker(&mut self) -> Result<u32> {
         debug_assert!(self.child.is_none());
+        let server = self.server();
         let mut command = build_local_worker_command(
             &self.worker_binary,
             self.route.worker_id(),
-            &self.server.status().url,
-            &self.server.status().token,
+            &server.url,
+            &server.token,
         );
         if let Some(config_dir) = &self.config_dir {
             command
@@ -440,9 +506,10 @@ impl LocalWorkerSupervisor {
         command
             .stdout(self.output.sink())
             .stderr(self.output.sink());
-        let child = command
-            .spawn()
-            .with_context(|| format!("spawn local worker from {}", self.worker_binary.display()))?;
+        let child =
+            self.processes.spawn(command).await.with_context(|| {
+                format!("spawn local worker from {}", self.worker_binary.display())
+            })?;
         let pid = child.id().context("spawned local worker has no PID")?;
         self.child = Some(child);
         Ok(pid)
@@ -457,7 +524,7 @@ impl LocalWorkerSupervisor {
     }
 
     pub fn server(&self) -> LocalBrokerStatus {
-        self.server.status()
+        self.broker.watch.status()
     }
 
     fn stop_worker(&mut self) {
@@ -502,7 +569,6 @@ pub fn build_local_worker_command(
         .stdout(harnx_core::logging::child_output_sink())
         .stderr(harnx_core::logging::child_output_sink())
         .kill_on_drop(true);
-    configure_worker_process(&mut command);
     command
 }
 
@@ -629,33 +695,6 @@ fn output_tail(path: &Path) -> String {
     let _ = file.read_to_end(&mut body);
     render(String::from_utf8_lossy(&body).into_owned())
 }
-
-#[cfg(unix)]
-fn configure_worker_process(command: &mut Command) {
-    #[cfg(target_os = "linux")]
-    let parent_pid = std::process::id() as libc::pid_t;
-    // SAFETY: pre_exec invokes only async-signal-safe libc calls.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            #[cfg(target_os = "linux")]
-            {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent_pid {
-                    libc::raise(libc::SIGTERM);
-                }
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn configure_worker_process(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

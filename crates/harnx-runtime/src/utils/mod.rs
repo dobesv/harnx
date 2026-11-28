@@ -130,6 +130,35 @@ fn stdout_terminal_size() -> Option<(u16, u16)> {
 
 pub use harnx_core::config_paths::get_env_name;
 
+/// Test-only duration seam: parse a millisecond value from the named
+/// environment variable, or return `default`. Mirrors
+/// `HARNX_TEST_BROKER_NOTICE_MS`: it changes a cutoff or delay value in
+/// tests, never a boundary or lifecycle policy, and production runs never
+/// set the variable. Invalid or zero values fall back to the default.
+pub fn test_env_duration_ms(name: &str, default: std::time::Duration) -> std::time::Duration {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|millis| *millis > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+/// Test-only stall seam: sleep the millisecond value of the named
+/// environment variable, if set. Callers place it inside a budgeted
+/// operation so e2e tests can deterministically exceed the budget after
+/// readiness. No variable set in production or in the test sandbox means
+/// this is a no-op.
+pub async fn test_env_sleep_ms(name: &str) {
+    let stall = test_env_duration_ms(name, std::time::Duration::ZERO);
+    if !stall.is_zero() {
+        tokio::time::sleep(stall).await;
+    }
+}
+
 pub fn parse_bool(value: &str) -> Option<bool> {
     match value {
         "1" | "true" => Some(true),

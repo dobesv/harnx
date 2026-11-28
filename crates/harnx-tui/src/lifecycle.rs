@@ -14,6 +14,7 @@ use crossterm::event::{Event, KeyEventKind};
 use crossterm::terminal::enable_raw_mode;
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
+use harnx_render::pretty_error_string;
 use harnx_runtime::config::{
     list_assistant_agents_for_display, sort_sessions_for_picker_with_context, PickerMatchMode,
     PickerQueryContext,
@@ -245,6 +246,43 @@ pub(crate) fn append_markdown_links(items: &mut Vec<TranscriptItem>, markdown: &
     }
 }
 
+fn append_initial_agent_intro(
+    cfg: &harnx_runtime::config::Config,
+    entries: &mut Vec<TranscriptItem>,
+) {
+    if !cfg
+        .state()
+        .contains(harnx_runtime::config::StateFlags::AGENT)
+    {
+        return;
+    }
+    if let Ok(banner) = cfg.agent_banner() {
+        if !banner.trim().is_empty() {
+            entries.push(TranscriptItem::AssistantText {
+                text: banner.clone(),
+                seq: None,
+                timestamp: None, // Banner has no timestamp
+                rendered_cache: None,
+            });
+            append_markdown_links(entries, &banner);
+        }
+    }
+    if let Some(agent) = &cfg.agent {
+        let starters = agent.conversation_staters();
+        if !starters.is_empty() {
+            let list = starters
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("  {}. {s}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n");
+            entries.push(TranscriptItem::SystemText(format!(
+                "Conversation starters:\n{list}\n(type .starter <n> to use)"
+            )));
+        }
+    }
+}
+
 impl Tui {
     #[cfg(test)]
     pub(super) async fn queue_pending_message(&mut self, text: String) {
@@ -285,23 +323,15 @@ impl Tui {
         Ok(())
     }
 
-    // qual:allow(complexity, max_function_lines=69) reason: "the constructor's field list grows one line per frontend concern (surfaces here)"
     pub async fn init(config: &GlobalConfig) -> Result<Self> {
-        // Use display names for TUI picker; in cluster-client mode, this omits
-        // local/package agents and strips default-cluster suffix.
-        let agents = Self::assistant_agents_for_display(config).await;
-        // Skip agents check in tests: test configs use a bare `Config::default()`
-        // with no agents directory populated, but the production check is covered
-        // by direct unit tests of `check_agents_available`.
-        if !cfg!(test) {
-            Self::check_agents_available(config, &agents)?;
-        }
+        Self::preflight_agents(config).await?;
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         install_tui_agent_event_sink(event_tx.clone());
 
         // Build the initial transcript: welcome + banner (if agent)
-        let initial_transcript = Self::build_initial_transcript(config).await;
+        let (initial_transcript, initial_history_failed) =
+            Self::build_initial_transcript_with_status(config, None).await;
         let code_theme = config.read().render_options()?.theme;
 
         let mut app = build_initial_app(config, initial_transcript)?;
@@ -314,7 +344,29 @@ impl Tui {
             app.modal = Self::resolve_initial_modal(config).await;
         }
 
-        Ok(Self {
+        let mut tui = Self::assemble(config, code_theme, app, event_tx, event_rx);
+        tui.transcript_view_ownership.active_destination = tui.current_history_destination();
+        if initial_history_failed {
+            tui.history_repair_target = Some(tui.current_history_target());
+        } else {
+            tui.transcript_view_ownership.active_binding =
+                Some(tui.current_transcript_action_target());
+        }
+        Ok(tui)
+    }
+
+    /// Plain field mapping from the pieces `init` built, extracted so the
+    /// startup frame stays under the function-size budget. Nothing here
+    /// awaits or spawns; `init` owns the setup ordering.
+    // qual:allow(complexity, max_function_lines=79) reason: "plain field-mapping struct literal with #[cfg(test)] hooks; construction needs each Tui field initialized together and has no branching"
+    fn assemble(
+        config: &GlobalConfig,
+        code_theme: Option<syntect::highlighting::Theme>,
+        app: crate::types::App,
+        event_tx: mpsc::UnboundedSender<crate::types::TuiEvent>,
+        event_rx: mpsc::UnboundedReceiver<crate::types::TuiEvent>,
+    ) -> Self {
+        Self {
             config: config.clone(),
             code_theme,
             abort_signal: create_abort_signal(),
@@ -343,22 +395,73 @@ impl Tui {
             copy_to_clipboard_override: None,
             #[cfg(test)]
             command_override: None,
+            #[cfg(test)]
+            history_load_override: None,
+            #[cfg(test)]
+            history_command_gate: None,
+            #[cfg(test)]
+            picker_sessions_override: None,
+            #[cfg(test)]
+            info_overlay_override: None,
+            #[cfg(test)]
+            history_repair_retry_delay_override: None,
             pending_remote_activations: HashSet::new(),
             session_activity_target: None,
             session_activity_handle: None,
             subagent_monitor_root: None,
             subagent_monitor_handles: HashMap::new(),
             subagent_rows_dirty: true,
+            history_rebuild_seq: 0,
+            history_rebuild_abort: None,
+            history_rebuild_handle: None,
+            session_attachment_gen: 0,
+            session_stream_attached: false,
+            history_refresh_rev: 0,
+            transcript_mutation_seq: 0,
+            history_repair_target: None,
+            history_repair_uses_wrapper: true,
+            history_repair_retry_delay: crate::history_work::INITIAL_HISTORY_REPAIR_DELAY,
+            history_repair_retry_handle: None,
+            history_command_running: false,
+            history_command_abort: None,
+            history_command_queue: std::collections::VecDeque::new(),
+            title_rename_abort: None,
+            title_rename_seq: 0,
+            transcript_view_ownership: crate::types::TranscriptViewOwnership::initial(),
+            info_overlay_abort: None,
+            info_overlay_seq: 0,
+            picker_refresh_abort: None,
+            picker_refresh_seq: 0,
+            picker_incarnation: 0,
+            picker_refresh_target: None,
+            new_session_reservation_abort: None,
+            new_session_reservation_seq: 0,
+            picker_unread_toggle_abort: None,
+            picker_unread_toggle_seq: 0,
             needs_full_redraw: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             app,
             event_tx,
             event_rx,
-        })
+        }
     }
 
     pub(super) async fn assistant_agents_for_display(config: &GlobalConfig) -> Vec<String> {
         let discovery = list_assistant_agents_for_display(&config.read());
         discovery.await
+    }
+
+    /// Fail early when no agent is configured and none is installable. The
+    /// agents check is skipped in tests: test configs use a bare
+    /// `Config::default()` with no agents directory populated, but the
+    /// production check is covered by direct unit tests of
+    /// `check_agents_available`.
+    // qual:allow(iosp) reason: "the cfg(test) skip mirrors the guard that lived inline in init; extracting the branch would split the production/test contract it encodes"
+    async fn preflight_agents(config: &GlobalConfig) -> Result<()> {
+        let agents = Self::assistant_agents_for_display(config).await;
+        if !cfg!(test) {
+            Self::check_agents_available(config, &agents)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
@@ -452,20 +555,20 @@ impl Tui {
             else {
                 return Self::picker_sessions_direct(&cfg, &cluster, agent_name).await;
             };
-            let list_result = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                cfg.list_remote_sessions_with_meta(&cluster),
-            )
-            .await;
+            // The listing budget is enforced inside
+            // `list_remote_sessions_with_abort`: managed-local acquisition
+            // (which can wait patiently through broker recovery) happens
+            // before it and must not be cut off by an outer deadline here.
+            let list_result = cfg.list_remote_sessions_with_abort(&cluster, None).await;
             let dirty_session_ids = Self::drain_picker_read_invalidations(&mut read_invalidations);
             let _ = read_invalidations.unsubscribe().await;
 
             let mut sessions: Vec<harnx_runtime::config::SessionMeta> = match list_result {
-                Ok(Ok(sessions)) => sessions
+                Ok(sessions) => sessions
                     .into_iter()
                     .filter(|session| session.agent_name.as_deref() == agent_name)
                     .collect(),
-                Ok(Err(error)) => {
+                Err(error) => {
                     log::warn!(
                         "Failed to list NATS sessions for cluster '{}': {:#}",
                         cluster,
@@ -474,13 +577,6 @@ impl Tui {
                     return (
                         vec![],
                         Some(format!("NATS sessions unavailable: {error:#}")),
-                    );
-                }
-                Err(_) => {
-                    log::warn!("Timeout listing NATS sessions for picker");
-                    return (
-                        vec![],
-                        Some("NATS sessions unavailable: timeout".to_string()),
                     );
                 }
             };
@@ -606,49 +702,82 @@ impl Tui {
         }
     }
 
-    pub(crate) async fn select_new_session(
+    /// Selecting "New session" in the picker must reserve a fresh session id,
+    /// which can wait on managed-local acquisition. That wait runs as
+    /// cancellable background work (design 9): the reservation lands as a
+    /// `NewSessionReserved` / `NewSessionReservationFailed` event, so the
+    /// input loop stays responsive while a broker recovers.
+    pub(crate) fn select_new_session(&mut self, selection: NewSessionSelection) {
+        self.spawn_new_session_reservation(selection);
+    }
+
+    /// Apply a finished background "New session" reservation: switch the
+    /// session, refresh the chrome, and reconcile the transcript.
+    // qual:allow(iosp) reason: "applies a reservation result as one ordered sequence — session, unread flag, chrome, reconcile — mirroring apply_new_session_reservation_failed"
+    pub(crate) async fn apply_new_session_reserved(
         &mut self,
-        selection: NewSessionSelection,
-    ) -> Result<()> {
-        let NewSessionSelection {
-            sessions,
-            selected,
-            origin_agent,
-            origin_session,
-        } = selection;
-        let restore_picker = |this: &mut Self| {
-            this.app.modal = Some(ModalState::SessionPicker {
-                sessions: sessions.clone(),
-                selected,
-                origin_agent: origin_agent.clone(),
-                origin_session: origin_session.clone(),
-                error: None,
-            });
-        };
-        let new_session_id =
-            match harnx_runtime::config::Config::reserve_new_session_id(&self.config).await {
-                Ok(session_id) => session_id,
-                Err(error) => {
-                    restore_picker(self);
-                    return Err(error);
-                }
-            };
-        let use_result = self.config.write().use_session(Some(&new_session_id));
-        if let Err(error) = use_result {
-            restore_picker(self);
-            return Err(error);
+        session_id: String,
+        origin_agent: Option<String>,
+        origin_session: Option<String>,
+    ) {
+        self.retire_picker_refresh();
+        if let Err(error) = self.config.write().use_session(Some(&session_id)) {
+            // No picker data survives here; surface the failure in the
+            // transcript instead of silently keeping the old session.
+            self.app
+                .transcript
+                .push(TranscriptItem::ErrorText(pretty_error_string(&error)));
+            return;
         }
         // New sessions start as read (unread=false)
+        self.retire_pending_title_rename();
         self.app.current_session_unread = false;
         let llm_busy = self.app.llm_busy;
         let pending = self.app.pending_message.is_some();
         Self::refresh_input_chrome_from_state(&self.config, &mut self.app, llm_busy, pending);
         self.reconcile_transcript_after_command(origin_session, origin_agent, ".session")
             .await;
-        Ok(())
     }
 
+    /// A background "New session" reservation failed: restore the picker it
+    /// was started from, with the failure visible in it.
+    pub(crate) fn apply_new_session_reservation_failed(
+        &mut self,
+        error: String,
+        sessions: Vec<SessionMeta>,
+        selected: usize,
+        origin_agent: Option<String>,
+        origin_session: Option<String>,
+    ) {
+        self.retire_picker_refresh();
+        self.app.modal = Some(ModalState::SessionPicker {
+            sessions,
+            selected,
+            origin_agent,
+            origin_session,
+            error: Some(error),
+        });
+    }
+
+    #[cfg(test)]
     pub(crate) async fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptItem> {
+        Self::build_initial_transcript_with_status(config, None)
+            .await
+            .0
+    }
+
+    pub(crate) async fn build_initial_transcript_with_status(
+        config: &GlobalConfig,
+        abort_signal: Option<&harnx_runtime::utils::AbortSignal>,
+    ) -> (Vec<TranscriptItem>, bool) {
+        let history_result = load_session_history_transcript_items(config, abort_signal).await;
+        Self::build_initial_transcript_from_history(config, history_result)
+    }
+
+    pub(crate) fn build_initial_transcript_from_history(
+        config: &GlobalConfig,
+        history_result: Result<Vec<TranscriptItem>>,
+    ) -> (Vec<TranscriptItem>, bool) {
         let mut entries = vec![];
 
         // Show the welcome banner on startup, even when an agent/session status line is also present.
@@ -657,40 +786,21 @@ impl Tui {
             env!("CARGO_PKG_VERSION")
         )));
 
-        let history = session_history_transcript_items(config).await;
+        let mut failed = false;
+        let history = match history_result {
+            Ok(items) => items,
+            Err(error) => {
+                failed = true;
+                vec![TranscriptItem::ErrorText(format!(
+                    "Failed to load session history: {error:#}"
+                ))]
+            }
+        };
         let cfg = config.read();
-        let state = cfg.state();
         if !history.is_empty() {
             entries.extend(history);
         } else {
-            // Show agent banner and conversation starters if an agent is active
-            if state.contains(harnx_runtime::config::StateFlags::AGENT) {
-                if let Ok(banner) = cfg.agent_banner() {
-                    if !banner.trim().is_empty() {
-                        entries.push(TranscriptItem::AssistantText {
-                            text: banner.clone(),
-                            seq: None,
-                            timestamp: None, // Banner has no timestamp
-                            rendered_cache: None,
-                        });
-                        append_markdown_links(&mut entries, &banner);
-                    }
-                }
-                if let Some(agent) = &cfg.agent {
-                    let starters = agent.conversation_staters();
-                    if !starters.is_empty() {
-                        let list = starters
-                            .iter()
-                            .enumerate()
-                            .map(|(i, s)| format!("  {}. {s}", i + 1))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        entries.push(TranscriptItem::SystemText(format!(
-                            "Conversation starters:\n{list}\n(type .starter <n> to use)"
-                        )));
-                    }
-                }
-            }
+            append_initial_agent_intro(&cfg, &mut entries);
         }
 
         // Show status line if set (session / model info)
@@ -699,7 +809,7 @@ impl Tui {
             entries.push(TranscriptItem::SystemText(status));
         }
 
-        entries
+        (entries, failed)
     }
 
     /// Returns a reference to the transcript items collected during the session.
@@ -713,7 +823,41 @@ impl Tui {
 
     pub async fn run(&mut self) -> Result<()> {
         let _panic_terminal_hook = PanicTerminalHookGuard::install();
-        let mut terminal = Self::setup_terminal()?;
+        // Transfer the broker-wait notice route to the live TUI channel
+        // BEFORE terminal setup: bootstrap stderr routing stops here, so a
+        // waiting broker reports through the rendered transcript and nothing
+        // writes raw stderr once the terminal is in raw mode. Unit tests have
+        // no frontend broker scope; there is nothing to reroute.
+        let mut previous_notice_sink = None;
+        if !cfg!(test) {
+            let tx = self.event_tx.clone();
+            let sink = std::sync::Arc::new(
+                move |notice: harnx_runtime::nats_local_server::BrokerWaitNotice| {
+                    let _ = tx.send(TuiEvent::LocalAgent(harnx_core::event::AgentEvent::Notice(
+                        harnx_core::event::NoticeEvent::Warning(notice.to_string()),
+                    )));
+                },
+            );
+            previous_notice_sink =
+                harnx_runtime::nats_local_server::reroute_frontend_broker_notices(sink)
+                    .ok()
+                    .flatten();
+        }
+        let mut terminal = match Self::setup_terminal() {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                // Bootstrap failure: the TUI channel this run installed is
+                // about to disappear. Restore the pre-TUI route (the scope's
+                // stderr sink) so notices during unwinding keep reaching the
+                // user instead of a dead channel (routing cleanup, design 9).
+                if !cfg!(test) {
+                    harnx_runtime::nats_local_server::restore_frontend_broker_notices(
+                        previous_notice_sink,
+                    );
+                }
+                return Err(error);
+            }
+        };
 
         if let Some(title) = self.config.read().session.as_ref().and_then(|s| s.title()) {
             let _ = std::io::stdout().execute(crossterm::terminal::SetTitle(title));
@@ -1425,41 +1569,37 @@ fn prepare_session_history(config: &GlobalConfig) -> Option<SessionHistoryContex
     })
 }
 
-pub(crate) async fn session_history_transcript_items(config: &GlobalConfig) -> Vec<TranscriptItem> {
+pub(crate) async fn load_session_history_transcript_items(
+    config: &GlobalConfig,
+    abort_signal: Option<&harnx_runtime::utils::AbortSignal>,
+) -> Result<Vec<TranscriptItem>> {
     let Some(context) = prepare_session_history(config) else {
-        return vec![];
+        return Ok(vec![]);
     };
     match context.source {
         SessionHistorySource::Local {
             compressed_messages,
             messages,
             compaction_summary,
-        } => build_transcript_with_compaction(
+        } => Ok(build_transcript_with_compaction(
             &compressed_messages,
             &messages,
             compaction_summary.as_deref(),
             &context.declarations,
-        ),
+        )),
         SessionHistorySource::Remote {
             agent,
             cluster,
             session_id,
         } => {
-            let state = match crate::session_history_loader::load_remote_session_history(
+            let state = crate::session_history_loader::load_remote_session_history(
                 config,
                 agent,
                 cluster.clone(),
                 session_id,
+                abort_signal,
             )
-            .await
-            {
-                Ok(state) => state,
-                Err(error) => {
-                    return vec![TranscriptItem::ErrorText(format!(
-                        "Failed to load session history: {error:#}"
-                    ))];
-                }
-            };
+            .await?;
             let mut transcript = build_transcript_with_compaction_for_cluster(
                 &state.compressed_messages,
                 &state.messages,
@@ -1470,8 +1610,18 @@ pub(crate) async fn session_history_transcript_items(config: &GlobalConfig) -> V
             transcript.extend(state.replay_warnings.into_iter().map(|warning| {
                 TranscriptItem::ErrorText(format!("Session history warning: {warning}"))
             }));
-            transcript
+            Ok(transcript)
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn session_history_transcript_items(config: &GlobalConfig) -> Vec<TranscriptItem> {
+    match load_session_history_transcript_items(config, None).await {
+        Ok(transcript) => transcript,
+        Err(error) => vec![TranscriptItem::ErrorText(format!(
+            "Failed to load session history: {error:#}"
+        ))],
     }
 }
 

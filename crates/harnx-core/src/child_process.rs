@@ -34,6 +34,10 @@ enum ManagerRequest {
         runtime: tokio::runtime::Handle,
         response: oneshot::Sender<io::Result<Child>>,
     },
+    SpawnStd {
+        command: Box<std::process::Command>,
+        response: mpsc::SyncSender<io::Result<std::process::Child>>,
+    },
     Shutdown,
 }
 
@@ -69,15 +73,8 @@ impl ChildProcessManager {
                 "spawn managed child outside a Tokio runtime: {error}"
             ))
         })?;
-        let manager = self.inner.started.get_or_init(start_manager);
-        let sender = manager.sender.as_ref().ok_or_else(|| {
-            io::Error::other(format!(
-                "child process manager failed to start: {}",
-                manager.startup_error.as_deref().unwrap_or("unknown error")
-            ))
-        })?;
         let (response, result) = oneshot::channel();
-        sender
+        self.sender()?
             .send(ManagerRequest::Spawn {
                 command: Box::new(command),
                 runtime,
@@ -87,6 +84,32 @@ impl ChildProcessManager {
         result
             .await
             .map_err(|_| io::Error::other("child process manager stopped during spawn"))?
+    }
+
+    /// Spawn a synchronous child from the stable parent thread. Use this when
+    /// a drop guard must reap the child synchronously before releasing a resource.
+    pub fn spawn_std(&self, mut command: std::process::Command) -> io::Result<std::process::Child> {
+        configure_std_process(&mut command);
+        let (response, result) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(ManagerRequest::SpawnStd {
+                command: Box::new(command),
+                response,
+            })
+            .map_err(|_| io::Error::other("child process manager stopped unexpectedly"))?;
+        result
+            .recv()
+            .map_err(|_| io::Error::other("child process manager stopped during spawn"))?
+    }
+
+    fn sender(&self) -> io::Result<&mpsc::Sender<ManagerRequest>> {
+        let manager = self.inner.started.get_or_init(start_manager);
+        manager.sender.as_ref().ok_or_else(|| {
+            io::Error::other(format!(
+                "child process manager failed to start: {}",
+                manager.startup_error.as_deref().unwrap_or("unknown error")
+            ))
+        })
     }
 
     /// Stop the Unix process group created by this manager, including descendants.
@@ -156,13 +179,27 @@ fn run_manager(receiver: mpsc::Receiver<ManagerRequest>) {
                 let _guard = runtime.enter();
                 let _ = response.send(command.spawn());
             }
+            ManagerRequest::SpawnStd {
+                mut command,
+                response,
+            } => {
+                // The synchronous caller has no cancellation point between
+                // sending the request and receiving the child.
+                let _ = response.send(command.spawn());
+            }
             ManagerRequest::Shutdown => break,
         }
     }
 }
 
-#[cfg(unix)]
 fn configure_managed_process(command: &mut Command) {
+    configure_std_process(command.as_std_mut());
+}
+
+#[cfg(unix)]
+fn configure_std_process(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
     #[cfg(target_os = "linux")]
     let parent_pid = std::process::id() as libc::pid_t;
     // SAFETY: pre_exec invokes only async-signal-safe libc calls.
@@ -186,7 +223,7 @@ fn configure_managed_process(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn configure_managed_process(_command: &mut Command) {}
+fn configure_std_process(_command: &mut std::process::Command) {}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {

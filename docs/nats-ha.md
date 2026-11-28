@@ -1633,6 +1633,9 @@ configuration-backed local connections retain this guard. When an owner exits,
 survivors elect one replacement. Existing workers keep their PIDs, environments,
 tool servers, and activation routes. Exiting a frontend still shuts down that
 frontend's own worker tree; this recovery contract covers surviving frontends.
+Waiting for a live local `nats-server` to start or recover has no total
+wall-clock deadline — see
+[Local broker startup waits](#local-broker-startup-waits-visible-status-and-cancellation).
 
 All production runtime and tool-server connections use
 `harnx_nats_common::connect::NatsEndpoint`. It keeps reconnecting to the stable
@@ -1656,7 +1659,14 @@ Use these operation-specific patterns when adding a NATS caller:
 | Observe turn completion | Incremental transcript polling operates independently of live advisories. Durable coverage determines which prompt completed; a prior turn's advisory cannot complete an injected prompt. |
 | Consume worker activations | Reopen the durable pull stream after errors/closure; acknowledge according to the activation's durable admission and lease state. |
 
-General recovery operations have a 15-second budget. RPC handler heartbeats renew
+General recovery operations have a 15-second budget (`harnx_nats_common::recovery::RECOVERY_TIMEOUT`):
+the window an in-flight broker operation — a leader read, a CAS retry, an RPC
+awaiting its reply — keeps retrying a transient failure. It is an operation
+budget, not a process startup budget: waiting for a live local `nats-server` to
+publish its port, accept authenticated connections, or finish JetStream
+recovery is unbounded and cancellable instead (see
+[Local broker startup waits](#local-broker-startup-waits-visible-status-and-cancellation)).
+RPC handler heartbeats renew
 the activity deadline, so a healthy long-running handler has no imposed total
 duration beyond its configured timeout. Results retain a bounded receipt window.
 Loss of activity or exhausted recovery reports that the call's outcome is
@@ -1675,6 +1685,111 @@ Regression coverage lives in `nats_local_server/failover.rs`,
 `harnx-nats-common/tests/it/registry_ttl/recovery.rs`. Failover tests must retain
 existing clients and in-flight work while removing the broker owner; reconnecting
 a newly constructed client alone does not establish recovery.
+
+### Local broker startup waits, visible status, and cancellation
+
+Starting or recovering the local broker used to kill a healthy `nats-server`
+after a fixed 15-second startup deadline; a large JetStream store recovering at
+startup could never finish. There is no total startup deadline anymore. The
+startup wait covers four observed phases — the child reporting its version,
+publishing its bound port, accepting authenticated connections, and another
+owner holding the lifetime lock — and waits as long as the owned child stays
+alive. Status notices describe the observed phase, the child's PID where one is
+known, and elapsed wait time; they never claim JetStream is rebuilding, because
+slowness alone is not evidence of recovery. The first notice appears after 5
+seconds and repeats every 10 seconds in the same wait episode.
+
+- **Manual exit.** Every waiting caller can stop waiting: press Ctrl-C to
+  interrupt a Cmd-mode wait or exit a waiting TUI through its normal cleanup.
+  Notices say so. A wedged child may wait indefinitely by explicit user choice;
+  periodic status and cancellation replace the automatic deadline failure.
+- **Caller vs owner cancellation.** Cancelling one caller drops only that
+  caller's wait. The broker acquisition itself is owned by the frontend
+  execution scope, not by any request, so a cancelled caller never kills a
+  startup another caller still needs, and a turn/request abort cannot poison
+  later broker recovery. Real frontend shutdown is different: it joins the
+  startup/recovery task, stops and reaps the owned child before releasing the
+  lock, and prevents any late ready publication, so another process can take
+  over ownership afterwards.
+- **Retries stay bounded where they should be.** Genuine child exits and
+  definitive startup or configuration errors still fail fast with diagnostics
+  and keep the existing finite spawn-attempt policy. Per-attempt connect and
+  flush probes stay short (1 second) and retry against the same live PID
+  instead of tearing the child down; the child's exit is checked between
+  attempts. Shutdown keeps its bounded stop/escalation path.
+- **Fresh callers during recovery.** A new managed-local caller waits for the
+  current readiness generation — it never accepts a cached ready state, an
+  unchanged nonce, or a held lock as proof of authenticated reachability. If
+  its connection fails during an owner transition, it returns to the patient
+  acquisition path instead of failing through the shared connector's
+  recovery-operation budget; remote/HTTP/A2A callers keep their existing
+  connector policy. The managed-local wait itself also sits outside the
+  bounded operation budgets that start only after readiness: the 15-second
+  session-id reservation, the 10-second session listing, and the worker
+  operation/activation deadlines.
+- **Where notices appear.** Broker wait notices go to stderr during Cmd
+  operation and TUI bootstrap, before the terminal is set up, so they are
+  visible during slow startup and `--final-only` output on stdout stays
+  machine-readable; once the TUI is live they route as ordinary notices. A
+  TUI whose initial history load failed repairs its transcript after the
+  broker returns — the first successful stream attachment schedules a
+  read-only history reload in the background, failures leave the displayed
+  transcript alone and retry, and no restart or new turn is needed.
+
+### Scoped startup/recovery timeout audit
+
+Task-scoped audit for #2922, recorded 2026-11-26 against branch
+`local-broker-restart-loop-nats-server-is-killed` (`13b32b329` plus the
+uncommitted T4 documentation). Each row was rechecked against current code at
+the named symbol; this is not a claim that every timeout in the repository was
+inspected. Dispositions other than "keep" are follow-up work candidates, not
+changes made by this fix: the contracts below are independent subsystems.
+
+| Site / symbol | Budget | Purpose | Progress on expiry | Retry / cancel / status | Disposition |
+| --- | --- | --- | --- | --- | --- |
+| `harnx-runtime/src/nats_local_server.rs` + `nats_local_server/wait_notice.rs` startup waits | none (formerly 15s `PORT_REPORT_TIMEOUT`/`STARTUP_TIMEOUT` total deadlines) | wait for version probe, port report, authenticated readiness, or another owner | never discarded while the child lives; notices at 5s then every 10s; Ctrl-C cancels the individual waiter; frontend shutdown reaps the owned child before unlock | fixed by this change (#2922 T1/T2) |
+| `nats_local_server.rs` `CONNECT_TIMEOUT` | 1s per attempt | per-attempt connect/flush probe | probe failure retries the same live PID; child exit between attempts fails fast | keep |
+| `nats_local_server.rs` `SHUTDOWN_TIMEOUT` | 5s | stop/escalate the owned child during shutdown | shutdown correctness; unlock still requires reaped child | keep |
+| `harnx-nats-common/src/recovery.rs` `RECOVERY_TIMEOUT` | 15s | retry window for in-flight broker operations (leader reads, CAS, RPC with heartbeats) | reports outcome "not known"; never rolls back a side effect | keep; operation budget, distinct from startup (see above). Managed-local acquisition was moved outside it |
+| `harnx-nats-common/src/connect.rs` `NatsEndpoint::connect` | 15s initial connect recovery | bound the first connect of a remote/HTTP/A2A endpoint | reconnect options keep retrying afterwards; connect no longer waits before the first attempt (#2918) | keep for remote endpoints — an externally operated broker outage must surface as an error, and a silent unbounded remote wait would have no local status to show. Managed-local initial readiness no longer routes through it |
+| `harnx-runtime/src/config/paths_split.rs` `reserve_new_session_id_with_timeout` | 15s reservation, 3s per attempt | bound the actual session-id reservation operation | managed-local acquisition/readiness now happens outside the budget and is caller-cancellable (T1); the reservation itself stays bounded | keep |
+| `harnx-runtime/src/config/session_ops_split.rs` `REMOTE_SESSION_LIST_TIMEOUT` | 10s | bound the session listing after readiness | readiness wait outside the budget (T1/T2); listing stays bounded | keep |
+| `harnx-runtime/src/nats_worker/tool_supervisor.rs` `TOOL_STARTUP_TIMEOUT` | 15s | wait for a spawned tool server's registration | server is reported "unregistered" (tools degraded for that activation) with a "may still be starting" diagnostic; the timeout does not kill the still-running child, and `retry_unregistered` re-waits live children rather than stacking a second copy; no wait status to the user | can abandon healthy progress if a tool server legitimately needs >15s to register — follow-up F2 |
+| `harnx-runtime/src/nats_worker/daemon_runtime.rs` `SESSION_TOOL_SERVER_START_TIMEOUT` | 20s | session waits for a tool server another session is still starting | same degraded-tools fallback | keep, revisit together with F2 |
+| `harnx-runtime/src/nats_worker/activation_transport.rs` `WORK_NOTIFY_ACK_WAIT` / `ack_wait` | 30s | activation acknowledgement and redelivery correctness | delivery semantics, not startup; max-deliver and backoff rules apply | keep |
+| `harnx-mcp-bridge/src/lib.rs` `INITIALIZE_TIMEOUT` / `LIST_TOOLS_TIMEOUT` | 30s / 10s | MCP handshake and tool listing; warns every 5s while a handshake is outstanding; on timeout the wrapped child is torn down with the transport | can kill a healthy MCP server that is slow to initialize, discarding its startup progress; no cancellation short of the caller's abort | follow-up F1 |
+| `harnx-client/src/llama_server/process.rs` `wait_until_ready` (`DEFAULT_READY_TIMEOUT`) | 300s (configurable) | wait for llama-server health on its socket; child exit fails fast | no wait notice and no in-wait cancellation during the silent 5-minute window | follow-up F3 |
+| `harnx-runtime/src/local_orchestrator.rs` `wait_for_readiness` | unbounded while the worker lives | local worker startup | notices after 5s, every 10s; abort checked between polls | keep — this is the precedent the broker wait now follows |
+
+Follow-ups, ranked by user impact, each a separate design and change:
+
+- **F1 — MCP bridge startup patience.** A healthy MCP server needing more than
+  30s to initialize is killed. Mirror the broker wait: visible status, caller
+  cancellation, and no total deadline for a live child that is still making
+  progress. Constraints: tools must be known before the agent loop runs, the
+  tool-supervisor registration deadline interacts with this one, and the
+  progress warning currently only logs — surfacing it to the frontend needs
+  worker-side notice plumbing.
+- **F2 — tool-server startup patience (15s/20s pair).** A tool server slower
+  than 15s leaves its tools missing for the activation. Constraints: the
+  activation ack window and the session start timeout must grow together,
+  startup retry must not double-register a server, and the current
+  degraded-tools fallback is safe, so the deadline is wrong only for slow
+  starts.
+- **F3 — llama-server readiness status.** Add the same notice cadence and a
+  cancellable wait to `wait_until_ready` without changing the 300s default or
+  the fast-fail on child exit. Constraints: model-server lifecycle is out of
+  scope for the broker fix and any change must keep a genuine hang bounded by
+  user choice, not a silent deadline.
+
+Timeouts serving different contracts were reviewed and left intact on purpose:
+leader reads / CAS / RPC retry windows (`recovery.rs`), session leases (~30s
+TTL, ~10s renewal, reclaim by proof-of-death), shutdown escalation, daemon
+tool-server registration (90s KV TTL refreshed every 30s, so a terminating
+replica cannot delete a shared registration), activation ack/redelivery, and
+lease acquisition timeout (`nats_lease_acquisition_timeout_secs`, 60s default).
+These bound correctness of in-flight operations, not healthy startup progress,
+and removing them would create split-brain or lost-work risks.
 
 ### Leases & Fencing
 Harnx uses a renewable CAS (Compare-And-Swap) lease in NATS KV:
