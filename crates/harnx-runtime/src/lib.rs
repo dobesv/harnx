@@ -53,6 +53,7 @@ pub mod operator_tools;
 pub mod remote_session_cleanup;
 mod script_shape;
 pub mod script_tool_provider;
+pub mod script_usage;
 pub use script_shape::ScriptShape;
 mod script_tools;
 pub mod server_identity;

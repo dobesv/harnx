@@ -40,6 +40,9 @@ async fn example() {
   `ScriptRun.error`, independent of stream caps. BashKit 0.21.1 reports late
   syntax errors as ordinary stderr with exit 2; if its own stderr cap has
   discarded that diagnostic, the backend can't recover it.
+- The `bash` tool's result carries the status, exit code and an inner call trace;
+  `harnx info script-usage` aggregates them across stored sessions (see the
+  [command-line guide](../../docs/command-line-guide.md)).
 - BashKit is pinned to `=0.21.1`, with `jq` and `python` enabled. HTTP, SSH,
   git and host filesystems aren't enabled. `http`/`curl`/`wget` are also filtered out at
   construction. Builtins operate on virtual files, including BashKit's synthetic
