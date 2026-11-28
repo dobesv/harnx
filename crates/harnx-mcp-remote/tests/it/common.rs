@@ -351,6 +351,167 @@ pub async fn spawn_proxy_client_with_lifecycle(
     }
 }
 
+/// Proxy stderr, captured incrementally into a shared buffer so a test can
+/// read it while the proxy is still running.
+#[derive(Clone)]
+pub struct CapturedStderr {
+    pub buffer: Arc<Mutex<String>>,
+    /// Set by the capture task once the child's stderr closes, so tests can
+    /// prove they have drained everything the child ever printed.
+    eof: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CapturedStderr {
+    pub fn text(&self) -> String {
+        self.buffer.lock().expect("stderr buffer").clone()
+    }
+}
+
+pub fn capture_stderr(mut stderr: tokio::process::ChildStderr) -> CapturedStderr {
+    let captured = CapturedStderr {
+        buffer: Arc::new(Mutex::new(String::new())),
+        eof: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let output = captured.clone();
+    // The capture task owns the pipe and runs until EOF, even if the caller
+    // already has a connect error and has not checked stderr yet.
+    drop(tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 4096];
+        while let Ok(read) = stderr.read(&mut chunk).await {
+            if read == 0 {
+                output.eof.store(true, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+            output
+                .buffer
+                .lock()
+                .expect("stderr buffer")
+                .push_str(&String::from_utf8_lossy(&chunk[..read]));
+        }
+    }));
+    captured
+}
+
+/// Whether the child's stderr has closed (child exit), so a caller can prove
+/// it has drained everything the child ever printed.
+pub fn stderr_at_eof(stderr: &CapturedStderr) -> bool {
+    stderr.eof.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Waits for the child's stderr to reach EOF (child exit), up to `timeout`.
+/// Returns `false` on expiry, leaving the caller to assert on the partial
+/// capture — a "nothing unsafe was logged" claim is only sound over a
+/// drained stderr, so tests fail on `false`.
+pub async fn stderr_wait_eof(stderr: &CapturedStderr, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !stderr_at_eof(stderr) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    stderr_at_eof(stderr)
+}
+
+/// Outcome of spawning the proxy with a live stderr capture, shared by the
+/// serving and rejection spawners below.
+enum Spawned {
+    Served(
+        rmcp::service::RunningService<RoleClient, TestClientHandler>,
+        RecordedMethods,
+        CapturedStderr,
+    ),
+    /// The downstream initialize was rejected. The transport is already
+    /// dropped, so rmcp kills the child (after its grace period) and the
+    /// capture reaches EOF on its own.
+    Rejected(anyhow::Error, CapturedStderr),
+}
+
+/// Spawns the proxy binary with extra child-environment entries and a live,
+/// EOF-tracked stderr capture, connecting downstream with the legacy
+/// `initialize` lifecycle. The child being rejected at initialize is an
+/// `Ok(Spawned::Rejected)`, not a spawn failure.
+async fn spawn_proxy_client_captured(args: &[String], env: &[(&str, &str)]) -> Result<Spawned> {
+    let bin = proxy_binary_path().context("harnx-mcp-remote binary not found")?;
+    let mut command = tokio::process::Command::new(bin);
+    command.args(args);
+    command.env_remove("MCP_REMOTE_OAUTH_TOKEN_URL");
+    command.env_remove("MCP_REMOTE_BEARER_TOKEN");
+    command.env_remove("MCP_REMOTE_URL");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn harnx-mcp-remote")?;
+    let captured = capture_stderr(stderr.expect("proxy stderr should be piped"));
+    let methods = RecordedMethods::default();
+    let transport = RecordingTransport {
+        inner: transport,
+        methods: methods.clone(),
+    };
+    let result = rmcp::service::serve_client_with_lifecycle(
+        TestClientHandler,
+        transport,
+        ClientLifecycleMode::Initialize,
+    )
+    .await;
+    match result {
+        Ok(service) => Ok(Spawned::Served(service, methods, captured)),
+        Err(err) => Ok(Spawned::Rejected(
+            anyhow::anyhow!(
+                "connect MCP client to proxy stdio: {err}; proxy stderr: {}",
+                captured.text()
+            ),
+            captured,
+        )),
+    }
+}
+
+/// Spawns the proxy binary with extra child-environment entries, connecting
+/// downstream with the legacy `initialize` lifecycle and keeping a live
+/// stderr capture. Unlike [`spawn_proxy_client_with_lifecycle`], the stderr
+/// task is not discarded, so tests can assert on logged output afterwards.
+pub async fn spawn_proxy_client_env(
+    args: &[String],
+    env: &[(&str, &str)],
+) -> Result<(
+    rmcp::service::RunningService<RoleClient, TestClientHandler>,
+    RecordedMethods,
+    CapturedStderr,
+)> {
+    match spawn_proxy_client_captured(args, env).await? {
+        Spawned::Served(service, methods, stderr) => Ok((service, methods, stderr)),
+        // Rejections surface as the plain connect error, as before; use
+        // [`spawn_proxy_client_rejected`] when the drained stderr matters.
+        Spawned::Rejected(err, _) => Err(err),
+    }
+}
+
+/// Spawns the proxy expecting its downstream initialize to be rejected, then
+/// drains the child's stderr to EOF and returns the connect error alongside
+/// the complete stderr text. Tests that must prove nothing unsafe was logged
+/// before or during a rejection need the drained capture, not the prefix
+/// captured at the moment the initialize failed.
+pub async fn spawn_proxy_client_rejected(
+    args: &[String],
+    env: &[(&str, &str)],
+) -> Result<(String, String)> {
+    match spawn_proxy_client_captured(args, env).await? {
+        Spawned::Rejected(err, stderr) => {
+            // The transport is already dropped; rmcp kills the child after
+            // its grace period, which closes stderr.
+            if !stderr_wait_eof(&stderr, std::time::Duration::from_secs(10)).await {
+                anyhow::bail!("proxy child stderr never reached EOF");
+            }
+            Ok((err.to_string(), stderr.text()))
+        }
+        Spawned::Served(service, _, _) => {
+            service.cancel().await?;
+            anyhow::bail!("expected the proxy to be rejected, but it connected")
+        }
+    }
+}
+
 pub fn text_content(result: &CallToolResult) -> String {
     result
         .content

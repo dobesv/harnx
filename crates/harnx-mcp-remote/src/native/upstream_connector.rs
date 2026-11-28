@@ -11,10 +11,10 @@ pub use rmcp::transport::streamable_http_client::StreamableHttpClientTransportCo
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::authenticated_http::AuthenticatedHttp;
 use crate::native::client_handler::PoolClientHandler;
 use crate::native::NativeConfig;
-
-use super::pool::UpstreamAuth;
+use crate::UpstreamAuth;
 
 /// Connects one upstream rmcp client for a principal's credential. The HTTP
 /// implementation lives here; other transports plug in through this trait.
@@ -87,7 +87,7 @@ impl UpstreamConnector for HttpUpstreamConnector {
         if self.strict_session {
             config.allow_stateless = false;
         }
-        let http = super::authenticated_http::AuthenticatedHttp {
+        let http = AuthenticatedHttp {
             http: self.http.clone(),
             auth,
         };

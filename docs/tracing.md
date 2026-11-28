@@ -59,6 +59,7 @@ A base endpoint such as `http://collector:4318` (for HTTP) or `http://collector:
 
 - **gRPC TLS**: Endpoints using `https://` use server TLS verified against bundled Mozilla root certificates (`webpki-roots`). Cleartext endpoints (`http://`) connect using HTTP/2 prior knowledge (h2c). Client certificate authentication (mTLS) is not supported.
 - **Credential Stripping on Cleartext Networks**: When exporting to a cleartext (`http://`) endpoint on a non-loopback host (any host other than `localhost`, `127.0.0.0/8`, or `::1`), Harnx logs a warning and strips credential headers (`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS`). This protection applies to both HTTP headers and gRPC metadata to prevent leaking secrets over unencrypted networks. Configure an `https://` endpoint to send credentials to a remote collector. Loopback destinations allow cleartext credentials for local development.
+- **Payload target exclusion (opt-in)**: `RUST_LOG` directives select what is interesting; they are not deny rules. A more specific directive (e.g. `rmcp::service=trace`) or tracing inside a dynamically enabled span lets a target through an `=off` rule, so an `EnvFilter` alone is not a payload-secrecy boundary. For binaries that need one, `harnx-telemetry` offers `init_telemetry_with_options` with `TelemetryOptions::exclude_targets`: a subscriber-level veto that drops spans and events from an exact target and its `::` descendants regardless of `RUST_LOG`, while every other target keeps the user's filter. `harnx-mcp-remote` uses this in client-credentials OAuth mode to keep `rmcp`, `reqwest`, `hyper`, and `hyper_util` payload logs out of OTLP while app-owned spans still export (see [Tool Credentials](tool-credentials.md)).
 
 ## Spans & Attributes
 
@@ -102,7 +103,7 @@ Tracing support across workspace binaries falls into four tiers:
 
 - **Full instrumentation** (tracer initialization and custom spans): `harnx`, `harnx-worker`, `harnx-serve`, `harnx-mcp-bridge`.
 - **Tool servers** (tracer initialization and inbound `tool_exec` server spans): all toolset-server binaries using the shared bootstrap (`harnx-fs-tools`, `harnx-bash-tools`, `harnx-plans-tools`, `harnx-aws-creds`, `harnx-k8s-creds`, `harnx-proxy-auth`, `harnx-claude-hook-tools`, etc.).
-- **Init-only** (tracer initialization to export telemetry if `OTEL_*` is set, without custom spans): `harnx-pkg`, `harnx-mcp-remote`.
+- **Init-only** (tracer initialization to export telemetry if `OTEL_*` is set, without custom spans): `harnx-pkg`, `harnx-mcp-remote` (`harnx-mcp-remote` additionally emits one safe startup span in OAuth client-credentials mode, as the positive control for its exclusion policy).
 - **Out of scope (untraced)**:
   - `harnx-sandbox-exec`: Short-lived command execution helper without a persistent Tokio runtime required by the batch log exporter.
   - `harnx_tty_probe`: Brief terminal probe utility without a Tokio runtime.

@@ -38,7 +38,7 @@ const USERINFO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_USERINFO_BODY_BYTES: usize = 64 * 1024;
 
 /// Standard OAuth 2.0 error codes (RFC 6749, RFC 7591, RFC 8414).
-const STANDARD_OAUTH_ERRORS: &[&str] = &[
+pub(crate) const STANDARD_OAUTH_ERRORS: &[&str] = &[
     "invalid_request",
     "invalid_client",
     "invalid_grant",

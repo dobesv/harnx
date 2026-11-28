@@ -1,18 +1,27 @@
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, InitializeRequestParams,
-    ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerConfig,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    InitializeRequestParams, ListPromptsResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig,
 };
-use rmcp::service::{RequestContext, RoleClient, RoleServer, RunningService};
+use rmcp::service::{RequestContext, RoleClient, RoleServer, RunningService, ServiceError};
 use rmcp::Peer;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::authenticated_http::SafeHttpError;
 use crate::cli::Cli;
 use crate::client_handler::RemoteClientHandler;
-use crate::transport::build_transport;
+use crate::transport::{build_client_credentials_transport, build_transport, UpstreamTransport};
+use rmcp::transport::streamable_http_client::StreamableHttpError;
+
+/// Replaces untrusted upstream text in failed tool results and decoded MCP
+/// service errors under client-credentials mode. Upstream text can echo the
+/// presented token (including a token that was retired mid-flight by a
+/// rotation), so no part of it can be forwarded without a redaction
+/// guarantee we cannot give here.
+const SAFE_UPSTREAM_FAILURE: &str = "remote MCP call failed; upstream error output was withheld";
 
 /// Maps service/transport errors to JSON-RPC error frames.
 /// Per SEP-1303, transport and lifecycle errors legitimately remain as
@@ -20,6 +29,94 @@ use crate::transport::build_transport;
 fn proxy_error(err: rmcp::service::ServiceError) -> ErrorData {
     // Preserve the existing JSON-RPC error mapping and upstream message text.
     ErrorData::internal_error(err.to_string(), None)
+}
+
+/// Renders the OAuth transport's positively identified safe diagnostic, or
+/// `None` when the chain is not one.
+///
+/// `AuthenticatedHttp::safe_error` reduces every HTTP failure to its own
+/// app-authored `SafeHttpError` text or to one of rmcp's static labels
+/// before rmcp's worker ever sees it. But rmcp also builds transport errors
+/// *after* the adapter already ran: session recovery wraps the upstream
+/// JSON-RPC error in `ReinitializationFailed` (its Display embeds the
+/// upstream message and data), and response parsing keeps a body preview in
+/// `UnexpectedServerResponse`. Those, and any unclassified chain, carry
+/// upstream-controlled text and must not be displayed.
+// qual:allow(coupling, deh) reason: "The downcast is the security boundary itself: only a transport chain positively identified as the shared adapter's own error type may display, and rmcp gives no other way to recover the concrete type from DynamicTransportError's boxed source."
+fn oauth_safe_transport_text(
+    chain: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<String> {
+    match chain.downcast_ref::<StreamableHttpError<SafeHttpError>>()? {
+        // The adapter/provider's safe, status-bearing diagnostics.
+        StreamableHttpError::Client(safe) => Some(safe.to_string()),
+        // rmcp-owned static labels and numeric status metadata; none of it
+        // is upstream-derived.
+        StreamableHttpError::HttpStatus(_)
+        | StreamableHttpError::SessionExpired
+        | StreamableHttpError::SessionRecoveryTimeout
+        | StreamableHttpError::ServerDoesNotSupportSse
+        | StreamableHttpError::ServerDoesNotSupportDeleteSession
+        | StreamableHttpError::UnexpectedEndOfStream
+        | StreamableHttpError::ResponseBodyTooLarge { .. }
+        | StreamableHttpError::TransportChannelClosed
+        | StreamableHttpError::MissingSessionIdInResponse
+        | StreamableHttpError::ControlRequestTimeout => Some(chain.to_string()),
+        // Untrusted: upstream JSON-RPC error text (ReinitializationFailed),
+        // upstream body previews (UnexpectedServerResponse), upstream header
+        // values (UnexpectedContentType, AuthRequired, InsufficientScope) and
+        // everything unclassified fail closed.
+        _ => None,
+    }
+}
+
+/// Client-credentials mode error mapping. Decoded MCP service errors keep
+/// their error code with static text. Transport errors keep the shared
+/// adapter's safe status-bearing diagnostics only when positively identified
+/// as such; every other variant — including rmcp's session-recovery errors,
+/// whose Display embeds upstream JSON-RPC message and data — is replaced
+/// with the static fallback (B1).
+fn oauth_proxy_error(err: rmcp::service::ServiceError) -> ErrorData {
+    match err {
+        ServiceError::McpError(error) => ErrorData::new(error.code, SAFE_UPSTREAM_FAILURE, None),
+        ServiceError::TransportSend(transport) => {
+            match oauth_safe_transport_text(transport.error.as_ref()) {
+                Some(safe) => ErrorData::internal_error(safe, None),
+                None => ErrorData::internal_error(SAFE_UPSTREAM_FAILURE, None),
+            }
+        }
+        // Local lifecycle variants are rmcp-owned labels, but they are not
+        // audited against upstream-controlled content; fail closed.
+        other => {
+            let _ = other;
+            ErrorData::internal_error(SAFE_UPSTREAM_FAILURE, None)
+        }
+    }
+}
+
+/// Renders an initialize failure for the connect-path JSON-RPC frame under
+/// client-credentials mode. The transport chain is safe only when the
+/// adapter's own diagnostic can be positively identified; `ConnectionClosed`
+/// carries local rmcp stage labels only. Everything else — decoded JSON-RPC
+/// initialize errors (`JsonRpcError`), messages/results Debug-printed by
+/// `ExpectedInitResponse`/`ExpectedInitResult`, unknown future variants —
+/// gets the static fallback (B9).
+fn oauth_connect_error_text(err: &rmcp::service::ClientInitializeError) -> String {
+    match err {
+        rmcp::service::ClientInitializeError::TransportError { error, .. } => {
+            oauth_safe_transport_text(error.error.as_ref())
+        }
+        rmcp::service::ClientInitializeError::ConnectionClosed(_) => Some(err.to_string()),
+        _ => None,
+    }
+    .unwrap_or_else(|| SAFE_UPSTREAM_FAILURE.to_string())
+}
+
+/// Replace an `is_error: true` tool result's content with a static safe
+/// diagnostic, preserving the failure flag and result envelope. This is an
+/// `Ok` service response, so it never went through `proxy_error`; successful
+/// results are never touched.
+fn safe_tool_error() -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(SAFE_UPSTREAM_FAILURE)])
 }
 
 fn tool_call_succeeded(result: &Result<CallToolResult, ErrorData>) -> bool {
@@ -40,6 +137,22 @@ impl RemoteProxyServer {
             cli,
             connection: Mutex::new(None),
             shutdown: CancellationToken::new(),
+        }
+    }
+
+    /// Whether client-credentials proxy mode is selected. This mode changes
+    /// only the boundaries: the connect branch picks the auth adapter, and all
+    /// untrusted upstream text is replaced with safe diagnostics.
+    fn client_credentials_mode(&self) -> bool {
+        self.cli.oauth_token_url.is_some()
+    }
+
+    /// Error mapping for this server's mode.
+    fn proxy_error(&self, err: rmcp::service::ServiceError) -> ErrorData {
+        if self.client_credentials_mode() {
+            oauth_proxy_error(err)
+        } else {
+            proxy_error(err)
         }
     }
 
@@ -93,20 +206,44 @@ impl RemoteProxyServer {
     }
 
     async fn connect(&self) -> Result<RunningService<RoleClient, RemoteClientHandler>, ErrorData> {
-        let transport = build_transport(&self.cli).await.map_err(|err| {
+        let transport = self.connect_transport().await.map_err(|err| {
             ErrorData::internal_error(
                 format!("failed to build remote MCP transport: {err:#}"),
                 None,
             )
         })?;
-        rmcp::service::serve_client(RemoteClientHandler, transport)
-            .await
-            .map_err(|err| {
-                ErrorData::internal_error(
-                    format!("failed to connect to remote MCP server: {err}"),
-                    None,
-                )
-            })
+        // Two connect branches: client-credentials mode serves through the
+        // auth adapter transport, everything else keeps the plain proxy
+        // transport and its diagnostics unchanged.
+        let result = match transport {
+            UpstreamTransport::Plain(transport) => {
+                rmcp::service::serve_client(RemoteClientHandler, transport).await
+            }
+            UpstreamTransport::Authenticated(transport) => {
+                rmcp::service::serve_client(RemoteClientHandler, transport).await
+            }
+        };
+        result.map_err(|err| {
+            let rendered = if self.client_credentials_mode() {
+                oauth_connect_error_text(&err)
+            } else {
+                err.to_string()
+            };
+            ErrorData::internal_error(
+                format!("failed to connect to remote MCP server: {rendered}"),
+                None,
+            )
+        })
+    }
+
+    async fn connect_transport(&self) -> anyhow::Result<UpstreamTransport> {
+        if self.client_credentials_mode() {
+            Ok(UpstreamTransport::Authenticated(
+                build_client_credentials_transport(&self.cli).await?,
+            ))
+        } else {
+            Ok(UpstreamTransport::Plain(build_transport(&self.cli).await?))
+        }
     }
 }
 
@@ -152,7 +289,9 @@ impl ServerHandler for RemoteProxyServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let peer = self.ensure_connected().await?;
-        peer.list_tools(request).await.map_err(proxy_error)
+        peer.list_tools(request)
+            .await
+            .map_err(|err| self.proxy_error(err))
     }
 
     async fn call_tool(
@@ -171,7 +310,9 @@ impl ServerHandler for RemoteProxyServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
         let peer = self.ensure_connected().await?;
-        peer.list_prompts(request).await.map_err(proxy_error)
+        peer.list_prompts(request)
+            .await
+            .map_err(|err| self.proxy_error(err))
     }
 
     async fn list_resources(
@@ -180,7 +321,9 @@ impl ServerHandler for RemoteProxyServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
         let peer = self.ensure_connected().await?;
-        peer.list_resources(request).await.map_err(proxy_error)
+        peer.list_resources(request)
+            .await
+            .map_err(|err| self.proxy_error(err))
     }
 }
 
@@ -208,7 +351,20 @@ impl RemoteProxyServer {
         // includes remote CallToolResults where `is_error==true`, which correctly
         // propagates to callers. The Err path (transport/lifecycle failures) is mapped
         // to ErrorData via proxy_error.
-        let result = peer.call_tool(request).await.map_err(proxy_error);
+        let result = peer
+            .call_tool(request)
+            .await
+            .map_err(|err| self.proxy_error(err));
+        // Client-credentials mode: a failed tool result is an Ok service
+        // response whose content is untrusted upstream text — it can echo the
+        // presented token, including one retired mid-flight by a rotation.
+        // The failure flag and envelope survive; the content does not.
+        let result = match result {
+            Ok(upstream) if self.client_credentials_mode() && upstream.is_error == Some(true) => {
+                Ok(safe_tool_error())
+            }
+            other => other,
+        };
         // mcp-remote is stdio-only; without a cached list, labels follow the upstream tool namespace.
         harnx_metrics::record_tool_call(
             &tool_name,
@@ -225,8 +381,13 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use rmcp::service::{ClientLifecycleMode, RxJsonRpcMessage, TxJsonRpcMessage};
+    use rmcp::model::ErrorData;
+    use rmcp::service::ServiceError;
+    use rmcp::service::{
+        ClientInitializeError, ClientLifecycleMode, RxJsonRpcMessage, TxJsonRpcMessage,
+    };
     use rmcp::transport::Transport;
+    use rmcp::transport::{streamable_http_client::StreamableHttpError, DynamicTransportError};
     use rmcp::ServiceExt;
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, TcpStream};
@@ -234,6 +395,123 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::authenticated_http::SafeHttpError;
+
+    /// Wraps a transport error the way rmcp's service worker does, so the
+    /// OAuth mappers can be audited against the real chain types.
+    fn transport_send<E: std::error::Error + Send + Sync + 'static>(error: E) -> ServiceError {
+        ServiceError::TransportSend(DynamicTransportError::from_parts(
+            "test-transport",
+            std::any::TypeId::of::<()>(),
+            Box::new(error),
+        ))
+    }
+
+    /// B1: rmcp builds `ReinitializationFailed` after a session-recovery
+    /// re-initialization whose answer is an upstream JSON-RPC error. Its
+    /// Display embeds the upstream message and data, so it must fall back
+    /// to the static text — while the adapter's own `SafeHttpError`
+    /// diagnostics keep flowing through.
+    #[test]
+    fn oauth_transport_error_whitelist_fails_closed_on_untrusted_variants() {
+        let sentinels = ["reinit-msg-sentinel-4101", "reinit-data-sentinel-4102"];
+        let reinit = transport_send(
+            StreamableHttpError::<SafeHttpError>::ReinitializationFailed(
+                ErrorData::internal_error(
+                    format!("rejected {}", sentinels[0]),
+                    Some(serde_json::json!({ "echo": sentinels[1] })),
+                ),
+            ),
+        );
+        let frame = oauth_proxy_error(reinit);
+        assert_eq!(frame.message, SAFE_UPSTREAM_FAILURE);
+        for sentinel in sentinels {
+            assert!(!frame.message.contains(sentinel), "{}", frame.message);
+        }
+
+        // A body preview kept by rmcp's response parsing is upstream text too.
+        let preview = transport_send(
+            StreamableHttpError::<SafeHttpError>::UnexpectedServerResponse(
+                format!("HTTP 200 OK: {}", sentinels[0]).into(),
+            ),
+        );
+        assert_eq!(oauth_proxy_error(preview).message, SAFE_UPSTREAM_FAILURE);
+
+        // Attacker-controlled header values stay behind the fallback.
+        let content_type = transport_send(
+            StreamableHttpError::<SafeHttpError>::UnexpectedContentType(Some(sentinels[0].into())),
+        );
+        assert_eq!(
+            oauth_proxy_error(content_type).message,
+            SAFE_UPSTREAM_FAILURE
+        );
+    }
+
+    /// The adapter's positively identified safe diagnostics — the provider's
+    /// status-bearing token errors and rmcp's own static labels — keep
+    /// flowing; removing the whitelist would break these assertions.
+    #[test]
+    fn oauth_transport_error_whitelist_keeps_safe_diagnostics() {
+        let refresh = transport_send(StreamableHttpError::<SafeHttpError>::Client(SafeHttpError(
+            "client-credentials token refresh failed (token endpoint returned HTTP 500)"
+                .to_string(),
+        )));
+        assert!(oauth_proxy_error(refresh)
+            .message
+            .contains("client-credentials token refresh failed"));
+
+        let expired = transport_send(StreamableHttpError::<SafeHttpError>::SessionExpired);
+        assert!(oauth_proxy_error(expired)
+            .message
+            .contains("Session expired (HTTP 404)"));
+    }
+
+    /// B9: a decoded JSON-RPC error answering the initial authenticated
+    /// initialize reaches the connect path's non-transport fallback, as do
+    /// the Debug-printing message/result variants. Identified adapter
+    /// diagnostics and local `ConnectionClosed` labels keep their text.
+    #[test]
+    fn oauth_connect_error_text_uses_static_fallback_for_decoded_errors() {
+        let json_rpc = ClientInitializeError::JsonRpcError(ErrorData::internal_error(
+            "init-msg-sentinel-4101 echoed bearer access-token-1",
+            Some(serde_json::json!({ "echo": "init-data-sentinel-4102" })),
+        ));
+        let rendered = oauth_connect_error_text(&json_rpc);
+        assert_eq!(rendered, SAFE_UPSTREAM_FAILURE);
+        assert!(!rendered.contains("sentinel"));
+
+        let transport = ClientInitializeError::TransportError {
+            error: DynamicTransportError::from_parts(
+                "test-transport",
+                std::any::TypeId::of::<()>(),
+                Box::new(StreamableHttpError::<SafeHttpError>::Client(SafeHttpError(
+                    "client-credentials token refresh failed".to_string(),
+                ))),
+            ),
+            context: "sending initialize".into(),
+        };
+        assert!(oauth_connect_error_text(&transport)
+            .contains("client-credentials token refresh failed"));
+
+        // An unidentified transport chain falls back instead of echoing it.
+        let unknown = ClientInitializeError::TransportError {
+            error: DynamicTransportError::from_parts(
+                "test-transport",
+                std::any::TypeId::of::<()>(),
+                Box::new(
+                    StreamableHttpError::<SafeHttpError>::ReinitializationFailed(
+                        ErrorData::internal_error("init-msg-sentinel-4101", None),
+                    ),
+                ),
+            ),
+            context: "sending initialize".into(),
+        };
+        assert_eq!(
+            oauth_connect_error_text(&unknown),
+            SAFE_UPSTREAM_FAILURE,
+            "unknown chains must not render their Display"
+        );
+    }
 
     fn proxy_for_url(url: &str) -> Arc<RemoteProxyServer> {
         Arc::new(RemoteProxyServer::new(Cli::parse_from([

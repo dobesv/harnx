@@ -150,13 +150,7 @@ async fn upstream_401_retries_with_refresh_and_403_insufficient_scope() {
     fixture.connect_alice().await;
 
     // 1. Simulate 401 on the active access token
-    fixture
-        .mock
-        .state
-        .rejected_tokens
-        .lock()
-        .unwrap()
-        .insert(fixture.mock.state.initial_access_token.clone());
+    reject_initial_token(&fixture.mock.state);
 
     // Calling whoami receives 401, refreshes token, and retries successfully
     let who = invoke(toolset, "whoami", Some("alice"), &[], Value::Null)
@@ -181,6 +175,32 @@ async fn upstream_401_retries_with_refresh_and_403_insufficient_scope() {
         msg.contains("missing required scope (insufficient_scope)"),
         "{msg}"
     );
+
+    fixture.shutdown().await;
+}
+
+fn reject_initial_token(state: &MockOAuthServerState) {
+    state
+        .rejected_tokens
+        .lock()
+        .unwrap()
+        .insert(state.initial_access_token.clone());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_401_replays_short_lived_native_token_once_with_nats() {
+    harnx_core::require_nextest();
+    let fixture = OAuthFixture::spawn(3600).await;
+    fixture.connect_alice().await;
+    let state = &fixture.mock.state;
+    state.refresh_expires_in.store(30, Ordering::SeqCst);
+    reject_initial_token(state);
+
+    let who = invoke(fixture.toolset(), "whoami", Some("alice"), &[], Value::Null)
+        .await
+        .expect("native call should replay with the short-lived replacement");
+    assert_eq!(who["content"][0]["text"], json!("user:alice@example.test"));
+    assert_eq!(state.refresh_count.load(Ordering::SeqCst), 1);
 
     fixture.shutdown().await;
 }
