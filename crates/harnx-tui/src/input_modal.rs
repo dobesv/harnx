@@ -5,7 +5,6 @@ use crate::types::{ModalState, Tui};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_runtime::config::ConfigLock;
-use harnx_runtime::nats_session_metadata::SessionMetadataStore;
 
 // Escape differs between startup and a picker opened from an existing session.
 enum PickerCancelAction {
@@ -16,15 +15,25 @@ enum PickerCancelAction {
 }
 
 impl Tui {
-    pub(super) async fn check_picker_modal(&self) -> Option<ModalState> {
+    // qual:allow(iosp) reason: "the agent/session bootstrap branches share the one picker-opening contract; extraction would split a single interaction"
+    pub(super) async fn check_picker_modal(&mut self) {
         let (no_agent, no_session) = {
             let cfg = self.config.read();
             (cfg.agent.is_none(), cfg.session.is_none())
         };
-        if no_agent || no_session {
-            crate::types::Tui::resolve_initial_modal(&self.config).await
-        } else {
-            None
+        if no_agent {
+            // Agent discovery is a local config read; no broker wait.
+            let agents = Self::assistant_agents_for_display(&self.config).await;
+            if agents.is_empty() {
+                return;
+            }
+            self.app.modal = Some(crate::types::ModalState::AgentPicker {
+                agents,
+                selected: 0,
+                query: String::new(),
+            });
+        } else if no_session {
+            self.open_session_picker();
         }
     }
 
@@ -37,8 +46,12 @@ impl Tui {
         });
     }
 
-    pub(crate) async fn open_session_picker(&mut self) {
-        let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
+    /// Open the session picker immediately and load its list in the
+    /// background: listing sessions can wait on managed-local acquisition,
+    /// so opening (or refreshing) the picker must not block the input loop
+    /// while a broker recovers (design 9). The list arrives as a
+    /// `PickerSessionsLoaded` event and fills the open picker.
+    pub(crate) fn open_session_picker(&mut self) {
         let origin_agent = self.config.read().active_agent_ref();
         let origin_session = self
             .config
@@ -46,13 +59,26 @@ impl Tui {
             .session
             .as_ref()
             .map(|s| s.id().to_string());
+        self.open_session_picker_with_origin(origin_agent, origin_session);
+    }
+
+    /// Same picker-opening path with explicit Esc-restore origins: callers
+    /// that just switched the agent capture the pre-switch values.
+    pub(crate) fn open_session_picker_with_origin(
+        &mut self,
+        origin_agent: Option<String>,
+        origin_session: Option<String>,
+    ) {
+        self.retire_picker_refresh();
+        self.cancel_inflight_picker_unread_toggle();
         self.app.modal = Some(crate::types::ModalState::SessionPicker {
-            sessions,
+            sessions: vec![],
             selected: 0,
             origin_agent,
             origin_session,
-            error: fetch_error,
+            error: Some("Loading NATS sessions…".to_string()),
         });
+        self.spawn_picker_sessions_refresh();
     }
 
     pub(super) async fn maybe_open_picker_after_command(
@@ -67,7 +93,7 @@ impl Tui {
                     (cfg.active_agent_ref(), cfg.session.is_none())
                 };
                 if prev_agent != curr_agent && session_missing {
-                    self.open_session_picker().await;
+                    self.open_session_picker();
                 }
             }
             harnx_runtime::commands::CommandOutcome::Exit => {
@@ -77,7 +103,7 @@ impl Tui {
                 self.open_agent_picker().await;
             }
             harnx_runtime::commands::CommandOutcome::OpenSessionPicker => {
-                self.open_session_picker().await;
+                self.open_session_picker();
             }
         }
     }
@@ -107,6 +133,9 @@ impl Tui {
                 self.config
                     .write()
                     .apply_prepared_agent_selection(candidate.read().clone());
+                self.retire_pending_title_rename();
+                self.retire_picker_refresh();
+                self.retire_info_overlay();
                 self.app.modal = None;
                 self.refresh_input_chrome();
             }
@@ -343,16 +372,12 @@ impl Tui {
             });
             return Err(error);
         }
-        // Keep the session-fetch future off the picker handler's stack.
-        let (sessions, fetch_error) =
-            Box::pin(async { Self::picker_sessions(&self.config).await }).await;
-        self.app.modal = Some(ModalState::SessionPicker {
-            sessions,
-            selected: 0,
-            origin_agent: prev_agent,
-            origin_session: prev_session,
-            error: fetch_error,
-        });
+        self.retire_pending_title_rename();
+        self.retire_info_overlay();
+        // Session listing happens in the background (design 9): the picker
+        // opens empty and fills from the `PickerSessionsLoaded` event. The
+        // pre-switch origins keep Esc-restore semantics.
+        self.open_session_picker_with_origin(prev_agent, prev_session);
         Ok(())
     }
 
@@ -368,14 +393,17 @@ impl Tui {
             return Ok(());
         };
         if selected == 0 {
-            return self
-                .select_new_session(crate::lifecycle::NewSessionSelection {
-                    sessions,
-                    selected,
-                    origin_agent,
-                    origin_session,
-                })
-                .await;
+            self.retire_picker_refresh();
+            // Reserving the new session id can wait on managed-local
+            // acquisition; it runs as cancellable background work and
+            // completes as a `NewSessionReserved`/`...Failed` event.
+            self.select_new_session(crate::lifecycle::NewSessionSelection {
+                sessions,
+                selected,
+                origin_agent,
+                origin_session,
+            });
+            return Ok(());
         }
         let Some(session) = sessions.get(selected - 1) else {
             self.app.modal = Some(ModalState::SessionPicker {
@@ -399,6 +427,8 @@ impl Tui {
             });
             return Err(error);
         }
+        self.retire_pending_title_rename();
+        self.retire_picker_refresh();
         self.app.current_session_unread = unread;
         let busy = self.app.llm_busy;
         let pending = self.app.pending_message.is_some();
@@ -431,102 +461,53 @@ impl Tui {
     async fn cancel_picker_selection(&mut self) {
         match self.picker_cancel_action() {
             PickerCancelAction::RestoreOrigin => self.restore_picker_origin().await,
-            PickerCancelAction::BackToAgents => self.open_agent_picker().await,
+            PickerCancelAction::BackToAgents => {
+                self.retire_picker_refresh();
+                self.open_agent_picker().await;
+            }
             PickerCancelAction::Exit => self.request_exit().await,
-            PickerCancelAction::Dismiss => self.app.modal = None,
+            PickerCancelAction::Dismiss => {
+                self.retire_picker_refresh();
+                self.app.modal = None;
+            }
         }
     }
 
     async fn handle_picker_mark_unread_toggle(&mut self) {
-        let (session_id, storage_key, new_unread, selected) = {
-            let Some(crate::types::ModalState::SessionPicker {
-                sessions, selected, ..
-            }) = &self.app.modal
-            else {
-                return;
-            };
-            // Index 0 is "New session".
-            let Some(session) = selected
-                .checked_sub(1)
-                .and_then(|index| sessions.get(index))
-            else {
-                return;
-            };
+        // The metadata-store write can wait on managed-local acquisition;
+        // the toggle must never block the input loop (design 9). The whole
+        // action — jetstream lookup, bucket ensure, mark read/unread — runs
+        // as cancellable background work; the picker re-lists only when the
+        // toggle finishes and the picker is still the current view.
+        let Some(ModalState::SessionPicker {
+            sessions, selected, ..
+        }) = &self.app.modal
+        else {
+            return;
+        };
+        let Some(session) = selected
+            .checked_sub(1)
+            .and_then(|index| sessions.get(index))
+        else {
+            return;
+        };
+        let (cluster, storage_key, mark_unread) = {
+            let config = self.config.read();
+            let cluster = config
+                .remote_agent
+                .as_ref()
+                .map(|(_, cluster)| cluster.clone())
+                .unwrap_or_else(|| config.default_cluster_key().to_string());
             (
-                session.id.clone(),
+                cluster,
                 harnx_core::session_identity::session_key(
                     session.agent_name.as_deref(),
                     &session.id,
                 ),
                 !session.unread,
-                *selected,
             )
         };
-        let cluster = {
-            let config = self.config.read();
-            config
-                .remote_agent
-                .as_ref()
-                .map(|(_, cluster)| cluster.clone())
-                .unwrap_or_else(|| config.default_cluster_key().to_string())
-        };
-        let Some(store) = self.picker_session_metadata_store(&cluster).await else {
-            return;
-        };
-        if new_unread {
-            if let Err(error) = store.mark_unread(&storage_key).await {
-                log::warn!("Failed to mark session as unread in picker: {error:#}");
-            }
-        } else if let Err(error) = store.mark_read(&storage_key).await {
-            log::warn!("Failed to mark session as read in picker: {error:#}");
-        }
-
-        self.refresh_picker_after_unread_toggle(&session_id, selected)
-            .await;
-    }
-
-    async fn picker_session_metadata_store(&self, cluster: &str) -> Option<SessionMetadataStore> {
-        let config = self.config.read().clone();
-        let jetstream = match config.nats_jetstream(cluster).await {
-            Ok(jetstream) => jetstream,
-            Err(error) => {
-                log::warn!("Failed to get jetstream for picker mark-unread: {error:#}");
-                return None;
-            }
-        };
-        match SessionMetadataStore::ensure(&jetstream, 1).await {
-            Ok(store) => Some(store),
-            Err(error) => {
-                log::warn!("Failed to ensure metadata store for picker mark-unread: {error:#}");
-                None
-            }
-        }
-    }
-
-    async fn refresh_picker_after_unread_toggle(&mut self, session_id: &str, selected: usize) {
-        // Boxed to keep the picker handler's future frame compact.
-        let (sessions, fetch_error) =
-            Box::pin(async { Self::picker_sessions(&self.config).await }).await;
-        let origin = match &self.app.modal {
-            Some(crate::types::ModalState::SessionPicker {
-                origin_agent,
-                origin_session,
-                ..
-            }) => (origin_agent.clone(), origin_session.clone()),
-            _ => (None, None),
-        };
-        let new_selected = sessions
-            .iter()
-            .position(|session| session.id == session_id)
-            .map(|index| index + 1)
-            .unwrap_or_else(|| selected.min(sessions.len()));
-        self.app.modal = Some(crate::types::ModalState::SessionPicker {
-            sessions,
-            selected: new_selected,
-            origin_agent: origin.0,
-            origin_session: origin.1,
-            error: fetch_error,
-        });
+        self.spawn_picker_unread_toggle(cluster, storage_key, mark_unread);
     }
 
     /// Execute the action associated with the current modal and clear it.
@@ -548,16 +529,31 @@ impl Tui {
             return Ok(());
         };
         match modal {
-            ModalState::ConfirmDelete { from, to } => {
+            ModalState::ConfirmDelete { from, to, target } => {
+                if !self.validate_history_command_target(Some(&target)) {
+                    self.finish_transcript_confirmation();
+                    self.show_stale_transcript_notice();
+                    return Ok(());
+                }
                 let command = if from == to {
                     format!(".delete message {from}")
                 } else {
                     format!(".delete message {from}-{to}")
                 };
-                self.run_command(&command).await?;
+                self.run_bound_history_command(&command, target).await?;
             }
-            ModalState::ConfirmRewind { seq, user_text } => {
-                self.run_command(&format!(".rewind {seq}")).await?;
+            ModalState::ConfirmRewind {
+                seq,
+                user_text,
+                target,
+            } => {
+                if !self.validate_history_command_target(Some(&target)) {
+                    self.finish_transcript_confirmation();
+                    self.show_stale_transcript_notice();
+                    return Ok(());
+                }
+                self.run_bound_history_command(&format!(".rewind {seq}"), target)
+                    .await?;
                 if let Some(text) = user_text {
                     self.set_input_text(&text);
                 }

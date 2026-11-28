@@ -77,7 +77,7 @@ impl Tui {
                 );
             }
         } else {
-            self.mark_current_session_read(false).await;
+            self.mark_current_session_read_background();
         }
         self.request_exit().await;
     }
@@ -92,6 +92,13 @@ impl Tui {
         if let Some(prompt_abort) = &self.current_prompt_abort {
             prompt_abort.set_ctrlc();
         }
+
+        // Cancel the background history/picker/info work this frontend owns
+        // (design 9): an in-flight rebuild, history command, info-overlay
+        // load, picker refresh, or "New session" reservation waiting on a
+        // recovering broker stops here. Each job has its own signal, so
+        // later work is never poisoned and nothing is left un-aborted.
+        self.cancel_background_history_work();
 
         // Fire-and-forget cancel; TUI stays alive so detached spawn is safe.
         // Exit paths that quit must use cancel_sequencing via start_exit_cancel.
@@ -110,7 +117,7 @@ impl Tui {
             self.active_remote_session = None;
         }
         // Mark current session as read before clearing state (if unread)
-        self.mark_current_session_read(false).await;
+        self.mark_current_session_read_background();
     }
 
     /// Enter fullscreen transcript browsing at the last navigable item without
@@ -131,7 +138,7 @@ impl Tui {
         true
     }
 
-    async fn exit_transcript_browsing(&mut self) {
+    fn exit_transcript_browsing(&mut self) {
         self.clear_footer_notice();
         self.app.transcript_browsing = false;
         self.app.transcript_focus = None;
@@ -139,7 +146,7 @@ impl Tui {
         self.app.scroll_state.follow = true;
         self.refresh_input_chrome();
         // Mark read on exit from transcript focus/browsing (if unread).
-        self.mark_current_session_read(false).await;
+        self.mark_current_session_read_background();
     }
 
     fn scroll_browsing_page(&mut self, up: bool) {
@@ -153,18 +160,18 @@ impl Tui {
         }
     }
 
-    async fn handle_ordinary_esc(&mut self) {
+    fn handle_ordinary_esc(&mut self) {
         self.clear_footer_notice();
         if self.app.detail_view_open {
             self.app.detail_view_open = false;
             // Return to browsing view (transcript_browsing stays true if it was true)
         } else if self.app.transcript_focus.is_some() {
-            self.exit_transcript_browsing().await;
+            self.exit_transcript_browsing();
         } else if !self.app.completions.is_empty() {
             self.app.completions.clear();
         } else {
             // ESC with no special state: mark read (if unread) and enter browse.
-            self.mark_current_session_read(false).await;
+            self.mark_current_session_read_background();
             if !self.enter_transcript_browsing() {
                 self.app.show_footer_notice("Nothing to browse");
             }
@@ -174,7 +181,7 @@ impl Tui {
     pub(super) async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, KeyModifiers::NONE) => {
-                self.handle_browsing_esc().await;
+                self.handle_browsing_esc();
             }
             (KeyCode::Up, KeyModifiers::NONE) => {
                 self.handle_up_key(key);
@@ -231,8 +238,8 @@ impl Tui {
 
     /// Top-level browse Esc exits browsing; while a confirmation is pending it
     /// returns to the guarded tray, not the hidden composer (plan decision 5).
-    async fn handle_browsing_esc(&mut self) {
-        self.exit_transcript_browsing().await;
+    fn handle_browsing_esc(&mut self) {
+        self.exit_transcript_browsing();
         if self.interaction_pending() {
             self.arm_interaction_return_guard();
         }
@@ -284,7 +291,7 @@ impl Tui {
                 self.handle_tab(true).await;
             }
             (KeyCode::Esc, KeyModifiers::NONE) => {
-                self.handle_ordinary_esc().await;
+                self.handle_ordinary_esc();
             }
             // D4: Keyboard actions on selected transcript item(s)
             // All mutation shortcuts are blocked while the detail view is open.
@@ -349,7 +356,7 @@ impl Tui {
         }
         self.clear_footer_notice();
         // First character typed marks the current session read when needed.
-        self.mark_current_session_read(false).await;
+        self.mark_current_session_read_background();
         // Exit history preview on any editing key — keep current content as new draft.
         if self.app.history_preview {
             self.app.history_index = None;
@@ -380,7 +387,7 @@ impl Tui {
         if text.trim().is_empty() && self.app.attachments.is_empty() {
             return Ok(());
         }
-        self.mark_current_session_read(false).await;
+        self.mark_current_session_read_background();
         self.abort_signal.reset();
         self.push_history(text.clone());
         if self.app.llm_busy {
@@ -390,8 +397,13 @@ impl Tui {
         if text.trim_start().starts_with('.') {
             return self.submit_dot_command(text).await;
         }
-        if let Some(modal) = self.check_picker_modal().await {
-            self.app.modal = Some(modal);
+        if self.app.modal.is_none() {
+            // Opening an initial picker when agent/session is missing must
+            // not wait on the broker: the session list loads in the
+            // background (design 9).
+            self.check_picker_modal().await;
+        }
+        if self.app.modal.is_some() {
             return Ok(());
         }
         let attachments_snapshot = self.app.attachments.clone();
@@ -810,7 +822,7 @@ impl Tui {
                     return;
                 }
                 Some(PickerCommand::Session) => {
-                    self.open_session_picker().await;
+                    self.open_session_picker();
                     return;
                 }
                 None => return,
@@ -918,6 +930,49 @@ impl Tui {
             self.refresh_input_chrome();
         })
     }
+
+    /// Fire-and-forget variant of `mark_current_session_read(false)`: the
+    /// durable mark-read writes can wait on managed-local acquisition while
+    /// the broker recovers, so presence keystrokes (draft typing, Esc,
+    /// Enter, Ctrl-C) must not block the input/event loop on them (design
+    /// 9). The unread cache is cleared optimistically — mark_read is
+    /// idempotent and the activity monitor self-corrects a failed write —
+    /// and the write runs detached: its failure paths only log, like the
+    /// inline variant's.
+    fn mark_current_session_read_background(&mut self) {
+        if !self.app.current_session_unread {
+            return;
+        }
+        // Use session_activity_destination to resolve the current session even
+        // when idle (presence typing, ESC, CTRL-C); active_remote_session may
+        // be None.
+        let Some((storage_key, cluster)) = self.session_activity_destination() else {
+            return;
+        };
+        self.app.current_session_unread = false;
+        self.refresh_input_chrome();
+        let config = self.config.read().clone();
+        // Detached spawn is safe: the TUI outlives this fire-and-forget write.
+        tokio::spawn(async move {
+            let jetstream = match config.nats_jetstream(&cluster).await {
+                Ok(js) => js,
+                Err(e) => {
+                    log::warn!("Failed to get jetstream for mark-read: {e:#}");
+                    return;
+                }
+            };
+            let store = match SessionMetadataStore::ensure(&jetstream, 1).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("Failed to ensure metadata store for mark-read: {e:#}");
+                    return;
+                }
+            };
+            if let Err(e) = store.mark_read(&storage_key).await {
+                log::warn!("Failed to mark session as read: {e:#}");
+            }
+        });
+    }
 }
 
 /// What pressing `e` on a browse selection does: dispatch an `.edit message`
@@ -955,6 +1010,14 @@ impl Tui {
     pub(super) fn show_busy_notice(&mut self) {
         self.app.show_footer_notice(
             "Busy: wait for the current turn to finish (or answer pending approval)",
+        );
+    }
+
+    /// Notice for browse/confirmation actions refused because the displayed
+    /// rows belong to an older target or superseded view revision.
+    pub(super) fn show_stale_transcript_notice(&mut self) {
+        self.app.show_footer_notice(
+            "Session changed — wait for current transcript to load before editing",
         );
     }
 
@@ -1042,6 +1105,10 @@ impl Tui {
             self.show_busy_notice();
             return Ok(());
         }
+        let Some(target) = self.actionable_transcript_binding() else {
+            self.show_stale_transcript_notice();
+            return Ok(());
+        };
         let Some((start_idx, end_idx)) = self.get_selected_index_range() else {
             self.app.show_footer_notice("Nothing selected");
             return Ok(());
@@ -1059,7 +1126,7 @@ impl Tui {
                 } else {
                     format!(".edit message {}-{}", from, to)
                 };
-                self.run_command(&cmd).await?;
+                self.run_bound_history_command(&cmd, target).await?;
                 self.app.transcript_focus = None;
                 self.app.transcript_selection_anchor = None;
                 self.app.transcript_browsing = false;
@@ -1103,12 +1170,16 @@ impl Tui {
             self.show_busy_notice();
             return;
         }
+        let Some(target) = self.actionable_transcript_binding() else {
+            self.show_stale_transcript_notice();
+            return;
+        };
         let Some((from, to)) = self.selected_seq_range() else {
             self.app
                 .show_footer_notice(&self.browse_refusal_noun("Can't delete this"));
             return;
         };
-        self.app.modal = Some(crate::types::ModalState::ConfirmDelete { from, to });
+        self.app.modal = Some(crate::types::ModalState::ConfirmDelete { from, to, target });
     }
 
     /// Handle 'i' key: copy item text into input field, clear focus.
@@ -1191,6 +1262,10 @@ impl Tui {
             self.show_busy_notice();
             return;
         }
+        let Some(target) = self.actionable_transcript_binding() else {
+            self.show_stale_transcript_notice();
+            return;
+        };
         // Browse mode can be active with no focus; degrade to a notice
         // instead of unwrapping.
         let Some(focus) = self.app.transcript_focus else {
@@ -1213,7 +1288,11 @@ impl Tui {
             TranscriptItem::UserText { text, .. } => Some(text.clone()),
             _ => None,
         };
-        self.app.modal = Some(crate::types::ModalState::ConfirmRewind { seq, user_text });
+        self.app.modal = Some(crate::types::ModalState::ConfirmRewind {
+            seq,
+            user_text,
+            target,
+        });
     }
 }
 

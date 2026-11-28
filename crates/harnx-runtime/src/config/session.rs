@@ -18,8 +18,10 @@ pub(crate) use super::session_persistence::active_session_sink;
 #[cfg(test)]
 pub(crate) use super::session_persistence::attach_memory_log;
 pub use super::session_persistence::{
-    append_event, persist_active_session_override, persist_session_overrides, record_title,
-    session_overrides, SessionAppendSink, TitleRecord,
+    active_session_sink_with_storage_key, append_event, capture_title_target,
+    install_session_sink_if_missing, persist_active_session_override, persist_session_overrides,
+    record_title, record_title_captured, record_title_durably, session_overrides,
+    SessionAppendSink, TitleRecord, TitleWriteTarget,
 };
 use super::session_persistence::{
     append_event_seq, append_event_status, require_authoritative_appends, AppendStatus,

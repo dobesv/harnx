@@ -1,34 +1,43 @@
 use anyhow::Result;
+use harnx_core::abort::wait_abort_signal;
 use harnx_runtime::config::{
-    remote_session_ops::{load_remote_transcript_for_render, RemoteTranscriptState},
+    remote_session_ops::{load_remote_transcript_for_render_readonly, RemoteTranscriptState},
     GlobalConfig,
 };
-use harnx_runtime::{NatsSession, NatsSessionConfig};
+use harnx_runtime::utils::AbortSignal;
 
+/// Load remote session transcript strictly read-only without mutating
+/// `GlobalConfig`, creating JetStream buckets/streams, claiming metadata, or
+/// installing/altering the active session persistence sink.
 pub(crate) async fn load_remote_session_history(
     config: &GlobalConfig,
     agent: String,
     cluster: String,
     session_id: String,
+    abort_signal: Option<&AbortSignal>,
 ) -> Result<RemoteTranscriptState> {
-    // Do not create this temporary read guard inside the async constructor's
-    // argument list: temporaries can live through `.await`, while
-    // `from_global_config` later needs a write guard to attach its metadata
-    // persistence sink.
-    let initializer = {
-        let config = config.read();
-        harnx_runtime::SessionInitializer::named_from_config(agent, &config)
+    if let Some(abort) = abort_signal {
+        if abort.aborted() {
+            anyhow::bail!("session history load cancelled");
+        }
+    }
+    let config_snapshot = config.read().clone();
+    let storage_key = harnx_core::session_identity::session_key(Some(&agent), &session_id);
+    let load = async move {
+        let client = config_snapshot
+            .nats_client_with_abort(&cluster, abort_signal)
+            .await?;
+        let jetstream = async_nats::jetstream::new(client);
+        load_remote_transcript_for_render_readonly(&jetstream, &storage_key, &session_id).await
     };
-    let session = NatsSession::from_global_config(
-        NatsSessionConfig {
-            cluster,
-            initializer,
-            session_id: Some(session_id),
-            activation_route: harnx_runtime::SessionActivationRoute::ClusterShared,
-        },
-        config,
-        harnx_runtime::utils::create_abort_signal(),
-    )
-    .await?;
-    load_remote_transcript_for_render(&session).await
+    match abort_signal {
+        Some(abort) => {
+            tokio::select! {
+                biased;
+                _ = wait_abort_signal(abort) => anyhow::bail!("session history load cancelled"),
+                result = load => result,
+            }
+        }
+        None => load.await,
+    }
 }

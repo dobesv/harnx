@@ -6,6 +6,25 @@ use std::time::Duration;
 
 const REMOTE_SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Test-only budget seam: `HARNX_TEST_SESSION_LIST_TIMEOUT_MS` shrinks the
+/// listing cutoff so e2e tests can prove the post-readiness budget fires
+/// without multi-second sleeps. It changes the cutoff value, never the
+/// boundary — managed-local acquisition stays outside the budget. Unused
+/// in production (no variable set).
+fn remote_session_list_timeout() -> Duration {
+    crate::utils::test_env_duration_ms(
+        "HARNX_TEST_SESSION_LIST_TIMEOUT_MS",
+        REMOTE_SESSION_LIST_TIMEOUT,
+    )
+}
+
+/// Test-only stall seam: `HARNX_TEST_SESSION_LIST_STALL_MS` sleeps inside the
+/// budgeted listing future so e2e tests can deterministically exceed the
+/// post-readiness budget. Unused in production (no variable set).
+async fn session_list_test_stall() {
+    crate::utils::test_env_sleep_ms("HARNX_TEST_SESSION_LIST_STALL_MS").await;
+}
+
 /// Convert canonical metadata joined with activity to `SessionMeta`.
 ///
 /// This mapping is used by `list_remote_sessions_with_meta` to translate
@@ -179,14 +198,14 @@ impl Config {
         Ok(())
     }
 
-    pub(crate) fn empty_session_after_persisted_clear(&mut self) -> Result<()> {
+    pub fn empty_session_after_persisted_clear(&mut self) -> Result<()> {
         let session = self.session.as_mut().context("No session")?;
         crate::config::session::clear_messages_after_persisted_clear(session);
         self.discontinuous_last_message();
         Ok(())
     }
 
-    pub(crate) fn reset_session_after_persisted_clear(&mut self) -> Result<()> {
+    pub fn reset_session_after_persisted_clear(&mut self) -> Result<()> {
         // Capture current session name before exiting
         let old_session_name = self.session.as_ref().map(|s| s.id().to_string());
 
@@ -221,9 +240,20 @@ impl Config {
     /// This distinction allows callers to differentiate "no remote sessions" from
     /// "could not reach the cluster" — important for CLI error reporting and TUI visibility.
     pub async fn list_remote_sessions_with_meta(&self, cluster: &str) -> Result<Vec<SessionMeta>> {
+        self.list_remote_sessions_with_abort(cluster, None).await
+    }
+
+    /// Wait for managed-local readiness outside the listing budget.
+    pub async fn list_remote_sessions_with_abort(
+        &self,
+        cluster: &str,
+        abort: Option<&AbortSignal>,
+    ) -> Result<Vec<SessionMeta>> {
+        let prepared = self.prepare_managed_local(cluster, abort).await?;
+        let client = prepared.map(|(_, client)| client);
         tokio::time::timeout(
-            REMOTE_SESSION_LIST_TIMEOUT,
-            self.list_remote_sessions_with_meta_inner(cluster),
+            remote_session_list_timeout(),
+            self.list_remote_sessions_with_meta_inner(cluster, client),
         )
         .await
         .with_context(|| {
@@ -237,14 +267,16 @@ impl Config {
     async fn list_remote_sessions_with_meta_inner(
         &self,
         cluster: &str,
+        prepared: Option<async_nats::Client>,
     ) -> Result<Vec<SessionMeta>> {
-        let jetstream = match self.nats_jetstream(cluster).await {
-            Ok(js) => js,
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("Failed to connect to NATS cluster '{cluster}' for session enumeration")
-                });
-            }
+        // Inside the listing budget: only the test stall seam runs before the
+        // KV round trips, so a stalled listing proves the budget enforces.
+        session_list_test_stall().await;
+        let jetstream = match prepared {
+            Some(client) => async_nats::jetstream::new(client),
+            None => self.nats_jetstream(cluster).await.with_context(|| {
+                format!("Failed to connect to NATS cluster '{cluster}' for session enumeration")
+            })?,
         };
 
         let metadata_store = session_metadata_store_for_listing(&jetstream, cluster).await?;

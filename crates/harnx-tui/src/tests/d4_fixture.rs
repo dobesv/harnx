@@ -12,6 +12,14 @@ use crate::compaction_history::ArchiveView;
 use crate::types::{TranscriptItem, Tui};
 
 pub(super) async fn fixture_config(entries: &[(u64, SessionLogEntry)]) -> GlobalConfig {
+    assert!(
+        ENV_LOCK.try_lock().is_err(),
+        "d4_fixture::fixture_config mutates local NATS state and requires holding ENV_LOCK + TestEnvironment"
+    );
+    assert!(
+        std::env::var_os("HARNX_DATA_DIR").is_some(),
+        "d4_fixture::fixture_config requires TestEnvironment isolation"
+    );
     let config = super::test_config_with_mock_client_and_agent("archive", None);
     config.write().session = Some(replay(entries));
     let server = harnx_runtime::config::resolve_local_nats_server_config()
@@ -475,4 +483,193 @@ fn archive_mut(tui: &mut Tui) -> &mut ArchiveView {
         .views
         .last_mut()
         .unwrap()
+}
+
+fn install_gated_loader(
+    tui: &mut Tui,
+    rows: Vec<TranscriptItem>,
+) -> (
+    std::sync::Arc<tokio::sync::Notify>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let load_started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let started_tx = load_started.clone();
+    tui.history_load_override = Some(std::sync::Arc::new(move |_cfg, _mode, abort| {
+        let started_tx = started_tx.clone();
+        let mut release_rx = release_rx.clone();
+        let rows = rows.clone();
+        Box::pin(async move {
+            started_tx.notify_one();
+            tokio::select! {
+                _ = harnx_core::abort::wait_abort_signal(&abort) => {
+                    anyhow::bail!("history load aborted")
+                }
+                _ = release_rx.wait_for(|released| *released) => Ok(rows),
+            }
+        })
+    }));
+    (load_started, release_tx)
+}
+
+async fn switch_via_picker_and_cancel(
+    tui: &mut Tui,
+    load_started: &tokio::sync::Notify,
+    target_session: &str,
+    origin_session: &str,
+) {
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![harnx_runtime::config::SessionMeta {
+            id: target_session.to_string(),
+            session_id: Some(target_session.to_string()),
+            agent_name: Some("archive".to_string()),
+            title: None,
+            user_id: None,
+            modified: None,
+            contexts: vec![],
+            unread: false,
+        }],
+        selected: 1,
+        origin_agent: Some("archive".to_string()),
+        origin_session: Some(origin_session.to_string()),
+        error: None,
+    });
+    press(tui, KeyCode::Enter).await;
+    load_started.notified().await;
+    tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    tui.flush_history_work_for_test().await;
+}
+
+fn transcript_snapshot(tui: &Tui) -> Vec<String> {
+    tui.app
+        .transcript
+        .iter()
+        .map(|item| format!("{item:?}"))
+        .collect()
+}
+
+fn assert_unbound_compaction_error(tui: &Tui, expected_rows: &[String]) {
+    assert!(tui.app.archive_browser.is_none());
+    assert!(tui.app.detail_view_open);
+    assert_eq!(
+        tui.app.detail_view_title.as_deref(),
+        Some("Earlier history unavailable")
+    );
+    assert_eq!(
+        tui.app.detail_view_text.as_deref(),
+        Some("Failed to load earlier history: Session changed — waiting for current transcript to load")
+    );
+    assert!(tui.actionable_transcript_binding().is_none());
+    assert_eq!(transcript_snapshot(tui), expected_rows);
+}
+
+async fn spawn_counting_nats_listener() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((_stream, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    (addr, attempts, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d4_unbound_compaction_marker_enter_rejects_without_broker_access() {
+    use std::sync::atomic::Ordering;
+
+    let (addr, connect_attempts, accept_task) = spawn_counting_nats_listener().await;
+    let config = super::non_broker_test_config_with_mock_client_and_agent("archive", None);
+    {
+        let mut cfg = config.write();
+        let mut session_a = replay(&fixture());
+        session_a.id = "session-a".to_string();
+        cfg.session = Some(session_a);
+        cfg.nats_servers.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "counting",
+                "url": format!("nats://{addr}"),
+            }))
+            .unwrap(),
+        );
+    }
+
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
+    assert!(harness.tui().actionable_transcript_binding().is_some());
+    let marker_rows = harness.tui().app.transcript.clone();
+    let (load_started, _release_tx) = install_gated_loader(harness.tui(), marker_rows);
+    switch_via_picker_and_cancel(harness.tui(), &load_started, "session-b", "session-a").await;
+
+    config.write().remote_agent = Some(("archive".into(), "counting".into()));
+    let transcript_before = transcript_snapshot(harness.tui());
+    select_marker(harness.tui()).await;
+    press(harness.tui(), KeyCode::Enter).await;
+    assert_eq!(connect_attempts.load(Ordering::SeqCst), 0);
+    assert_unbound_compaction_error(harness.tui(), &transcript_before);
+    harness.render();
+    assert!(harness
+        .screen_contents()
+        .contains("Earlier history unavailable"));
+    press(harness.tui(), KeyCode::Esc).await;
+    assert!(!harness.tui().app.detail_view_open);
+    assert!(harness.tui().app.archive_browser.is_none());
+    assert_eq!(harness.tui().app.transcript.len(), transcript_before.len());
+    accept_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d4_unbound_then_fenced_bound_compaction_marker_opens_archive_nats() {
+    use harnx_runtime::nats_session_metadata::{SessionMetadata, SessionMetadataStore};
+    use harnx_runtime::SessionInitializer;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _environment = TestEnvironment::set(temp.path());
+    let config = fixture_config(&fixture()).await;
+    {
+        let cfg = config.read().clone();
+        let js = cfg.nats_jetstream(LOCAL_CLUSTER_KEY).await.unwrap();
+        let store = SessionMetadataStore::ensure(&js, 1).await.unwrap();
+        store
+            .create(&SessionMetadata::new(
+                "session-b",
+                SessionInitializer::named("archive", Default::default()),
+            ))
+            .await
+            .unwrap();
+        let b_log = NatsSessionLog::for_agent(js, "archive", "session-b").with_replicas(1);
+        for (_, entry) in &fixture() {
+            b_log.append_event_async(entry).await.unwrap();
+        }
+    }
+    config.write().remote_agent = Some(("archive".into(), LOCAL_CLUSTER_KEY.into()));
+
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
+    let origin_session = config.read().session.as_ref().unwrap().id().to_string();
+    let (load_started, _release_tx) = install_gated_loader(harness.tui(), Vec::new());
+    switch_via_picker_and_cancel(harness.tui(), &load_started, "session-b", &origin_session).await;
+
+    let transcript_before = transcript_snapshot(harness.tui());
+    select_marker(harness.tui()).await;
+    press(harness.tui(), KeyCode::Enter).await;
+    assert_unbound_compaction_error(harness.tui(), &transcript_before);
+    press(harness.tui(), KeyCode::Esc).await;
+
+    harness.tui().history_load_override = None;
+    harness.tui().schedule_history_rebuild_for_command(true);
+    harness.tui().flush_history_work_for_test().await;
+    assert!(harness.tui().actionable_transcript_binding().is_some());
+
+    select_marker(harness.tui()).await;
+    press(harness.tui(), KeyCode::Enter).await;
+    assert!(!harness.tui().app.detail_view_open);
+    assert_first_archive(&mut harness);
 }

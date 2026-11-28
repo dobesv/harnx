@@ -7,15 +7,15 @@
 
 #![cfg(unix)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use harnx::test_utils::interrupt::{
-    script_call_trivial_tool, script_call_wait_tool, script_stall_streaming, send_sigint,
-    spawn_oneshot, spawn_oneshot_final_only, spawn_oneshot_in_tmux, spawn_oneshot_with_args,
-    spawn_tui, wait_for_cmd_exit, wait_for_exit, wait_for_prompt_return, write_minimal_config,
-    write_with_blocking_hook, write_with_wait_tool,
+    assert_process_reaped, script_call_trivial_tool, script_call_wait_tool, script_stall_streaming,
+    send_sigint, spawn_oneshot, spawn_oneshot_final_only, spawn_oneshot_in_tmux,
+    spawn_oneshot_with_args, spawn_tui, wait_for_cmd_exit, wait_for_exit, wait_for_prompt_return,
+    write_minimal_config, write_with_blocking_hook, write_with_wait_tool, GatedNats,
 };
 use harnx::test_utils::mock_openai_server::{
     MockOpenAiError, MockOpenAiScript, MockOpenAiServer, MockOpenAiTurn,
@@ -509,5 +509,209 @@ fn interrupt_cmd_raw_mode_ctrlc() -> Result<()> {
         nonzero,
         "expected non-zero exit after Ctrl-C in raw-mode streaming"
     );
+    Ok(())
+}
+
+/// Broker-wait notice cadence seam for the managed-startup tests below, same
+/// value as `patient_nats_cli::NOTICE_SEAM_MS`.
+const NOTICE_SEAM_MS: &str = "200";
+
+/// Managed-local broker acquisition during TUI bootstrap blocks before the
+/// terminal is set up (design 8): the wait notice stays on stderr — the TUI
+/// event sink is not installed yet — and Ctrl-C exits through cleanup, not a
+/// raw SIGINT death. `run_main` awaits the broker scope shutdown on the way
+/// out, so the owned broker child is reaped and a second TUI can start once
+/// the gate opens.
+///
+/// Like `interrupt_cmd_raw_mode_ctrlc`, this drives a real tmux pane so Ctrl-C
+/// is delivered as the terminal would deliver it, before raw mode exists.
+#[test]
+fn nats_tui_ctrl_c_before_terminal_setup_exits_through_cleanup() -> Result<()> {
+    if !TmuxHarness::is_available() {
+        eprintln!("tmux unavailable; skipping nats_tui_ctrl_c_before_terminal_setup_exits_through_cleanup");
+        return Ok(());
+    }
+    let Some(gate) = GatedNats::new()? else {
+        eprintln!("nats-server unavailable; skipping nats_tui_ctrl_c_before_terminal_setup_exits_through_cleanup");
+        return Ok(());
+    };
+
+    let tmp = tempfile::tempdir()?;
+    let paths = write_minimal_config(tmp.path(), "http://127.0.0.1:1/v1")?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let envs = gate.pane_env(NOTICE_SEAM_MS);
+
+    let tmux = TmuxHarness::new(&repo_root, 120, 35)?;
+    let mut export_line = format!(
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}\n",
+        paths.harnx_config_dir.to_string_lossy(),
+        paths.harnx_data_dir.to_string_lossy(),
+        paths.harnx_state_dir.to_string_lossy()
+    );
+    for (key, value) in &envs {
+        export_line = format!("{export_line}export {key}={value}\n");
+    }
+    tmux.send_text(&export_line)?;
+    tmux.send_text(&format!(
+        "{} --agent default --session || echo HARNX_EXIT:$?\n",
+        harnx_bin.to_string_lossy()
+    ))?;
+
+    // Bootstrap blocks on the gated broker; the notice proves the stderr
+    // route is live before the terminal is set up.
+    tmux.wait_for_contains("Waiting for nats-server", Duration::from_secs(20))?;
+    let broker_pid = gate.started(0)?;
+
+    tmux.send_keys(&["C-c"])?;
+    tmux.wait_for_contains("HARNX_EXIT:1", Duration::from_secs(10))?;
+    // The owned broker child was reaped before the process exited, so the
+    // OS-level lock it held is free for the next process.
+    assert_process_reaped(broker_pid);
+
+    // With the gate open, a fresh TUI acquires the broker and reaches the
+    // rendered input area — the scope shutdown of the cancelled run really
+    // released the broker. Same readiness predicate as `spawn_tui`.
+    gate.allow()?;
+    tmux.send_text(&format!(
+        "{} --agent default --session\n",
+        harnx_bin.to_string_lossy()
+    ))?;
+    let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    tmux.wait_for(Duration::from_secs(20), |screen| {
+        screen.contains("Input")
+            || screen.contains("• 🤖")
+            || spinner_frames.iter().any(|frame| screen.contains(*frame))
+    })?;
+    Ok(())
+}
+
+// libc::kill has no safe wrapper; the PID belongs to this test's gated
+// broker fixture.
+fn sigkill(pid: u32) {
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    assert_eq!(
+        result,
+        0,
+        "failed to kill the broker child: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Active-TUI evidence for the patient managed-local broker (plan #2922, T2):
+/// with the TUI fully interactive, kill the owned broker and close the gate so
+/// broker recovery is pending. While a broker-waiting history command (the
+/// `.empty session` clear) waits on recovery, the input loop must stay
+/// responsive (typed text renders), broker wait notices reach the transcript,
+/// and Ctrl-C cancels the pending command — its cancellation error lands in
+/// the transcript and the TUI stays alive. Reopening the gate completes the
+/// recovery and the resubmitted command finishes (its mutation schedules the
+/// history rebuild); a clean Ctrl-D exit then goes through the broker scope
+/// shutdown, reaping the recovered broker child.
+#[test]
+fn nats_tui_active_cancels_broker_recovery_and_recovers() -> Result<()> {
+    if !TmuxHarness::is_available() {
+        eprintln!(
+            "tmux unavailable; skipping nats_tui_active_cancels_broker_recovery_and_recovers"
+        );
+        return Ok(());
+    }
+    let Some(gate) = GatedNats::new()? else {
+        eprintln!("nats-server unavailable; skipping nats_tui_active_cancels_broker_recovery_and_recovers");
+        return Ok(());
+    };
+    // The gate is open from the start: the TUI must come up fully interactive
+    // against a ready broker before the broker is killed.
+    gate.allow()?;
+    let tmp = tempfile::tempdir()?;
+    // No model is called in this test; the config only needs the agent.
+    let paths = write_minimal_config(tmp.path(), "http://127.0.0.1:1/v1")?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let envs = gate.pane_env(NOTICE_SEAM_MS);
+
+    let tmux = TmuxHarness::new(&repo_root, 120, 35)?;
+    let mut export_line = format!(
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}\n",
+        paths.harnx_config_dir.to_string_lossy(),
+        paths.harnx_data_dir.to_string_lossy(),
+        paths.harnx_state_dir.to_string_lossy()
+    );
+    for (key, value) in &envs {
+        export_line = format!("{export_line}export {key}={value}\n");
+    }
+    tmux.send_text(&export_line)?;
+    // `; echo HARNX_EXIT:$?` reports both success and failure exits.
+    tmux.send_text(&format!(
+        "{} --agent default --session; echo HARNX_EXIT:$?\n",
+        harnx_bin.to_string_lossy()
+    ))?;
+    let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    tmux.wait_for(Duration::from_secs(20), |screen| {
+        screen.contains("Input")
+            || screen.contains("• 🤖")
+            || spinner_frames.iter().any(|frame| screen.contains(*frame))
+    })
+    .context("TUI did not reach the interactive input area")?;
+    let broker_pid = gate.started(0)?;
+
+    // Pending recovery: kill the owned broker child and close the gate, so
+    // the frontend's restarted broker cannot report its port.
+    gate.close()?;
+    sigkill(broker_pid);
+
+    // A broker-waiting history command: `.empty session` clears the remote
+    // session log as cancellable background work (design 9). Its broker wait
+    // reports through the rerouted transcript notice.
+    tmux.send_text(".empty session")?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for_contains("Waiting for nats-server", Duration::from_secs(10))?;
+    // Input loop responsiveness during the pending recovery: typed text
+    // renders in the input area while the broker is unavailable.
+    tmux.send_text("still-alive")?;
+    tmux.wait_for_contains("still-alive", Duration::from_secs(5))
+        .context("input loop froze while broker recovery was pending")?;
+
+    // Ctrl-C cancels the pending command: the cancellation error lands in the
+    // transcript and the TUI stays alive (no exit sentinel appears).
+    tmux.send_keys(&["C-c"])?;
+    // The cancellation error rendering after Ctrl-C proves the event loop
+    // is still alive, and the TUI must not have exited.
+    let screen = tmux
+        .wait_for_contains("cancelled while waiting for NATS", Duration::from_secs(10))
+        .context("Ctrl-C must cancel the pending history command")?;
+    assert!(
+        !screen.contains("HARNX_EXIT:"),
+        "the TUI must stay alive after Ctrl-C cancelled the pending command"
+    );
+
+    // Recovery: reopening the gate lets the restarted broker report its
+    // port. The resubmitted clear then completes. Its rebuild's "Loading
+    // session history…" status line is transient (the rebuild replaces the
+    // transcript within one capture poll), so completion is proven with a
+    // second history command queued behind the clear: `.session` with one
+    // argument fails deterministically once the queue drains past the clear,
+    // and its error text stays in the transcript.
+    gate.allow()?;
+    // Clear the probe draft, then resubmit.
+    for _ in 0.."still-alive".len() {
+        tmux.send_keys(&["BSpace"])?;
+    }
+    tmux.send_text(".empty session")?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.send_text(".session one-arg")?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for_contains(
+        "An explicit agent and session ID are required",
+        Duration::from_secs(30),
+    )
+    .context("frontend did not recover after the broker returned")?;
+
+    // Clean shutdown: exit with Ctrl-D. The frontend scope awaits the broker
+    // shutdown, so the recovered child is reaped.
+    tmux.send_keys(&["C-d"])?;
+    tmux.wait_for_contains("HARNX_EXIT:0", Duration::from_secs(30))?;
+    let recovered_pid = gate.started(1)?;
+    assert_process_reaped(recovered_pid);
     Ok(())
 }
