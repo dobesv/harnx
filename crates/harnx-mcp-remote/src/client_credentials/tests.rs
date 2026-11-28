@@ -1,6 +1,12 @@
-use super::token::PRE_EXPIRY_WINDOW;
 use super::*;
-use std::collections::VecDeque;
+use reqwest::header::CONTENT_TYPE;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
+use tokio::time::Instant;
+use url::{form_urlencoded, Url};
 
 use axum::{
     body::{Body, Bytes},
@@ -15,6 +21,16 @@ use tokio::{
     sync::{mpsc, Barrier},
     task::JoinHandle,
 };
+
+const PRE_EXPIRY_WINDOW: Duration = Duration::from_secs(60);
+const RETIRED_SECRET_GENERATIONS: usize = 4;
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn lock<T>(lockable: &Mutex<T>) -> MutexGuard<'_, T> {
+    lockable
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const SECRET: &str = "test-client-secret+s&=p";
 
@@ -563,32 +579,6 @@ async fn invalid_access_tokens_are_rejected_with_safe_errors() {
     }
 }
 
-#[test]
-fn bearer_token_grammar_accepts_all_token_characters_and_trailing_padding() {
-    let unpadded = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~+/";
-    for token in [unpadded.to_owned(), format!("{unpadded}==")] {
-        let body = serde_json::json!({"access_token": token, "token_type": "Bearer"});
-        let cached = parse_token_response(body.to_string().as_bytes()).unwrap();
-        assert_eq!(cached.header.to_str().unwrap(), format!("Bearer {token}"));
-        assert!(cached.header.is_sensitive());
-    }
-}
-
-#[test]
-fn bearer_token_grammar_rejects_whitespace_invalid_chars_and_internal_padding() {
-    for token in ["a b", "a\tb", "a@b", "a:b", "a=b", "=a", "="] {
-        let body = serde_json::json!({"access_token": token, "token_type": "Bearer"});
-        let error = parse_token_response(body.to_string().as_bytes())
-            .err()
-            .expect("invalid access_token");
-        assert_eq!(
-            error.to_string(),
-            "access_token is not a valid header value"
-        );
-        assert!(!error.to_string().contains(token));
-    }
-}
-
 #[tokio::test]
 async fn token_type_must_be_bearer_case_insensitively() {
     for (token_type, accepted) in [
@@ -1046,25 +1036,6 @@ async fn redaction_covers_current_retired_and_client_secret_forms() {
     assert!(!redacted.contains(SECRET));
     assert!(!redacted.contains("gen-token-1"));
     assert!(!redacted.contains(&recent));
-}
-
-#[test]
-fn secret_file_reading_strips_only_trailing_crlf() {
-    let file = tempfile::NamedTempFile::new().unwrap();
-    for (content, expected) in [
-        ("abc\r\n", Some("abc")),
-        ("abc\r\n\r\n", Some("abc")),
-        ("a\r\nb", Some("a\r\nb")),
-        ("  spaced  ", Some("  spaced  ")),
-        ("\r\n", None),
-    ] {
-        std::fs::write(file.path(), content).unwrap();
-        let read = read_client_secret_file(file.path());
-        match expected {
-            Some(secret) => assert_eq!(read.unwrap().expose(), secret, "{content:?}"),
-            None => assert!(read.is_err(), "{content:?}"),
-        }
-    }
 }
 
 mod refresh;

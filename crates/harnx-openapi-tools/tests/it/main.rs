@@ -4,3 +4,6 @@ mod credential_classification;
 mod jira_catalog;
 mod media_contract;
 mod media_fixture;
+mod name_collisions;
+mod operation_selection;
+mod spec_patch;

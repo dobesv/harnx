@@ -9,8 +9,11 @@ use url::Url;
 use crate::authenticated_http::AuthenticatedHttp;
 use crate::cli::Cli;
 use crate::client_credentials::ClientCredentialsProvider;
-use crate::native::tls::{client_builder_for, TlsPaths};
 use crate::UpstreamAuth;
+use harnx_http_auth::{
+    net::{has_embedded_credentials, is_http_endpoint, is_https_or_loopback},
+    tls::{credentialed_client_builder, TlsPaths},
+};
 
 fn config_from_cli(cli: &Cli) -> Result<StreamableHttpClientTransportConfig> {
     let parsed_url = Url::parse(cli.url.as_str())
@@ -164,7 +167,7 @@ fn validated_oauth_endpoints(cli: &Cli) -> Result<(Url, Url)> {
 /// endpoint, with or without `--insecure`.
 fn require_http_endpoint(url: &Url, what: &'static str) -> Result<()> {
     anyhow::ensure!(
-        matches!(url.scheme(), "http" | "https") && url.host().is_some(),
+        is_http_endpoint(url),
         "the {what} must be an absolute http(s) URL with a host"
     );
     Ok(())
@@ -174,7 +177,7 @@ fn require_http_endpoint(url: &Url, what: &'static str) -> Result<()> {
 /// userinfo into a Basic Authorization header, so a safe scheme alone is not
 /// enough to clear an embedded credential.
 fn reject_embedded_credentials(url: &Url, what: &'static str) -> Result<()> {
-    if !url.username().is_empty() || url.password().is_some() {
+    if has_embedded_credentials(url) {
         bail!("the {what} must not contain embedded user credentials (user:pass@...)");
     }
     Ok(())
@@ -185,30 +188,13 @@ fn ensure_credentials_transport_is_secure(
     what: &'static str,
     insecure: bool,
 ) -> Result<()> {
-    if insecure || credentials_endpoint_is_safe(url) {
+    if insecure || is_https_or_loopback(url) {
         return Ok(());
     }
     bail!(
         "refusing to send OAuth client credentials over the non-HTTPS {what}; \
          use HTTPS, loopback, or --insecure"
     );
-}
-
-/// OAuth-only endpoint safety, separate from the plain proxy's legacy check.
-/// The plain helper matches `host_str`, which is bracketed (`[::1]`) for IPv6
-/// URLs, so it never recognizes IPv6 loopback; matching the typed host fixes
-/// that for OAuth without widening the legacy plain bearer policy.
-fn credentials_endpoint_is_safe(url: &Url) -> bool {
-    uses_https(url) || is_loopback_host_typed(url)
-}
-
-fn is_loopback_host_typed(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
 }
 
 /// Static rejection for malformed `--header` entries in client-credentials
@@ -270,7 +256,7 @@ fn required_client_credentials(cli: &Cli) -> Result<(String, std::path::PathBuf)
 
 /// Owned TLS flag values, moved into the blocking-pool task that loads the
 /// cert/key/CA PEM and the client secret: those reads are synchronous
-/// `std::fs` I/O (native/tls.rs, native/oauth.rs), and this builder runs on a
+/// `std::fs` I/O (in harnx-http-auth), and this builder runs on a
 /// Tokio worker.
 struct OwnedTlsPaths {
     cert: Option<std::path::PathBuf>,
@@ -282,16 +268,13 @@ struct OwnedTlsPaths {
 /// proxies, redirects refused. No request timeout: the token exchange owns
 /// its own 30-second deadline and MCP streams must stay unbounded.
 fn oauth_http_client(tls: &OwnedTlsPaths) -> Result<reqwest::Client> {
-    let builder = client_builder_for(&TlsPaths {
+    credentialed_client_builder(&TlsPaths {
         cert: tls.cert.as_deref(),
         key: tls.key.as_deref(),
         ca: tls.ca.as_deref(),
-    })?;
-    builder
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("build OAuth HTTP client")
+    })?
+    .build()
+    .context("build OAuth HTTP client")
 }
 
 /// Build the client-credentials proxy transport. Validation happens first, so

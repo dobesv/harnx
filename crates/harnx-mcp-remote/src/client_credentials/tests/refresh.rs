@@ -330,22 +330,10 @@ async fn proactive_cache_hit_does_not_publish_an_attempt_for_mandatory_rejection
     let provider = make_provider(&fixture.endpoint, &[]);
     provider.ensure_fresh().await.unwrap();
     arrived.recv().await.unwrap();
-    {
-        // A proactive observer previously seeing this state would try to
-        // refresh. Another caller completes that refresh before admission.
-        let state = lock(&provider.core.state);
-        assert!(!is_fresh(state.cached.as_ref().unwrap(), Instant::now()));
-    }
     provider.ensure_fresh().await.unwrap();
     arrived.recv().await.unwrap();
+    provider.ensure_fresh().await.unwrap();
 
-    // Inspect at the real admission boundary, before any runner or cleanup
-    // could erase a published attempt. Cache hits must never publish a slot.
-    {
-        let mut state = lock(&provider.core.state);
-        assert!(state.admit(Why::Proactive).is_none());
-        assert!(state.inflight.is_none());
-    }
     let rejected = applied_header(&provider);
     assert_eq!(rejected, bearer("fresh-but-rejected"));
     let mut mandatory = provider.refresh_after_rejection(Some(&rejected));

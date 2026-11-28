@@ -23,337 +23,28 @@
 //!   properties) is reported as a diagnostic and kept verbatim; deciding how
 //!   to handle such operations is a planning decision, not a silent repair.
 
-use std::collections::{HashMap, HashSet};
-
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::error::{SpecError, SpecResult};
-use crate::refs::resolve_pointer;
+#[path = "compact/compactor.rs"]
+mod compactor;
+#[path = "compact/definition_names.rs"]
+mod definition_names;
+#[path = "compact/diagnostics.rs"]
+mod diagnostics;
+pub(crate) mod materialization;
 
-/// Schema keys dropped from compact catalogs. Everything not listed and not
-/// recursed into structurally is kept verbatim.
-const DROPPED_KEYS: &[&str] = &[
-    "description",
-    "example",
-    "examples",
-    "title",
-    "xml",
-    "externalDocs",
-    "$schema",
-    "deprecated",
-];
+pub use compactor::SchemaCompactor;
 
-/// Child positions that hold schemas and must be walked.
-const NESTED_OBJECT_KEYS: &[&str] = &[
-    "properties",
-    "patternProperties",
-    "definitions",
-    "$defs",
-    "dependentSchemas",
-];
-
-/// Child positions that hold a list of schemas.
-const NESTED_LIST_KEYS: &[&str] = &["allOf", "anyOf", "oneOf"];
-
-/// Guard against hostile/deeply nested schemas.
-const MAX_SCHEMA_DEPTH: usize = 128;
+#[cfg(test)]
+use crate::error::SpecError;
 
 /// How many leading `#/$defs/…` references to follow when deriving wire
 /// semantics (property names, binary detection) from a schema.
 const MAX_REF_CHAIN: usize = 16;
 
-/// Compacts one operation's schemas into a single reachable-`$defs` map.
-pub struct SchemaCompactor<'a> {
-    root: &'a Value,
-    context: String,
-    defs: Map<String, Value>,
-    pointer_names: HashMap<String, String>,
-    occupied: HashSet<String>,
-    depth: usize,
-    schema_diagnostics: Vec<String>,
-}
-
-impl<'a> SchemaCompactor<'a> {
-    pub fn new(root: &'a Value, context: impl Into<String>) -> Self {
-        Self {
-            root,
-            context: context.into(),
-            defs: Map::new(),
-            pointer_names: HashMap::new(),
-            occupied: HashSet::new(),
-            depth: 0,
-            schema_diagnostics: Vec::new(),
-        }
-    }
-
-    /// Diagnostics emitted while compacting this operation's schemas.
-    pub fn take_diagnostics(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.schema_diagnostics)
-    }
-
-    /// Compact a source schema. References are rewritten into `#/$defs/…` and
-    /// their definitions collected for [`SchemaCompactor::finish`].
-    pub fn compact(&mut self, schema: &Value) -> SpecResult<Value> {
-        self.depth += 1;
-        if self.depth > MAX_SCHEMA_DEPTH {
-            return Err(SpecError::unsupported(
-                self.context.clone(),
-                format!("schema nesting exceeds {MAX_SCHEMA_DEPTH} levels"),
-            ));
-        }
-        let compacted = self.compact_inner(schema)?;
-        self.depth -= 1;
-        Ok(compacted)
-    }
-
-    fn compact_inner(&mut self, schema: &Value) -> SpecResult<Value> {
-        match schema {
-            Value::Bool(_) => Ok(schema.clone()),
-            Value::Object(object) => {
-                if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
-                    self.compact_reference(object, reference)
-                } else {
-                    self.compact_object(object)
-                }
-            }
-            Value::Null => Ok(Value::Null),
-            _ => Err(SpecError::invalid(
-                self.context.clone(),
-                format!("schema must be an object or boolean, got {schema}"),
-            )),
-        }
-    }
-
-    /// Compact `{ "type": "object", … }`, dispatching each key's shape.
-    ///
-    /// Cycle safety and reference handling live in [`Self::compact_reference`];
-    /// this only walks structural positions and copies everything else
-    /// verbatim.
-    fn compact_object(&mut self, object: &Map<String, Value>) -> SpecResult<Value> {
-        let mut result = Map::new();
-        for (key, value) in object {
-            if DROPPED_KEYS.contains(&key.as_str()) || key.starts_with("x-") {
-                continue;
-            }
-            self.compact_key(&mut result, key, value)?;
-        }
-        self.record_contradiction_diagnostic(&result);
-        Ok(Value::Object(result))
-    }
-
-    /// Compact one schema key at its correct structural position.
-    fn compact_key(
-        &mut self,
-        result: &mut Map<String, Value>,
-        key: &str,
-        value: &Value,
-    ) -> SpecResult<()> {
-        match key {
-            "items" => {
-                // JSON Schema allows a single schema (Swagger 2.0/draft-4) or
-                // a tuple of schemas; preserve the source shape.
-                let compacted = match value {
-                    Value::Array(items) => Value::Array(
-                        items
-                            .iter()
-                            .map(|item| self.compact(item))
-                            .collect::<SpecResult<Vec<_>>>()?,
-                    ),
-                    schema => self.compact(schema)?,
-                };
-                result.insert(key.to_string(), compacted);
-            }
-            "additionalProperties"
-            | "additionalItems"
-            | "not"
-            | "if"
-            | "then"
-            | "else"
-            | "contains"
-            | "propertyNames" => {
-                let compacted = if value.is_object() {
-                    self.compact(value)?
-                } else {
-                    value.clone()
-                };
-                result.insert(key.to_string(), compacted);
-            }
-            key if NESTED_OBJECT_KEYS.contains(&key) => {
-                if let Value::Object(entries) = value {
-                    result.insert(key.to_string(), self.compact_entries(entries)?);
-                }
-            }
-            key if NESTED_LIST_KEYS.contains(&key) => {
-                if let Value::Array(entries) = value {
-                    let compacted = entries
-                        .iter()
-                        .map(|entry| self.compact(entry))
-                        .collect::<SpecResult<Vec<_>>>()?;
-                    result.insert(key.to_string(), Value::Array(compacted));
-                }
-            }
-            _ => {
-                result.insert(key.to_string(), value.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Compact a `{name: schema, …}` map (`properties`, `$defs`, …).
-    fn compact_entries(&mut self, entries: &Map<String, Value>) -> SpecResult<Value> {
-        let mut compacted = Map::new();
-        for (name, entry) in entries {
-            compacted.insert(name.clone(), self.compact(entry)?);
-        }
-        Ok(Value::Object(compacted))
-    }
-
-    /// Compact `{"$ref": "…"}` with optional sibling keywords, which win over
-    /// the target per JSON Schema reference semantics.
-    ///
-    /// The target is always collected into `$defs` under a stable name, like a
-    /// bare reference. When the reference recurses while its target is still
-    /// being compacted, the cycle is represented by the `$ref` form with the
-    /// siblings merged in — never by inlining (which would recurse until the
-    /// depth guard trips).
-    fn compact_reference(
-        &mut self,
-        object: &Map<String, Value>,
-        reference: &str,
-    ) -> SpecResult<Value> {
-        if object.len() == 1 {
-            return self.reference_to_def(reference);
-        }
-        let name = self.def_name_for(reference)?;
-        // `pointer_names` knows the reference before its target finishes
-        // compacting; a missing `$defs` entry therefore means re-entry during
-        // that compaction, i.e. a cycle.
-        let expanded = match self.defs.get(&name) {
-            Some(collected) => collected.clone(),
-            None => json!({"$ref": format!("#/$defs/{name}")}),
-        };
-        let mut siblings = object.clone();
-        siblings.remove("$ref");
-        let merged = self.compact(&Value::Object(siblings))?;
-        Ok(merge_objects(expanded, merged))
-    }
-
-    /// Rewrite a bare local `$ref` to `#/$defs/<name>`, compacting its target
-    /// into the per-operation definitions map exactly once.
-    fn reference_to_def(&mut self, reference: &str) -> SpecResult<Value> {
-        let name = self.def_name_for(reference)?;
-        Ok(json!({"$ref": format!("#/$defs/{name}")}))
-    }
-
-    /// The stable `$defs` name for a reference, collecting its target the
-    /// first time it is seen.
-    fn def_name_for(&mut self, reference: &str) -> SpecResult<String> {
-        if let Some(name) = self.pointer_names.get(reference) {
-            return Ok(name.clone());
-        }
-        let target = resolve_pointer(self.root, reference, &self.context)?;
-        let name = self.allocate_def_name(reference);
-        // Claim the name before compacting so nested references to the same
-        // pointer see the cycle and keep the `$ref` form.
-        self.pointer_names
-            .insert(reference.to_string(), name.clone());
-        let compacted = self.compact(target)?;
-        self.defs.insert(name.clone(), compacted);
-        Ok(name)
-    }
-
-    fn allocate_def_name(&mut self, reference: &str) -> String {
-        let base = reference
-            .rsplit('/')
-            .next()
-            .map(sanitize_def_name)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "def".to_string());
-        if self.occupied.insert(base.clone()) {
-            base
-        } else {
-            // A different pointer already claimed this name; keep both stable
-            // by pinning the full pointer in a hash suffix.
-            format!("{base}_{}", short_hash(reference))
-        }
-    }
-
-    /// Record — without mutating anything — that an upstream schema
-    /// contradicts itself: it lists a name under `required`, declares no
-    /// property for it and forbids additional properties, so no request can
-    /// validate. Schemas using `patternProperties` are skipped: a required
-    /// name may be satisfiable through a pattern this release cannot prove or
-    /// disprove. The operation stays registered with the schema verbatim;
-    /// resolving such vendor typos is a planning decision, not a silent
-    /// repair.
-    fn record_contradiction_diagnostic(&mut self, result: &Map<String, Value>) {
-        if result.get("additionalProperties") != Some(&Value::Bool(false)) {
-            return;
-        }
-        if result.contains_key("patternProperties") {
-            return;
-        }
-        let Some(required) = result.get("required").and_then(Value::as_array) else {
-            return;
-        };
-        let declared = result.get("properties").and_then(Value::as_object);
-        let undeclared: Vec<String> = required
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|name| !declared.is_some_and(|properties| properties.contains_key(*name)))
-            .map(str::to_string)
-            .collect();
-        if undeclared.is_empty() {
-            return;
-        }
-        let names: Vec<String> = undeclared.iter().map(|name| format!("{name:?}")).collect();
-        let diagnostic = format!(
-            "{}: schema requires {} but declares no property for it while \
-             additionalProperties is false, so no request can satisfy the schema (an \
-             upstream/vendor typo); the schema is kept verbatim and the operation \
-             cannot construct a valid request pending a plan decision",
-            self.context,
-            names.join(", ")
-        );
-        if !self.schema_diagnostics.contains(&diagnostic) {
-            self.schema_diagnostics.push(diagnostic);
-        }
-    }
-
-    /// The reachable, compacted definitions for the operation. Attach the
-    /// result under `$defs` at the root of the operation's input schema.
-    pub fn finish(self) -> Map<String, Value> {
-        self.defs
-    }
-}
-
-/// Merge `overriding` keys into `base` (both must be JSON objects).
-fn merge_objects(base: Value, overriding: Value) -> Value {
-    let (Some(mut base), Some(overriding)) = (base.as_object().cloned(), overriding.as_object())
-    else {
-        return base;
-    };
-    for (key, value) in overriding {
-        base.insert(key.clone(), value.clone());
-    }
-    Value::Object(base)
-}
-
-fn sanitize_def_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// First 8 hex characters of the SHA-256 of `input` — a short, stable,
-/// collision-safe disambiguator.
+/// First 8 hex characters of the SHA-256 of `input`, used as the stable first
+/// disambiguator; callers still check each complete name for collisions.
 pub fn short_hash(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
     digest.iter().take(4).map(|b| format!("{b:02x}")).collect()
@@ -402,6 +93,10 @@ pub fn is_binary_schema(schema: &Value, defs: &Map<String, Value>) -> bool {
 }
 
 #[cfg(test)]
+#[path = "compact/materialization_tests.rs"]
+mod materialization_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -437,7 +132,7 @@ mod tests {
         let compacted = compactor
             .compact(&json!({"$ref": "#/components/schemas/Node"}))
             .unwrap();
-        let defs = compactor.finish();
+        let defs = compactor.finish().unwrap();
         assert_eq!(compacted, json!({"$ref": "#/$defs/Node"}));
         let node = &defs["Node"];
         assert_eq!(node["type"], "object");
@@ -450,17 +145,15 @@ mod tests {
     }
 
     #[test]
-    fn sibling_keywords_override_the_target() {
+    fn prose_siblings_do_not_inline_the_target() {
         harnx_core::require_nextest();
         let root = root();
         let mut compactor = SchemaCompactor::new(&root, "TEST /test");
         let compacted = compactor
             .compact(&json!({"$ref": "#/components/schemas/Node", "description": "use text"}))
             .unwrap();
-        let defs = compactor.finish();
-        assert!(compacted.get("$ref").is_none());
-        assert_eq!(compacted["type"], "object");
-        // The sibling use collects the target definition too.
+        let defs = compactor.finish().unwrap();
+        assert_eq!(compacted, json!({"$ref": "#/$defs/Node"}));
         assert!(defs.contains_key("Node"));
     }
 
@@ -487,7 +180,7 @@ mod tests {
             .compact(&json!({"$ref": "#/components/schemas/Loop"}))
             .unwrap();
         assert_eq!(compacted, json!({"$ref": "#/$defs/Loop"}));
-        let defs = compactor.finish();
+        let defs = compactor.finish().unwrap();
         let next = &defs["Loop"]["properties"]["next"];
         assert_eq!(next["nullable"], json!(true));
         assert_eq!(next["$ref"], json!("#/$defs/Loop"));
@@ -506,7 +199,7 @@ mod tests {
             }
         });
         let compacted = compactor.compact(&schema).unwrap();
-        let defs = compactor.finish();
+        let defs = compactor.finish().unwrap();
         let node_ref = compacted["properties"]["node"]["$ref"].as_str().unwrap();
         let param_ref = compacted["properties"]["param"]["$ref"].as_str().unwrap();
         assert_eq!(node_ref, "#/$defs/Node");
@@ -527,7 +220,7 @@ mod tests {
         let compacted = compactor
             .compact(&json!({"$ref": "#/components/schemas/Tree"}))
             .unwrap();
-        let defs = compactor.finish();
+        let defs = compactor.finish().unwrap();
         assert_eq!(compacted, json!({"$ref": "#/$defs/Tree"}));
         let names = object_property_names(&defs["Tree"], &defs).unwrap();
         assert_eq!(names, vec!["name".to_string(), "children".to_string()]);

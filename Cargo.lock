@@ -4814,6 +4814,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-http-auth"
+version = "0.35.1"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "ipnet",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "urlencoding",
+]
+
+[[package]]
 name = "harnx-k8s-creds"
 version = "0.35.1"
 dependencies = [
@@ -4939,6 +4956,7 @@ dependencies = [
  "harnx-core",
  "harnx-credentials",
  "harnx-healthz",
+ "harnx-http-auth",
  "harnx-metrics",
  "harnx-nats-common",
  "harnx-script",
@@ -4946,7 +4964,6 @@ dependencies = [
  "harnx-test-bins",
  "harnx-toolset",
  "harnx-toolset-server",
- "ipnet",
  "log",
  "oauth2",
  "opentelemetry",
@@ -5040,6 +5057,9 @@ version = "0.35.1"
 dependencies = [
  "harnx-core",
  "harnx-toolset",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
  "jsonschema",
  "serde",
  "serde_json",

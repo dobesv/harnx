@@ -1,0 +1,27 @@
+[package]
+name = "harnx-http-auth"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared HTTP service-account OAuth, TLS, and credential handling"
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+ipnet.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "sync"] }
+tracing.workspace = true
+url = "2"
+urlencoding.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

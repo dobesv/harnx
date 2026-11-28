@@ -7,14 +7,20 @@
 mod body;
 mod input;
 mod params;
+mod sites;
 
 use serde_json::{Map, Value};
 
-use crate::compact::SchemaCompactor;
+use crate::compact::{
+    materialization::{MaterializationBudget, MaterializationCost},
+    SchemaCompactor,
+};
 use crate::document::SpecDocument;
-use crate::error::{SpecError, SpecResult};
+use crate::error::SpecResult;
 use crate::naming::{fallback_base, Namer};
 use crate::security::{operation_security, SecuritySchemes};
+
+use sites::{operation_sites, OperationSite};
 
 pub use body::{BodySpec, FormField};
 pub use input::path_template_names;
@@ -68,22 +74,13 @@ impl NormalizedOperation {
     }
 }
 
-/// One operation under normalization, with its borrowed document context.
-struct OperationSite<'a> {
-    document: &'a SpecDocument,
-    path: &'a str,
-    method: &'a str,
-    path_item: &'a Map<String, Value>,
-    operation: &'a Map<String, Value>,
-    context: String,
-}
-
 /// The mutable state threaded through every operation: name assignment and
 /// the contradictory-schema diagnostics the server surfaces at startup.
 struct NormalizeState<'a> {
     namer: &'a mut Namer,
     schemes: &'a SecuritySchemes,
     schema_diagnostics: &'a mut Vec<String>,
+    materialization_budget: &'a mut MaterializationBudget,
 }
 
 /// Normalize every operation of a document into one table.
@@ -99,122 +96,65 @@ pub fn normalize_document(
     schemes: &SecuritySchemes,
     schema_diagnostics: &mut Vec<String>,
 ) -> SpecResult<Vec<NormalizedOperation>> {
-    operation_sites(document)?
-        .into_iter()
-        .map(|site| {
-            let state = NormalizeState {
-                namer: &mut *namer,
-                schemes,
-                schema_diagnostics: &mut *schema_diagnostics,
-            };
-            normalize_operation(&site, state)
-        })
-        .collect()
-}
-
-/// Every operation site of a document, in document order, rejecting malformed
-/// path items and unsupported path-item `$ref`s up front.
-fn operation_sites<'a>(document: &'a SpecDocument) -> SpecResult<Vec<OperationSite<'a>>> {
-    let Some(paths) = document.root.get("paths").and_then(Value::as_object) else {
-        return Err(SpecError::invalid(
-            "document",
-            "the `paths` field is missing or not an object",
-        ));
-    };
-    let mut sites = Vec::new();
-    for (path, path_item) in paths {
-        sites.extend(path_item_sites(document, path, path_item)?);
-    }
-    Ok(sites)
-}
-
-/// Diagnostic location for a path-level problem.
-fn path_location(path: &str) -> String {
-    format!("path {path}")
-}
-
-/// The operation sites of one path item.
-fn path_item_sites<'a>(
-    document: &'a SpecDocument,
-    path: &'a str,
-    path_item: &'a Value,
-) -> SpecResult<Vec<OperationSite<'a>>> {
-    let Some(path_item) = path_item.as_object() else {
-        return Err(SpecError::invalid(
-            path_location(path),
-            "the path item is not an object",
-        ));
-    };
-    if path_item.contains_key("$ref") {
-        return Err(SpecError::unsupported(
-            path_location(path),
-            "path-item `$ref` is not supported; inline the referenced path item",
-        ));
-    }
-    let mut sites = Vec::new();
-    for method in METHODS {
-        if let Some(operation) = path_item.get(method) {
-            sites.push(operation_site(
-                document, path, method, path_item, operation,
-            )?);
-        }
-    }
-    for key in path_item.keys() {
-        if METHODS.contains(&key.as_str())
-            || PATH_ITEM_FIELDS.contains(&key.as_str())
-            || key.starts_with("x-")
-        {
-            continue;
-        }
-        return Err(SpecError::unsupported(
-            path_location(path),
-            format!(
-                "unsupported HTTP method `{key}`; supported methods: {}",
-                METHODS.join(", ")
-            ),
-        ));
-    }
-    Ok(sites)
-}
-
-/// The site of one operation, validating that the entry is an object.
-fn operation_site<'a>(
-    document: &'a SpecDocument,
-    path: &'a str,
-    method: &'a str,
-    path_item: &'a Map<String, Value>,
-    operation: &'a Value,
-) -> SpecResult<OperationSite<'a>> {
-    let Some(operation) = operation.as_object() else {
-        return Err(SpecError::invalid(
-            format!("{} {path}", method.to_uppercase()),
-            "the operation is not an object",
-        ));
-    };
-    Ok(OperationSite {
+    normalize_document_with_budget(
         document,
-        path,
-        method,
-        path_item,
-        operation,
-        context: format!("{} {path}", method.to_uppercase()),
-    })
+        namer,
+        schemes,
+        schema_diagnostics,
+        MaterializationBudget::new(
+            crate::compact::materialization::DEFAULT_MATERIALIZATION_VALUE_BUDGET,
+            crate::compact::materialization::DEFAULT_MATERIALIZATION_BYTE_BUDGET,
+        ),
+    )
+    .map(|(operations, _)| operations)
+}
+
+fn normalize_document_with_budget(
+    document: &SpecDocument,
+    namer: &mut Namer,
+    schemes: &SecuritySchemes,
+    schema_diagnostics: &mut Vec<String>,
+    mut materialization_budget: MaterializationBudget,
+) -> SpecResult<(Vec<NormalizedOperation>, MaterializationCost)> {
+    let mut operations = Vec::new();
+    for site in operation_sites(document)? {
+        let state = NormalizeState {
+            namer: &mut *namer,
+            schemes,
+            schema_diagnostics: &mut *schema_diagnostics,
+            materialization_budget: &mut materialization_budget,
+        };
+        operations.push(normalize_operation(&site, state)?);
+    }
+    Ok((operations, materialization_budget.used()))
 }
 
 fn normalize_operation(
     site: &OperationSite<'_>,
     state: NormalizeState<'_>,
 ) -> SpecResult<NormalizedOperation> {
-    let mut compactor = SchemaCompactor::new(&site.document.root, site.context.clone());
+    let (value_budget, byte_budget) = state.materialization_budget.remaining();
+    let mut compactor = SchemaCompactor::with_budget(
+        &site.document.root,
+        site.context.clone(),
+        value_budget,
+        byte_budget,
+    );
     let parts = collect_parts(site, state.schemes, &mut compactor)?;
     record_diagnostics(state.schema_diagnostics, &mut compactor);
-    let defs = compactor.finish();
+    let materialized = compactor.materialization_used();
+    let defs = compactor.finish()?;
+    state.materialization_budget.charge(
+        materialized,
+        &site.context,
+        "document materialization budget",
+    )?;
     let mut body = parts.body;
     resolve_body_input(&mut body, &defs, &site.context)?;
     let mut normalized = NormalizedOperation {
         method: site.method.to_string(),
         path: site.path.to_string(),
-        raw_tool_name: assign_tool_name(site, state.namer),
+        raw_tool_name: assign_tool_name(site, state.namer)?,
         description: operation_description(site),
         deprecated: is_deprecated(site.operation),
         tags: operation_tags(site),
@@ -296,7 +236,7 @@ fn record_diagnostics(diagnostics: &mut Vec<String>, compactor: &mut SchemaCompa
     }
 }
 
-fn assign_tool_name(site: &OperationSite<'_>, namer: &mut Namer) -> String {
+fn assign_tool_name(site: &OperationSite<'_>, namer: &mut Namer) -> SpecResult<String> {
     let base = site
         .operation
         .get("operationId")
@@ -378,3 +318,7 @@ mod tests {
         assert_eq!(schema["properties"]["body"], json!({"type": "object"}));
     }
 }
+
+#[cfg(test)]
+#[path = "materialization_tests.rs"]
+mod materialization_tests;

@@ -24,34 +24,19 @@ use tracing::instrument::WithSubscriber;
 use url::Url;
 
 use super::NativeConfig;
-pub(crate) use policy::{AddressClass, GuardedResolver};
+use harnx_http_auth::net::GuardedResolver;
+pub(crate) use policy::AddressClass;
 #[cfg(test)]
 pub(crate) use transport::sanitize_oauth_error_body;
 
 /// Default and maximum upper bound for OAuth HTTP request timeouts.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum allowed HTTP response body size (1 MiB).
-pub const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
-
 const USERINFO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_USERINFO_BODY_BYTES: usize = 64 * 1024;
 
-/// Standard OAuth 2.0 error codes (RFC 6749, RFC 7591, RFC 8414).
-pub(crate) const STANDARD_OAUTH_ERRORS: &[&str] = &[
-    "invalid_request",
-    "invalid_client",
-    "invalid_grant",
-    "unauthorized_client",
-    "unsupported_grant_type",
-    "invalid_scope",
-    "access_denied",
-    "unsupported_response_type",
-    "server_error",
-    "temporarily_unavailable",
-    "invalid_client_metadata",
-    "invalid_redirect_uri",
-];
+pub use harnx_http_auth::oauth::MAX_RESPONSE_BODY_BYTES;
+use harnx_http_auth::oauth::STANDARD_OAUTH_ERRORS;
 
 /// Static error type that never formats dynamic strings, URLs, or secrets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -86,9 +71,7 @@ impl OAuthHttp {
         let allowed_classes = policy::determine_allowed_classes(&upstream_url);
 
         let builder = super::pool::http_client_builder(config)?;
-        let resolver = Arc::new(GuardedResolver {
-            allowed_classes: allowed_classes.clone(),
-        });
+        let resolver = Arc::new(GuardedResolver::new(allowed_classes.clone()));
         let client = builder
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())

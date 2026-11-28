@@ -8,10 +8,10 @@
 //! least [`MIN_RAW_NAME_BUDGET`] characters for the raw name is a
 //! configuration error, not a silent truncation.
 //!
-//! Truncation and duplicate-ID collisions append `_` plus the first 8 hex
-//! characters of the SHA-256 of `"<METHOD> <path>"`, so the same document plus
-//! the same server name always produces the same names, and no two operations
-//! share one.
+//! Truncation and duplicate-ID collisions start with `_` plus the first 8 hex
+//! characters of the SHA-256 of `"<METHOD> <path>"`. The complete candidate is
+//! checked against every reserved name; a deterministic counter suffix handles
+//! a literal name that already occupies it. Uncollided names stay unchanged.
 //!
 //! Sanitization reuses `harnx_core::package_namespace::sanitize_for_tool_name`
 //! and additionally folds to strict ASCII `[A-Za-z0-9_-]`: provider function
@@ -29,6 +29,9 @@ pub const MAX_MODEL_TOOL_NAME_LEN: usize = 64;
 
 /// Smallest raw-name budget a usable server name must leave.
 pub const MIN_RAW_NAME_BUDGET: usize = 24;
+
+/// Stop trying suffix variants after this many final candidates.
+const MAX_NAME_DISAMBIGUATION_ATTEMPTS: usize = 256;
 
 /// Assigns unique raw tool names for one catalog build.
 pub struct Namer {
@@ -78,17 +81,37 @@ impl Namer {
     }
 
     /// Sanitize a proposed base name (an `operationId` or a `{method}_{path}`
-    /// fallback) and make it unique.
-    pub fn assign(&mut self, base: &str, method: &str, path: &str) -> String {
-        let mut candidate = sanitize_operation_id(base);
-        if candidate.len() > self.max_raw || self.used.contains(&candidate) {
-            let suffix = format!("_{}", short_hash(&format!("{method} {path}")));
-            let trunk_len = self.max_raw.saturating_sub(suffix.len());
-            candidate = truncate_bytes(&candidate, trunk_len);
-            candidate.push_str(&suffix);
+    /// fallback) and make it unique. Returns a located error if every bounded
+    /// suffix candidate is already reserved.
+    pub fn assign(&mut self, base: &str, method: &str, path: &str) -> SpecResult<String> {
+        let base = sanitize_operation_id(base);
+        if base.len() <= self.max_raw && self.used.insert(base.clone()) {
+            return Ok(base);
         }
-        self.used.insert(candidate.clone());
-        candidate
+
+        let hash = short_hash(&format!("{method} {path}"));
+        for attempt in 0..MAX_NAME_DISAMBIGUATION_ATTEMPTS {
+            let suffix = if attempt == 0 {
+                format!("_{hash}")
+            } else {
+                format!("_{hash}_{attempt}")
+            };
+            let trunk_len = self.max_raw.saturating_sub(suffix.len());
+            let mut candidate = truncate_bytes(&base, trunk_len);
+            candidate.push_str(&suffix);
+            if self.used.insert(candidate.clone()) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(SpecError::invalid(
+            format!("{} {path}", method.to_uppercase()),
+            format!(
+                "could not allocate a unique tool name within the {}-character name budget after \
+                 {MAX_NAME_DISAMBIGUATION_ATTEMPTS} deterministic suffix candidates",
+                self.max_raw
+            ),
+        ))
     }
 }
 
@@ -213,16 +236,16 @@ mod tests {
         harnx_core::require_nextest();
         let mut namer = Namer::new("jira").unwrap();
         let long_id = "a".repeat(100);
-        let name = namer.assign(&long_id, "get", "/x");
+        let name = namer.assign(&long_id, "get", "/x").unwrap();
         assert!(name.len() <= namer.max_raw_len());
         assert_eq!(name.len(), 59);
         assert!(name.ends_with(&format!("_{}", short_hash("get /x"))));
         // Deterministic: rebuilding from the same assignments gives the same name.
         let mut again = Namer::new("jira").unwrap();
-        assert_eq!(name, again.assign(&long_id, "get", "/x"));
+        assert_eq!(name, again.assign(&long_id, "get", "/x").unwrap());
         assert_eq!(
-            namer.assign("other", "get", "/y"),
-            again.assign("other", "get", "/y")
+            namer.assign("other", "get", "/y").unwrap(),
+            again.assign("other", "get", "/y").unwrap()
         );
     }
 
@@ -230,22 +253,79 @@ mod tests {
     fn duplicate_operation_ids_get_distinct_stable_names() {
         harnx_core::require_nextest();
         let mut namer = Namer::new("jira").unwrap();
-        let first = namer.assign("dupOp", "get", "/a");
-        let second = namer.assign("dupOp", "post", "/b");
+        let first = namer.assign("dupOp", "get", "/a").unwrap();
+        let second = namer.assign("dupOp", "post", "/b").unwrap();
         assert_eq!(first, "dupOp");
         assert_ne!(first, second);
         assert!(second.starts_with("dupOp_"));
         // Stable across rebuilds.
         let mut rebuilt = Namer::new("jira").unwrap();
-        assert_eq!(rebuilt.assign("dupOp", "get", "/a"), first);
-        assert_eq!(rebuilt.assign("dupOp", "post", "/b"), second);
+        assert_eq!(rebuilt.assign("dupOp", "get", "/a").unwrap(), first);
+        assert_eq!(rebuilt.assign("dupOp", "post", "/b").unwrap(), second);
+    }
+
+    #[test]
+    fn literal_operation_id_cannot_shadow_a_generated_suffix() {
+        harnx_core::require_nextest();
+        let mut namer = Namer::new("jira").unwrap();
+        let original = namer.assign("dupOp", "get", "/first").unwrap();
+        let hash = short_hash("post /generated");
+        let literal = format!("dupOp_{hash}");
+        assert_eq!(namer.assign(&literal, "get", "/literal").unwrap(), literal);
+
+        let generated = namer.assign("dupOp", "post", "/generated").unwrap();
+        assert_eq!(original, "dupOp");
+        assert_ne!(generated, literal);
+        assert!(
+            generated.starts_with(&format!("dupOp_{hash}_")),
+            "{generated}"
+        );
+        assert!(generated.len() <= namer.max_raw_len());
+
+        let mut rebuilt = Namer::new("jira").unwrap();
+        assert_eq!(rebuilt.assign("dupOp", "get", "/first").unwrap(), original);
+        assert_eq!(
+            rebuilt.assign(&literal, "get", "/literal").unwrap(),
+            literal
+        );
+        assert_eq!(
+            rebuilt.assign("dupOp", "post", "/generated").unwrap(),
+            generated
+        );
+    }
+
+    #[test]
+    fn exhausted_final_candidates_return_a_located_error() {
+        harnx_core::require_nextest();
+        let mut namer = Namer::new("jira").unwrap();
+        let base = sanitize_operation_id("dupOp");
+        namer.used.insert(base.clone());
+        let hash = short_hash("post /generated");
+        for attempt in 0..MAX_NAME_DISAMBIGUATION_ATTEMPTS {
+            let suffix = if attempt == 0 {
+                format!("_{hash}")
+            } else {
+                format!("_{hash}_{attempt}")
+            };
+            let mut candidate = truncate_bytes(&base, namer.max_raw - suffix.len());
+            candidate.push_str(&suffix);
+            namer.used.insert(candidate);
+        }
+
+        let error = namer.assign("dupOp", "post", "/generated").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("POST /generated"), "{message}");
+        assert!(
+            message.contains("256 deterministic suffix candidates"),
+            "{message}"
+        );
     }
 
     #[test]
     fn unicode_long_names_stay_within_the_byte_budget() {
         harnx_core::require_nextest();
         let mut namer = Namer::new("jira").unwrap();
-        let name = namer.assign(&"ü".repeat(100), "get", "/x");
+        let name = namer.assign(&"ü".repeat(100), "get", "/x").unwrap();
         assert!(name.len() <= namer.max_raw_len(), "{name}");
         // The folding means the sanitized candidate is ASCII underscores.
         assert!(name.starts_with("_"), "{name}");

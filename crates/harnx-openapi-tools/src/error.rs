@@ -34,6 +34,13 @@ pub enum SpecError {
         message: String,
     },
 
+    /// An operator-supplied source patch (applied to the parsed document
+    /// root before normalization) failed. The message names the patch by
+    /// one-based index and a failure category only — never the expression
+    /// text, document content, or the underlying jaq error chain.
+    #[error("spec patch failed: {0}")]
+    SpecPatch(String),
+
     /// The operator-supplied configuration (server name, prefix budget) is
     /// unusable, independent of the specification content.
     #[error("configuration error: {0}")]
@@ -61,6 +68,10 @@ impl SpecError {
 
     pub(crate) fn config(message: impl Into<String>) -> Self {
         Self::Config(message.into())
+    }
+
+    pub(crate) fn spec_patch(message: impl Into<String>) -> Self {
+        Self::SpecPatch(message.into())
     }
 }
 

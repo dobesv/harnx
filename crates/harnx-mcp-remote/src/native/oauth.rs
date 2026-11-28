@@ -148,18 +148,9 @@ fn read_client_secret(config: &NativeConfig) -> Result<Option<Secret<String>>> {
     let Some(path) = &config.oauth_client_secret_file else {
         return Ok(None);
     };
-    read_client_secret_file(path).map(Some)
-}
-
-/// Read the client secret from one file, preserving native semantics: only
-/// trailing CR/LF is stripped, interior whitespace and CR/LF are kept, and
-/// an empty result is rejected.
-pub(crate) fn read_client_secret_file(path: &std::path::Path) -> Result<Secret<String>> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|_| anyhow!("cannot read --oauth-client-secret-file"))?;
-    let text = text.trim_end_matches(['\r', '\n']);
-    anyhow::ensure!(!text.is_empty(), "--oauth-client-secret-file is empty");
-    Ok(Secret::from(text))
+    harnx_http_auth::oauth::read_client_secret_file(path)
+        .map(Secret::from)
+        .map(Some)
 }
 
 async fn discover_server_metadata(

@@ -12,6 +12,7 @@ name = "harnx_mcp_remote"
 path = "src/lib.rs"
 
 [dependencies]
+harnx-http-auth.workspace = true
 harnx-nats-common = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-credentials = { path = "../harnx-credentials" }
@@ -35,9 +36,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 url = "2"
 oauth2 = { workspace = true }
-futures = { workspace = true }
 tracing = { workspace = true }
-ipnet = { workspace = true }
 thiserror = { workspace = true }
 
 [[bin]]
@@ -45,6 +44,7 @@ name = "harnx-mcp-remote"
 path = "src/main.rs"
 
 [dev-dependencies]
+futures.workspace = true
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 axum = { workspace = true }

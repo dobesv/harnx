@@ -29,6 +29,7 @@ members = [
     "crates/harnx-fetch-tools",
     "crates/harnx-openapi-tools",
     "crates/harnx-mcp-remote",
+    "crates/harnx-http-auth",
     "crates/harnx-plans-tools",
     "crates/harnx-git-history",
     "crates/harnx-nats-common",
@@ -219,6 +220,7 @@ jsonwebtoken = { version = "12.0.0", features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
 harnx-core = { path = "crates/harnx-core" }
 harnx-credentials = { path = "crates/harnx-credentials" }
+harnx-http-auth = { path = "crates/harnx-http-auth" }
 harnx-nats-common = { path = "crates/harnx-nats-common" }
 harnx-telemetry = { path = "crates/harnx-telemetry" }
 harnx-toolset = { path = "crates/harnx-toolset" }

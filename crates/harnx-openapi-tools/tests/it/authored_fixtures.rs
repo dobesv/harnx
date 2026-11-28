@@ -200,6 +200,88 @@ fn duplicate_operation_ids_get_distinct_stable_names() {
 }
 
 #[test]
+fn literal_operation_id_cannot_shadow_a_generated_suffix_or_its_schema() {
+    harnx_core::require_nextest();
+    let generated_path = "/generated";
+    let generated_hash =
+        harnx_openapi_tools::compact::short_hash(&format!("post {generated_path}"));
+    let literal_id = format!("dupOp_{generated_hash}");
+    let operation = |operation_id: String, min_length| {
+        json!({
+            "operationId": operation_id,
+            "parameters": [{
+                "name": "value",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string", "minLength": min_length}
+            }],
+            "responses": {"200": {"description": "ok"}}
+        })
+    };
+    let document = SpecDocument::from_value(json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Names", "version": "1"},
+        "paths": {
+            "/first": {"get": operation("dupOp".to_string(), 1)},
+            "/literal": {"get": operation(literal_id.clone(), 3)},
+            "/generated": {"post": operation("dupOp".to_string(), 7)}
+        }
+    }))
+    .unwrap();
+    let catalog = Catalog::build(&document, "names").unwrap();
+    let first = catalog.find_by_method_path("get", "/first").unwrap();
+    let literal = catalog.find_by_method_path("get", "/literal").unwrap();
+    let generated = catalog.find_by_method_path("post", generated_path).unwrap();
+    assert_eq!(first.raw_tool_name, "dupOp");
+    assert_eq!(literal.raw_tool_name, literal_id);
+    assert!(
+        generated
+            .raw_tool_name
+            .starts_with(&format!("dupOp_{generated_hash}_")),
+        "{}",
+        generated.raw_tool_name
+    );
+    assert!(generated.raw_tool_name.len() <= 64 - "names_".len());
+    for operation in [first, literal, generated] {
+        assert_eq!(
+            catalog
+                .find_operation(&operation.raw_tool_name)
+                .map(|found| found.path.as_str()),
+            Some(operation.path.as_str())
+        );
+    }
+    let names = catalog
+        .tool_specs()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(names.len(), catalog.operations.len());
+
+    for (operation, minimum, accepted, rejected) in [
+        (first, 1, "x", ""),
+        (literal, 3, "xxx", "x"),
+        (generated, 7, "1234567", "short"),
+    ] {
+        let raw_schema = &operation.input_schema;
+        assert_eq!(
+            raw_schema["properties"]["query"]["properties"]["value"]["minLength"],
+            minimum
+        );
+        let core_schema = harnx_core::json_schema::JsonSchema::from_tool_schema(raw_schema.clone())
+            .unwrap()
+            .into_value();
+        let raw_validator = jsonschema::validator_for(raw_schema).unwrap();
+        let core_validator = jsonschema::validator_for(&core_schema).unwrap();
+        let valid = json!({"query": {"value": accepted}});
+        let invalid = json!({"query": {"value": rejected}});
+        assert!(raw_validator.is_valid(&valid));
+        assert!(!raw_validator.is_valid(&invalid));
+        assert!(core_validator.is_valid(&valid));
+        assert!(!core_validator.is_valid(&invalid));
+    }
+}
+
+#[test]
 fn swagger2_json_and_yaml_fixtures_normalize_identically() {
     harnx_core::require_nextest();
     let json_document = common::load_fixture("swagger2.json");

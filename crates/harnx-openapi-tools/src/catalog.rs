@@ -46,9 +46,6 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    // qual:api — the catalog is the stable T2 interface consumed by T3
-    // (dispatch) and T4 (server registration); acceptance tests also call
-    // build() directly.
     /// Normalize a document into a catalog for the given server name.
     ///
     /// Fails on the first unsupported or invalid construct, with method/path
@@ -73,6 +70,25 @@ impl Catalog {
             // keeps names and inventory deterministic.
             operations,
         })
+    }
+
+    // qual:api — the future tool server CLI (T4) applies the operator's
+    // repeatable `--spec-patch <JAQ>` values through this seam; the patched
+    // (effective) source then drives discovery and dispatch together.
+    /// Normalize a document after applying the ordered operator patch list.
+    ///
+    /// An empty patch list behaves exactly like [`Catalog::build`]. Any
+    /// patch failure — compile, runtime, cardinality, non-object output, or
+    /// limit — fails atomically: nothing registers from a half-patched
+    /// source.
+    pub fn build_patched(
+        document: &SpecDocument,
+        server_name: &str,
+        patches: &[String],
+        limits: crate::spec_patch::SpecPatchLimits,
+    ) -> SpecResult<Self> {
+        let patched = crate::spec_patch::apply_spec_patches(document, patches, limits)?;
+        Self::build(&patched, server_name)
     }
 
     /// The compact discovery list. One `ToolSpec` per operation.

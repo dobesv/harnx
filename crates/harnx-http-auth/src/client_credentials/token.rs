@@ -2,7 +2,7 @@
 //! safe diagnostics for one client-credentials exchange. Everything here is
 //! side-effect free; the state machine lives in the parent module.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Result};
 use reqwest::header::HeaderValue;
@@ -10,7 +10,9 @@ use serde_json::Value;
 use tokio::time::Instant;
 use url::form_urlencoded;
 
-use crate::native::oauth_http::STANDARD_OAUTH_ERRORS;
+use crate::oauth::STANDARD_OAUTH_ERRORS;
+
+use super::AccessToken;
 
 /// Read one token-response body up to `limit`. Unlike the native
 /// best-effort reader, a mid-body read failure is a failure: chunk errors
@@ -44,7 +46,7 @@ pub(super) const PRE_EXPIRY_WINDOW: Duration = Duration::from_secs(60);
 /// forms of its secret, and its monotonic expiry.
 #[derive(Clone)]
 pub(super) struct CachedToken {
-    pub(super) header: HeaderValue,
+    pub(super) credential: AccessToken,
     pub(super) secrets: Vec<String>,
     /// `None` means the response carried no `expires_in`: refresh only
     /// after a rejection.
@@ -140,6 +142,12 @@ pub(super) fn parse_token_response(body: &[u8]) -> Result<CachedToken> {
     let object = value
         .as_object()
         .ok_or_else(|| anyhow!("token response is not a JSON object"))?;
+    let token = parse_bearer(object)?;
+    let expires_at = parse_expiry(object.get("expires_in"))?;
+    to_cached_token(token, expires_at)
+}
+
+fn parse_bearer(object: &serde_json::Map<String, Value>) -> Result<&str> {
     let token = object
         .get("access_token")
         .and_then(Value::as_str)
@@ -157,9 +165,13 @@ pub(super) fn parse_token_response(body: &[u8]) -> Result<CachedToken> {
     if !token_type.trim().eq_ignore_ascii_case("bearer") {
         bail!("token response token_type is not Bearer");
     }
+    Ok(token)
+}
+
+fn parse_expiry(value: Option<&Value>) -> Result<Option<Instant>> {
     // `as_u64` rejects fractions, negatives and strings; a value that fits
     // u64 but overflows the clock on addition is rejected just as strictly.
-    let expires_in = match object.get("expires_in") {
+    let expires_in = match value {
         None => None,
         Some(raw) => Some(
             raw.as_u64()
@@ -167,20 +179,56 @@ pub(super) fn parse_token_response(body: &[u8]) -> Result<CachedToken> {
         ),
     };
     let now = Instant::now();
-    let expires_at = match expires_in {
-        None => None,
-        Some(secs) => Some(
+    expires_in
+        .map(|secs| {
             now.checked_add(Duration::from_secs(secs))
-                .ok_or_else(|| anyhow!("token response expires_in exceeds the clock range"))?,
-        ),
-    };
+                .ok_or_else(|| anyhow!("token response expires_in exceeds the clock range"))
+        })
+        .transpose()
+}
+
+fn to_cached_token(token: &str, expires_at: Option<Instant>) -> Result<CachedToken> {
     let raw = token.to_owned();
     let mut header = HeaderValue::from_str(&format!("Bearer {raw}"))
         .map_err(|_| anyhow!("access_token is not a valid header value"))?;
     header.set_sensitive(true);
     Ok(CachedToken {
-        header,
+        credential: AccessToken(Arc::new(header)),
         secrets: vec![raw.clone(), format!("Bearer {raw}")],
         expires_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_token_grammar_accepts_all_token_characters_and_trailing_padding() {
+        let unpadded = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~+/";
+        for token in [unpadded.to_owned(), format!("{unpadded}==")] {
+            let body = serde_json::json!({"access_token": token, "token_type": "Bearer"});
+            let cached = parse_token_response(body.to_string().as_bytes()).unwrap();
+            assert_eq!(
+                cached.credential.authorization_header().to_str().unwrap(),
+                format!("Bearer {token}")
+            );
+            assert!(cached.credential.authorization_header().is_sensitive());
+        }
+    }
+
+    #[test]
+    fn bearer_token_grammar_rejects_whitespace_invalid_chars_and_internal_padding() {
+        for token in ["a b", "a\tb", "a@b", "a:b", "a=b", "=a", "="] {
+            let body = serde_json::json!({"access_token": token, "token_type": "Bearer"});
+            let error = parse_token_response(body.to_string().as_bytes())
+                .err()
+                .expect("invalid access_token");
+            assert_eq!(
+                error.to_string(),
+                "access_token is not a valid header value"
+            );
+            assert!(!error.to_string().contains(token));
+        }
+    }
 }
