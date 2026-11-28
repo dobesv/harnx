@@ -16,6 +16,8 @@ pub mod report;
 mod retention;
 mod snapshot;
 
+pub(crate) use snapshot::open_metadata_store;
+
 use crate::nats_session_metadata::{SessionActivity, SessionAgentSource};
 pub use report::{
     AgeCounts, AgentStatsReport, AgentTotals, ClusterStatsReport, OwnedAttachments, OwnedCount,

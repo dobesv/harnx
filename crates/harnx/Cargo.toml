@@ -72,6 +72,7 @@ process-wrap = { workspace = true }
 libc = { workspace = true }
 glob = { workspace = true }
 globset = { workspace = true }
+humantime = { workspace = true }
 harnx-blob-store = { path = "../harnx-blob-store" }
 harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
