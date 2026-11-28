@@ -15,7 +15,7 @@ pub struct Cli {
     #[arg(
         long,
         env = "MCP_REMOTE_INSECURE",
-        help = "Allow bearer tokens over non-HTTPS transport for non-loopback hosts"
+        help = "Allow credentials over plaintext HTTP for non-loopback endpoints (does not disable TLS certificate verification)"
     )]
     pub insecure: bool,
 
@@ -49,8 +49,8 @@ pub struct Cli {
     pub healthz_addr: Option<String>,
 
     // ---- Native NATS mode (user-credentials plan, T5). Supplying
-    // --credentials-key-file selects this mode; without it the classic stdio
-    // proxy runs unchanged. ----
+    // --credentials-key-file selects this mode; without it (and without
+    // --oauth-token-url), plain stdio proxy behavior runs unchanged. ----
     /// Enables native NATS mode: encrypted per-user credentials, connect
     /// pages and per-user tool registrations.
     #[arg(long, env = "HARNX_CREDENTIALS_KEY_FILE")]
@@ -70,18 +70,29 @@ pub struct Cli {
     )]
     pub auth_methods: String,
 
-    /// Pre-registered OAuth client id. Without it, dynamic client
-    /// registration is attempted when the server supports it.
+    /// OAuth client ID (required in client-credentials proxy mode; optional in
+    /// native mode, where dynamic client registration is attempted when omitted).
     #[arg(long)]
     pub oauth_client_id: Option<String>,
 
-    /// File holding the pre-registered OAuth client secret.
+    /// File holding the OAuth client secret (required in client-credentials
+    /// proxy mode; optional for a pre-registered confidential client in native
+    /// mode). Trailing CR/LF is stripped; no environment variable is supported.
     #[arg(long)]
     pub oauth_client_secret_file: Option<PathBuf>,
 
-    /// OAuth scope to request. Repeatable.
+    /// OAuth scope to request. Repeatable (sent space-joined in
+    /// client-credentials proxy mode).
     #[arg(long, action = ArgAction::Append)]
     pub oauth_scope: Vec<String>,
+
+    /// OAuth 2.0 token endpoint for client-credentials proxy authentication.
+    /// Also reads from MCP_REMOTE_OAUTH_TOKEN_URL. Selects client-credentials
+    /// mode for the stdio proxy; requires --oauth-client-id and
+    /// --oauth-client-secret-file, and conflicts with --bearer-token, native
+    /// mode (--credentials-key-file), and custom Authorization headers.
+    #[arg(long, env = "MCP_REMOTE_OAUTH_TOKEN_URL", hide_env_values = true)]
+    pub oauth_token_url: Option<String>,
 
     /// Maximum and default absolute credential lifetime (e.g. `365d`).
     /// Also reads from HARNX_CREDENTIAL_TTL.

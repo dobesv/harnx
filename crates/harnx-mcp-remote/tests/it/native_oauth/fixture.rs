@@ -2,7 +2,7 @@
 //! Shared test fixture and mock OAuth 2.0 / MCP server for native OAuth integration tests.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -117,6 +117,7 @@ pub struct MockOAuthServerState {
     pub initial_access_token: String,
     pub initial_refresh_token: String,
     pub initial_expires_in: u64,
+    pub refresh_expires_in: AtomicU64,
     pub dcr_422: AtomicBool,
     pub reject_authorization: AtomicBool,
     pub invalid_grant: AtomicBool,
@@ -406,7 +407,7 @@ async fn handle_refresh_token(state: &MockOAuthServerState) -> Response {
     let res = json!({
         "access_token": new_access,
         "token_type": "Bearer",
-        "expires_in": 3600,
+        "expires_in": state.refresh_expires_in.load(Ordering::SeqCst),
         "refresh_token": new_refresh,
         "scope": "offline_access"
     });
@@ -567,6 +568,7 @@ impl MockOAuthServer {
             initial_access_token: initial_access,
             initial_refresh_token: initial_refresh,
             initial_expires_in,
+            refresh_expires_in: AtomicU64::new(3600),
             dcr_422: AtomicBool::new(false),
             reject_authorization: AtomicBool::new(false),
             invalid_grant: AtomicBool::new(false),

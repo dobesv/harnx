@@ -33,6 +33,7 @@ use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProces
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing_subscriber::filter::{filter_fn, FilterFn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
@@ -394,6 +395,67 @@ fn build_grpc_exporter(
     Ok(exporter_builder.build()?)
 }
 
+/// Options that change how telemetry initialization applies its policies
+/// without altering the default behavior for existing callers. This is a
+/// narrow opt-in surface, not a telemetry redesign: today it carries only
+/// target exclusions.
+///
+/// `exclude_targets` names tracing targets whose spans and events must not
+/// reach OTLP. Each exclusion matches the exact target and its `::`
+/// descendants. Exclusions are independent of `RUST_LOG`; every other
+/// target keeps the user's filter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TelemetryOptions {
+    pub exclude_targets: Vec<String>,
+}
+
+impl TelemetryOptions {
+    fn validate(&self) -> Result<()> {
+        for target in &self.exclude_targets {
+            let valid = !target.trim().is_empty() && !target.contains(['=', ',', ' ']);
+            anyhow::ensure!(
+                valid,
+                "invalid telemetry exclusion target {target:?}: expected a non-empty target prefix"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn telemetry_env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
+}
+
+// A separate subscriber filter vetoes spans and events before the OTLP layer
+// sees them. An `=off` EnvFilter directive can't veto more specific directives
+// or tracing inside a dynamically enabled span.
+fn telemetry_target_filter(
+    options: &TelemetryOptions,
+) -> Result<FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool + use<>>> {
+    options.validate()?;
+    let excluded = options.exclude_targets.clone();
+    Ok(filter_fn(move |metadata| {
+        let target = metadata.target();
+        !excluded.iter().any(|prefix| {
+            target == prefix
+                || target
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with("::"))
+        })
+    }))
+}
+
+/// [`init_telemetry`] with caller-supplied [`TelemetryOptions`]. Default
+/// options give exactly the same behavior as [`init_telemetry`]; excluded
+/// targets are a strict addition for callers that need a payload-secrecy
+/// boundary.
+pub fn init_telemetry_with_options(
+    service_name: &str,
+    options: &TelemetryOptions,
+) -> Result<TelemetryGuard> {
+    init_telemetry_inner(service_name, options)
+}
+
 /// Installs OTLP tracing when a standard OTLP endpoint environment variable is set.
 ///
 /// # Failure modes
@@ -402,7 +464,7 @@ fn build_grpc_exporter(
 ///   is set to an unrecognized value (not `grpc` or `http/protobuf`), a warning is logged and an
 ///   inert guard is returned with `provider: None`. Trace export is disabled for the lifetime
 ///   of the guard, but the process continues safely.
-/// - **Exporter build failure**: If the exporter fails to build (e.g., invalid TLS configuration,
+/// - **Exporter build failure**: If the exporter fails to build (e.g. invalid TLS configuration,
 ///   incompatible endpoint scheme for the transport, or tonic/reqwest construction error), the
 ///   error is propagated as `Err`. The caller must handle this explicitly.
 ///
@@ -410,15 +472,39 @@ fn build_grpc_exporter(
 /// happen at most every 5 seconds (or immediately on shutdown). Spans are buffered
 /// until the next scheduled export or explicit shutdown.
 pub fn init_telemetry(service_name: &str) -> Result<TelemetryGuard> {
+    init_telemetry_inner(service_name, &TelemetryOptions::default())
+}
+
+fn init_telemetry_inner(service_name: &str, options: &TelemetryOptions) -> Result<TelemetryGuard> {
     if env::var_os(OTLP_ENDPOINT).is_none() && env::var_os(OTLP_TRACES_ENDPOINT).is_none() {
         return Ok(TelemetryGuard { provider: None });
     }
 
-    // Resolve the protocol from environment variables. Unsupported values result in
-    // telemetry being disabled for this run, rather than falling back to a default.
-    // This is a deliberate divergence from the OTel specification (which specifies
-    // fallback to default), because sending to an unsupported/unexpected transport
-    // could fail or cause unwanted behavior.
+    // An unsupported protocol disables telemetry for this run instead of
+    // falling back to a default transport; the warning is logged where the
+    // protocol is resolved.
+    let Some(exporter) = resolve_trace_exporter()? else {
+        return Ok(TelemetryGuard { provider: None });
+    };
+    let provider = trace_provider(exporter, service_name);
+    let tracer = provider.tracer("harnx-telemetry");
+    global::set_tracer_provider(provider.clone());
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    let subscriber = Registry::default()
+        .with(telemetry_env_filter())
+        .with(telemetry_target_filter(options)?)
+        .with(tracing_opentelemetry::layer().with_tracer(tracer));
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    Ok(TelemetryGuard {
+        provider: Some(provider),
+    })
+}
+
+/// The OTLP trace exporter for the configured protocol, or `None` when the
+/// protocol is unsupported (the warning is logged here).
+fn resolve_trace_exporter() -> Result<Option<SpanExporter>> {
     let protocol = match resolve_trace_protocol() {
         Ok(p) => p,
         Err(err) => {
@@ -427,7 +513,7 @@ pub fn init_telemetry(service_name: &str) -> Result<TelemetryGuard> {
                 err.value,
                 err.var_name
             );
-            return Ok(TelemetryGuard { provider: None });
+            return Ok(None);
         }
     };
 
@@ -435,8 +521,9 @@ pub fn init_telemetry(service_name: &str) -> Result<TelemetryGuard> {
     let credential_headers = effective_credential_headers();
 
     // Determine whether credentials should be dropped from the request.
-    // This applies when the endpoint is cleartext (non-TLS) and on a non-loopback host.
-    // Parse header names once and emit a single warning if stripping is needed.
+    // This applies when the endpoint is cleartext (non-TLS) and on a
+    // non-loopback host. Parse header names once and emit a single warning
+    // if stripping is needed.
     let credential_headers_to_filter = if endpoint.as_deref().is_some_and(|ep| {
         let should_filter = !should_send_headers(ep, true);
         let has_creds = credential_headers
@@ -458,14 +545,19 @@ pub fn init_telemetry(service_name: &str) -> Result<TelemetryGuard> {
         TraceProtocol::HttpProtobuf => build_http_exporter(filtered_ref)?,
         TraceProtocol::Grpc => build_grpc_exporter(filtered_ref)?,
     };
+    Ok(Some(exporter))
+}
 
-    // The batch span processor runs exporters on a Tokio async runtime. Both
-    // Reqwest (HTTP) and Tonic (gRPC) async clients require an active Tokio runtime.
-    // Default schedule_delay of 5s means exports happen every 5s or on shutdown.
-    // Use builder() without explicit schedule_delay to rely on SDK defaults.
+/// The batched tracer provider behind every successful init.
+///
+/// The batch span processor runs exporters on a Tokio async runtime. Both
+/// Reqwest (HTTP) and Tonic (gRPC) async clients require an active Tokio
+/// runtime. Default schedule_delay of 5s means exports happen every 5s or on
+/// shutdown; the builder relies on the SDK defaults.
+fn trace_provider(exporter: SpanExporter, service_name: &str) -> SdkTracerProvider {
     let batch = BatchSpanProcessor::builder(exporter, opentelemetry_sdk::runtime::Tokio).build();
     let provider_builder = SdkTracerProvider::builder().with_span_processor(batch);
-    let provider = if env::var_os(OTEL_SERVICE_NAME).is_none() {
+    if env::var_os(OTEL_SERVICE_NAME).is_none() {
         provider_builder
             .with_resource(
                 Resource::builder()
@@ -475,22 +567,7 @@ pub fn init_telemetry(service_name: &str) -> Result<TelemetryGuard> {
             .build()
     } else {
         provider_builder.build()
-    };
-
-    let tracer = provider.tracer("harnx-telemetry");
-    global::set_tracer_provider(provider.clone());
-    global::set_text_map_propagator(TraceContextPropagator::new());
-
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
-    let subscriber = Registry::default()
-        .with(filter)
-        .with(tracing_opentelemetry::layer().with_tracer(tracer));
-    tracing::subscriber::set_global_default(subscriber)?;
-
-    Ok(TelemetryGuard {
-        provider: Some(provider),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1063,5 +1140,198 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.var_name, OTLP_TRACES_PROTOCOL);
         assert_eq!(err.value, "invalid-protocol");
+    }
+
+    // === Target-exclusion policy (TelemetryOptions) tests ===
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Probe {
+        Span(&'static str),
+        Event(&'static str),
+    }
+
+    #[derive(Default)]
+    struct RecordingLayer {
+        probes: Arc<Mutex<Vec<Probe>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordingLayer {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.probes
+                .lock()
+                .expect("record probes")
+                .push(Probe::Span(attrs.metadata().target()));
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.probes
+                .lock()
+                .expect("record probes")
+                .push(Probe::Event(event.metadata().target()));
+        }
+    }
+
+    fn record_probes(options: &TelemetryOptions, emit: impl FnOnce()) -> Vec<Probe> {
+        let layer = RecordingLayer::default();
+        let probes = Arc::clone(&layer.probes);
+        let subscriber = Registry::default()
+            .with(telemetry_env_filter())
+            .with(telemetry_target_filter(options).expect("valid target filter"))
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, emit);
+        let recorded = std::mem::take(&mut *probes.lock().expect("read recorded probes"));
+        recorded
+    }
+
+    fn emit_probe_events() {
+        tracing::info!(target: "harnx_mcp_remote", "app-owned safe event");
+        tracing::info!(target: "rmcp::transport", "dependency payload");
+        tracing::info!(target: "reqwest::connect", "dependency payload");
+    }
+
+    struct RustLogGuard(Option<std::ffi::OsString>);
+
+    impl RustLogGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prior = env::var_os("RUST_LOG");
+            // SAFETY: nextest runs each test in a separate process.
+            unsafe {
+                match value {
+                    Some(value) => env::set_var("RUST_LOG", value),
+                    None => env::remove_var("RUST_LOG"),
+                }
+            }
+            Self(prior)
+        }
+    }
+
+    impl Drop for RustLogGuard {
+        fn drop(&mut self) {
+            // SAFETY: nextest runs each test in a separate process.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => env::set_var("RUST_LOG", value),
+                    None => env::remove_var("RUST_LOG"),
+                }
+            }
+        }
+    }
+
+    fn excluded_options() -> TelemetryOptions {
+        TelemetryOptions {
+            exclude_targets: vec!["rmcp".to_string(), "reqwest".to_string()],
+        }
+    }
+
+    #[test]
+    fn exclusions_override_a_broad_rust_log_directive() {
+        harnx_core::require_nextest();
+        let _env = RustLogGuard::set(Some("trace"));
+        assert_eq!(
+            record_probes(&excluded_options(), emit_probe_events),
+            [Probe::Event("harnx_mcp_remote")],
+        );
+    }
+
+    fn emit_target_probes() {
+        drop(tracing::trace_span!(target: "rmcp", "dependency"));
+        tracing::trace!(target: "rmcp", "dependency payload");
+        drop(tracing::trace_span!(target: "rmcp::service", "descendant"));
+        tracing::trace!(target: "rmcp::service", "descendant payload");
+        drop(tracing::trace_span!(target: "rmcp_other", "neighbor"));
+        tracing::trace!(target: "rmcp_other", "neighbor event");
+    }
+
+    const ALLOWED_NEIGHBOR: [Probe; 2] = [Probe::Span("rmcp_other"), Probe::Event("rmcp_other")];
+
+    #[test]
+    fn exclusions_veto_exact_and_descendant_directives_but_keep_adjacent_targets() {
+        harnx_core::require_nextest();
+        let _env = RustLogGuard::set(Some("off,rmcp=trace,rmcp::service=trace,rmcp_other=trace"));
+        assert_eq!(
+            record_probes(&excluded_options(), emit_target_probes),
+            ALLOWED_NEIGHBOR,
+        );
+    }
+
+    #[test]
+    fn exclusions_veto_spans_and_events_inside_a_dynamically_enabled_scope() {
+        harnx_core::require_nextest();
+        let _env = RustLogGuard::set(Some("off,harnx_telemetry[probe{enabled=true}]=trace"));
+        let emit = || {
+            let _scope =
+                tracing::info_span!(target: "harnx_telemetry", "probe", enabled = true).entered();
+            emit_target_probes();
+        };
+        use Probe::{Event, Span};
+        assert_eq!(
+            record_probes(&TelemetryOptions::default(), emit),
+            [
+                Span("harnx_telemetry"),
+                Span("rmcp"),
+                Event("rmcp"),
+                Span("rmcp::service"),
+                Event("rmcp::service"),
+                Span("rmcp_other"),
+                Event("rmcp_other"),
+            ],
+            "the field-based directive must enable these probes without exclusions"
+        );
+        assert_eq!(
+            record_probes(&excluded_options(), emit),
+            [
+                Span("harnx_telemetry"),
+                Span("rmcp_other"),
+                Event("rmcp_other")
+            ],
+        );
+    }
+
+    #[test]
+    fn default_filter_is_unchanged_without_options() {
+        harnx_core::require_nextest();
+        let _env = RustLogGuard::set(Some("rmcp=trace,harnx_mcp_remote=info"));
+        assert_eq!(
+            record_probes(&TelemetryOptions::default(), emit_probe_events),
+            [
+                Probe::Event("harnx_mcp_remote"),
+                Probe::Event("rmcp::transport")
+            ],
+            "callers that pass default options must keep the user's RUST_LOG behavior"
+        );
+    }
+
+    #[test]
+    fn exclusion_validation_rejects_empty_and_directive_like_targets() {
+        harnx_core::require_nextest();
+        for target in ["", "  ", "rmcp=trace", "rmcp,reqwest", "rm cp"] {
+            let options = TelemetryOptions {
+                exclude_targets: vec![target.to_string()],
+            };
+            assert!(
+                telemetry_target_filter(&options).is_err(),
+                "target {target:?} must be rejected as an exclusion"
+            );
+        }
+    }
+
+    #[test]
+    fn exclusions_without_rust_log_keep_the_default_harnx_only_filter() {
+        harnx_core::require_nextest();
+        let _env = RustLogGuard::set(None);
+        assert_eq!(
+            record_probes(&excluded_options(), emit_probe_events),
+            [Probe::Event("harnx_mcp_remote")],
+            "the default filter never enables dependency targets anyway"
+        );
     }
 }

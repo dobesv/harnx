@@ -98,6 +98,14 @@ impl EnvGuard {
         Self::configure_internal(endpoint, Some("http/protobuf"), None)
     }
 
+    // qual:allow(complexity, unsafe) reason: "Tests set RUST_LOG before starting Tokio; nextest isolates each test in its own process."
+    fn with_rust_log(mut self, value: &str) -> Self {
+        self.saved.push(("RUST_LOG", std::env::var_os("RUST_LOG")));
+        // SAFETY: nextest isolates the test, and this runs before creating its runtime.
+        unsafe { std::env::set_var("RUST_LOG", value) };
+        self
+    }
+
     fn configure_for_grpc(endpoint: Option<&str>) -> Self {
         Self::configure_internal(endpoint, Some("grpc"), None)
     }
@@ -694,6 +702,59 @@ fn unset_otel_endpoint_keeps_same_agent_call_inert() {
         assert_eq!(collector.exports(), 0);
         assert!(collector.spans().is_empty());
     });
+}
+
+#[test]
+fn otlp_target_exclusions_keep_app_spans_but_drop_dependency_payloads() {
+    harnx_core::require_nextest();
+    let (collector_listener, collector_endpoint) = bind_local();
+    let _env = EnvGuard::configure(Some(&collector_endpoint)).with_rust_log(
+        "off,rmcp::service=trace,harnx_telemetry[app_safe_span{enabled=true}]=trace",
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    runtime.block_on(async move {
+        let collector = FakeCollector::spawn(collector_listener);
+        let telemetry = harnx_telemetry::init_telemetry_with_options(
+            "harnx-test",
+            &harnx_telemetry::TelemetryOptions {
+                exclude_targets: vec!["rmcp".to_string(), "reqwest".to_string()],
+            },
+        )
+        .expect("telemetry init with exclusions");
+
+        emit_otlp_target_probes();
+        telemetry.shutdown().await;
+        let spans = collector.spans();
+        let mut names: Vec<_> = spans.iter().map(|span| span.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["adjacent_safe_span", "app_safe_span"]);
+        let rendered = format!("{spans:?}");
+        assert!(
+            rendered.contains("adjacent-safe-event"),
+            "safe event must export"
+        );
+        assert!(
+            !rendered.contains("dependency-event-sentinel"),
+            "dependency events must not attach to the allowed app span"
+        );
+    });
+}
+
+fn emit_otlp_target_probes() {
+    let app = tracing::info_span!(target: "harnx_telemetry", "app_safe_span", enabled = true);
+    // The span field enables trace callsites in its scope, even without
+    // a matching target directive (reqwest and rmcp_other below).
+    let _entered = app.enter();
+    drop(tracing::trace_span!(target: "rmcp::service", "dependency_descendant_span"));
+    tracing::trace!(target: "rmcp::service", "descendant-dependency-event-sentinel");
+    drop(tracing::trace_span!(target: "reqwest::connect", "dependency_dynamic_span"));
+    tracing::trace!(target: "reqwest::connect", "dynamic-dependency-event-sentinel");
+    tracing::trace!(target: "rmcp_other", "adjacent-safe-event");
+    drop(tracing::trace_span!(target: "rmcp_other", "adjacent_safe_span"));
 }
 
 #[derive(Clone)]

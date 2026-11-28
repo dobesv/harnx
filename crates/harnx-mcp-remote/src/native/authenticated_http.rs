@@ -1,5 +1,5 @@
 //! Refresh at the HTTP boundary, including requests on an existing MCP session.
-//! Only an HTTP 401 (rejected before execution) permits one POST retry.
+//! Only an identified HTTP 401 permits one POST or SSE GET replay.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -16,7 +16,7 @@ use rmcp::{
 };
 use tracing::instrument::WithSubscriber;
 
-use super::pool::UpstreamAuth;
+use crate::UpstreamAuth;
 
 type Headers = HashMap<HeaderName, HeaderValue>;
 type HttpResult<T> = Result<T, StreamableHttpError<SafeHttpError>>;
@@ -36,16 +36,32 @@ pub(crate) struct AuthenticatedHttp {
     pub auth: Arc<dyn UpstreamAuth>,
 }
 
+fn provider_error(error: anyhow::Error) -> StreamableHttpError<SafeHttpError> {
+    StreamableHttpError::Client(SafeHttpError(error.to_string()))
+}
+
 impl AuthenticatedHttp {
     async fn headers(&self, mut headers: Headers) -> HttpResult<Headers> {
-        self.auth
-            .ensure_fresh()
-            .await
-            .map_err(|error| StreamableHttpError::Client(SafeHttpError(error.to_string())))?;
-        let mut config = StreamableHttpClientTransportConfig::with_uri("");
-        self.auth.apply(&mut config);
-        headers.extend(config.custom_headers);
+        self.auth.ensure_fresh().await.map_err(provider_error)?;
+        match self.apply_credentials(&mut headers) {
+            Err(_) if self.auth.refreshable() => {
+                // A concurrent 401 can retire the token before we stamp it.
+                // Retry once so we can join the replacement exchange.
+                self.auth.ensure_fresh().await.map_err(provider_error)?;
+                self.apply_credentials(&mut headers)
+            }
+            result => result,
+        }?;
         Ok(headers)
+    }
+
+    fn apply_credentials(&self, headers: &mut Headers) -> HttpResult<()> {
+        let mut config = StreamableHttpClientTransportConfig::with_uri("");
+        self.auth
+            .apply_for_request(&mut config)
+            .map_err(provider_error)?;
+        headers.extend(config.custom_headers);
+        Ok(())
     }
 
     fn auth_error(&self) -> StreamableHttpError<SafeHttpError> {
@@ -56,8 +72,10 @@ impl AuthenticatedHttp {
         self.auth
             .refresh_after_rejection(headers.get(&AUTHORIZATION))
             .await
-            .map_err(|error| StreamableHttpError::Client(SafeHttpError(error.to_string())))?;
-        self.headers(headers.clone()).await
+            .map_err(provider_error)?;
+        let mut headers = headers.clone();
+        self.apply_credentials(&mut headers)?;
+        Ok(headers)
     }
 
     fn rejected_before_execution(error: &StreamableHttpError<reqwest::Error>) -> bool {
@@ -66,9 +84,10 @@ impl AuthenticatedHttp {
             StreamableHttpError::HttpStatus(error) => {
                 error.status == reqwest::StatusCode::UNAUTHORIZED.as_u16()
             }
-            // rmcp 3.8 preserves only 429/5xx as HttpStatus. Its challenge-less
-            // 401 path builds this exact status prefix before the response body.
-            // Don't search arbitrary error text: that could replay an executed call.
+            // rmcp 3.11's POST adapter prefixes unchallenged 401 errors with
+            // the actual HTTP status, before any provider text. A non-text
+            // WWW-Authenticate instead yields the same statusless error for
+            // both 401 and 403. Don't retry that error or search the body.
             StreamableHttpError::UnexpectedServerResponse(message) => {
                 message.starts_with("HTTP 401 Unauthorized:")
             }

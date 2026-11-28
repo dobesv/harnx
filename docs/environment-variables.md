@@ -91,6 +91,10 @@ starts.
 - **HARNX_LOG_FILTER**: Only log records whose target starts with this prefix.
   Default `harnx`, which matches every `harnx_*` crate. Narrow it to one crate
   with e.g. `HARNX_LOG_FILTER=harnx_mcp_bridge`.
+  This is one literal prefix, not a comma-separated list: unlike `RUST_LOG`,
+  a value like `harnx_a,harnx_b` matches nothing, because the whole string is
+  compared as a single `starts_with` prefix. `HARNX_LOG_LEVEL` is the separate
+  severity knob.
 - **HARNX_LOG_PATH**: Log file for the `harnx` CLI and TUI. Default
   `<state dir>/harnx.log` — `$HARNX_STATE_DIR`, else `$XDG_STATE_HOME/harnx`,
   else `~/.local/state/harnx`.

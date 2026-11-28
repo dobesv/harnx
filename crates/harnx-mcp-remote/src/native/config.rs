@@ -60,11 +60,35 @@ pub struct NativeConfig {
     pub credentials_key_file: PathBuf,
 }
 
+/// Startup text shared by the two places that reject the mixed
+/// native+client-credentials invocation: the binary's `main.rs` must reject
+/// before the native startup log (which prints the raw configured URL), and
+/// `NativeConfig::from_cli` keeps the same gate for direct callers. The
+/// message is static on purpose: the rejection must never echo the URLs.
+/// Public only so the separate binary crate can reuse the same text.
+pub const OAUTH_TOKEN_URL_NATIVE_REJECTION: &str =
+    "native mode does not accept --oauth-token-url: client-credentials proxy \
+     authentication belongs to the stdio proxy mode; native credentials are \
+     per user, never process-wide";
+
+/// The startup gates native mode owns: the key file is required, and the
+/// process-wide client-credentials flag is refused because native
+/// credentials are per user, never process-wide.
+fn native_mode_gates(cli: &crate::cli::Cli) -> Result<std::path::PathBuf> {
+    let Some(credentials_key_file) = cli.credentials_key_file.clone() else {
+        bail!("native mode requires --credentials-key-file");
+    };
+    anyhow::ensure!(
+        cli.oauth_token_url.is_none(),
+        "{}",
+        OAUTH_TOKEN_URL_NATIVE_REJECTION
+    );
+    Ok(credentials_key_file)
+}
+
 impl NativeConfig {
     pub fn from_cli(cli: &crate::cli::Cli) -> Result<Self> {
-        let Some(credentials_key_file) = cli.credentials_key_file.clone() else {
-            bail!("native mode requires --credentials-key-file");
-        };
+        let credentials_key_file = native_mode_gates(cli)?;
         let server_name = cli
             .name
             .clone()

@@ -6,9 +6,11 @@ tools act with their identity and their access limits. Credentials are stored
 encrypted in NATS, per user and per tool server, and users connect them
 without ever pasting a secret into chat.
 
-Only `harnx-mcp-remote` in native mode supports credentials today. The crate
-backing the storage (`harnx-credentials`) is reusable by other tool servers,
-but no other server is wired up.
+Only `harnx-mcp-remote` in native mode supports **per-user** stored credentials
+today. (For a single machine identity in the stdio proxy, see
+[Proxy mode: OAuth client credentials](#proxy-mode-oauth-client-credentials-machine-to-machine).)
+The crate backing the storage (`harnx-credentials`) is reusable by other tool
+servers, but no other server is wired up.
 
 ## How a connection works
 
@@ -70,8 +72,9 @@ The file looks like:
 Rules for key files:
 
 - Pass the file with `--credentials-key-file` (or `HARNX_CREDENTIALS_KEY_FILE`).
-  Supplying it is what selects native mode; without it `harnx-mcp-remote` runs
-  as the classic stdio proxy, unchanged.
+  Supplying it selects native mode; without it (and without
+  `--oauth-token-url`), `harnx-mcp-remote` runs as the plain stdio proxy,
+  unchanged.
 - A missing or invalid key file is a startup error. The server never generates
   a key on its own and never derives one from the NATS token.
 - **All instances** of one tool server share the same key file. Different
@@ -257,7 +260,81 @@ connect form.
 
 See [`example_config/tool_servers/pendo-token.yaml`](../example_config/tool_servers/pendo-token.yaml).
 
+## Proxy mode: OAuth client credentials (machine-to-machine)
+
+Everything above describes native mode (`--credentials-key-file`), where each
+person connects their own account through HTTP connect pages, optional dynamic
+client registration (DCR), and per-user encrypted NATS storage.
+`harnx-mcp-remote` also supports a process-wide machine identity for the
+stdio proxy — an OAuth 2.0 `client_credentials` grant against a token
+endpoint, with the client secret in a file. Use it when the upstream belongs
+to a service account, not to any human.
+
+```sh
+harnx-mcp-remote \
+  --url https://mcp.example.com/api \
+  --oauth-token-url https://sso.example.com/oauth2/token \
+  --oauth-client-id svc-account \
+  --oauth-client-secret-file /etc/harnx/upstream-client-secret \
+  --oauth-scope mcp.read
+```
+
+This mode is opt-in (`--oauth-token-url` / `MCP_REMOTE_OAUTH_TOKEN_URL`) and
+never affects the plain proxy or native mode defaults. It uses no DCR, connect
+pages, or encrypted NATS token store: `--oauth-client-id` and
+`--oauth-client-secret-file` (file-only, trailing CR/LF stripped, no environment
+variable) are required, and tokens are cached in memory only (any returned
+`refresh_token` is ignored).
+
+Because the token is a process-wide credential, configuration validation
+rejects `--bearer-token`, `MCP_REMOTE_BEARER_TOKEN`, custom `Authorization`
+`--header` values (any case), malformed `--header` entries, and native mode
+(`--credentials-key-file`) with static diagnostics before any network request.
+Both the token URL and the MCP URL must parse as `http://` or `https://` with a
+host and no embedded `user:pass@` credentials (even with `--insecure`), and each
+must independently use `https://` or loopback (`localhost`, `127.0.0.1`,
+`[::1]`) unless `--insecure` is passed. `--insecure` waives only the endpoint
+HTTPS policy; it never disables TLS certificate verification. The HTTP clients
+used for the grant and the MCP session ignore system proxies, never follow
+redirects, and share the `--tls-ca`/`--tls-cert`/`--tls-key` identity.
+
+Validation and token acquisition are lazy: `--healthz-addr` can report ready as
+soon as the stdio proxy starts listening, before OAuth flags, URLs, the secret
+file, or the token endpoint are validated; endpoint validation and secret-file
+reading happen on the first upstream MCP connect (without contacting either
+endpoint on failure), and the first token exchange runs on the first
+authenticated upstream request. Each token exchange has a 30-second total
+deadline covering headers and body (1 MiB cap); MCP streams keep no request
+timeout. Tokens with `expires_in` refresh lazily inside the 60-second
+pre-expiry window on the same upstream session (`expires_in: 0` refreshes on
+the next independent request), while responses omitting `expires_in` refresh
+only on an identifiable HTTP `401`. `POST` and SSE `GET` requests replay at most
+once on a positively identified HTTP `401`: the refresh step reuses a
+replacement installed by another caller if it has not actually expired (the
+60-second pre-expiry window is for proactive refresh only), and a replay is
+not sent if the credentials are invalidated again before stamping. `DELETE`
+does not replay, non-`401` errors (including `403`) never replay, and
+statusless malformed `WWW-Authenticate` challenges fail closed without
+retrying.
+
+Upstream failure text can echo the presented token (including a token retired
+mid-flight by rotation), so failed tool results (`is_error: true`), JSON-RPC
+errors, and connect/recovery failures replace untrusted upstream text with
+static diagnostics (preserving JSON-RPC error codes and `is_error`), while
+successful tool output passes through unchanged. Token-endpoint failures emit
+only static text, the HTTP status when known, and at most one allowlisted
+standard OAuth error code. In this mode only, stderr logging is restricted to
+app-owned (`harnx*`) targets regardless of `HARNX_LOG_FILTER`/`HARNX_LOG_LEVEL`,
+`rmcp`, `reqwest`, `hyper`, and `hyper_util` (exact targets and `::`
+descendants) are excluded from OTLP exports regardless of `RUST_LOG` (while
+app-owned OTLP telemetry stays active), and configured URLs are never logged.
+
+See the [harnx-mcp-remote README](../crates/harnx-mcp-remote/README.md) for
+the full flag list.
+
 ## Security model and limits
+
+Native mode (`--credentials-key-file`):
 
 - Secrets never pass through chat, tool arguments, tool results, session
   properties, session logs, interaction responses or the invocation journal.
@@ -272,6 +349,15 @@ See [`example_config/tool_servers/pendo-token.yaml`](../example_config/tool_serv
   routing*, not hard multi-user isolation. Tokens themselves never leave the
   tool server process and are encrypted at rest. Hard isolation needs scoped
   NATS credentials (a planned follow-up).
+
+Client-credentials proxy mode (`--oauth-token-url`):
+
+- Client secrets come only from `--oauth-client-secret-file`, tokens stay in
+  memory for the proxy process, configured URLs are never logged, upstream error
+  text is replaced with static diagnostics on failed tool results and JSON-RPC
+  or connect errors (successful tool output is unmodified), and dependency
+  payload targets (`rmcp`, `reqwest`, `hyper`, `hyper_util`) are excluded from
+  stderr and OTLP exports.
 
 Follow-ups not included here: per-component NATS credentials, and a
 credentials settings page in the web app.

@@ -13,15 +13,23 @@ use reqwest::header::{HeaderName, HeaderValue};
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::secret_redaction::redact_secrets;
-pub use super::upstream_connector::StreamableHttpClientTransportConfig;
+use crate::secret_redaction::redact_secrets;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
 /// How one credential's secret material reaches the upstream transport, and
 /// how its echo is redacted from upstream-sourced text.
 #[async_trait]
 pub trait UpstreamAuth: Send + Sync {
-    /// Stamp this credential onto one transport config.
+    /// Stamp cached credentials onto one transport config without I/O.
     fn apply(&self, config: &mut StreamableHttpClientTransportConfig);
+
+    /// Stamp credentials for a send without I/O. If a refreshable provider
+    /// loses its cached credential, a failed initial stamp gets one more
+    /// freshness check and stamp. A failed replay stamp is final.
+    fn apply_for_request(&self, config: &mut StreamableHttpClientTransportConfig) -> Result<()> {
+        self.apply(config);
+        Ok(())
+    }
 
     /// Refresh before use when the access token is near expiry; token
     /// material is a no-op.
@@ -35,8 +43,10 @@ pub trait UpstreamAuth: Send + Sync {
         false
     }
 
-    /// Refresh only if this rejected token is still current. A concurrent
-    /// refresher may already have replaced it while the 401 was in flight.
+    /// Refresh after a 401 unless another caller has installed a usable
+    /// replacement. On success the caller uses [`Self::apply_for_request`]
+    /// without another [`Self::ensure_fresh`]. If the credential has since
+    /// been invalidated, stamping can fail and prevent the replay.
     async fn refresh_after_rejection(&self, _rejected: Option<&HeaderValue>) -> Result<()> {
         anyhow::bail!("upstream credential rejected")
     }

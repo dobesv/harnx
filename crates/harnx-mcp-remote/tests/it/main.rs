@@ -18,3 +18,5 @@ mod native_common;
 mod streamable_http;
 
 mod native_oauth;
+
+mod client_credentials;
