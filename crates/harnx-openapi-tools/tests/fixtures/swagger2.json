@@ -1,0 +1,134 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Petstore (authored fixture)",
+    "version": "1.0.0"
+  },
+  "host": "petstore.example.com",
+  "basePath": "/v2",
+  "schemes": ["https"],
+  "security": [
+    {"petstoreAuth": ["write:pets"]}
+  ],
+  "securityDefinitions": {
+    "petstoreAuth": {
+      "type": "oauth2",
+      "flow": "implicit",
+      "authorizationUrl": "https://petstore.example.com/oauth/authorize",
+      "scopes": {"write:pets": "write pets", "read:pets": "read pets"}
+    },
+    "apiKeyHeader": {"type": "apiKey", "in": "header", "name": "X-API-Key"},
+    "apiKeyQuery": {"type": "apiKey", "in": "query", "name": "apiKey"},
+    "basicAuth": {"type": "basic"}
+  },
+  "parameters": {
+    "PageLimit": {
+      "name": "limit",
+      "in": "query",
+      "type": "integer",
+      "format": "int32",
+      "minimum": 1,
+      "maximum": 500,
+      "default": 20
+    }
+  },
+  "paths": {
+    "/pets": {
+      "get": {
+        "operationId": "listPets",
+        "summary": "List pets",
+        "tags": ["pets"],
+        "parameters": [
+          {"$ref": "#/parameters/PageLimit"},
+          {"name": "tags", "in": "query", "type": "array", "items": {"type": "string"}, "collectionFormat": "csv"},
+          {"name": "apiKey", "in": "query", "type": "string", "required": false}
+        ],
+        "security": [
+          {"petstoreAuth": ["read:pets"]},
+          {"basicAuth": []}
+        ],
+        "responses": {"200": {"description": "ok"}}
+      },
+      "post": {
+        "operationId": "createPet",
+        "summary": "Create a pet",
+        "parameters": [
+          {"name": "body", "in": "body", "required": true, "schema": {"$ref": "#/definitions/Pet"}}
+        ],
+        "responses": {"201": {"description": "created"}}
+      }
+    },
+    "/pets/{petId}": {
+      "parameters": [
+        {"name": "petId", "in": "path", "required": true, "type": "integer", "format": "int64"},
+        {"name": "verbose", "in": "query", "type": "boolean", "required": true}
+      ],
+      "get": {
+        "operationId": "getPet",
+        "summary": "Get one pet",
+        "parameters": [
+          {"name": "petId", "in": "path", "required": true, "type": "string"},
+          {"name": "verbose", "in": "query", "type": "boolean", "required": false, "default": false}
+        ],
+        "responses": {"200": {"description": "ok"}}
+      },
+      "delete": {
+        "operationId": "deletePet",
+        "summary": "Delete a pet",
+        "deprecated": true,
+        "parameters": [
+          {"name": "X-Request-Id", "in": "header", "type": "string", "required": false}
+        ],
+        "responses": {"204": {"description": "deleted"}}
+      }
+    },
+    "/pets/{petId}/uploadImage": {
+      "post": {
+        "operationId": "uploadPetImage",
+        "summary": "Upload a pet image",
+        "parameters": [
+          {"name": "petId", "in": "path", "required": true, "type": "integer", "format": "int64"},
+          {"name": "file", "in": "formData", "required": true, "type": "file"},
+          {"name": "labels", "in": "formData", "type": "array", "items": {"type": "string"}, "collectionFormat": "multi"},
+          {"name": "X-API-Key", "in": "header", "type": "string", "required": true}
+        ],
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/admin/dupOp": {
+      "get": {"operationId": "dupOp", "summary": "First duplicate ID"}
+    },
+    "/admin/dupOp2": {
+      "get": {"operationId": "dupOp", "summary": "Second duplicate ID"}
+    }
+  },
+  "definitions": {
+    "Pet": {
+      "type": "object",
+      "required": ["name", "photoUrls"],
+      "properties": {
+        "id": {"type": "integer", "format": "int64"},
+        "name": {"type": "string"},
+        "photoUrls": {"type": "array", "items": {"type": "string"}},
+        "category": {"$ref": "#/definitions/Category"},
+        "tags": {"type": "array", "items": {"$ref": "#/definitions/Tag"}},
+        "status": {"type": "string", "enum": ["available", "pending", "sold"]}
+      }
+    },
+    "Category": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "integer"},
+        "name": {"type": "string"},
+        "parent": {"$ref": "#/definitions/Category"}
+      }
+    },
+    "Tag": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "integer"},
+        "name": {"type": "string"}
+      }
+    }
+  }
+}

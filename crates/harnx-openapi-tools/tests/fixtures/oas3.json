@@ -1,0 +1,239 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Things API (authored fixture)",
+    "version": "2.0.0"
+  },
+  "servers": [{"url": "https://things.example.com/api"}],
+  "security": [{"oauth": ["read"]}],
+  "components": {
+    "securitySchemes": {
+      "oauth": {
+        "type": "oauth2",
+        "flows": {
+          "clientCredentials": {
+            "tokenUrl": "https://idp.example.com/token",
+            "scopes": {"read": "read things", "write": "write things"}
+          }
+        }
+      },
+      "basic": {"type": "http", "scheme": "basic"},
+      "tokenHeader": {"type": "apiKey", "in": "header", "name": "X-Things-Token"},
+      "tokenQuery": {"type": "apiKey", "in": "query", "name": "apiToken"}
+    },
+    "parameters": {
+      "ThingId": {
+        "name": "thingId",
+        "in": "path",
+        "required": true,
+        "schema": {"type": "string", "minLength": 1}
+      },
+      "PageSize": {
+        "name": "pageSize",
+        "in": "query",
+        "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}
+      }
+    },
+    "requestBodies": {
+      "ThingBody": {
+        "required": true,
+        "content": {
+          "application/json": {"schema": {"$ref": "#/components/schemas/Thing"}}
+        }
+      }
+    },
+    "schemas": {
+      "Thing": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1, "maxLength": 200},
+          "count": {"type": "integer", "nullable": true, "minimum": 0},
+          "status": {"type": "string", "enum": ["draft", "live", "archived"]},
+          "children": {"type": "array", "items": {"$ref": "#/components/schemas/Node"}},
+          "meta": {"type": "object", "additionalProperties": {"type": "string"}}
+        }
+      },
+      "ThingUpdate": {
+        "allOf": [
+          {"$ref": "#/components/schemas/Thing"},
+          {
+            "type": "object",
+            "properties": {"revision": {"type": "integer", "minimum": 1}}
+          }
+        ]
+      },
+      "Node": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string"},
+          "children": {"type": "array", "items": {"$ref": "#/components/schemas/Node"}}
+        }
+      },
+      "ColumnSpec": {
+        "type": "object",
+        "properties": {
+          "columns": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+        },
+        "required": ["columns"]
+      }
+    }
+  },
+  "paths": {
+    "/things": {
+      "get": {
+        "operationId": "listThings",
+        "summary": "List things",
+        "parameters": [{"$ref": "#/components/parameters/PageSize"}],
+        "responses": {"200": {"description": "ok"}}
+      },
+      "post": {
+        "operationId": "createThing",
+        "summary": "Create a thing",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/Thing"}}
+          }
+        },
+        "responses": {"201": {"description": "created"}}
+      }
+    },
+    "/things/{thingId}": {
+      "parameters": [
+        {"$ref": "#/components/parameters/ThingId"},
+        {"name": "verbose", "in": "query", "required": true, "schema": {"type": "boolean"}}
+      ],
+      "get": {
+        "operationId": "getThing",
+        "summary": "Get a thing",
+        "parameters": [
+          {"name": "verbose", "in": "query", "required": false, "schema": {"type": "boolean", "default": false}}
+        ],
+        "security": [{"oauth": ["read"]}, {"basic": []}],
+        "responses": {"200": {"description": "ok"}}
+      },
+      "put": {
+        "operationId": "replaceThing",
+        "summary": "Replace a thing",
+        "parameters": [
+          {"name": "verbose", "in": "query", "required": false,
+           "schema": {"type": "boolean", "default": false}}
+        ],
+        "requestBody": {"$ref": "#/components/requestBodies/ThingBody"},
+        "responses": {"200": {"description": "ok"}}
+      },
+      "patch": {
+        "operationId": "updateThing",
+        "summary": "Patch a thing with a JSON Patch array",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json-patch+json": {"schema": {"type": "object"}}
+          }
+        },
+        "responses": {"200": {"description": "ok"}}
+      },
+      "head": {
+        "operationId": "headThing",
+        "summary": "Fetch a thing's headers",
+        "responses": {"200": {"description": "ok"}}
+      },
+      "options": {
+        "operationId": "optionsThing",
+        "summary": "Discover a thing's supported methods",
+        "responses": {"200": {"description": "ok"}}
+      },
+      "trace": {
+        "operationId": "traceThing",
+        "summary": "Echo a diagnostic trace for a thing",
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/things/{thingId}/merge": {
+      "post": {
+        "operationId": "mergeThing",
+        "summary": "Merge into a thing (composed allOf schema)",
+        "parameters": [{"$ref": "#/components/parameters/ThingId"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/ThingUpdate"}}
+          }
+        },
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/things/{thingId}/name": {
+      "put": {
+        "operationId": "setThingName",
+        "summary": "Set the name as JSON or plain text",
+        "parameters": [{"$ref": "#/components/parameters/ThingId"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"type": "string"}},
+            "text/plain": {"schema": {"type": "string"}}
+          }
+        },
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/things/{thingId}/columns": {
+      "parameters": [{"$ref": "#/components/parameters/ThingId"}],
+      "put": {
+        "operationId": "setThingColumns",
+        "summary": "Set columns through a wildcard entry",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "*/*": {"schema": {"$ref": "#/components/schemas/ColumnSpec"}},
+            "multipart/form-data": {"schema": {"$ref": "#/components/schemas/ColumnSpec"}}
+          }
+        },
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/things/{thingId}/icon": {
+      "post": {
+        "operationId": "setIcon",
+        "summary": "Upload an icon (wildcard binary)",
+        "parameters": [{"$ref": "#/components/parameters/ThingId"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "*/*": {"schema": {"type": "string", "format": "binary"}}
+          }
+        },
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/things/{thingId}/archive": {
+      "post": {
+        "operationId": "archiveThing",
+        "summary": "Archive with raw bytes",
+        "parameters": [{"$ref": "#/components/parameters/ThingId"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {"schema": {"type": "string", "format": "binary"}}
+          }
+        },
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/nodes": {
+      "get": {
+        "operationId": "getNodes",
+        "summary": "Fetch a recursive node tree",
+        "parameters": [
+          {"name": "X-Things-Token", "in": "header", "required": true, "schema": {"type": "string"}},
+          {"name": "apiToken", "in": "query", "required": false, "schema": {"type": "string"}},
+          {"name": "mode", "in": "query", "required": true, "schema": {"type": "string", "enum": ["flat", "deep"]}}
+        ],
+        "responses": {"200": {"description": "ok"}}
+      }
+    }
+  }
+}

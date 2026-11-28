@@ -27,6 +27,7 @@ members = [
     "crates/harnx-grep-tools",
     "crates/harnx-exa-tools",
     "crates/harnx-fetch-tools",
+    "crates/harnx-openapi-tools",
     "crates/harnx-mcp-remote",
     "crates/harnx-plans-tools",
     "crates/harnx-git-history",
