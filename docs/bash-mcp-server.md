@@ -187,6 +187,14 @@ Every command template automatically injects four reserved parameters into its s
 
 Declaring any of these names under a template's YAML `parameters` map causes the template to fail loading with an error naming the parameter. Reserved parameters are handled by the server and stripped before arguments reach the script environment.
 
+### Template snapshots
+
+```yaml
+snapshots: none
+```
+
+By default a template invocation participates in execution history like any `exec`: the server snapshots eligible worktree bytes into the repository's local Git object store before and after the command, and reports what changed. `snapshots: none` opts a template out entirely — no snapshot is taken before `prepare_exec` runs, nothing is classified, and the invocation reports no diff. Declare it for a tool whose own scanner must be the first and only reader of the working tree's bytes: the plan publisher uses it so a host-side pre-scan snapshot cannot copy flagged content into local Git objects before the scanner refuses it. `snapshots: none` cannot combine with `protocol:` (a protocol template's result is its stderr plus the whole diff, which needs snapshots); loading rejects the pair.
+
 ### Template output defaults
 
 Use an optional top-level `output:` block to set per-template defaults:

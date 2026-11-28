@@ -2,6 +2,8 @@
 
 `harnx-proxy-auth` is a TLS-intercepting authentication proxy designed to inject credentials and run hooks on outgoing HTTP requests. It allows agents to securely access protected APIs without exposing long-lived credentials to the agent's environment.
 
+> **Truly anonymous requests**: absence of a caller `Authorization` header does not make a request anonymous. When a configured hook matches the request (e.g. by target host) and credentials are available — from the proxy's environment or from external stores — the proxy injects them. A command that must reach an API anonymously (e.g. a GitHub visibility probe) has to bypass the proxy and all ambient credential sources: run it with curl `-q --proxy '' --noproxy '*'` in a fresh environment with no `Authorization` header and no netrc. `packages/pantheon/scripts/publish-plan.sh` (its anonymous probe) is a working example; it also avoids custom and proxy CAs as egress-isolation/trust policy, so TLS validates against the system CA store.
+
 ## Modes of Operation
 
 `harnx-proxy-auth` operates as a long-lived tool service (over NATS by default, or MCP via `--mcp-stdio` / `--mcp-http`). It exposes the `proxy_auth` toolset containing the `environment` tool (invoked as `proxy_auth_environment` by in-process middleware or queried directly by `harnx-sandbox-run`). In-process tool middleware and sandbox-run query `environment` to obtain proxy defaults and merged environment variables, retaining the proxy process for the command's lifetime.

@@ -562,6 +562,183 @@ async fn tool_template_sandbox_grants_control_real_file_access() {
     let _ = toolset.cleanup_log_dir().await;
 }
 
+/// The `bash_publish_plan` shape under a real sandbox: the script `cd`s into
+/// the typed worktree parameter, a package-relative `$HARNX_PACKAGE_DIR`
+/// script grant expanded at registration covers the packaged script, declared
+/// env passthrough reaches the child, and nothing else is readable.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn sandboxed_template_honors_worktree_and_package_local_grant() {
+    if !sandbox_runtime_works() {
+        return;
+    }
+
+    let _env_guard = env_lock();
+    let work = TestDir::new();
+    let secret_dir = TestDir::new();
+    let package = TestDir::new();
+    let secret_file = secret_dir.path().join("capability-marker.txt");
+    std::fs::write(&secret_file, "sandbox-secret-marker").expect("write secret marker");
+    let scripts = package.path().join("scripts");
+    std::fs::create_dir_all(&scripts).expect("create package scripts dir");
+    std::fs::write(
+        scripts.join("probe.sh"),
+        "#!/usr/bin/env bash\n\
+         set -u\n\
+         printf 'CWD=%s\\n' \"$(pwd -P)\"\n\
+         printf 'PKG_SET=%s\\n' \"${HARNX_PACKAGE_DIR:+yes}\"\n\
+         cat \"$HARNX_PACKAGE_DIR/scripts/probe.sh\" >/dev/null && printf 'PROBE_READ_OK\\n'\n\
+         if cat \"$SECRET_PROBE\" >/dev/null 2>&1; then printf 'SECRET_READ_OK\\n'; else printf 'SECRET_READ_DENIED\\n'; fi\n",
+    )
+    .expect("write probe script");
+
+    let template = crate::tool_template::parse_template_str(
+        "name: publish_like\n\
+         parameters:\n\
+         \x20 dir: { type: string, required: true }\n\
+         \x20 secret_probe: { type: string, required: true }\n\
+         sandbox:\n\
+         \x20 read:\n\
+         \x20   - \"$HARNX_PACKAGE_DIR/scripts/probe.sh\"\n\
+         \x20 env: [\"HARNX_PACKAGE_DIR\"]\n\
+         template: false\n\
+         script: |\n\
+         \x20 set -euo pipefail\n\
+         \x20 cd \"$DIR\"\n\
+         \x20 bash \"$HARNX_PACKAGE_DIR/scripts/probe.sh\"\n",
+        Path::new("publish_like.yaml"),
+    )
+    .expect("parse publish-like template");
+
+    let _package_dir = EnvVar::set("HARNX_PACKAGE_DIR", package.path().as_os_str());
+    let mut sandbox_config = enabled_sandbox_config();
+    sandbox_config.allowlist = allowlist_for_paths(vec![work.path().to_path_buf()]);
+    let toolset = crate::BashToolset::new(sandbox_config, vec![template])
+        .await
+        .expect("build template toolset");
+
+    let result: CallToolResult = serde_json::from_value(
+        toolset
+            .invoke(
+                "publish_like",
+                serde_json::json!({
+                    "dir": work.path().to_string_lossy(),
+                    "secret_probe": secret_file.to_string_lossy(),
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("invoke publish-like template"),
+    )
+    .expect("deserialize publish-like result");
+    let text = text_content(&result);
+    assert_eq!(extract_field(&text, "exit_code"), "0");
+    let canonical = work.path().canonicalize().expect("canonical worktree");
+    assert!(
+        text.contains(&format!("CWD={}", canonical.to_string_lossy())),
+        "sandboxed template must run in the typed worktree:\n{text}"
+    );
+    assert!(text.contains("PKG_SET=yes"), "missing package env:\n{text}");
+    assert!(
+        text.contains("PROBE_READ_OK"),
+        "package grant failed:\n{text}"
+    );
+    assert!(
+        text.contains("SECRET_READ_DENIED") && !text.contains("SECRET_READ_OK"),
+        "ungranted secret file must stay unread:\n{text}"
+    );
+    assert!(
+        !text.contains("sandbox-secret-marker"),
+        "ungranted template exposed marker:\n{text}"
+    );
+    let _ = toolset.cleanup_log_dir().await;
+}
+
+/// A sandboxed template launch forwards declared ambient env names to the
+/// helper as name-only `--env NAME` arguments; the helper — which inherits
+/// this process's environment — passes the values through itself. The
+/// helper's argv must never carry the value. A wrapper in `sandbox_run_path`
+/// captures the real helper's argv, so the synthetic token is asserted on
+/// both sides: the child receives it, the argv does not.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn sandboxed_template_ambient_env_never_reaches_helper_argv() {
+    if !sandbox_runtime_works() {
+        return;
+    }
+
+    let _env_guard = env_lock();
+    let work = TestDir::new();
+    let capture = work.path().join("helper-argv.txt");
+    let wrapper = work.path().join("helper-wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {capture}\nexec {helper} \"$@\"\n",
+            capture = capture.to_string_lossy(),
+            helper = sandbox_run_test_path().to_string_lossy(),
+        ),
+    )
+    .expect("write argv-capture wrapper");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod wrapper");
+    }
+
+    let template = crate::tool_template::parse_template_str(
+        "name: token_probe\n\
+         sandbox:\n\
+         \x20 env: [\"GH_TOKEN\"]\n\
+         template: false\n\
+         script: |\n\
+         \x20 set -euo pipefail\n\
+         \x20 printf 'TOKEN=%s\n' \"${GH_TOKEN:-unset}\"\n",
+        Path::new("token_probe.yaml"),
+    )
+    .expect("parse token-probe template");
+
+    let _token = EnvVar::set("GH_TOKEN", "synthetic-argv-token");
+    let mut sandbox_config = enabled_sandbox_config();
+    sandbox_config.allowlist = allowlist_for_paths(vec![work.path().to_path_buf()]);
+    sandbox_config.sandbox_run_path = wrapper;
+    let toolset = crate::BashToolset::new(sandbox_config, vec![template])
+        .await
+        .expect("build template toolset");
+
+    let result: CallToolResult = serde_json::from_value(
+        toolset
+            .invoke(
+                "token_probe",
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("invoke token-probe template"),
+    )
+    .expect("deserialize token-probe result");
+    let text = text_content(&result);
+    assert_eq!(extract_field(&text, "exit_code"), "0");
+    assert!(
+        text.contains("TOKEN=synthetic-argv-token"),
+        "sandboxed child must receive the ambient value through name-only \
+         passthrough:\n{text}"
+    );
+
+    let argv = std::fs::read_to_string(&capture).expect("read captured helper argv");
+    assert!(
+        argv.lines().any(|line| line == "--env") && argv.lines().any(|line| line == "GH_TOKEN"),
+        "helper argv must keep the name-only --env transfer:\n{argv}"
+    );
+    assert!(
+        !argv.contains("synthetic-argv-token") && !argv.contains("GH_TOKEN=synthetic-argv-token"),
+        "ambient value leaked into sandbox helper argv:\n{argv}"
+    );
+    let _ = toolset.cleanup_log_dir().await;
+}
+
 #[cfg(unix)]
 fn sandbox_server(root: impl Into<PathBuf>) -> BashServer {
     server_with_sandbox(vec![root.into()], enabled_sandbox_config())

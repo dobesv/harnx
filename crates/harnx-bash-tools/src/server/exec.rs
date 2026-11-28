@@ -30,6 +30,83 @@ fn rollback_failure(e: anyhow::Error) -> Result<CallToolResult, ErrorData> {
     }
 }
 
+/// Env for a template invocation: declared ambient passthrough (resolved
+/// only on local launches) is overridden by author-supplied top-level env,
+/// and parameter bindings win over both.
+///
+/// Ambient passthrough resolves here only for launches that run locally.
+/// A sandboxed launch forwards the declared names to the helper as
+/// name-only `--env NAME` arguments, and the helper — which inherits this
+/// process's environment — passes the values through itself. Resolving the
+/// values here as well would duplicate them into `extra_env`, which lands
+/// verbatim in the helper's argv (`--env NAME=VALUE`), where any host
+/// observer with argv access could read credentials like `GH_TOKEN`.
+fn template_extra_env(
+    registered: &RegisteredToolTemplate,
+    bound_env: &HashMap<String, String>,
+    sandboxed_launch: bool,
+) -> HashMap<String, String> {
+    let mut extra_env = HashMap::new();
+    if !sandboxed_launch {
+        for pass_name in &registered.pass_env {
+            if let Ok(value) = std::env::var(pass_name) {
+                extra_env.entry(pass_name.clone()).or_insert(value);
+            }
+        }
+    }
+    if let Some(template_env) = &registered.template.env {
+        extra_env.extend(template_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    extra_env.extend(bound_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // Inserted last so a template cannot override the runtime-declared protocol.
+    if let Some(protocol) = registered.protocol {
+        extra_env.insert(
+            TOOL_PROTOCOL_ENV.to_string(),
+            protocol.env_value().to_string(),
+        );
+    }
+    extra_env
+}
+
+/// A template invocation prepared for execution: the registered entry, the
+/// rendered command, the resolved timeout, and the bound arguments.
+struct BoundInvocation<'a> {
+    registered: &'a RegisteredToolTemplate,
+    command: String,
+    timeout_secs: u64,
+    bound: crate::tool_template::output::BoundTemplateArgs,
+}
+
+/// Looks up a registered template and renders its script from bound
+/// arguments. Unknown tools, the timeout argument and parameter validation
+/// all reject here, before anything executes.
+fn bind_template_invocation<'a>(
+    templates: &'a std::collections::BTreeMap<String, RegisteredToolTemplate>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Result<BoundInvocation<'a>, ErrorData> {
+    let registered = templates
+        .get(name)
+        .ok_or_else(|| ErrorData::invalid_params(format!("unknown tool template: {name}"), None))?;
+    let mut script_args = args.clone();
+    let requested_timeout = parse_template_timeout(script_args.remove(COMMAND_TIMEOUT_ARG))?;
+    let timeout_secs = resolve_command_timeout(requested_timeout)?;
+    let bound = registered
+        .template
+        .validate_and_bind(&script_args)
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+    let command = registered
+        .template
+        .render_script(&bound.env)
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+    Ok(BoundInvocation {
+        registered,
+        command,
+        timeout_secs,
+        bound,
+    })
+}
+
 impl BashServer {
     // exec
     // -----------------------------------------------------------------------
@@ -59,45 +136,27 @@ impl BashServer {
         .await
     }
 
-    pub(crate) async fn invoke_template(
-        &self,
-        name: &str,
-        args: &Map<String, Value>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let registered = self.inner.templates.get(name).ok_or_else(|| {
-            ErrorData::invalid_params(format!("unknown tool template: {name}"), None)
-        })?;
-        let mut script_args = args.clone();
-        let requested_timeout = parse_template_timeout(script_args.remove(COMMAND_TIMEOUT_ARG))?;
-        let timeout_secs = resolve_command_timeout(requested_timeout)?;
-        let bound = registered
-            .template
-            .validate_and_bind(&script_args)
-            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-        let command = registered
-            .template
-            .render_script(&bound.env)
-            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-
-        // Parameter bindings take precedence over author-supplied top-level env.
-        let mut extra_env = registered.template.env.clone().unwrap_or_default();
-        extra_env.extend(bound.env);
-        // Inserted last so a template cannot override the runtime-declared protocol.
-        if let Some(protocol) = registered.protocol {
-            extra_env.insert(
-                TOOL_PROTOCOL_ENV.to_string(),
-                protocol.env_value().to_string(),
-            );
-        }
-        warn_if_unsandboxed(name, registered);
-
-        self.exec_pipeline(ExecPipelineParams {
-            command: &command,
+    /// Assembles the pipeline call for a template invocation: sandbox
+    /// grants, output controls and truncation, and the template's snapshot
+    /// policy as the diff level.
+    fn template_pipeline_params<'a>(
+        bound_call: &'a BoundInvocation<'a>,
+        extra_env: &'a HashMap<String, String>,
+    ) -> ExecPipelineParams<'a> {
+        let BoundInvocation {
+            registered,
+            command,
+            timeout_secs,
+            bound,
+            ..
+        } = bound_call;
+        ExecPipelineParams {
+            command: command.as_str(),
             on_user_message: registered.on_user_message,
             protocol: registered.protocol,
             working_dir: None,
-            extra_env: Some(&extra_env),
-            timeout_secs: Some(timeout_secs),
+            extra_env: Some(extra_env),
+            timeout_secs: Some(*timeout_secs),
             truncate_opts: Self::truncate_opts_from(
                 bound.output.head_lines,
                 bound.output.tail_lines,
@@ -115,9 +174,45 @@ impl BashServer {
                 pass_env: &registered.pass_env,
                 no_network: registered.no_network,
             }),
-            diff: None,
-        })
-        .await
+            // A `snapshots: none` template pins its diff level to `none`
+            // before `prepare_exec` classifies or snapshots anything, so its
+            // invocation never copies eligible worktree bytes into the
+            // repository's local Git object store. Other templates keep the
+            // default (`None` → full/summary per invocation style).
+            diff: match registered.snapshot_policy {
+                crate::tool_template::SnapshotPolicy::None => Some(DiffLevel::None),
+                crate::tool_template::SnapshotPolicy::Auto => None,
+            },
+        }
+    }
+
+    pub(crate) async fn invoke_template(
+        &self,
+        name: &str,
+        args: &Map<String, Value>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let bound_call = bind_template_invocation(&self.inner.templates, name, args)?;
+
+        // Mirrors `build_command_with_sandbox`: the helper launch needs both
+        // the server-wide config and the template's own sandbox flag, and
+        // only Unix launches through the helper at all. Every other
+        // combination runs locally, where extra_env values go to the child's
+        // environment, never to argv.
+        #[cfg(unix)]
+        let sandboxed_launch =
+            self.inner.sandbox_config.enabled && bound_call.registered.sandbox_enabled;
+        #[cfg(not(unix))]
+        let sandboxed_launch = false;
+
+        let extra_env = template_extra_env(
+            bound_call.registered,
+            &bound_call.bound.env,
+            sandboxed_launch,
+        );
+        warn_if_unsandboxed(name, bound_call.registered);
+
+        self.exec_pipeline(Self::template_pipeline_params(&bound_call, &extra_env))
+            .await
     }
 
     pub(crate) async fn exec_pipeline(
@@ -579,5 +674,83 @@ mod timeout_tests {
         assert!(parse_template_timeout(Some(json!(-1))).is_err());
         assert!(parse_template_timeout(Some(json!(1.5))).is_err());
         assert!(parse_template_timeout(Some(json!("17"))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod extra_env_tests {
+    use super::template_extra_env;
+    use crate::server::BashServer;
+    use crate::test_support::{env_lock, EnvVar};
+    use harnx_sandbox_common::SandboxConfig;
+    use harnx_tool_allow::ResolvedAllowlist;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    fn registered_with_sandbox_env(yaml: &str) -> crate::server::RegisteredToolTemplate {
+        let template = crate::tool_template::parse_template_str(yaml, Path::new("env-probe.yaml"))
+            .expect("template should parse");
+        // Registration ignores the server-wide sandbox flag; the launch-mode
+        // decision is exercised through the `sandboxed_launch` argument.
+        let server = BashServer::new_with_templates(
+            SandboxConfig {
+                enabled: false,
+                allowlist: Arc::new(ResolvedAllowlist::new()),
+                extra_env_passthrough: vec![],
+                env_overrides: vec![],
+                sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
+            },
+            vec![template],
+        )
+        .expect("template should register");
+        let registered = server
+            .tool_templates()
+            .next()
+            .expect("one registered template")
+            .1
+            .clone();
+        registered
+    }
+
+    /// A sandboxed launch must not resolve ambient passthrough values into
+    /// `extra_env`: those values travel as `--env NAME=VALUE` in the sandbox
+    /// helper's argv, where host observers can read them. The sandbox keeps
+    /// the name-only transfer, and the helper — which inherits this process's
+    /// environment — passes the value through itself.
+    #[test]
+    fn sandboxed_launch_keeps_ambient_values_out_of_extra_env() {
+        let _guard = env_lock();
+        let _token = EnvVar::set("GH_TOKEN", "synthetic-argv-token");
+        let registered = registered_with_sandbox_env(
+            "name: env_probe\nsandbox:\n  env: [\"GH_TOKEN\"]\nscript: |\n  printf 'token'\n",
+        );
+
+        let env = template_extra_env(&registered, &HashMap::new(), true);
+        assert_eq!(registered.pass_env, ["GH_TOKEN"]);
+        assert!(
+            !env.contains_key("GH_TOKEN"),
+            "sandboxed launch must keep ambient values out of extra_env (helper argv): {env:?}"
+        );
+    }
+
+    /// A local launch has no helper argv, so ambient values resolve into the
+    /// child environment here — including when the template opted into the
+    /// sandbox but the server-wide sandbox is disabled, and on non-Unix
+    /// platforms where the helper launch does not exist.
+    #[test]
+    fn local_launch_resolves_ambient_values() {
+        let _guard = env_lock();
+        let _token = EnvVar::set("GH_TOKEN", "synthetic-argv-token");
+        let registered = registered_with_sandbox_env(
+            "name: env_probe\nsandbox:\n  env: [\"GH_TOKEN\"]\nscript: |\n  printf 'token'\n",
+        );
+
+        let env = template_extra_env(&registered, &HashMap::new(), false);
+        assert_eq!(
+            env.get("GH_TOKEN").map(String::as_str),
+            Some("synthetic-argv-token"),
+            "local launch must resolve declared ambient passthrough: {env:?}"
+        );
     }
 }

@@ -4,6 +4,9 @@
 
 mod mcp_http_client;
 mod pr_waiter;
+mod publish_plan;
 mod rollback;
 mod script_results;
+mod template_support;
+mod tool_template_bindings;
 mod tool_templates;

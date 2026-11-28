@@ -188,6 +188,42 @@ local `~/.config/harnx/agents/shared/` directory.
 
 ---
 
+## Plan snapshot publishing
+
+After the Mnemosyne step, Atlas and Sisyphus pass plan context and delivery
+outcomes to Clio. Clio renders public-safe Markdown from the plan or writes a
+factual retrospective when no usable plan exists. Clio automatically
+publishes clean snapshots to `refs/plans/<branch>` on the same GitHub
+repository before composing the delivery commit. Only successful publication
+adds an immutable `Plan: <blob URL>` paragraph. Re-delivery keeps the file name
+and history; identical bytes reuse the previous snapshot commit.
+
+The publisher verifies the destination and repository visibility and scans
+exactly the bytes it would write. Flagged content stops publication before
+Git objects or refs are written. Diagnostics give categories and locations
+without echoing flagged values. Clio sanitizes and retries; there is no bypass.
+
+The publisher is `scripts/publish-plan.sh`, exposed to Clio as the registered
+`bash_publish_plan` command template (`bash_tools/publish_plan.yaml`) with
+typed `source`, `branch`, and `worktree` inputs; the tool's script `cd`s into
+the worktree. The template grants its own packaged script locally (expanded
+from `$HARNX_PACKAGE_DIR` at registration, so relocated installs need no grant
+rewrite) and uses the ambient GitHub credential route (`GH_TOKEN`/
+`GITHUB_TOKEN` or gh config) the same way `wait_for_pr_stable` does. Runtime
+prerequisites: Git (SHA-1 object format), Python 3, curl, a system CA store,
+direct anonymous access to `api.github.com` (the visibility probe
+deliberately strips proxies and credentials), and a GitHub token for
+authenticated lookups and pushes.
+
+Interrupted publication (e.g. a failed push) can leave a safe local candidate on
+`refs/plans/<branch>`. A retry with the same bytes and a compatible base
+recovers it; different bytes are reported as a conflict and the local history
+is left intact. Tests live in
+`crates/harnx-bash-tools/tests/it/publish_plan.rs` and
+`crates/harnx-runtime/tests/it/middleware/publish_plan.rs`.
+
+---
+
 ## Tool servers
 
 The package includes ready-to-use tool server configs in `tool_servers/`. Bundled native toolset servers run directly, while external stdio servers use a bridge adapter. All servers are automatically active when the package is installed — you don't need to copy or symlink anything.
@@ -201,7 +237,7 @@ The package includes ready-to-use tool server configs in `tool_servers/`. Bundle
 
 | Server | Namespace | Requires | Notes |
 |--------|-----------|----------|-------|
-| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution and the PR-stability waiter used after delivery. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Uses in-process tool middleware with `proxy_auth` for GitHub/Atlassian credential injection. |
+| `bash.yaml` | `bash_*` | None (bundled binary) | Shell execution, the PR-stability waiter used after delivery, and the `publish_plan` snapshot-publication template. Opts into common system, development-tool, and repository allow batches plus explicit app paths. Uses in-process tool middleware with `proxy_auth` for GitHub/Atlassian credential injection before exec/spawn. |
 | `proxy_auth.yaml` | `proxy_auth_*` | None (bundled binary) | Long-lived GitHub/Atlassian auth proxy tool service. Provides `proxy_auth_environment` used by bash middleware. |
 | `fs.yaml` | `fs_*` | None (bundled binary) | Filesystem read/write. Opts into repository and development-tool allow batches. |
 | `plans.yaml` | `plans_*` | None (bundled binary) | NATS-backed plan/task/note management using canonical `cid:plan:` URLs. |

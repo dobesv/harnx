@@ -295,11 +295,7 @@ async fn template_timeout_is_adjustable_and_zero_is_rejected() {
     tokio::fs::write(&template_path, yaml)
         .await
         .expect("add delay parameter");
-    let templates =
-        discover_tool_templates(None, &[template_path], &[]).expect("discover command template");
-    let toolset = BashToolset::new(sandbox_config_for(directory.path()), templates)
-        .await
-        .expect("build toolset");
+    let toolset = crate::template_support::toolset_for(directory.path(), &[template_path]).await;
 
     let timed_out = toolset
         .invoke(

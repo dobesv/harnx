@@ -95,8 +95,26 @@ This deletes the package directory. Session transcripts referencing the package'
     tool_servers/          # .yaml files — tool server configs (native & bridged MCP)
     clients/               # .yaml files — client configs
     script_tools/          # .yaml files — custom script tool definitions (one per file)
+    scripts/              # Arbitrary data/executable files — installed but not auto-loaded
   my-agents.patch.yaml     # Optional local overrides (sibling to the dir)
 ```
+
+### Shipping executable scripts
+
+Only `agents/`, `tool_servers/`, `clients/`, and `script_tools/` are parsed and
+loaded. Anything else (e.g. `scripts/`, `hooks/`, `middleware/`) is installed
+verbatim as data files. To let an agent execute an installed script, register
+a command template for it under `bash_tools/` (see Pantheon's
+`bash_tools/publish_plan.yaml`): the template declares typed parameters and a
+`sandbox` whose `read`/`write`/`env` grants cover exactly what the script
+needs. Grant paths expand `$VARIABLE` references and a leading `~` at
+registration using the server process's environment — the supervisor sets
+`HARNX_PACKAGE_DIR` to the installed package directory, so a package
+installed outside the standard `~/.config/harnx/packages/` location needs no
+grant rewrite. A `sandbox.env` grant passes the named ambient variable through
+to the script: a sandboxed launch forwards the name to the helper (which
+supplies the value from the server's environment), and a local launch resolves
+the value directly into the child environment.
 
 If package directories resolve to the same canonical path (for example, through
 symlink aliases), Harnx loads tool servers, clients, and script tools from that

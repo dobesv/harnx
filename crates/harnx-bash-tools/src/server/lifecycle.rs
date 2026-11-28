@@ -16,6 +16,26 @@ fn register_tool_templates(
     Ok(registered)
 }
 
+/// The advertised description: the author's text (or a default) plus the
+/// new-message termination policy when the template opts in.
+fn template_description(template: &ToolTemplate) -> String {
+    let name = template.name.as_str();
+    let mut description = template
+        .description
+        .clone()
+        .unwrap_or_else(|| format!("Run shell command template `{name}`."));
+    if template.on_user_message == OnUserMessage::Terminate {
+        let trimmed = description.trim_end();
+        let punctuation = trimmed.chars().last();
+        description = trimmed.to_owned();
+        if !matches!(punctuation, Some('.' | '!' | '?')) {
+            description.push('.');
+        }
+        description.push_str(" A new message for you may end this command early with 'stopped_by: new_message'; the process group is terminated and partial output is returned. Read the message, then re-run this tool if still appropriate.");
+    }
+    description
+}
+
 fn build_registered_tool_template(
     template: ToolTemplate,
 ) -> anyhow::Result<(String, RegisteredToolTemplate)> {
@@ -36,19 +56,9 @@ fn build_registered_tool_template(
     let has_grants = sandbox_has_grants(&sandbox);
     let (read_paths, write_paths) = expand_template_grant_paths(&template.name, &sandbox)?;
     let name = template.name.clone();
-    let mut description = template
-        .description
-        .clone()
-        .unwrap_or_else(|| format!("Run shell command template `{name}`."));
-    if template.on_user_message == OnUserMessage::Terminate {
-        let trimmed = description.trim_end();
-        let punctuation = trimmed.chars().last();
-        description = trimmed.to_owned();
-        if !matches!(punctuation, Some('.' | '!' | '?')) {
-            description.push('.');
-        }
-        description.push_str(" A new message for you may end this command early with 'stopped_by: new_message'; the process group is terminated and partial output is returned. Read the message, then re-run this tool if still appropriate.");
-    }
+    let description = template_description(&template);
+    // Copy before `template` moves into the entry below.
+    let snapshot_policy = template.snapshots;
     let entry = RegisteredToolTemplate {
         on_user_message: template.on_user_message,
         protocol: template.protocol,
@@ -61,6 +71,7 @@ fn build_registered_tool_template(
         sandbox_enabled: sandbox.enabled,
         no_network: !sandbox.network,
         ignored_grants: !sandbox.enabled && has_grants,
+        snapshot_policy,
     };
     Ok((name, entry))
 }

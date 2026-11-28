@@ -14,6 +14,8 @@ mod policy;
 mod provenance;
 mod proxy_auth;
 mod proxy_auth_policy;
+#[cfg(unix)]
+mod publish_plan;
 mod shipped;
 mod timing;
 

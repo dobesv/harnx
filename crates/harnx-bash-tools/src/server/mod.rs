@@ -115,6 +115,8 @@ pub(crate) struct RegisteredToolTemplate {
     pub(crate) ignored_grants: bool,
     pub(crate) on_user_message: OnUserMessage,
     pub(crate) protocol: Option<ToolProtocol>,
+    /// Whether invocations take execution-history snapshots (`snapshots:`).
+    pub(crate) snapshot_policy: crate::tool_template::SnapshotPolicy,
 }
 
 #[derive(Clone, Copy)]

@@ -1,0 +1,37 @@
+name: publish_plan
+description: Publish a clean plan snapshot from a delivery worktree to refs/plans/<branch> on the validated GitHub origin
+# The publisher's scanner must be the first reader of the worktree's bytes.
+# Execution-history snapshots would copy eligible tracked/untracked bytes
+# into the delivery repository's local Git object store before the scanner
+# refuses them, so this invocation takes no snapshot and reports no diff.
+snapshots: none
+parameters:
+  source:
+    type: string
+    required: true
+    description: Rendered snapshot Markdown file; relative to the worktree, or absolute within it, /tmp, or /var/tmp
+    min: 1
+    max: 4096
+  branch:
+    type: string
+    required: true
+    description: Delivery branch name; the snapshot publishes under refs/plans/<branch>
+    pattern: "^[A-Za-z0-9._/-]+$"
+    min: 1
+    max: 255
+  worktree:
+    type: string
+    required: true
+    description: Absolute path of the delivery Git worktree to publish from; the script cd's into it
+    pattern: "^/[A-Za-z0-9._/-]+$"
+    min: 1
+sandbox:
+  read:
+    - "~/.config/gh"
+    - "$HARNX_PACKAGE_DIR/scripts/publish-plan.sh"
+  env: ["GH_TOKEN", "GITHUB_TOKEN", "HARNX_PACKAGE_DIR"]
+template: false
+script: |
+  set -euo pipefail
+  cd -P "$WORKTREE"
+  exec bash "$HARNX_PACKAGE_DIR/scripts/publish-plan.sh" --source "$SOURCE" --branch "$BRANCH"

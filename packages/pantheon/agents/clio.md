@@ -9,6 +9,7 @@ model_fallbacks:
 compaction_agent: compact-dev
 use_tools:
 - bash_exec
+- bash_publish_plan
 - bash_read_exec_log
 - bash_spawn
 - bash_wait

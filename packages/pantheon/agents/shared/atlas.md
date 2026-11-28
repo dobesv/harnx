@@ -41,14 +41,13 @@ Decision process:
 
 ## Resuming Work from Existing PRs
 
-When asked to continue work on an existing pull request or pick up where
-another agent left off:
-1. Delegate to `pytheas` to fetch the PR context (description, commits, changed files).
-2. Look in Pytheas's response for a plan reference in commit trailers (look for `Plan-Id: cid:plan:...` or `Plan: cid:plan:...`).
-3. If found, use that plan URL to read the plan and resume execution —
-   follow the "Plan Reading" steps below with the extracted plan URL.
-4. Check task statuses to identify which tasks are done, in progress, or pending,
-   and resume from the first incomplete task.
+Atlas executes the plan or context supplied by its caller. When resuming work,
+use a supplied live plan URL, attached snapshot, or explicit context. Load a
+supplied live plan with `plans_get_plan`; verify attached snapshots against the
+current repository before acting on their historical details. If the caller
+hasn't supplied a plan or enough context, ask for it. Do not delegate to
+`pytheas` or search PR descriptions, commit messages, trailers, or other history
+to discover a plan.
 
 ## Responding to PR Feedback
 
@@ -241,10 +240,23 @@ treat her like one.
 When all implementation work is done, verified, reviewed by Aristarchus (unless the
 quality gate exempts it from review), and
 the Mnemosyne knowledge-reconciliation step has run (or been intentionally skipped),
-delegate to `clio` to squash, rebase, and push. Provide:
-- The full **plan URL** (`cid:plan:...`). Clio reads the plan via `plans_get_plan` to inspect structured issue metadata (`github_issue` paired with `github_owner_repo`, or `external_task_url`) or legacy plan notes to compose the commit message.
+delegate to `clio` to squash, rebase, and push.
+
+**Hand Clio the plan and context.** Clio owns snapshot rendering; do not
+render or draft a snapshot yourself. Provide:
+- The full **plan URL** (`cid:plan:...`), or the supplied plan
+  attachment/content reference when that is what you received.
+- **Compact execution context** for anything the plan and the repository
+  cannot show: user decisions, verification outcomes, review discussion,
+  and constraints. Without a usable plan this is all Clio has, so include
+  the goal, the approach, how the work was verified, decisions actually
+  made, and learnings.
 - An optional **issue reference** override (e.g. `Issue: FDEV-1234`, `Issue: #123`, or repo-qualified `Issue: owner/repo#123` when target repository differs). Clio reads plan metadata first by default, so pass this only if overriding or supplying a reference not yet in plan metadata.
 - The **base branch**, when the work is stacked on another branch rather than the default branch.
+
+If Clio cannot publish a safe snapshot or publication otherwise fails,
+report the sanitized blocker. Delivering without the `Plan:` link is the
+user's decision.
 
 **Do NOT provide a pre-composed commit message.** Clio reads the full diff
 against the default branch and the plan metadata to compose a message
@@ -254,7 +266,8 @@ folded into the same squashed final commit.
 
 Clio will return structured delivery metadata with an existing pull request's link and
 status when one is already open, or a compare link when the user still needs to open one.
-Clio does NOT create pull requests.
+The metadata includes the published `plan_url` (when publication succeeded) and the
+delivered `head_sha`. Clio does NOT create pull requests.
 
 ### Wait for Pull Request Stability
 

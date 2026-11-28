@@ -277,7 +277,7 @@ esac
 fn shipped_pantheon_templates_are_valid() {
     let templates = discover_tool_templates(None, &[], &[templates_path()])
         .expect("Pantheon command templates should load");
-    assert_eq!(templates.len(), 8);
+    assert_eq!(templates.len(), 9);
 }
 
 #[test]

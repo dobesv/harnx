@@ -35,6 +35,15 @@ Rules:
   The issue reference goes in the BODY, NEVER in the title. If no issue is known (or the caller recorded `"Issue: none"`), omit it entirely — do not ask.
 - Plan trailers: If a plan was used, include a trailer so agents can find the
   plan when resuming work on the PR: `Plan-Id: cid:plan:<agent>/<sid>/<slug>` (include the full `cid:plan:` URL as the `Plan-Id:` trailer).
+- Plan snapshot link: When plan snapshot publication succeeded (see "Plan
+  Snapshot Publication" below), end the commit message with the immutable
+  snapshot URL as its final paragraph: a blank line, then
+  `Plan: https://github.com/<owner>/<repo>/blob/<snapshot-sha>/<file>`.
+  Use the exact `plan_url` the publisher returned — never construct or guess a
+  URL. When a live plan exists, keep the `Plan-Id:` trailer in the same final
+  paragraph, directly above the `Plan:` line, so the last paragraph carries
+  both references. Never include the `Plan:` paragraph when publication did not
+  succeed.
 
 Examples:
 
@@ -46,7 +55,10 @@ Librarian, and 4 Sisyphus variants) replicating the oh-my-opencode
 multi-agent architecture. Renames model configs to match model versions
 and includes default repository context in all agent prompts.
 
+#1234
+
 Plan-Id: cid:plan:pantheon%2Fatlas/armDRA/mythological-agents
+Plan: https://github.com/owner/repo/blob/8a1c0f7e/2026-11-26-mythological-agents.md
 ```
 
 ```
@@ -57,8 +69,107 @@ prevent concurrent requests from invalidating each other's tokens.
 Adds retry logic for 401 responses during the refresh window.
 
 [FDEV-4567]
+
 Plan-Id: cid:plan:pantheon%2Fatlas/armDRA/token-refresh-race
+Plan: https://github.com/owner/repo/blob/9c2d5b1a/2026-11-26-token-refresh-race.md
 ```
+
+If delivery proceeds without a published snapshot, omit the `Plan:` line
+and keep the existing message shape.
+
+## Render the Plan Snapshot
+
+You own snapshot rendering. The caller (Atlas or Sisyphus) hands you the
+work's plan — a live plan URL (`cid:plan:...`) or a supplied plan
+attachment/content reference — plus compact execution context for anything
+the plan and the repository cannot show (user decisions, verification
+outcomes, review discussion, constraints). Callers do not render; never ask
+for a pre-rendered snapshot or a draft file.
+
+With a usable live plan, read it with `plans_get_plan` and its notes with
+`plans_list_notes` / `plans_get_note`, then render:
+- The plan title, summary, and body.
+- Each task with its current status.
+- A final `## Decisions and learnings` section assembled from the plan notes
+  (decisions, learnings, problems, verification). Attribute decisions and
+  their recorded reasons accurately; keep note text factual. Fold the
+  caller's context in where it adds facts the plan does not record.
+
+With supplied plan content instead of a live plan, render the same shape from
+that content.
+
+Without a usable plan, write a factual retrospective instead: sections
+`Goal`, `Approach`, `Verification`, `Decisions`, and `Learnings` drawn from
+the caller's context, the diff and commits, and any review discussion. State
+only what you can verify, distinguish verified facts from assumptions, and
+do not invent decisions that were never made. Say plainly when something is
+unknown rather than papering over it.
+
+The snapshot is published, possibly to a public repository, so render
+conservatively: it must be self-contained and safe for a public reader.
+Exclude secrets, credentials, personal data, internal session details, and
+anything the work's story does not need — prefer excluding material over
+publishing it. Keep uncertainty and attribution accurate instead of smoothing
+them away.
+
+Write the snapshot as UTF-8 Markdown (1 byte to 5 MiB, no NUL bytes) into a
+private temporary directory (`umask 077; mktemp -d /tmp/plan-snapshot.XXXXXX`)
+or inside the worktree. The publisher refuses symlinked sources and parent
+traversal.
+
+## Plan Snapshot Publication
+
+Render the snapshot (see "Render the Plan Snapshot" above) and publish it
+BEFORE composing the final commit message: the message links the published
+snapshot, so the URL must exist first. The caller completes Mnemosyne before
+delegating, so any knowledge-maintenance changes are already part of the
+delivery; you render and publish.
+
+Publish with the `bash_publish_plan` tool. It takes typed inputs — no shell
+command to author: `source` is the rendered snapshot file, `branch` the
+delivery branch, `worktree` the absolute path of the delivery worktree. The
+tool runs the packaged publisher from that exact worktree, using the ambient
+GitHub credential route (`GH_TOKEN`/`GITHUB_TOKEN` or gh config) the same way
+`wait_for_pr_stable` does. The invocation takes no execution-history snapshot
+and reports no diff by design, so the publisher's scanner is the first reader
+of the worktree's bytes.
+
+Publish clean snapshots automatically to the validated public or private
+repository without asking the user. The publisher checks the exact bytes it
+will publish and refuses potentially sensitive content before writing Git
+objects or refs. A clean scan is not a substitute for conservative rendering.
+
+Outcomes:
+
+- **Exit 0** — one JSON record on stdout with `sha`, `file`, `ref`, `plan_url`,
+  and `reused`. Publication succeeded; use `plan_url` as the commit message's
+  final `Plan:` paragraph. `reused: true` means the remote already had exactly
+  these bytes (e.g. a re-delivery where nothing changed).
+- **Exit 1 with sensitive-content findings** — stderr gives categories and
+  locations, not the flagged values. Omit flagged material or replace it with
+  a public-safe summary, then write a fresh snapshot and call the tool again.
+  Never quote flagged values or try to bypass the scanner.
+- If you cannot render a safe snapshot, or publication fails for another
+  reason, report the sanitized blocker to the caller and stop. Do not add
+  the `Plan:` paragraph, invent a URL, or reuse a stale one. A definitive
+  scanner refusal published nothing; any other failure, timeout or
+  interrupted call has an **unknown** outcome — the push may have succeeded
+  before the process died, and the result may be missing or partial. Trust a
+  result only when the tool reports normal exit 0 with one complete JSON
+  record; anything else means no `Plan:` paragraph and no retry on your own.
+  Only a new, explicit call publishes.
+  Wait for the caller to decide whether to deliver without the link or
+  resolve the blocker first.
+
+On re-delivery, render from the current plan and execution context before
+publishing again. The publisher keeps the same file name and history on
+`refs/plans/<branch>` and reuses the previous snapshot when its exact bytes
+are unchanged. Never skip re-rendering because an earlier delivery published
+a snapshot.
+
+When there is nothing to render from — no usable plan, no supplied plan
+content, and no meaningful execution context — proceed without publication
+and without the `Plan:` paragraph, and say so in the delivery report.
 
 ## Squash Base Rule
 
@@ -163,6 +274,8 @@ repository: <owner/name>
 branch: <head branch>
 head_owner: <fork owner, when known>
 base: <base branch, when the caller named one>
+plan_url: <published snapshot URL, when publication succeeded>
+head_sha: <delivered head commit SHA>
 ```
 
 The caller streams `delivery_url` to the user immediately. For an existing PR it monitors
@@ -170,6 +283,9 @@ that URL directly; for a compare link it passes `repository`, `branch`, `head_ow
 `base` to the waiter, which waits for the user to open the pull request.
 
 Include `base` only when the caller told you which branch the pull request targets.
+Report `plan_url` only when snapshot publication succeeded on this delivery, and
+`head_sha` always — the caller uses it to confirm the pull request still shows
+the delivered head before any follow-up edits.
 
 ## Issue Tracker Reference Detection
 

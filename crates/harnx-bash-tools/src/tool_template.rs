@@ -29,6 +29,25 @@ pub(crate) enum OnUserMessage {
     Terminate,
 }
 
+/// Whether invocations of this template take execution-history snapshots of
+/// the working tree.
+///
+/// `auto` (the default) keeps the usual behavior: the exec pipeline snapshots
+/// eligible worktree bytes into the repository's local Git object store
+/// before and after the command, so it can report what the command changed.
+/// `none` opts out entirely — no snapshot is taken, nothing is classified,
+/// and the invocation reports no diff. A tool whose own scanner must be the
+/// first and only reader of sensitive worktree bytes (the plan publisher)
+/// needs exactly that: a host-side pre-scan snapshot would copy flagged bytes
+/// into local Git objects before the scanner refuses them.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SnapshotPolicy {
+    #[default]
+    Auto,
+    None,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ToolTemplate {
     pub(crate) name: String,
@@ -43,6 +62,10 @@ pub struct ToolTemplate {
     pub(crate) template: bool,
     #[serde(default)]
     pub(crate) on_user_message: OnUserMessage,
+    /// Whether invocations take execution-history snapshots; see
+    /// [`SnapshotPolicy`].
+    #[serde(default)]
+    pub(crate) snapshots: SnapshotPolicy,
     #[serde(default)]
     pub(crate) protocol: Option<ToolProtocol>,
     pub(crate) script: String,
@@ -505,6 +528,19 @@ fn validate_env_name_uniqueness(template: &ToolTemplate) -> Result<()> {
     Ok(())
 }
 
+/// `snapshots: none` cannot combine with `protocol:`: a protocol template's
+/// result is its stderr plus the whole diff, which needs snapshots, so the
+/// opt-out would be silently ignored.
+fn validate_snapshot_policy(template: &ToolTemplate) -> Result<()> {
+    if template.snapshots == SnapshotPolicy::None && template.protocol.is_some() {
+        anyhow::bail!(
+            "`snapshots: none` cannot combine with `protocol:` in tool `{}`",
+            template.name
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct DiscoveredTemplate {
     template: ToolTemplate,
@@ -684,6 +720,8 @@ pub(crate) fn parse_template_str(yaml: &str, source: &Path) -> Result<ToolTempla
         .with_context(|| format!("failed to load tool template {}", source.display()))?;
     validate_env_name_uniqueness(&template)
         .with_context(|| format!("failed to load tool template {}", source.display()))?;
+    validate_snapshot_policy(&template)
+        .with_context(|| format!("failed to load tool template {}", source.display()))?;
     template
         .input_schema()
         .with_context(|| format!("failed to load tool template {}", source.display()))?;
@@ -697,7 +735,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{discover_templates, param_to_env_name, parse_template_str, ParamType};
+    use super::{
+        discover_templates, param_to_env_name, parse_template_str, ParamType, SnapshotPolicy,
+    };
 
     const CANONICAL_YAML: &str = r#"name: gh_issue_view
 description: View a GitHub issue as JSON
@@ -948,6 +988,90 @@ script: echo ok
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].name, "gh_issue_view");
+    }
+
+    #[test]
+    fn shipped_publish_plan_template_loads_with_typed_surface() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/pantheon/bash_tools/publish_plan.yaml");
+
+        let templates = discover_templates(None, &[path], &[])
+            .expect("shipped publish_plan template should load");
+
+        assert_eq!(templates.len(), 1);
+        let template = &templates[0];
+        assert_eq!(template.name, "publish_plan");
+        assert!(matches!(
+            template
+                .parameters
+                .get("worktree")
+                .expect("worktree parameter")
+                .ty,
+            ParamType::String
+        ));
+        for name in ["source", "branch", "worktree"] {
+            assert!(
+                template
+                    .parameters
+                    .get(name)
+                    .expect("publisher parameter")
+                    .required,
+                "publisher parameter `{name}` must be required"
+            );
+        }
+        // Waiter-shaped grants: the packaged script and the gh config the
+        // credential fallback reads, nothing else; credentials arrive as
+        // declared ambient passthrough, never through middleware injection.
+        let sandbox = template.sandbox.as_ref().expect("publish_plan sandbox");
+        assert_eq!(
+            sandbox.read,
+            ["~/.config/gh", "$HARNX_PACKAGE_DIR/scripts/publish-plan.sh"]
+        );
+        assert_eq!(
+            sandbox.env,
+            ["GH_TOKEN", "GITHUB_TOKEN", "HARNX_PACKAGE_DIR"]
+        );
+        // The publisher's scanner must be the only pre-publication reader of
+        // the worktree: the invocation takes no execution-history snapshot.
+        assert_eq!(template.snapshots, SnapshotPolicy::None);
+    }
+
+    #[test]
+    fn snapshots_policy_parses_none_defaults_to_auto_and_rejects_unknown_values() {
+        let parsed = parse_template_str(
+            "name: snap\nsnapshots: none\nscript: echo ok\n",
+            Path::new("snap.yaml"),
+        )
+        .expect("`snapshots: none` should parse");
+        assert_eq!(parsed.snapshots, SnapshotPolicy::None);
+
+        let parsed =
+            parse_template_str("name: auto_snap\nscript: echo ok\n", Path::new("auto.yaml"))
+                .expect("omitted snapshots should parse");
+        assert_eq!(parsed.snapshots, SnapshotPolicy::Auto);
+
+        let error = parse_template_str(
+            "name: bad_snap\nsnapshots: sometimes\nscript: echo ok\n",
+            Path::new("bad.yaml"),
+        )
+        .expect_err("unknown snapshots value should fail");
+        assert!(
+            format!("{error:#}").contains("snapshots"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn snapshots_none_cannot_combine_with_protocol() {
+        let error = parse_template_str(
+            "name: proto_snap\nsnapshots: none\nprotocol: jsonl\nscript: echo ok\n",
+            Path::new("proto.yaml"),
+        )
+        .expect_err("`snapshots: none` + `protocol:` should fail");
+        assert!(
+            format!("{error:#}").contains("`snapshots: none` cannot combine with `protocol:`"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
