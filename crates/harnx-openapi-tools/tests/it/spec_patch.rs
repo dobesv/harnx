@@ -7,7 +7,8 @@ use crate::common;
 
 use harnx_core::json_schema::JsonSchema;
 use harnx_openapi_tools::{
-    apply_spec_patches, validate_spec_patches, Catalog, SpecDocument, SpecPatchLimits,
+    apply_spec_patches, build_catalog_with_controls, validate_spec_patches, Catalog, SpecDocument,
+    SpecError, SpecPatchLimits,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -425,6 +426,191 @@ fn patched_invalid_document_revalidation_does_not_leak_document_content() {
     );
     assert!(!rendered.contains(SENTINEL), "{rendered}");
     // The Debug render (error-chain formatting included) stays clean too.
-    let debugged = format!("{error:?}");
+    let debugged = debug_render(&error);
     assert!(!debugged.contains(SENTINEL), "{debugged}");
+}
+
+/// Every sanitization assertion must hold in the Debug render too: the
+/// same payload, nothing deeper retained.
+fn debug_render(error: &SpecError) -> String {
+    format!("{error:?}")
+}
+
+/// A root-valid OpenAPI document that normalizes cleanly on its own.
+/// The sentinel patch below makes it semantically invalid without touching
+/// root validation, so a passing test exercises the deep normalization
+/// boundary, not `SpecDocument::from_value` again.
+fn semantic_base() -> SpecDocument {
+    SpecDocument::from_value(serde_json::json!({
+        "openapi": "3.0.1",
+        "info": {"title": "t", "version": "1"},
+        "paths": {"/x": {"get": {"operationId": "x",
+            "responses": {"200": {"description": "ok"}}}}}
+    }))
+    .expect("the base document must be valid and buildable")
+}
+
+/// A patch that plants a sentinel-bearing dangling local security-scheme
+/// `$ref`. Root validation still passes; security-scheme resolution during
+/// `Catalog::build` fails with the sentinel in the returned error.
+const SENTINEL_SCHEME_REF: &str = "hunter2-scheme-sentinel";
+
+fn sentinel_scheme_patch() -> Vec<String> {
+    vec![format!(
+        r##".components = {{"securitySchemes": {{"oauth":
+            {{"$ref": "#/components/securitySchemes/{SENTINEL_SCHEME_REF}"}}}}}}"##
+    )]
+}
+
+#[test]
+fn patched_semantic_failure_is_sanitized_at_build_patched() {
+    use std::error::Error as StdError;
+    harnx_core::require_nextest();
+    let document = semantic_base();
+    // Control: the base document builds without the patch.
+    Catalog::build(&document, "srv").expect("the base document must build");
+    let error = Catalog::build_patched(
+        &document,
+        "srv",
+        &sentinel_scheme_patch(),
+        SpecPatchLimits::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, SpecError::SpecPatch(_)), "{error:?}");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("patch 1 of 1"),
+        "the failure must be indexed to the final stage: {rendered}"
+    );
+    assert!(
+        rendered.contains("reference that cannot be resolved"),
+        "the safe failure category must be preserved: {rendered}"
+    );
+    assert!(!rendered.contains(SENTINEL_SCHEME_REF), "{rendered}");
+    // The Debug render and the error chain carry the same sanitized
+    // payload; nothing deeper may retain the patched document.
+    let debugged = debug_render(&error);
+    assert!(!debugged.contains(SENTINEL_SCHEME_REF), "{debugged}");
+    assert!(
+        StdError::source(&error).is_none(),
+        "no error chain may carry the patched document"
+    );
+}
+
+#[test]
+fn patched_semantic_failure_is_sanitized_at_controls_seam() {
+    use std::error::Error as StdError;
+    harnx_core::require_nextest();
+    let document = semantic_base();
+    let error = build_catalog_with_controls(
+        &document,
+        "srv",
+        &sentinel_scheme_patch(),
+        SpecPatchLimits::default(),
+        &[],
+    )
+    .unwrap_err();
+    assert!(matches!(error, SpecError::SpecPatch(_)), "{error:?}");
+    let rendered = error.to_string();
+    assert!(rendered.contains("patch 1 of 1"), "{rendered}");
+    assert!(
+        rendered.contains("reference that cannot be resolved"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(SENTINEL_SCHEME_REF), "{rendered}");
+    let debugged = debug_render(&error);
+    assert!(!debugged.contains(SENTINEL_SCHEME_REF), "{debugged}");
+    assert!(StdError::source(&error).is_none());
+}
+
+#[test]
+fn unpatched_semantic_errors_keep_located_diagnostics() {
+    harnx_core::require_nextest();
+    // The same broken ref planted directly in the source document (no
+    // patches) must keep its ordinary located diagnostic, including the
+    // pointer itself: sanitization applies only to patched documents.
+    let document = SpecDocument::from_value(serde_json::json!({
+        "openapi": "3.0.1",
+        "info": {"title": "t", "version": "1"},
+        "paths": {"/x": {"get": {"operationId": "x",
+            "responses": {"200": {"description": "ok"}}}}},
+        "components": {"securitySchemes": {"oauth":
+            {"$ref": "#/components/securitySchemes/directly-broken-scheme"}}}
+    }))
+    .expect("root validation must pass");
+    let error =
+        Catalog::build_patched(&document, "srv", &[], SpecPatchLimits::default()).unwrap_err();
+    assert!(
+        matches!(error, SpecError::UnresolvedRef { .. }),
+        "{error:?}"
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("directly-broken-scheme"),
+        "the unpatched located diagnostic must be preserved: {rendered}"
+    );
+    assert!(!rendered.contains("spec patch failed"), "{rendered}");
+}
+
+#[test]
+fn config_diagnostics_survive_patch_sanitization() {
+    harnx_core::require_nextest();
+    // A source-independent configuration failure keeps its ordinary
+    // diagnostic even when patches were applied.
+    let document = semantic_base();
+    let patches = vec![r#".info.title = "patched""#.to_string()];
+    let impossible_server_name = "x".repeat(40);
+    let error = Catalog::build_patched(
+        &document,
+        &impossible_server_name,
+        &patches,
+        SpecPatchLimits::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, SpecError::Config(_)), "{error:?}");
+    let rendered = error.to_string();
+    assert!(rendered.contains("configuration error"), "{rendered}");
+    assert!(
+        !rendered.contains("spec patch failed"),
+        "configuration diagnostics must not become patch failures: {rendered}"
+    );
+}
+
+#[test]
+fn selector_diagnostics_survive_patch_sanitization() {
+    harnx_core::require_nextest();
+    // Selector problems are operator diagnostics, not document-derived
+    // content: patches applied to the source must not sanitize them.
+    let document = semantic_base();
+    let patches = vec![r#".info.title = "patched""#.to_string()];
+    let error = build_catalog_with_controls(
+        &document,
+        "srv",
+        &patches,
+        SpecPatchLimits::default(),
+        &["bogus".to_string()],
+    )
+    .unwrap_err();
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("invalid operation selector"),
+        "selector diagnostics must be preserved: {rendered}"
+    );
+    assert!(
+        !rendered.contains("left a document"),
+        "selector errors must not become post-patch categories: {rendered}"
+    );
+    let error = build_catalog_with_controls(
+        &document,
+        "srv",
+        &patches,
+        SpecPatchLimits::default(),
+        &["id:nope".to_string()],
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("matched no operation"),
+        "{}",
+        error
+    );
 }

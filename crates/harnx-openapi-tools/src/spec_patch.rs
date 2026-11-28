@@ -23,7 +23,8 @@
 //!   — a failed patch never yields a half-patched document.
 //! * The evaluator boundary disables host effects and ambient input: the
 //!   `env`, `now`, `debug`, `stderr`, `halt`, `halt_error`,
-//!   `localtime`/`strflocaltime` (ambient timezone) and `input`/`inputs`
+//!   `localtime`/`strflocaltime` (ambient timezone), `strptime` (ambient
+//!   timezone database through Jiff) and `input`/`inputs`
 //!   builtins are removed from the compiled definition and function tables,
 //!   so referencing one is a compile failure. Empty globals alone do not
 //!   disable builtins — the builtins themselves are removed. No global
@@ -71,10 +72,12 @@ pub const MAX_SPEC_PATCH_DOCUMENT_DEPTH: usize = 128;
 /// `env` reads process environment variables (credential-bearing), `now`
 /// reads the wall clock (breaks deterministic listings), `debug_empty` and
 /// `stderr_empty` write to operator-visible logs, `halt` terminates the host
-/// process, and `localtime`/`strflocaltime` depend on the machine's
-/// timezone. `input`/`inputs` are not installed by this evaluator but are
-/// listed so the exclusion is enforced, not incidental.
-const DISABLED_FUNS: [&str; 9] = [
+/// process, and `localtime`/`strflocaltime`/`strptime` consult the machine's
+/// timezone (`strptime` reaches Jiff's global timezone database — and with
+/// it `TZDIR`/zoneinfo reads — even for an explicit UTC offset).
+/// `input`/`inputs` are not installed by this evaluator but are listed so
+/// the exclusion is enforced, not incidental.
+const DISABLED_FUNS: [&str; 10] = [
     "env",
     "now",
     "halt",
@@ -82,6 +85,7 @@ const DISABLED_FUNS: [&str; 9] = [
     "stderr_empty",
     "localtime",
     "strflocaltime",
+    "strptime",
     "input",
     "inputs",
 ];
@@ -187,10 +191,13 @@ fn compile_patch(expression: &str) -> Result<JsonFilter, ()> {
         .or(Err(()))
 }
 
-/// Convert `serde_json::Value` → `Val` by round-tripping through JSON text.
-fn json_to_val(value: &Value) -> Val {
+/// Convert `serde_json::Value` → `Val` by round-tripping through JSON
+/// text. The round-trip cannot fail for a `serde_json` value, but a
+/// defensive failure is reported as the sanitized conversion category
+/// instead of silently substituting a different input.
+fn json_to_val(value: &Value) -> Result<Val, PatchFailure> {
     let json = value.to_string();
-    jaq_json::read::parse_single(json.as_bytes()).unwrap_or(Val::Null)
+    jaq_json::read::parse_single(json.as_bytes()).map_err(|_| PatchFailure::NotValidJson)
 }
 
 /// Convert `Val` → `serde_json::Value` via the `Display` impl (which writes
@@ -215,7 +222,7 @@ fn classify_exn<E>(exn: jaq_core::Exn<E>) -> PatchFailure {
 
 /// Run one compiled stage: exactly one output, and no error may follow it.
 fn run_patch(filter: &JsonFilter, input: Value) -> Result<Value, PatchFailure> {
-    let input_val = json_to_val(&input);
+    let input_val = json_to_val(&input)?;
     let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
     let mut outputs = filter.id.run((ctx, input_val));
     let first = match outputs.next() {
@@ -378,9 +385,10 @@ pub fn validate_spec_patches(patches: &[String], limits: SpecPatchLimits) -> Spe
 }
 
 /// The sanitized failure category for a patched document that fails
-/// re-validation: variant shape only, never the error's message, context or
-/// reference fields, so no patched document content can be echoed.
-fn revalidation_category(error: &SpecError) -> &'static str {
+/// re-validation or normalization: variant shape only, never the error's
+/// message, context or reference fields, so no patched document content
+/// can be echoed.
+fn document_failure_category(error: &SpecError) -> &'static str {
     match error {
         SpecError::Unsupported { .. } => {
             "left a document that uses a specification feature this crate does not support"
@@ -392,6 +400,25 @@ fn revalidation_category(error: &SpecError) -> &'static str {
             "left a document with a reference that cannot be resolved"
         }
         _ => "left a document that is not a usable specification",
+    }
+}
+
+/// Sanitize a document-derived failure raised from the source left after
+/// the final patch stage (root re-validation or any deeper normalization).
+///
+/// The document after patching may embed operator secrets from the patch
+/// list, so its own diagnostics — which carry pointers, reference strings
+/// and message text from the document — must not be echoed. The failure is
+/// described as the state the final stage left behind, never as causation
+/// by that stage's expression, and carries the final stage's index and a
+/// safe category only. Source-independent operator diagnostics (server-name
+/// configuration, selector problems) pass through verbatim; the no-patch
+/// path never routes through this seam and keeps its located errors.
+pub(crate) fn post_patch_failure(patches: &[String], error: SpecError) -> SpecError {
+    let total = patches.len();
+    match &error {
+        SpecError::Config(_) | SpecError::SpecPatch(_) => error,
+        _ => patch_error(total, total, document_failure_category(&error)),
     }
 }
 
@@ -424,7 +451,7 @@ pub fn apply_spec_patches(
     // other patch failure.
     SpecDocument::from_value(root).map_err(|error| {
         let total = patches.len();
-        patch_error(total, total, revalidation_category(&error))
+        patch_error(total, total, document_failure_category(&error))
     })
 }
 
@@ -638,6 +665,13 @@ mod tests {
             "inputs",
             "localtime",
             "strflocaltime(\"%Y\")",
+            // Ambient timezone database: `strptime/1` (string input piped,
+            // format as the argument) reaches Jiff's global zoneinfo/TZDIR
+            // data even for an explicit UTC offset. The call below is a
+            // syntactically valid unary use that compiles against the
+            // unfiltered jaq std table, so rejecting it proves the builtin
+            // removal, not an arity typo.
+            ".dates = [\"2024-01-02\" | strptime(\"%Y-%m-%d\")]",
             "$undeclared",
         ] {
             let Err(error) = apply(&minimal(), &[expression]) else {

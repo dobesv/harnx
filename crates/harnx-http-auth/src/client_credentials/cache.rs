@@ -5,6 +5,9 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+#[cfg(test)]
+use tokio::sync::oneshot;
+
 use anyhow::{anyhow, bail, Result};
 use futures_util::FutureExt as _;
 use reqwest::header::HeaderValue;
@@ -19,6 +22,8 @@ use super::{
 pub(super) struct Core {
     pub(super) grant: Grant,
     state: Mutex<RefreshState>,
+    #[cfg(test)]
+    snapshot_hooks: Mutex<VecDeque<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 /// Retired tokens that stay redactable after rotation. Upstream text can
@@ -162,6 +167,25 @@ impl Core {
         Self {
             grant,
             state: Mutex::default(),
+            #[cfg(test)]
+            snapshot_hooks: Mutex::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn queue_snapshot_hook(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, reached_signal) = oneshot::channel();
+        let (release_signal, release) = oneshot::channel();
+        lock(&self.snapshot_hooks).push_back((reached, release));
+        (reached_signal, release_signal)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn before_token_snapshot(&self) {
+        let hook = lock(&self.snapshot_hooks).pop_front();
+        if let Some((reached, release)) = hook {
+            let _ = reached.send(());
+            let _ = release.await;
         }
     }
 

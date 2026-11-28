@@ -289,7 +289,9 @@ pub fn build_catalog_with_controls(
     operation_selectors: &[String],
 ) -> SpecResult<Catalog> {
     let effective = crate::spec_patch::apply_spec_patches(document, spec_patches, patch_limits)?;
-    let full = Catalog::build(&effective, server_name)?;
+    // The same effective source is used once here and reused for ID
+    // matching below; patches are never applied twice.
+    let full = crate::catalog::build_from_patched(&effective, server_name, spec_patches)?;
     select_operations(&full, &effective, operation_selectors)
 }
 

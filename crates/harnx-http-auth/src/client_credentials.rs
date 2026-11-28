@@ -67,10 +67,14 @@ impl ClientCredentialsProvider {
     /// freshness check and the snapshot, try once more before failing closed.
     pub async fn token(&self) -> Result<AccessToken> {
         self.ensure_fresh().await?;
+        #[cfg(test)]
+        self.core.before_token_snapshot().await;
         if let Some(token) = self.core.current_token() {
             return Ok(token);
         }
         self.ensure_fresh().await?;
+        #[cfg(test)]
+        self.core.before_token_snapshot().await;
         self.require_cached_token()
     }
 
@@ -141,5 +145,123 @@ impl ClientCredentialsProvider {
             secrets.push(encoded);
         }
         redact_secrets(text, &secrets)
+    }
+}
+
+#[cfg(test)]
+mod token_snapshot_recovery_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use tokio::{io::AsyncWriteExt as _, net::TcpListener, time::timeout};
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    async fn provider() -> (ClientCredentialsProvider, TcpListener) {
+        let endpoint = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", endpoint.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let secret = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret.path(), "test-secret").unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let provider = ClientCredentialsProvider::new(
+            url,
+            "test-client".into(),
+            secret.path(),
+            Vec::new(),
+            http,
+        )
+        .unwrap();
+        (provider, endpoint)
+    }
+
+    async fn answer_token_request(endpoint: &TcpListener, token: &str) {
+        let (mut socket, _) = timeout(DEADLINE, endpoint.accept())
+            .await
+            .expect("token exchange did not arrive")
+            .unwrap();
+        let body = format!(r#"{{"access_token":"{token}","token_type":"Bearer"}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn initial_token(
+        provider: &ClientCredentialsProvider,
+        endpoint: &TcpListener,
+    ) -> AccessToken {
+        let token = provider.token();
+        let (_, token) = tokio::join!(answer_token_request(endpoint, "initial"), token);
+        token.unwrap()
+    }
+
+    #[tokio::test]
+    async fn token_reacquires_after_one_retirement_before_snapshot() {
+        let (provider, endpoint) = provider().await;
+        let initial = initial_token(&provider, &endpoint).await;
+        let (reached, release) = provider.core.queue_snapshot_hook();
+        let request = {
+            let provider = provider.clone();
+            tokio::spawn(async move { provider.token().await })
+        };
+
+        timeout(DEADLINE, reached)
+            .await
+            .expect("token() did not reach snapshot boundary")
+            .unwrap();
+        assert!(provider.reject(&initial));
+        release.send(()).unwrap();
+
+        answer_token_request(&endpoint, "replacement").await;
+        let recovered = timeout(DEADLINE, request)
+            .await
+            .expect("token() did not complete after reacquisition")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.authorization_header(), "Bearer replacement");
+    }
+
+    #[tokio::test]
+    async fn token_fails_closed_after_two_retirements_before_snapshot() {
+        let (provider, endpoint) = provider().await;
+        let initial = initial_token(&provider, &endpoint).await;
+        let (first_reached, release_first) = provider.core.queue_snapshot_hook();
+        let (second_reached, release_second) = provider.core.queue_snapshot_hook();
+        let request = {
+            let provider = provider.clone();
+            tokio::spawn(async move { provider.token().await })
+        };
+
+        timeout(DEADLINE, first_reached)
+            .await
+            .expect("token() did not reach first snapshot boundary")
+            .unwrap();
+        assert!(provider.reject(&initial));
+        release_first.send(()).unwrap();
+
+        answer_token_request(&endpoint, "replacement").await;
+        timeout(DEADLINE, second_reached)
+            .await
+            .expect("retry did not reach second snapshot boundary")
+            .unwrap();
+        let replacement = provider
+            .core
+            .current_token()
+            .expect("exchange should publish replacement before snapshot");
+        assert!(provider.reject(&replacement));
+        release_second.send(()).unwrap();
+
+        let error = timeout(DEADLINE, request)
+            .await
+            .expect("token() did not fail after retry was exhausted")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "client-credentials token is unavailable; retry the call"
+        );
     }
 }

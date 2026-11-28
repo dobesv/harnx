@@ -39,6 +39,41 @@ fn sibling_reference_expansion_stops_at_cumulative_budget() {
 }
 
 #[test]
+fn retained_utf8_sibling_exhausts_byte_budget_and_poisons_compactor() {
+    harnx_core::require_nextest();
+    let root = json!({
+        "components": {"schemas": {
+            "Payload": {"type": "string"}
+        }}
+    });
+    let long_key = "界".repeat(1_024);
+    let long_value = "é".repeat(2_048);
+    let schema = json!({
+        "$ref": "#/components/schemas/Payload",
+        (long_key): long_value
+    });
+    let mut compactor = SchemaCompactor::with_budget(&root, "POST /utf8", 1_000, 4_096);
+
+    let error = compactor.compact(&schema).unwrap_err().to_string();
+    assert!(error.contains("POST /utf8"), "{error}");
+    assert!(
+        error.contains("0 / 4096 estimated bytes and 0 / 1000 JSON values used"),
+        "{error}"
+    );
+    assert!(
+        error.contains("next expansion needs")
+            && error.contains("estimated bytes and 10 JSON values"),
+        "{error}"
+    );
+
+    let reuse_error = compactor.compact(&json!({"type": "string"})).unwrap_err();
+    assert!(reuse_error
+        .to_string()
+        .contains("cannot be reused after a failed compaction"));
+    assert!(compactor.finish().is_err());
+}
+
+#[test]
 fn discarded_prose_siblings_do_not_expand_collected_reference() {
     harnx_core::require_nextest();
     let root = json!({

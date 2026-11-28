@@ -45,6 +45,30 @@ pub struct Catalog {
     pub operations: Vec<NormalizedOperation>,
 }
 
+/// Normalize the effective (post-patch) source into a catalog through the
+/// sanitized post-patch seam shared by both public builders.
+///
+/// With no patches this is plain [`Catalog::build`]: located document
+/// diagnostics pass through unchanged. With patches applied, a
+/// document-derived failure (root re-validation or any deeper
+/// normalization) is sanitized to the final stage's index and a safe
+/// category — the patched document may embed operator secrets, and its
+/// own diagnostics would echo them. Source-independent configuration
+/// errors keep their ordinary text either way. The caller passes the same
+/// effective document it will use for selection, so patches are applied
+/// exactly once per build.
+pub(crate) fn build_from_patched(
+    effective: &SpecDocument,
+    server_name: &str,
+    patches: &[String],
+) -> SpecResult<Catalog> {
+    if patches.is_empty() {
+        return Catalog::build(effective, server_name);
+    }
+    Catalog::build(effective, server_name)
+        .map_err(|error| crate::spec_patch::post_patch_failure(patches, error))
+}
+
 impl Catalog {
     /// Normalize a document into a catalog for the given server name.
     ///
@@ -78,17 +102,21 @@ impl Catalog {
     /// Normalize a document after applying the ordered operator patch list.
     ///
     /// An empty patch list behaves exactly like [`Catalog::build`]. Any
-    /// patch failure — compile, runtime, cardinality, non-object output, or
-    /// limit — fails atomically: nothing registers from a half-patched
-    /// source.
+    /// patch failure — compile, runtime, cardinality, non-object output,
+    /// limit, or a patched document that fails re-validation or
+    /// normalization — fails atomically: nothing registers from a
+    /// half-patched source. A document-derived failure after patching is
+    /// reported as a sanitized indexed patch failure (see
+    /// [`build_from_patched`]); source-independent configuration errors
+    /// keep their ordinary diagnostics.
     pub fn build_patched(
         document: &SpecDocument,
         server_name: &str,
         patches: &[String],
         limits: crate::spec_patch::SpecPatchLimits,
     ) -> SpecResult<Self> {
-        let patched = crate::spec_patch::apply_spec_patches(document, patches, limits)?;
-        Self::build(&patched, server_name)
+        let effective = crate::spec_patch::apply_spec_patches(document, patches, limits)?;
+        build_from_patched(&effective, server_name, patches)
     }
 
     /// The compact discovery list. One `ToolSpec` per operation.
