@@ -436,42 +436,44 @@ fn consume_window_member(
     None
 }
 
+// qual:api
 pub async fn load_remote_transcript_for_render(
     session: &NatsSession,
+) -> Result<RemoteTranscriptState> {
+    load_remote_transcript_for_render_readonly(
+        session.jetstream(),
+        session.storage_key(),
+        session.session_id(),
+    )
+    .await
+}
+
+/// Read-only transcript load from a JetStream context without creating
+/// streams, claiming session metadata, or installing a persistence sink.
+pub async fn load_remote_transcript_for_render_readonly(
+    jetstream: &async_nats::jetstream::Context,
+    storage_key: &str,
+    session_id: &str,
 ) -> Result<RemoteTranscriptState> {
     // Double-sample lease status: before and after the bounded log read.
     // Mirrors load_nats_session in harnx-serve. A worker appending ToolCalls
     // mid-read would be captured by the second sample; the first sample
     // preserves pending state for a lease released during the read.
-    let lease_was_active =
-        crate::nats_lease::session_has_active_lease(session.jetstream(), session.storage_key())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to inspect worker lease for session '{}'",
-                    session.session_id()
-                )
-            })?;
-    let log = NatsSessionLog::new(
-        session.jetstream().clone(),
-        session.storage_key().to_string(),
-    );
+    let lease_was_active = crate::nats_lease::session_has_active_lease(jetstream, storage_key)
+        .await
+        .with_context(|| format!("failed to inspect worker lease for session '{session_id}'"))?;
+    let log = NatsSessionLog::new(jetstream.clone(), storage_key.to_string());
     let entries = log.load_events_async().await?;
     // If the first sample was idle, check again for a worker that acquired the
     // lease and appended this snapshot's trailing tool call during the read.
     let preserve_pending = if lease_was_active {
         true
     } else {
-        crate::nats_lease::session_has_active_lease(session.jetstream(), session.storage_key())
+        crate::nats_lease::session_has_active_lease(jetstream, storage_key)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to inspect worker lease for session '{}'",
-                    session.session_id()
-                )
-            })?
+            .with_context(|| format!("failed to inspect worker lease for session '{session_id}'"))?
     };
-    transcript_state_from_entries(&entries, session.session_id(), preserve_pending)
+    transcript_state_from_entries(&entries, session_id, preserve_pending)
 }
 
 fn transcript_state_from_entries(

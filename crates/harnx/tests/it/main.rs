@@ -8,6 +8,8 @@ mod engine_smoke;
 mod interact_cli;
 mod interrupt_e2e;
 mod openai_responses_e2e;
+#[cfg(unix)]
+mod patient_nats_cli;
 mod session_cli_e2e;
 mod session_dump_history_nats;
 mod session_stats_cli_e2e;

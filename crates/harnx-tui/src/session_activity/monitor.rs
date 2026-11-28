@@ -41,6 +41,15 @@ impl SessionEventForwarder<'_> {
             || (self.attached_during_turn && after_seq == self.attached_seq)
     }
 
+    fn send_stream_attached(&self, active: bool) -> bool {
+        self.send(TuiEvent::SessionStreamAttached {
+            stamp: EventStamp::live(&self.live),
+            session_id: self.target.0.clone(),
+            cluster: self.target.1.clone(),
+            active,
+        })
+    }
+
     fn send_durable_activity(&self, active: bool) -> bool {
         self.send_activity_stamped(active, EventStamp::live(&self.live), true)
     }
@@ -178,7 +187,8 @@ async fn monitor_session_connection(
     };
     // A reconnect can seed its cursor beyond the missed child result while
     // the parent is still busy, so reconcile the attachment history as well.
-    if !forwarder.recover_subagent_progress(stream.history(), 0)
+    if !forwarder.send_stream_attached(attached_during_turn)
+        || !forwarder.recover_subagent_progress(stream.history(), 0)
         || !forwarder.send_durable_activity(attached_during_turn)
     {
         return false;

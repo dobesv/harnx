@@ -828,17 +828,16 @@ impl NatsSession {
     ) -> Result<Self> {
         let cluster = config.cluster.clone();
         let config_snapshot = global_config.read().clone();
-        let server = config_snapshot.resolve_nats_server(&cluster).await?;
+        let (server, client) = config_snapshot
+            .resolve_nats_connection(&cluster, Some(&abort_signal))
+            .await
+            .context("failed to connect to NATS cluster")?;
         let attachment_replicas = server.resolved_replicas();
         config.initializer = config
             .initializer
             .with_default_user_id(config_snapshot.default_user_id(Some(&server)));
         let lease_acquisition_timeout =
             std::time::Duration::from_secs(config_snapshot.nats_lease_acquisition_timeout_secs);
-        let client = config_snapshot
-            .nats_client(&cluster)
-            .await
-            .context("failed to connect to NATS cluster")?;
         let jetstream = async_nats::jetstream::new(client.clone());
 
         let nats_session = Self::new_with_resolved_options(

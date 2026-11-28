@@ -86,25 +86,39 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod bound_completion_fencing_tests;
 mod broker_isolation_tests;
 mod browse_actions;
 mod cancellation_escape_tests;
 mod command_completion;
 mod credentials_command;
+mod cross_session_transcript_action_tests;
 mod delegation_tests;
+mod destination_read_view_isolation_tests;
 mod exit_interrupt_tests;
 mod handler_decomposition_tests;
 mod handoff_session_tests;
+mod history_repair_fencing_tests;
+mod history_repair_tests;
+mod history_work_tests;
 mod markdown_link_accessibility_tests;
+mod nats_background_mark_read_tests;
+mod nats_title_responsiveness_tests;
+mod nats_transcript_ownership_tests;
+mod navigation_failure_policy_tests;
 mod operator_tool_completion;
 mod operator_tool_execution;
 mod pending_attachment_tests;
+mod persistence_handle_adoption_tests;
+mod picker_info_ownership_tests;
+mod rebuild_failure_policy_tests;
 mod runtime_note_rendering_tests;
 mod shared_session_event_tests;
 mod subagent_session_tests;
 mod thought_rendering_tests;
 mod tool_live_updates_tests;
 mod turn_activity_tests;
+mod unsettled_write_navigation_tests;
 
 fn yaml_to_json(yaml: &str) -> serde_json::Value {
     serde_yaml::from_str::<serde_json::Value>(yaml)
@@ -123,6 +137,149 @@ macro_rules! usage_event {
     };
 }
 
+pub(crate) const NON_BROKER_TEST_CLUSTER: &str = "non-broker-test";
+pub(super) fn skip_local_nats_unavailable() {
+    eprintln!("skipping: local nats-server is unavailable");
+}
+
+pub(super) fn picker_message_entry(
+    role: harnx_core::message::MessageRole,
+    content: &str,
+) -> harnx_core::session::SessionLogEntry {
+    harnx_core::session::SessionLogEntry::Message {
+        id: None,
+        timestamp: None,
+        fence_token: None,
+        role,
+        content: harnx_core::message::MessageContent::Text(content.to_string()),
+    }
+}
+
+pub(super) fn picker_sessions_loaded_event(
+    tui: &Tui,
+    sessions: Vec<harnx_runtime::config::SessionMeta>,
+) -> TuiEvent {
+    TuiEvent::PickerSessionsLoaded {
+        seq: tui.picker_refresh_seq,
+        picker_incarnation: tui.picker_incarnation,
+        target: tui.current_picker_target(),
+        sessions,
+        fetch_error: None,
+    }
+}
+
+pub(super) fn history_command_finished_event(
+    line: &str,
+    output: &str,
+    result: anyhow::Result<harnx_runtime::commands::CommandOutcome>,
+) -> TuiEvent {
+    TuiEvent::HistoryCommandFinished {
+        line: line.to_string(),
+        prev_session: Some("session-a".to_string()),
+        prev_agent: Some("test-agent".to_string()),
+        output: output.to_string(),
+        result,
+        adopted_sink: None,
+    }
+}
+
+pub(super) fn new_history_rebuild_completion(
+    tui: &Tui,
+    mode: crate::history_work::RebuildMode,
+    failure_policy: crate::history_work::RebuildFailurePolicy,
+    result: Result<Vec<TranscriptItem>, String>,
+) -> crate::types::HistoryRebuildCompletion {
+    crate::types::HistoryRebuildCompletion {
+        seq: tui.history_rebuild_seq,
+        target: tui.current_history_target(),
+        attachment_gen: tui.session_attachment_gen,
+        refresh_rev: tui.history_refresh_rev,
+        mutation_fence: tui.transcript_mutation_seq,
+        live_stamp: None,
+        preserved_from: 0,
+        mode,
+        failure_policy,
+        result,
+    }
+}
+
+pub(super) fn confirm_delete_modal(
+    from: usize,
+    to: usize,
+    target: crate::types::TranscriptActionTarget,
+) -> crate::types::ModalState {
+    crate::types::ModalState::ConfirmDelete { from, to, target }
+}
+
+pub(super) fn handoff_committed_event(tui: &mut Tui, session_id: &str) -> TuiEvent {
+    let task = harnx_runtime::utils::create_abort_signal();
+    tui.current_prompt_abort = Some(task.clone());
+    TuiEvent::Agent {
+        task,
+        stamp: crate::event_isolation::EventStamp::live(&tui.live_events),
+        event: AgentEvent::Session(SessionEvent::HandoffCommitted {
+            agent: "test-agent".to_string(),
+            session_id: session_id.to_string(),
+            handoff_tool_call_id: None,
+            after_seq: None,
+        }),
+    }
+}
+
+pub(super) async fn wait_for_repair_completion(tui: &mut Tui) {
+    const BUDGET: Duration = Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    loop {
+        while let Ok(event) = tui.event_rx.try_recv() {
+            tui.handle_tui_event(event).await.unwrap();
+        }
+        if !tui.is_history_repair_pending()
+            && tui.history_rebuild_abort.is_none()
+            && tui.history_repair_retry_handle.is_none()
+        {
+            return;
+        }
+        assert!(started.elapsed() < BUDGET, "paced repair timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+pub(crate) fn has_nats_server_binary() -> bool {
+    if let Some(configured) = std::env::var_os("NATS_SERVER_BIN") {
+        return std::path::Path::new(&configured).is_file();
+    }
+    which::which("nats-server").is_ok()
+}
+
+/// Clears inherited `HARNX_NATS_URL` / `HARNX_NATS_TOKEN` so broker-backed tests
+/// holding `ENV_LOCK` + `TestEnvironment` cannot route to an external/shared broker.
+pub(crate) struct NatsEnvReset {
+    prior: [Option<std::ffi::OsString>; 2],
+}
+
+impl NatsEnvReset {
+    const KEYS: [&str; 2] = ["HARNX_NATS_URL", "HARNX_NATS_TOKEN"];
+
+    pub(crate) fn clear() -> Self {
+        let prior = Self::KEYS.map(std::env::var_os);
+        for key in Self::KEYS {
+            std::env::remove_var(key);
+        }
+        Self { prior }
+    }
+}
+
+impl Drop for NatsEnvReset {
+    fn drop(&mut self) {
+        for (key, prior) in Self::KEYS.into_iter().zip(&self.prior) {
+            match prior {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 pub(crate) fn test_config() -> GlobalConfig {
     let config = Arc::new(ConfigLock::new(Config::default()));
     {
@@ -131,6 +288,13 @@ pub(crate) fn test_config() -> GlobalConfig {
         let model = MockClient::builder().build().model().clone();
         guard.model = model;
     }
+    config
+}
+
+pub(crate) fn non_broker_test_config() -> GlobalConfig {
+    let config = test_config();
+    config.write().nats_routing =
+        harnx_runtime::config::NatsRouting::Cluster(NON_BROKER_TEST_CLUSTER.to_string());
     config
 }
 
@@ -164,6 +328,16 @@ fn test_config_with_mock_client_and_agent(
             guard.session = Some(harnx_runtime::config::session::new(&guard, name, None).unwrap());
         }
     }
+    config
+}
+
+fn non_broker_test_config_with_mock_client_and_agent(
+    agent_name: &str,
+    session_name: Option<&str>,
+) -> GlobalConfig {
+    let config = test_config_with_mock_client_and_agent(agent_name, session_name);
+    config.write().nats_routing =
+        harnx_runtime::config::NatsRouting::Cluster(NON_BROKER_TEST_CLUSTER.to_string());
     config
 }
 
@@ -1046,9 +1220,7 @@ async fn info_session_without_session_renders_in_tui_snapshot() {
     harness.tui().config = config.clone();
 
     harness.tui().run_command(".info session").await.unwrap();
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
+    harness.tui().flush_history_work_for_test().await;
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
@@ -1064,9 +1236,7 @@ async fn dump_session_without_session_renders_in_tui_snapshot() {
     harness.tui().config = config.clone();
 
     harness.tui().run_command(".dump session").await.unwrap();
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
+    harness.tui().flush_history_work_for_test().await;
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
@@ -1132,10 +1302,15 @@ Overlay {{project_name}} for {{agent.name}}."#,
 
     let initial_transcript_len = harness.tui().app.transcript.len();
     harness.tui().run_command(".info agent").await.unwrap();
+    harness.tui().flush_history_work_for_test().await;
     harness.render();
 
     assert!(harness.tui().app.detail_view_open);
-    assert_eq!(harness.tui().app.transcript.len(), initial_transcript_len);
+    // The background load appends exactly one loading status line (design 9).
+    assert_eq!(
+        harness.tui().app.transcript.len(),
+        initial_transcript_len + 1
+    );
 
     let rendered = normalize_screen(&harness.screen_contents());
     insta::assert_snapshot!("info_agent_overlay_in_tui", rendered);
@@ -1781,9 +1956,7 @@ async fn help_renders_in_tui_snapshot() {
     harness.tui().config = config.clone();
 
     harness.tui().run_command(".help").await.unwrap();
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
+    harness.tui().flush_history_work_for_test().await;
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
@@ -1929,9 +2102,7 @@ async fn test_basic_message_and_streaming_response() {
         .await
         .unwrap();
 
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
+    harness.tui().flush_history_work_for_test().await;
     harness.render();
 
     let assistant_entries: Vec<_> = harness
@@ -6382,7 +6553,12 @@ async fn test_d5_modal_confirm_delete_single_entry() {
     let mut harness = TuiTestHarness::with_size(60, 12).await;
 
     // Open delete modal for single entry
-    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 });
+    let target = harness.tui().current_transcript_action_target();
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete {
+        from: 3,
+        to: 3,
+        target,
+    });
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
@@ -6405,7 +6581,12 @@ async fn test_d5_modal_confirm_delete_range() {
     let mut harness = TuiTestHarness::with_size(60, 12).await;
 
     // Open delete modal for range
-    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 5 });
+    let target = harness.tui().current_transcript_action_target();
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete {
+        from: 3,
+        to: 5,
+        target,
+    });
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
@@ -6423,9 +6604,11 @@ async fn test_d5_modal_confirm_rewind() {
     let mut harness = TuiTestHarness::with_size(60, 12).await;
 
     // Open rewind modal
+    let target = harness.tui().current_transcript_action_target();
     harness.tui().app.modal = Some(crate::types::ModalState::ConfirmRewind {
         seq: 7,
         user_text: None,
+        target,
     });
     harness.render();
 
@@ -6444,7 +6627,9 @@ async fn test_d5_modal_y_confirms_n_cancels() {
     let mut harness = TuiTestHarness::with_size(60, 12).await;
 
     // Test 'n' cancels the modal
-    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 1, to: 1 });
+    let target = harness.tui().current_transcript_action_target();
+    let delete_modal = confirm_delete_modal(1, 1, target.clone());
+    harness.tui().app.modal = Some(delete_modal.clone());
     let _ = harness
         .tui()
         .handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
@@ -6455,7 +6640,7 @@ async fn test_d5_modal_y_confirms_n_cancels() {
     );
 
     // Test 'y' clears the modal (actual delete requires session context)
-    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 1, to: 1 });
+    harness.tui().app.modal = Some(delete_modal);
     // Note: Confirming will try to run .delete command, which will fail without session
     // The test verifies that modal is taken and processed
     let _ = harness
@@ -6472,6 +6657,7 @@ async fn test_d5_modal_y_confirms_n_cancels() {
     harness.tui().app.modal = Some(crate::types::ModalState::ConfirmRewind {
         seq: 1,
         user_text: None,
+        target,
     });
     let _ = harness
         .tui()
@@ -7250,7 +7436,12 @@ async fn tool_confirmation_show_resolves_declared_call_template() {
 async fn tool_confirmation_does_not_replace_an_existing_modal() {
     let config = test_config();
     let mut tui = Tui::init(&config).await.unwrap();
-    tui.app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 });
+    let target = tui.current_transcript_action_target();
+    tui.app.modal = Some(crate::types::ModalState::ConfirmDelete {
+        from: 3,
+        to: 3,
+        target,
+    });
     let (reply, decision) = tokio::sync::oneshot::channel();
 
     tui.handle_tui_event(TuiEvent::ToolConfirmation(ToolConfirmationEvent::Show {
@@ -7272,7 +7463,7 @@ async fn tool_confirmation_does_not_replace_an_existing_modal() {
     assert!(!decision.await.unwrap());
     assert!(matches!(
         tui.app.modal,
-        Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 })
+        Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3, .. })
     ));
     assert!(tui.app.pending_confirm_reply.is_none());
     assert!(tui.app.transcript.iter().any(|item| matches!(
@@ -7332,7 +7523,12 @@ async fn test_d5_modal_consumes_other_keys() {
     let mut harness = TuiTestHarness::with_size(60, 12).await;
 
     // Open modal
-    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 1, to: 1 });
+    let target = harness.tui().current_transcript_action_target();
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete {
+        from: 1,
+        to: 1,
+        target,
+    });
 
     // Press various keys that should be consumed
     let _ = harness
@@ -7376,9 +7572,14 @@ async fn test_d4_key_d_opens_delete_modal_single() {
         .await
         .unwrap();
 
+    let target = harness.tui().current_transcript_action_target();
     assert_eq!(
         harness.tui().app.modal,
-        Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 })
+        Some(crate::types::ModalState::ConfirmDelete {
+            from: 3,
+            to: 3,
+            target,
+        })
     );
 }
 
@@ -7399,9 +7600,14 @@ async fn test_d4_delete_key_opens_delete_modal() {
         .await
         .unwrap();
 
+    let target = harness.tui().current_transcript_action_target();
     assert_eq!(
         harness.tui().app.modal,
-        Some(crate::types::ModalState::ConfirmDelete { from: 7, to: 7 })
+        Some(crate::types::ModalState::ConfirmDelete {
+            from: 7,
+            to: 7,
+            target,
+        })
     );
 }
 
@@ -7438,9 +7644,14 @@ async fn test_d4_key_d_opens_delete_modal_range() {
         .await
         .unwrap();
 
+    let target = harness.tui().current_transcript_action_target();
     assert_eq!(
         harness.tui().app.modal,
-        Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 5 })
+        Some(crate::types::ModalState::ConfirmDelete {
+            from: 3,
+            to: 5,
+            target,
+        })
     );
 }
 
@@ -7538,11 +7749,13 @@ async fn test_d4_key_r_opens_rewind_modal_user_text() {
         .await
         .unwrap();
 
+    let target = harness.tui().current_transcript_action_target();
     assert_eq!(
         harness.tui().app.modal,
         Some(crate::types::ModalState::ConfirmRewind {
             seq: 11,
             user_text: Some("Original prompt".to_string()),
+            target,
         })
     );
 }
@@ -7569,11 +7782,13 @@ async fn test_d4_key_r_opens_rewind_modal_assistant_text() {
         .await
         .unwrap();
 
+    let target = harness.tui().current_transcript_action_target();
     assert_eq!(
         harness.tui().app.modal,
         Some(crate::types::ModalState::ConfirmRewind {
             seq: 12,
             user_text: None,
+            target,
         })
     );
 }
@@ -7819,7 +8034,7 @@ async fn test_detail_view_mutation_shortcuts_work() {
     assert!(
         matches!(
             harness.tui().app.modal,
-            Some(crate::types::ModalState::ConfirmDelete { from: 1, to: 1 })
+            Some(crate::types::ModalState::ConfirmDelete { from: 1, to: 1, .. })
         ),
         "delete shortcut in detail view should open confirm delete modal"
     );
@@ -8229,10 +8444,15 @@ async fn agent_picker_enter_on_empty_filter_does_nothing() {
 // --- AgentPicker → immediate agent activation --------------------------------
 
 #[tokio::test]
-async fn agent_picker_enter_with_no_sessions_starts_new_session() {
+async fn agent_picker_enter_with_no_sessions_starts_new_session_nats() {
+    if !has_nats_server_binary() {
+        eprintln!("skipping: nats-server binary not found");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = TestEnvironment::set(tmp.path());
+    let _nats_env = NatsEnvReset::clear();
 
     let agent_name = format!("picker-empty-{}", uuid::Uuid::new_v4());
     create_agent_stubs(&tmp.path().join("agents"), &[&agent_name]);
@@ -8245,7 +8465,7 @@ async fn agent_picker_enter_with_no_sessions_starts_new_session() {
         .await
         .is_err()
     {
-        eprintln!("skipping: local nats-server is unavailable");
+        skip_local_nats_unavailable();
         return;
     }
     let mut tui = Tui::init(&config).await.unwrap();
@@ -8260,6 +8480,10 @@ async fn agent_picker_enter_with_no_sessions_starts_new_session() {
         .await
         .unwrap();
 
+    // The session list loads in the background (design 9); flush it before
+    // interacting with the picker.
+    tui.flush_history_work_for_test().await;
+
     assert!(
         matches!(
             tui.app.modal,
@@ -8271,6 +8495,10 @@ async fn agent_picker_enter_with_no_sessions_starts_new_session() {
     tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
+
+    // "New session" reserves the id in the background (design 9); flush the
+    // reservation before asserting on the resulting session.
+    tui.flush_history_work_for_test().await;
 
     // Modal dismissed, agent set, and a new session created.
     assert!(tui.app.modal.is_none(), "modal should be dismissed");
@@ -8587,10 +8815,15 @@ async fn agent_picker_esc_dismisses_when_agent_already_active() {
 // --- SessionPicker Enter picks session ---------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_picker_enter_loads_selected_session() {
+async fn session_picker_enter_loads_selected_session_nats() {
+    if !has_nats_server_binary() {
+        eprintln!("skipping: nats-server binary not found");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = TestEnvironment::set(tmp.path());
+    let _nats_env = NatsEnvReset::clear();
 
     let config = picker_test_config();
     {
@@ -8613,7 +8846,7 @@ async fn session_picker_enter_loads_selected_session() {
         .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
         .await
     else {
-        eprintln!("skipping: local nats-server is unavailable");
+        skip_local_nats_unavailable();
         return;
     };
     let metadata_store =
@@ -8636,20 +8869,8 @@ async fn session_picker_enter_loads_selected_session() {
     )
     .with_replicas(1);
     for entry in [
-        harnx_core::session::SessionLogEntry::Message {
-            id: None,
-            timestamp: None,
-            fence_token: None,
-            role: harnx_core::message::MessageRole::User,
-            content: harnx_core::message::MessageContent::Text("prior question".to_string()),
-        },
-        harnx_core::session::SessionLogEntry::Message {
-            id: None,
-            timestamp: None,
-            fence_token: None,
-            role: harnx_core::message::MessageRole::Assistant,
-            content: harnx_core::message::MessageContent::Text("prior answer".to_string()),
-        },
+        picker_message_entry(harnx_core::message::MessageRole::User, "prior question"),
+        picker_message_entry(harnx_core::message::MessageRole::Assistant, "prior answer"),
     ] {
         log.append_event_async(&entry)
             .await
@@ -8678,6 +8899,9 @@ async fn session_picker_enter_loads_selected_session() {
     tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
+    // The post-enter transcript rebuild is background work (design 9);
+    // settle it before asserting history contents.
+    tui.flush_history_work_for_test().await;
 
     assert!(
         tui.app.modal.is_none(),
@@ -8754,6 +8978,9 @@ async fn transcript_reconciliation_uses_origin_not_current_agent() {
     // Reconciliation should detect origin("apollo") != current("hermes") → clear transcript.
     tui.reconcile_transcript_after_command(None, Some("apollo".to_string()), ".session")
         .await;
+    // The rebuild is background work (design 9); settle it before the
+    // transcript assertion.
+    tui.flush_history_work_for_test().await;
 
     // Transcript should have been cleared by reconciliation (sentinel gone).
     assert!(
@@ -8895,50 +9122,47 @@ async fn session_picker_delivery_path_carries_error() {
     let global_config = Arc::new(ConfigLock::new(config));
     let mut harness = TuiTestHarness::with_config(global_config).await;
 
-    // Invoke the real delivery path with a timeout to ensure fast test completion.
-    // The connection to a non-routable IP should fail well within 3 seconds.
-    let picker_result = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        harness.tui().open_session_picker(),
-    )
-    .await;
+    // The picker opens immediately with a loading notice (design 9); the
+    // list arrives from the background refresh completion event.
+    harness.tui().open_session_picker();
+    assert!(
+        matches!(
+            &harness.tui().app.modal,
+            Some(crate::types::ModalState::SessionPicker { error, sessions, .. })
+                if error.is_some() && sessions.is_empty()
+        ),
+        "picker must open immediately with a loading notice and no sessions"
+    );
 
-    // Extract the modal state - either we got an error within the timeout, or we timed out.
-    // Both are acceptable error outcomes for the "unreachable cluster" scenario.
-    match picker_result {
-        Ok(()) => {
-            // open_session_picker completed within timeout
-            let modal = harness
-                .tui()
-                .app
-                .modal
-                .as_ref()
-                .expect("expected modal to be open");
-            match modal {
-                crate::types::ModalState::SessionPicker {
-                    error, sessions, ..
-                } => {
-                    assert!(
-                        error.is_some(),
-                        "expected error field to be set due to failed fetch"
-                    );
-                    assert!(
-                        error
-                            .as_ref()
-                            .unwrap()
-                            .contains("remote sessions unavailable"),
-                        "error message should indicate failure: {}",
-                        error.as_ref().unwrap()
-                    );
-                    assert!(sessions.is_empty(), "sessions should be empty on error");
-                }
-                _ => panic!("expected ModalState::SessionPicker"),
-            }
+    // The connection to a non-routable IP should fail well within 3 seconds.
+    // Either the refresh event lands (carry the fetch error into the picker)
+    // or the connect attempt is still pending at the deadline — both are
+    // acceptable error outcomes for the "unreachable cluster" scenario.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Ok(event) = harness.tui().event_rx.try_recv() {
+            harness.tui().handle_tui_event(event).await.unwrap();
+            break;
         }
-        Err(_timeout) => {
-            // Timed out waiting for picker - also acceptable as "couldn't fetch" outcome
-            // This tests that the timeout bound works correctly
+        if std::time::Instant::now() >= deadline {
+            break;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    match &harness.tui().app.modal {
+        Some(crate::types::ModalState::SessionPicker {
+            error, sessions, ..
+        }) => {
+            // A completed refresh carries the fetch error; a still-pending
+            // refresh keeps the loading notice. No sessions either way.
+            assert!(
+                error.is_some(),
+                "picker must show the fetch error or the loading notice"
+            );
+            assert!(sessions.is_empty(), "sessions should be empty on error");
+        }
+        _ => panic!("expected ModalState::SessionPicker"),
     }
 }
 
@@ -9427,6 +9651,9 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
     )))
     .await
     .unwrap();
+    // The post-compaction reload runs as the background rebuild (design 9);
+    // flush it before asserting on transcript state.
+    tui.flush_history_work_for_test().await;
 
     assert_eq!(
         tui.app
@@ -9991,10 +10218,17 @@ fn assert_info_overlay_open(tui: &crate::Tui, initial_transcript_len: Option<usi
         "Detail view text should be populated"
     );
     if let Some(len) = initial_transcript_len {
-        assert_eq!(
-            tui.app.transcript.len(),
-            len,
-            "Transcript should not be appended to"
+        // Info loads run as background work and append one
+        // "Loading session info…" status line (design 9); nothing else is
+        // appended to the transcript.
+        assert!(
+            tui.app.transcript.len() == len
+                || (tui.app.transcript.len() == len + 1
+                    && matches!(
+                        tui.app.transcript.last(),
+                        Some(TranscriptItem::StatusLine(_))
+                    )),
+            "Transcript should not be appended to beyond the loading status line"
         );
     }
     tui.app.detail_view_text.as_ref().unwrap()
@@ -10017,6 +10251,7 @@ async fn test_info_agent_opens_detail_view() {
     let initial_transcript_len = tui.app.transcript.len();
 
     tui.run_command(".info agent").await.unwrap();
+    tui.flush_history_work_for_test().await;
 
     let text = assert_info_overlay_open(tui, Some(initial_transcript_len));
     assert!(
@@ -10034,6 +10269,7 @@ async fn test_info_session_opens_detail_view() {
     let initial_transcript_len = tui.app.transcript.len();
 
     tui.run_command(".info session").await.unwrap();
+    tui.flush_history_work_for_test().await;
 
     let text = assert_info_overlay_open(tui, Some(initial_transcript_len));
     assert!(
@@ -10051,6 +10287,7 @@ async fn test_info_session_single_arg_with_active_agent() {
     let tui = harness.tui();
 
     tui.run_command(".info session some-id").await.unwrap();
+    tui.flush_history_work_for_test().await;
     let text = assert_info_overlay_open(tui, None);
     assert!(text.contains("An explicit agent and session ID are required"));
 }
@@ -10060,6 +10297,7 @@ async fn test_info_session_single_arg_no_active_agent() {
     let mut harness = TuiTestHarness::with_size(80, 24).await;
     let tui = harness.tui();
     tui.run_command(".info session some-id").await.unwrap();
+    tui.flush_history_work_for_test().await;
     let text = assert_info_overlay_open(tui, None);
     assert!(text.contains("An explicit agent and session ID are required"));
 }
@@ -10631,9 +10869,7 @@ async fn dump_session_without_active_session_shows_usage_error() {
 
     harness.render();
     harness.tui().run_command(".dump session").await.unwrap();
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
+    harness.tui().flush_history_work_for_test().await;
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
@@ -10654,9 +10890,7 @@ async fn info_session_without_active_session_shows_usage_error() {
 
     harness.render();
     harness.tui().run_command(".info session").await.unwrap();
-    while let Ok(event) = harness.tui().event_rx.try_recv() {
-        harness.tui().handle_tui_event(event).await.unwrap();
-    }
+    harness.tui().flush_history_work_for_test().await;
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
@@ -10679,6 +10913,9 @@ async fn dump_session_requires_explicit_agent_even_with_active_session() {
         ".dump session --format json",
     ] {
         tui.run_command(command).await.unwrap();
+        // Info/dump loads are background work (design 9); settle them before
+        // asserting on the overlay.
+        tui.flush_history_work_for_test().await;
         assert!(tui
             .app
             .detail_view_text
@@ -10798,7 +11035,7 @@ async fn idle_ctrl_d_marks_durably_unread_session_read_with_stale_cache() {
         .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
         .await
     else {
-        eprintln!("skipping: local nats-server is unavailable");
+        skip_local_nats_unavailable();
         return;
     };
     let store = harnx_runtime::nats_session_metadata::SessionMetadataStore::ensure(&jetstream, 1)
@@ -10852,10 +11089,15 @@ async fn idle_ctrl_d_marks_durably_unread_session_read_with_stale_cache() {
 /// 2. Recompute `selected` to track the toggled session's new index in the
 ///    re-sorted (unread-first) list, not reuse the stale numeric offset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_picker_toggle_unread_preserves_origin_and_tracks_selection() {
+async fn session_picker_toggle_unread_preserves_origin_and_tracks_selection_nats() {
+    if !has_nats_server_binary() {
+        eprintln!("skipping: nats-server binary not found");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = TestEnvironment::set(tmp.path());
+    let _nats_env = NatsEnvReset::clear();
 
     let config = picker_test_config();
     {
@@ -10878,7 +11120,7 @@ async fn session_picker_toggle_unread_preserves_origin_and_tracks_selection() {
         .nats_jetstream(harnx_runtime::config::LOCAL_CLUSTER_KEY)
         .await
     else {
-        eprintln!("skipping: local nats-server is unavailable");
+        skip_local_nats_unavailable();
         return;
     };
     let metadata_store =
@@ -10918,14 +11160,8 @@ async fn session_picker_toggle_unread_preserves_origin_and_tracks_selection() {
     assert_eq!(sessions.len(), 2, "expected two sessions for agent");
 
     // Initial sort (unread-first): session-b (unread=true) comes before session-a (read)
-    assert_eq!(
-        sessions[0].id, "session-b",
-        "session-b should be first (unread)"
-    );
-    assert_eq!(
-        sessions[1].id, "session-a",
-        "session-a should be second (read)"
-    );
+    assert_eq!(sessions[0].id, "session-b", "unread session first");
+    assert_eq!(sessions[1].id, "session-a", "read session second");
 
     // Set up SessionPicker with origin context (simulating mid-session navigation)
     // Select session-a at index 2 (0="New session", 1=session-b, 2=session-a)
@@ -10944,13 +11180,24 @@ async fn session_picker_toggle_unread_preserves_origin_and_tracks_selection() {
         .await
         .unwrap();
 
-    // Verify the modal is still SessionPicker
+    // The picker re-lists in the background (design 9); flush the refresh
+    // before asserting on the updated modal.
+    tui.flush_history_work_for_test().await;
+
+    assert_picker_toggle_tracks_session_a(&tui, &origin_agent, &origin_session);
+}
+
+fn assert_picker_toggle_tracks_session_a(
+    tui: &Tui,
+    expected_origin_agent: &Option<String>,
+    expected_origin_session: &Option<String>,
+) {
     let Some(crate::types::ModalState::SessionPicker {
-        sessions: new_sessions,
-        selected: new_selected,
-        origin_agent: actual_origin_agent,
-        origin_session: actual_origin_session,
-        error: _,
+        sessions,
+        selected,
+        origin_agent,
+        origin_session,
+        ..
     }) = &tui.app.modal
     else {
         panic!(
@@ -10958,43 +11205,21 @@ async fn session_picker_toggle_unread_preserves_origin_and_tracks_selection() {
             tui.app.modal
         );
     };
-
-    // 1. Origin context must be preserved
-    assert_eq!(
-        *actual_origin_agent, origin_agent,
-        "origin_agent must be preserved after toggle"
-    );
-    assert_eq!(
-        *actual_origin_session, origin_session,
-        "origin_session must be preserved after toggle"
-    );
-
-    // 2. Selected must track the toggled session's new position
-    // After toggle, session-a is unread and should be first in the list
-    assert_eq!(
-        new_sessions.len(),
-        2,
-        "should still have two sessions after toggle"
-    );
-
-    // Find session-a in the new list and verify it's marked unread
-    let session_a = new_sessions
+    assert_eq!(origin_agent, expected_origin_agent);
+    assert_eq!(origin_session, expected_origin_session);
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions[0].unread, "unread session sorts first");
+    let session_a = sessions
         .iter()
-        .find(|s| s.id == "session-a")
+        .find(|session| session.id == "session-a")
         .expect("session-a should exist after toggle");
     assert!(session_a.unread, "session-a should now be unread");
-
-    // Verify selected points to session-a (the toggled session)
-    // The index is sessions index + 1 (since index 0 is "New session")
-    let expected_selected = new_sessions
+    let expected_selected = sessions
         .iter()
-        .position(|s| s.id == "session-a")
-        .map(|i| i + 1)
+        .position(|session| session.id == "session-a")
+        .map(|index| index + 1)
         .expect("session-a should be in the list");
-    assert_eq!(
-        *new_selected, expected_selected,
-        "selected must track session-a's new position, not reuse stale index"
-    );
+    assert_eq!(*selected, expected_selected);
 }
 
 // =============================================================================

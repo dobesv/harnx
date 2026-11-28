@@ -3,7 +3,7 @@
 mod append_status;
 pub(crate) use append_status::AppendStatus;
 
-use super::GlobalConfig;
+use super::{Config, GlobalConfig};
 use crate::nats_session_metadata::{
     SessionMetadata, SessionOverrideUpdate, SessionOverrides, SessionPropertiesUpdate,
 };
@@ -252,7 +252,38 @@ pub(crate) fn active_session_sink(
     detached_sink(session)
 }
 
+/// The active session's canonical storage key and persistence sink, if one
+/// is currently installed.
+pub fn active_session_sink_with_storage_key(
+    config: &GlobalConfig,
+) -> Option<(String, Arc<dyn SessionAppendSink>)> {
+    let guard = config.read();
+    let session = guard.session.as_ref()?;
+    let sink = detached_sink(session)?;
+    Some((session.storage_key(), sink))
+}
+
+/// Install `sink` onto the active session when it is still sinkless and
+/// matches `expected_storage_key`. Never overwrites an existing handle.
+// qual:allow(iosp) reason: "writes sink only after checking storage-key match and sinkless precondition under one write guard"
+pub fn install_session_sink_if_missing(
+    config: &GlobalConfig,
+    expected_storage_key: &str,
+    sink: Arc<dyn SessionAppendSink>,
+) -> bool {
+    let mut guard = config.write();
+    let Some(session) = guard.session.as_mut() else {
+        return false;
+    };
+    if session.storage_key() != expected_storage_key || session.runtime.is_some() {
+        return false;
+    }
+    session.runtime = Some(Arc::new(sink));
+    true
+}
+
 /// A title and how it was chosen, as [`record_title`] persists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TitleRecord {
     pub title: String,
     /// Set by the user. A manual title stops automatic regeneration.
@@ -261,34 +292,239 @@ pub struct TitleRecord {
     pub tokens: usize,
 }
 
-/// Persist canonical title metadata for session `session_id`, then set the
-/// in-memory title if that session is still the active one. Returns whether
-/// the in-memory title was set.
-///
-/// Call it without holding a config guard. It takes one only to find the
-/// sink and again to set the title, and writes the metadata in between with
-/// neither held. Two title writes to one config never overlap here:
-/// background titles run only where the agent loop runs, a worker's
-/// per-session config, and are single-flight through the session's
-/// `titling` flag, while front-end commands (`.set title`, `.title
-/// generate`) run one at a time on the front end's own config.
-pub fn record_title(config: &GlobalConfig, session_id: &str, record: TitleRecord) -> Result<bool> {
+/// A title write's full destination, captured under one config read so a
+/// concurrent `.session` switch can never mix record and destination state:
+/// the session's id and storage key, the cluster its broker connection
+/// resolves through, a routing snapshot for the broker acquisition, and
+/// the exact persistence sink if one is installed. The short session id
+/// alone is not an identity — different agents or clusters can reuse it
+/// while targeting different storage keys.
+#[derive(Clone)]
+pub struct TitleWriteTarget {
+    session_id: String,
+    storage_key: String,
+    cluster: String,
+    routing: Config,
+    sink: Option<Arc<dyn SessionAppendSink>>,
+}
+
+impl TitleWriteTarget {
+    /// Whether the captured sink exists. The sink-free case is the
+    /// pre-first-turn session; a durable write then has to obtain its own
+    /// broker connection.
+    pub(crate) fn has_sink(&self) -> bool {
+        self.sink.is_some()
+    }
+
+    pub fn matches_config(&self, config: &Config) -> bool {
+        title_target_still_active(config, self)
+    }
+}
+
+/// The cluster a session's broker traffic resolves through: the remote
+/// agent's cluster when one is selected, the default cluster otherwise.
+fn active_cluster(config: &Config) -> &str {
+    config
+        .remote_agent
+        .as_ref()
+        .map(|(_, cluster)| cluster.as_str())
+        .unwrap_or_else(|| config.default_cluster_key())
+}
+
+/// Whether `target` is still the active session, by full identity rather
+/// than short id: id, storage key, cluster, and active agent ref must all
+/// match. A same-id switch to a different agent or cluster fails this fence,
+/// so a stale completion can neither retitle another session's memory nor
+/// report success for it.
+fn title_target_still_active(config: &Config, target: &TitleWriteTarget) -> bool {
+    config.session.as_ref().is_some_and(|session| {
+        session.id == target.session_id
+            && session.storage_key() == target.storage_key
+            && active_cluster(config) == target.cluster
+            && config.active_agent_ref() == target.routing.active_agent_ref()
+    })
+}
+
+fn build_title_target(config: &Config, session: &Session) -> TitleWriteTarget {
+    TitleWriteTarget {
+        session_id: session.id.clone(),
+        storage_key: session.storage_key(),
+        cluster: active_cluster(config).to_string(),
+        routing: config.clone(),
+        sink: detached_sink(session),
+    }
+}
+
+/// Capture the title destination and active session token count atomically
+/// under one config read. Returns `None` when no session is active.
+pub(crate) fn capture_active_title_target(
+    config: &GlobalConfig,
+) -> Option<(TitleWriteTarget, usize)> {
+    let guard = config.read();
+    let session = guard.session.as_ref()?;
+    Some((build_title_target(&guard, session), session.tokens))
+}
+
+/// Capture the title destination for `session_id` atomically: one guard
+/// covers identity, routing, and sink, so the probe and the write can never
+/// observe different sessions. Returns `None` when `session_id` is not the
+/// active session.
+pub fn capture_title_target(config: &GlobalConfig, session_id: &str) -> Option<TitleWriteTarget> {
+    let guard = config.read();
+    let session = guard
+        .session
+        .as_ref()
+        .filter(|session| session.id == session_id)?;
+    Some(build_title_target(&guard, session))
+}
+
+/// Persist a title through an already-captured destination, then apply the
+/// fenced in-memory update. The captured sink is used exactly once; a
+/// session replaced between capture and completion never receives the
+/// write, the memory update, or a success report.
+pub fn record_title_captured(
+    config: &GlobalConfig,
+    target: TitleWriteTarget,
+    record: TitleRecord,
+) -> Result<bool> {
     let TitleRecord {
         title,
         manual,
         tokens,
     } = record;
-    if let Some(sink) = active_session_sink(config, Some(session_id)) {
+    if let Some(sink) = &target.sink {
         sink.persist_title(&title, manual, tokens)
             .context("failed to durably persist session title")?;
     }
-    let mut guard = config.write();
-    let Some(session) = guard.session.as_mut().filter(|s| s.id == session_id) else {
+    Ok(apply_recorded_title(config, &target, title, manual, tokens))
+}
+
+/// Persist canonical title metadata for session `session_id`, then set the
+/// in-memory title if that session is still the active one. Returns whether
+/// the in-memory title was set.
+///
+/// Call it without holding a config guard. It captures the destination
+/// under one short read and drops the guard before persisting; the sink's
+/// methods are NATS round trips, and the config lock must never be held
+/// across one. Two title writes to one config never overlap here:
+/// background titles run only where the agent loop runs, a worker's
+/// per-session config, and are single-flight through the session's
+/// `titling` flag, while front-end commands (`.set title`, `.title
+/// generate`) run one at a time on the front end's own config.
+pub fn record_title(config: &GlobalConfig, session_id: &str, record: TitleRecord) -> Result<bool> {
+    let Some(target) = capture_title_target(config, session_id) else {
         return Ok(false);
     };
-    session.set_title(title);
-    session.set_title_last_updated_tokens(if manual { usize::MAX } else { tokens });
-    Ok(true)
+    record_title_captured(config, target, record)
+}
+
+/// Durable manual-title write against an already-captured destination
+/// (`TitleWriteTarget`), covering both installed-sink and pre-first-turn
+/// (sink-less) sessions. Rejects stale targets before any persistence or
+/// broker connection, never recaptures live selection, and fences the
+/// in-memory update on `target` still being active.
+pub async fn record_title_durably(
+    config: &GlobalConfig,
+    target: TitleWriteTarget,
+    record: TitleRecord,
+    abort: Option<&crate::utils::AbortSignal>,
+) -> Result<bool> {
+    if abort.is_some_and(|signal| signal.aborted()) {
+        anyhow::bail!("session title write cancelled");
+    }
+    if !target.matches_config(&config.read()) {
+        return Ok(false);
+    }
+    if let Some(sink) = &target.sink {
+        // The sink captured before any await: a session switch during the
+        // round trip cannot redirect the write to another session's log.
+        sink.persist_title(&record.title, record.manual, record.tokens)
+            .context("failed to durably persist session title")?;
+    } else {
+        let persist = persist_title_without_sink(
+            &target.routing,
+            &target.cluster,
+            &target.storage_key,
+            &record,
+            abort,
+        );
+        // Remote endpoint connect is not abort-aware; race the whole explicit
+        // write against the caller's signal like the read-only history loader.
+        match abort {
+            Some(abort) => {
+                tokio::select! {
+                    biased;
+                    _ = harnx_core::abort::wait_abort_signal(abort) =>
+                        anyhow::bail!("session title write cancelled"),
+                    result = persist => result?,
+                }
+            }
+            None => persist.await?,
+        }
+    }
+    Ok(apply_recorded_title(
+        config,
+        &target,
+        record.title,
+        record.manual,
+        record.tokens,
+    ))
+}
+
+async fn persist_title_without_sink(
+    routing: &Config,
+    cluster: &str,
+    storage_key: &str,
+    record: &TitleRecord,
+    abort: Option<&crate::utils::AbortSignal>,
+) -> Result<()> {
+    let (server, client) = routing.resolve_nats_connection(cluster, abort).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = crate::nats_session_metadata::SessionMetadataStore::ensure(
+        &jetstream,
+        server.resolved_replicas(),
+    )
+    .await
+    .context("failed to open canonical session metadata store")?;
+    store
+        .patch(storage_key, |metadata| {
+            metadata.title.value = Some(record.title.clone());
+            metadata.title.manual = record.manual;
+            metadata.title.last_updated_tokens = record.tokens;
+            Ok(())
+        })
+        .await
+        .context("failed to durably persist session title")?;
+    Ok(())
+}
+
+/// Fenced in-memory half of a title write: the title lands only when the
+/// active session still matches the captured full target (id, storage key,
+/// cluster), so a session switch between the durable write and this step
+/// never retitles the wrong session — including a replacement that reuses
+/// the same short session id.
+fn apply_recorded_title(
+    config: &GlobalConfig,
+    target: &TitleWriteTarget,
+    title: String,
+    manual: bool,
+    tokens: usize,
+) -> bool {
+    let mut guard = config.write();
+    if !title_target_still_active(&guard, target) {
+        return false;
+    }
+    // `still_active` only passes with a session installed; the `None` arm is
+    // that unreachable case, reported like a fence failure rather than a
+    // panic.
+    match guard.session.as_mut() {
+        Some(session) => {
+            session.set_title(title);
+            session.set_title_last_updated_tokens(if manual { usize::MAX } else { tokens });
+            true
+        }
+        None => false,
+    }
 }
 
 pub fn session_overrides(session: &Session) -> Result<SessionOverrides> {

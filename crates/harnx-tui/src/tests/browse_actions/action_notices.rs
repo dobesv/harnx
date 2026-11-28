@@ -101,19 +101,22 @@ async fn assert_browse_action(case: &BrowseActionCase) {
             );
         }
         ExpectedOutcome::DeleteModal { from, to } => {
+            let target = harness.tui().current_transcript_action_target();
             assert_eq!(
                 harness.tui().app.modal,
-                Some(crate::types::ModalState::ConfirmDelete { from, to }),
+                Some(crate::types::ModalState::ConfirmDelete { from, to, target }),
                 "case: {}",
                 case.description
             );
         }
         ExpectedOutcome::RewindModal { seq } => {
+            let target = harness.tui().current_transcript_action_target();
             assert_eq!(
                 harness.tui().app.modal,
                 Some(crate::types::ModalState::ConfirmRewind {
                     seq,
-                    user_text: None
+                    user_text: None,
+                    target,
                 }),
                 "case: {}",
                 case.description

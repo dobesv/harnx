@@ -686,7 +686,12 @@ async fn ctrl_c_while_reading_keeps_interruption_semantics() {
 async fn other_modal_kinds_keep_their_existing_esc_behavior() {
     let mut tui = fresh_tui().await;
     tui.app.transcript.push(user_item("row"));
-    tui.app.modal = Some(ModalState::ConfirmDelete { from: 1, to: 1 });
+    let target = tui.current_transcript_action_target();
+    tui.app.modal = Some(ModalState::ConfirmDelete {
+        from: 1,
+        to: 1,
+        target,
+    });
     tui.handle_key(esc()).await.unwrap();
     assert!(tui.app.modal.is_none(), "ConfirmDelete dismissed as before");
     assert!(

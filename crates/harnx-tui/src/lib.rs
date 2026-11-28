@@ -12,6 +12,7 @@ mod cancellation;
 mod event_isolation;
 pub mod event_source;
 mod exit_confirmation;
+mod history_work;
 pub mod hyperlink;
 pub mod input;
 mod input_attachments;

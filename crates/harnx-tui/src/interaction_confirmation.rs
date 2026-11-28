@@ -193,6 +193,17 @@ impl Tui {
         self.present_child_confirmation();
     }
 
+    #[cfg(test)]
+    pub(crate) fn current_interaction_generation_for_test(&self) -> (Option<&str>, u64) {
+        (
+            self.interactions
+                .target
+                .as_ref()
+                .map(|(sid, _)| sid.as_str()),
+            self.interactions.generation,
+        )
+    }
+
     pub(super) fn handle_interaction_event(&mut self, event: InteractionEvent) {
         match event {
             InteractionEvent::ChildDecided {
