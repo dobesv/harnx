@@ -64,6 +64,8 @@ mod nats_session_metadata;
 mod nats_session_metadata_stale_replica;
 mod nats_session_properties;
 mod nats_session_stream_identity;
+mod nats_session_title_persistence;
+mod nats_session_title_target_fencing;
 mod nats_tool_confirmation;
 mod nats_tool_provider;
 mod nats_worker;

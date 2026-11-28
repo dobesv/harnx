@@ -6,4 +6,5 @@ mod initialization;
 mod lock_free_persistence;
 mod rendering;
 mod session_persistence;
+mod title_target_ownership_tests;
 mod tool_selection;

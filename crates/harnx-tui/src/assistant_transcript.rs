@@ -73,9 +73,9 @@ pub(super) fn refresh_assistant_links<'a>(
     transcript: &mut Vec<TranscriptItem>,
     index: usize,
     tracked: impl IntoIterator<Item = &'a mut Option<usize>>,
-) {
+) -> bool {
     let Some(TranscriptItem::AssistantText { text, .. }) = transcript.get(index) else {
-        return;
+        return false;
     };
     let mut links = Vec::new();
     crate::lifecycle::append_markdown_links(&mut links, text);
@@ -85,12 +85,26 @@ pub(super) fn refresh_assistant_links<'a>(
             .iter()
             .take_while(|item| matches!(item, TranscriptItem::MarkdownLink { .. }))
             .count();
+    let unchanged = transcript[start..end].len() == links.len()
+        && transcript[start..end].iter().zip(&links).all(|(a, b)| {
+            matches!(
+                (a, b),
+                (
+                    TranscriptItem::MarkdownLink { text: t1, url: u1 },
+                    TranscriptItem::MarkdownLink { text: t2, url: u2 }
+                ) if t1 == t2 && u1 == u2
+            )
+        });
+    if unchanged {
+        return false;
+    }
     for tracked in tracked.into_iter().flatten() {
         *tracked = rebase_link_index(*tracked, index, &transcript[start..end], &links);
     }
     // Refresh only this assistant's contiguous links. Repeated boundaries and
     // canonical finals replace the block instead of accumulating duplicates.
     transcript.splice(start..end, links);
+    true
 }
 
 fn rebase_link_index(

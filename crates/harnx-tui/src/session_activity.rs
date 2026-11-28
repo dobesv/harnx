@@ -22,6 +22,25 @@ impl Tui {
         Ok(())
     }
 
+    pub(super) fn handle_session_stream_attached(
+        &mut self,
+        observation: SessionObservation,
+        _active: bool,
+    ) {
+        if !observation.accepts(self) {
+            return;
+        }
+        let reconnected = self.session_stream_attached || self.session_attachment_gen == 0;
+        if reconnected {
+            self.session_attachment_gen = self.session_attachment_gen.saturating_add(1);
+        }
+        self.session_stream_attached = true;
+        if self.is_history_repair_pending() && (reconnected || self.history_rebuild_abort.is_none())
+        {
+            self.schedule_history_repair();
+        }
+    }
+
     pub(super) async fn handle_session_activity(
         &mut self,
         observation: SessionObservation,
@@ -108,29 +127,7 @@ impl Tui {
     /// pending-interaction regressions can exercise the real refresh path
     /// (review B1/B2), not only the normalization helper.
     pub(crate) async fn refresh_shared_session_transcript(&mut self, stamp: &EventStamp) {
-        let transcript = crate::lifecycle::session_history_transcript_items(&self.config).await;
-        if !stamp.allows(&self.live_events) {
-            return;
-        }
-        self.app.transcript = transcript;
-        self.app.streaming_open = false;
-        self.app.main_streamed_text_idx = None;
-        self.app.streamed_text_idx = None;
-        self.app.last_ui_output_source = None;
-        // The rebuilt transcript invalidates the browse selection: leaving
-        // transcript_browsing set with no focus strands the user in a browse
-        // mode whose action keys only show "Nothing selected" notices.
-        self.app.transcript_browsing = false;
-        self.app.transcript_focus = None;
-        self.app.transcript_selection_anchor = None;
-        self.subagent_rows_dirty = true;
-        self.pin_transcript_to_bottom();
-        // While a confirmation is pending, keep independently loaded read
-        // views alive across the rebuild and restore the guarded tray when
-        // none survives (binding review clarification).
-        if self.interaction_pending() {
-            self.normalize_reading_after_transcript_rebuild();
-        }
+        self.schedule_shared_session_refresh(stamp);
     }
 
     pub(super) async fn handle_turn_activity(
@@ -187,6 +184,8 @@ impl Tui {
         }
 
         self.stop_session_activity_monitor();
+        self.session_attachment_gen = self.session_attachment_gen.saturating_add(1);
+        self.session_stream_attached = false;
         self.session_activity_target = desired.clone();
         self.session_activity_handle = desired.map(|target| {
             self.live_events = self.live_events.fork();
@@ -199,7 +198,7 @@ impl Tui {
         });
     }
 
-    fn stop_session_activity_monitor(&mut self) {
+    pub(super) fn stop_session_activity_monitor(&mut self) {
         if let Some(handle) = self.session_activity_handle.take() {
             handle.abort();
         }
@@ -247,48 +246,25 @@ impl Tui {
     }
 
     async fn refresh_session_picker_for_read_invalidation(&mut self) {
-        let (selected, origin_agent, origin_session) = {
-            let Some(ModalState::SessionPicker {
-                selected,
-                origin_agent,
-                origin_session,
-                ..
-            }) = &self.app.modal
-            else {
-                return;
-            };
-            (*selected, origin_agent.clone(), origin_session.clone())
-        };
-        let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
-        self.app.modal = Some(ModalState::SessionPicker {
-            sessions,
-            selected,
-            origin_agent,
-            origin_session,
-            error: fetch_error,
-        });
+        if !matches!(self.app.modal, Some(ModalState::SessionPicker { .. })) {
+            return;
+        }
+        // The re-list can wait on managed-local acquisition; run it as
+        // cancellable background work (design 9). The completion updates the
+        // still-open picker in place.
+        self.spawn_picker_sessions_refresh();
     }
 
     pub(super) async fn handle_refresh_session_list(&mut self) {
-        let modal = self.app.modal.take();
-        let Some(crate::types::ModalState::SessionPicker {
-            selected,
-            origin_agent,
-            origin_session,
-            ..
-        }) = modal
-        else {
+        if !matches!(
+            self.app.modal,
+            Some(crate::types::ModalState::SessionPicker { .. })
+        ) {
             return;
-        };
-
-        let (sessions, fetch_error) = Self::picker_sessions(&self.config).await;
-        self.app.modal = Some(crate::types::ModalState::SessionPicker {
-            sessions,
-            selected,
-            origin_agent,
-            origin_session,
-            error: fetch_error,
-        });
+        }
+        // Same background refresh as the read-invalidation path: the periodic
+        // reconcile event never blocks the event loop on the broker.
+        self.spawn_picker_sessions_refresh();
     }
 }
 
@@ -297,6 +273,8 @@ impl Drop for Tui {
         self.clear_tool_confirmation_route();
         self.stop_session_activity_monitor();
         self.stop_subagent_monitors();
+        self.cancel_inflight_history_rebuild();
+        self.abort_history_repair_retry();
     }
 }
 
@@ -317,6 +295,7 @@ mod tests {
         let stamp = crate::event_isolation::EventStamp::live(&tui.live_events);
 
         tui.refresh_shared_session_transcript(&stamp).await;
+        tui.flush_history_work_for_test().await;
 
         assert!(!tui.app.transcript_browsing);
         assert_eq!(tui.app.transcript_focus, None);

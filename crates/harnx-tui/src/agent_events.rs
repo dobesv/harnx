@@ -1,6 +1,5 @@
 //! Project agent events, streaming replies and compaction outcomes into the transcript.
 
-use crate::lifecycle::session_history_transcript_items;
 use crate::strip_ansi;
 use crate::tool_transcript::{
     blocked_tool_to_transcript_items, tool_completed_to_transcript_items,
@@ -82,6 +81,7 @@ impl Tui {
         self.app
             .transcript
             .push(TranscriptItem::ThoughtText(text.trim().to_string()));
+        self.note_live_transcript_mutation();
     }
 
     #[cfg(test)]
@@ -96,7 +96,16 @@ impl Tui {
             )],
             SessionEvent::CompactingCompleted { outcome, .. } => match outcome {
                 harnx_core::session::CompactOutcome::Compacted => {
-                    self.rebuild_transcript_after_compaction().await;
+                    // Normal completion — reload the transcript. The load can
+                    // wait on managed-local acquisition, so it must not run
+                    // inline on the event loop: route it through the unified
+                    // background rebuild (design 9). `ReplaceAll` keeps
+                    // compaction's authoritative semantics — the loaded view
+                    // replaces the transcript — while the rebuild's seq/target
+                    // fencing still discards stale completions. If reload fails,
+                    // preserve pre-compaction rows as stale/non-actionable,
+                    // surface the reload error, and arm paced repair.
+                    self.schedule_compaction_history_rebuild();
                     vec![]
                 }
                 harnx_core::session::CompactOutcome::Unchanged(reason) => {
@@ -130,39 +139,6 @@ impl Tui {
         }
     }
 
-    /// Reload the transcript after a compaction completed. The transcript is
-    /// entirely rebuilt, so any prior focus/anchor indices reference
-    /// now-different items even when still in bounds.
-    async fn rebuild_transcript_after_compaction(&mut self) {
-        self.app.transcript = session_history_transcript_items(&self.config).await;
-        self.subagent_rows_dirty = true;
-        self.app.streaming_open = false;
-        // A compaction can land mid-turn after some assistant text has
-        // already streamed. The rebuild drops the parent streamed row, so its
-        // replacement index must also be cleared before the eventual Final event.
-        self.app.main_streamed_text_idx = None;
-        self.app.streamed_text_idx = None;
-        // The rebuild drops all SourceHeading entries, so the next
-        // output must re-emit its heading even if it shares the prior
-        // source. Without this, the first post-compaction message would
-        // render without an agent label.
-        self.app.last_ui_output_source = None;
-        self.app.transcript_focus = None;
-        self.app.transcript_selection_anchor = None;
-        // A compaction rebuilds the transcript, so a browse selection can
-        // only be stale. Clear the flag too, regardless of a pending modal:
-        // a surviving flag with no row would later route arrow keys into
-        // the hidden composer (review B2).
-        self.app.transcript_browsing = false;
-        // While a confirmation is pending, the rebuild must not strand a read
-        // view whose root rows vanished: keep independently loaded views,
-        // restore the tray otherwise.
-        if self.interaction_pending() {
-            self.normalize_reading_after_transcript_rebuild();
-        }
-        self.pin_transcript_to_bottom();
-    }
-
     fn clear_pending_tool_seq_on_turn_end(&mut self, event: &AgentEvent, is_sub_agent: bool) {
         // A finished turn has no more tool calls to bind. Don't let a pending
         // seq leak into a later round.
@@ -173,6 +149,19 @@ impl Tui {
             )
         {
             self.app.pending_tool_seq = None;
+        }
+    }
+
+    fn note_rendered_event_mutation(
+        &mut self,
+        event: &AgentEvent,
+        has_entries: bool,
+        is_thought: bool,
+    ) {
+        let mutates_inline = matches!(event, AgentEvent::Model(_) | AgentEvent::Tool(_));
+        let is_notice = matches!(event, AgentEvent::Notice(_));
+        if !is_notice && (has_entries || is_thought || mutates_inline) {
+            self.note_live_transcript_mutation();
         }
     }
 
@@ -202,10 +191,11 @@ impl Tui {
         }
         self.render_ui_output_heading(source.as_ref());
         let entries = self
-            .project_agent_event(event, source.as_ref(), is_sub_agent)
+            .project_agent_event(event.clone(), source.as_ref(), is_sub_agent)
             .await;
         let has_entries = !entries.is_empty();
         self.app.transcript.extend(entries);
+        self.note_rendered_event_mutation(&event, has_entries, is_thought);
         if has_entries || is_thought {
             self.pin_transcript_to_bottom();
         }
@@ -470,13 +460,15 @@ impl Tui {
     pub(super) fn close_assistant_stream(&mut self) {
         if self.app.streaming_open {
             if let Some(index) = self.app.streamed_text_idx {
-                self.refresh_root_assistant_links(index);
+                if self.refresh_root_assistant_links(index) {
+                    self.note_live_transcript_mutation();
+                }
             }
             self.app.streaming_open = false;
         }
     }
 
-    fn refresh_root_assistant_links(&mut self, index: usize) {
+    fn refresh_root_assistant_links(&mut self, index: usize) -> bool {
         crate::assistant_transcript::refresh_assistant_links(
             &mut self.app.transcript,
             index,
@@ -486,7 +478,7 @@ impl Tui {
                 &mut self.app.main_streamed_text_idx,
                 &mut self.app.streamed_text_idx,
             ],
-        );
+        )
     }
 
     pub(super) async fn finish_main_prompt_error(&mut self, err: String) {
@@ -499,6 +491,7 @@ impl Tui {
         self.app.streamed_text_idx = None;
         self.app.last_ui_output_source = None;
         self.app.transcript.push(TranscriptItem::ErrorText(err));
+        self.note_live_transcript_mutation();
         if self
             .current_prompt_abort
             .as_ref()
@@ -523,6 +516,7 @@ impl Tui {
             self.app.transcript.push(TranscriptItem::SystemText(
                 "Queued message not sent due to error. Press Enter to retry.".to_string(),
             ));
+            self.note_live_transcript_mutation();
         }
         self.pin_transcript_to_bottom();
         self.refresh_input_chrome();

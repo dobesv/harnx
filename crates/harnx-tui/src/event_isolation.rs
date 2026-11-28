@@ -99,25 +99,10 @@ impl Tui {
             TuiEvent::Agent { task, stamp, event } => {
                 self.handle_prompt_agent_event(task, stamp, event).await;
             }
-            TuiEvent::SessionActivity {
-                historical,
-                stamp,
-                session_id,
-                cluster,
-                active,
-            } => {
-                self.on_session_activity(historical, stamp, session_id, cluster, active)
-                    .await;
-            }
-            TuiEvent::SessionAgent {
-                stamp,
-                historical,
-                session_id,
-                cluster,
-                event,
-            } => {
-                self.on_shared_session_agent(historical, stamp, session_id, cluster, event)
-                    .await;
+            event @ (TuiEvent::SessionStreamAttached { .. }
+            | TuiEvent::SessionActivity { .. }
+            | TuiEvent::SessionAgent { .. }) => {
+                self.handle_shared_session_event(event).await;
             }
             TuiEvent::SubAgentSessionSnapshot { key, snapshot } => {
                 self.handle_subagent_snapshot(key, snapshot);
@@ -138,8 +123,61 @@ impl Tui {
             event @ (TuiEvent::SessionReadInvalidation { .. } | TuiEvent::RefreshSessionList) => {
                 self.handle_session_refresh_event(event).await;
             }
+            event @ (TuiEvent::HistoryRebuildFinished(_)
+            | TuiEvent::HistoryRepairRetryDue { .. }
+            | TuiEvent::HistoryCommandFinished { .. }
+            | TuiEvent::TitleRenameFinished { .. }) => {
+                self.handle_history_event(event).await;
+            }
+            event @ (TuiEvent::PickerSessionsLoaded { .. }
+            | TuiEvent::NewSessionReserved { .. }
+            | TuiEvent::NewSessionReservationFailed { .. }
+            | TuiEvent::PickerUnreadToggleFinished { .. }
+            | TuiEvent::InfoOverlayLoaded { .. }) => {
+                self.handle_background_work_event(event).await;
+            }
         }
         Ok(())
+    }
+
+    /// Shared-session advisories arrive as one family of struct variants;
+    /// dispatch keeps this inner match so the outer event dispatch stays a
+    /// thin (type-erasure-safe) table.
+    async fn handle_shared_session_event(&mut self, event: TuiEvent) {
+        match event {
+            TuiEvent::SessionStreamAttached {
+                stamp,
+                session_id,
+                cluster,
+                active,
+            } => {
+                self.handle_session_stream_attached(
+                    session_observation(true, stamp, session_id, cluster),
+                    active,
+                );
+            }
+            TuiEvent::SessionActivity {
+                historical,
+                stamp,
+                session_id,
+                cluster,
+                active,
+            } => {
+                self.on_session_activity(historical, stamp, session_id, cluster, active)
+                    .await;
+            }
+            TuiEvent::SessionAgent {
+                stamp,
+                historical,
+                session_id,
+                cluster,
+                event,
+            } => {
+                self.on_shared_session_agent(historical, stamp, session_id, cluster, event)
+                    .await;
+            }
+            _ => {}
+        }
     }
 
     /// Fold the activity arm's payload into the observation record its

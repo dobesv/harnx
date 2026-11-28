@@ -8,11 +8,11 @@ use harnx_nats_common::connect::{
     HARNX_NATS_TLS_CERT_ENV, HARNX_NATS_TLS_ENV, HARNX_NATS_TLS_KEY_ENV,
 };
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, path::Path, sync::OnceLock};
+use std::{borrow::Cow, path::Path};
 
-static LOCAL_NATS_SERVER: OnceLock<
-    tokio::sync::Mutex<Option<crate::nats_local_server::LocalBroker>>,
-> = OnceLock::new();
+use crate::nats_local_server::{connect_local_broker, LocalBrokerStatus};
+
+type ResolvedNatsConnection<'a> = (Cow<'a, NatsServerConfig>, async_nats::Client);
 
 /// Runtime role controlling the default NATS route for front-ends.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -95,21 +95,12 @@ impl NatsServerConfig {
 
 /// Resolve the shared auto-managed plaintext broker without consulting operator env.
 pub(crate) async fn resolve_managed_local_nats_server_config() -> Result<NatsServerConfig> {
-    let manager = LOCAL_NATS_SERVER.get_or_init(|| tokio::sync::Mutex::new(None));
-    let mut managed_server = manager.lock().await;
-    let needs_refresh = match managed_server.as_mut() {
-        Some(server) => !server.is_running(),
-        None => true,
-    };
-    if needs_refresh {
-        managed_server.take();
-        *managed_server = Some(crate::nats_local_server::LocalBroker::start().await?);
-    }
-    let server = managed_server
-        .as_ref()
-        .expect("local NATS server initialized above")
-        .status();
-    Ok(NatsServerConfig {
+    let (_, server, _) = connect_local_broker(None).await?;
+    Ok(managed_local_config(server))
+}
+
+fn managed_local_config(server: LocalBrokerStatus) -> NatsServerConfig {
+    NatsServerConfig {
         user_id: None,
         name: LOCAL_CLUSTER_KEY.to_string(),
         url: server.url,
@@ -121,7 +112,7 @@ pub(crate) async fn resolve_managed_local_nats_server_config() -> Result<NatsSer
         tls_ca: None,
         ignore_discovered_servers: None,
         agents: vec![],
-    })
+    }
 }
 
 /// Resolve connection details for the reserved shared-local cluster.
@@ -353,15 +344,71 @@ impl Config {
         cluster_key: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<async_nats::Client>> + Send + 'a>>
     {
+        self.nats_client_with_abort(cluster_key, None)
+    }
+
+    /// Open a client with optional wait-only cancellation. Managed-local
+    /// acquisition and recovery remain owned by the process broker scope.
+    pub fn nats_client_with_abort<'a>(
+        &'a self,
+        cluster_key: &'a str,
+        abort: Option<&'a AbortSignal>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<async_nats::Client>> + Send + 'a>>
+    {
         Box::pin(async move {
+            let (_, client) = self.resolve_nats_connection(cluster_key, abort).await?;
+            Ok(client)
+        })
+    }
+
+    // Keep async-nats's dial future out of the frame of session creation and
+    // other callers. Those paths run on small worker stacks in debug builds.
+    pub(crate) fn resolve_nats_connection<'a>(
+        &'a self,
+        cluster_key: &'a str,
+        abort: Option<&'a AbortSignal>,
+    ) -> futures_util::future::BoxFuture<'a, Result<ResolvedNatsConnection<'a>>> {
+        Box::pin(async move {
+            if let Some((config, client)) = self.prepare_managed_local(cluster_key, abort).await? {
+                return Ok((Cow::Owned(config), client));
+            }
+            // Named clusters and explicit worker handoffs keep their original
+            // connection behavior, including on resume after a turn abort.
             let server = self.resolve_nats_server(cluster_key).await?;
-            Self::connect_nats_server(&server).await.with_context(|| {
+            let client = Self::connect_nats_server(&server).await.with_context(|| {
                 format!(
                     "Failed to connect to NATS cluster '{}' at '{}'",
                     cluster_key, server.url
                 )
-            })
+            })?;
+            Ok((server, client))
         })
+    }
+
+    /// Acquire an authenticated client before a bounded operation. Pass this
+    /// same client into the operation so there is no second readiness race.
+    /// Named clusters and explicit worker handoffs keep their original budget.
+    pub(super) async fn prepare_managed_local(
+        &self,
+        cluster: &str,
+        abort: Option<&AbortSignal>,
+    ) -> Result<Option<(NatsServerConfig, async_nats::Client)>> {
+        if cluster != LOCAL_CLUSTER_KEY || !self.uses_managed_local() {
+            return Ok(None);
+        }
+        let (_, server, client) = connect_local_broker(abort).await?;
+        Ok(Some((managed_local_config(server), client)))
+    }
+
+    fn uses_managed_local(&self) -> bool {
+        match self.nats_routing {
+            NatsRouting::FrontendLocal => true,
+            NatsRouting::Default => {
+                std::env::var(HARNX_NATS_URL_ENV).is_err()
+                    && std::env::var(HARNX_NATS_TOKEN_ENV).is_err()
+            }
+            NatsRouting::Cluster(_) => false,
+        }
     }
 
     pub async fn nats_jetstream(&self, cluster_key: &str) -> Result<jetstream::Context> {

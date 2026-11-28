@@ -254,6 +254,7 @@ impl Tui {
     /// rebuild places them next to their tool result) and refresh resolution
     /// everywhere — including surfaces answered from another frontend.
     fn reconcile_surface_items(&mut self) {
+        let mut mutated = false;
         for snapshot in self.surfaces.snapshots.values() {
             let already_shown = self
                 .app
@@ -268,6 +269,7 @@ impl Tui {
                 payload: snapshot.payload.clone(),
                 resolved: snapshot.action.clone(),
             });
+            mutated = true;
         }
         for item in &mut self.app.transcript {
             if let TranscriptItem::UserSurface {
@@ -279,9 +281,13 @@ impl Tui {
                 if let Some(snapshot) = self.surfaces.snapshots.get(surface_id) {
                     if resolved != &snapshot.action {
                         *resolved = snapshot.action.clone();
+                        mutated = true;
                     }
                 }
             }
+        }
+        if mutated {
+            self.note_live_transcript_mutation();
         }
     }
 

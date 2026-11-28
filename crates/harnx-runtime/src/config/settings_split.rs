@@ -124,28 +124,115 @@ impl Config {
     /// canonical metadata record before it updates the in-memory session, and
     /// freezes automatic regeneration by setting `title_last_updated_tokens`
     /// to `usize::MAX`. Emits `TitleUpdated`. An empty value is rejected.
+    ///
+    /// This sync path needs the session's persistence sink (installed by the
+    /// first local turn); without one it fails rather than update memory and
+    /// claim success with no durable write. The destination is captured once
+    /// (`session::capture_title_target`) and used once, so a `.session`
+    /// switch racing the write can neither redirect it nor land the memory
+    /// update or event on a replacement session.
+    // qual:allow(iosp) reason: "the sink check and post-write result guard prevent a title from being reported successful unless persistence succeeded"
     fn set_session_title(config: &GlobalConfig, value: &str) -> Result<()> {
+        let (target, record) = Self::capture_manual_title_write(config, value)?;
+        let title = record.title.clone();
+        if !target.has_sink() {
+            bail!(concat!(
+                "Cannot durably set the title on this session yet: it has no active ",
+                "broker connection (before the first local turn). Try again once the ",
+                "broker is reachable."
+            ));
+        }
+        if !crate::config::session::record_title_captured(config, target, record)? {
+            bail!("The active session changed before its title was set");
+        }
+        harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+            harnx_core::event::SessionEvent::TitleUpdated(title),
+        ));
+        Ok(())
+    }
+
+    /// Capture coherent manual-title inputs and the full active destination
+    /// under a single config read. Returns `Usage: .set title <text>` on empty
+    /// text and `No active session to set a title on` when no session is
+    /// selected.
+    pub fn capture_manual_title_write(
+        config: &GlobalConfig,
+        value: &str,
+    ) -> Result<(
+        crate::config::session::TitleWriteTarget,
+        crate::config::session::TitleRecord,
+    )> {
         let title = value.trim().to_string();
         if title.is_empty() {
             bail!("Usage: .set title <text>");
         }
-
-        let (session_id, tokens) = {
-            let guard = config.read();
-            let session = guard
-                .session
-                .as_ref()
+        let (target, tokens) =
+            crate::config::session_persistence::capture_active_title_target(config)
                 .context("No active session to set a title on")?;
-            // Manual title: record the current token count for provenance;
-            // `record_title` freezes regeneration (usize::MAX) for manual titles.
-            (session.id.clone(), session.tokens)
-        };
-        let record = crate::config::session::TitleRecord {
-            title: title.clone(),
-            manual: true,
-            tokens,
-        };
-        if !crate::config::session::record_title(config, &session_id, record)? {
+        Ok((
+            target,
+            crate::config::session::TitleRecord {
+                title,
+                manual: true,
+                tokens,
+            },
+        ))
+    }
+
+    /// Parse a `.set title [<text>]` line using the exact `.set` command token
+    /// boundary (`^\s*(\.\S*)\s*` matching `".set"`) and [`durable_title_value`].
+    /// Returns `None` for `.settitle`, `/set title`, or other `.set <key>` forms.
+    pub fn parse_dot_set_title(line: &str) -> Option<&str> {
+        line.trim_start()
+            .strip_prefix(".set")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .map(str::trim)
+            .and_then(Self::durable_title_value)
+    }
+
+    fn durable_title_value(data: &str) -> Option<&str> {
+        let rest = data.trim_start().strip_prefix("title")?;
+        (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some(rest.trim())
+    }
+
+    /// `.set` dispatch that gives explicit writes their durable path.
+    ///
+    /// `title` is the one setting whose write must reach the broker even
+    /// before the first local turn installs a session sink; it runs
+    /// [`session::record_title_durably`] with the caller's cancellation. Every
+    /// other key keeps the sync [`Config::update`] path unchanged.
+    // qual:allow(iosp) reason: "the single dispatch condition selects the durable broker write only for title; all other settings retain the synchronous update path"
+    pub async fn update_setting_durably(
+        config: &GlobalConfig,
+        data: &str,
+        abort: Option<&crate::utils::AbortSignal>,
+    ) -> Result<()> {
+        // `title` takes a free-form, possibly multi-word value: mirror
+        // `Config::update`'s parsing so both entries accept the same input.
+        if let Some(title) = Self::durable_title_value(data) {
+            return Self::set_session_title_durably(config, title, abort).await;
+        }
+        Config::update(config, data)
+    }
+
+    /// Same contract as [`Self::set_session_title`], but obtains durable
+    /// persistence itself when no sink is installed: cancellable broker
+    /// acquisition, fenced on the captured session target, then the same
+    /// in-memory update and `TitleUpdated` emission. The full destination
+    /// (storage key, cluster, routing, exact optional sink) is captured once
+    /// by [`Self::capture_manual_title_write`]; completion — the in-memory title
+    /// and the event — is fenced on that captured target, so a `.session`
+    /// switch during the write can neither redirect persistence to another
+    /// session nor deliver the result to one.
+    // qual:allow(iosp) reason: "durable broker result and active-session fence must both pass before reporting success or emitting TitleUpdated"
+    async fn set_session_title_durably(
+        config: &GlobalConfig,
+        value: &str,
+        abort: Option<&crate::utils::AbortSignal>,
+    ) -> Result<()> {
+        let (target, record) = Self::capture_manual_title_write(config, value)?;
+        let title = record.title.clone();
+        if !crate::config::session::record_title_durably(config, target, record, abort).await? {
             bail!("The active session changed before its title was set");
         }
         harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
@@ -467,6 +554,7 @@ where
 mod title_command_tests {
     use super::super::*;
     use crate::config::ConfigLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -476,6 +564,38 @@ mod title_command_tests {
         crate::config::session::attach_memory_log(&mut session);
         config.session = Some(session);
         Arc::new(ConfigLock::new(config))
+    }
+
+    fn config_with_session_no_sink(_dir: &std::path::Path) -> GlobalConfig {
+        let mut config = Config::default();
+        let session = crate::config::session::new(&config, "title-test", None).unwrap();
+        config.session = Some(session);
+        Arc::new(ConfigLock::new(config))
+    }
+
+    /// Counts `persist_title` calls so tests can prove the installed sink
+    /// handled a title write instead of the no-sink durable fallback.
+    struct CountingTitleSink(Arc<AtomicUsize>);
+
+    impl crate::config::session::SessionAppendSink for CountingTitleSink {
+        fn append(&self, _entry: &harnx_core::session::SessionLogEntry) -> anyhow::Result<u64> {
+            unreachable!("title tests never append")
+        }
+
+        fn persist_title(&self, _title: &str, _manual: bool, _tokens: usize) -> anyhow::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn config_with_counting_sink() -> (GlobalConfig, Arc<AtomicUsize>) {
+        let mut config = Config::default();
+        let mut session = crate::config::session::new(&config, "title-test", None).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        session.runtime = Some(Arc::new(Arc::new(CountingTitleSink(Arc::clone(&calls)))
+            as Arc<dyn crate::config::session::SessionAppendSink>));
+        config.session = Some(session);
+        (Arc::new(ConfigLock::new(config)), calls)
     }
 
     #[test]
@@ -498,6 +618,158 @@ mod title_command_tests {
         let tmp = TempDir::new().unwrap();
         let config = config_with_session(tmp.path());
         assert!(Config::update(&config, "title   ").is_err());
+    }
+
+    /// The sync entry has no way to reach the broker; a sink-less session
+    /// must fail clearly instead of updating memory and claiming success
+    /// with no durable write (final-review B5).
+    #[test]
+    fn set_title_without_sink_fails_clearly_and_leaves_memory_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_session_no_sink(tmp.path());
+
+        let error = Config::update(&config, "title No Sink Title")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("Cannot durably set the title"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(config.read().session.as_ref().unwrap().title(), None);
+    }
+
+    /// With a sink installed, the durable dispatch routes through it and
+    /// never touches the no-sink broker fallback.
+    #[tokio::test]
+    async fn set_title_durably_routes_through_installed_sink() {
+        let (config, calls) = config_with_counting_sink();
+
+        Config::update_setting_durably(&config, "title Sink Path", None)
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let guard = config.read();
+        let session = guard.session.as_ref().unwrap();
+        assert_eq!(session.title(), Some("Sink Path"));
+        assert_eq!(session.title_last_updated_tokens(), usize::MAX);
+    }
+
+    /// Cancellation before the first turn (sink-less session, broker
+    /// unreachable) fails the explicit write without any memory update.
+    #[tokio::test]
+    async fn set_title_durably_cancelled_without_sink_fails_without_memory_update() {
+        let config = Config {
+            nats_routing: crate::config::NatsRouting::Cluster("dead".into()),
+            nats_servers: vec![crate::config::NatsServerConfig {
+                user_id: None,
+                name: "dead".to_string(),
+                url: "nats://127.0.0.1:1".to_string(),
+                token: None,
+                replicas: None,
+                tls: None,
+                tls_cert: None,
+                tls_key: None,
+                tls_ca: None,
+                ignore_discovered_servers: None,
+                agents: vec![],
+            }],
+            session: Some(
+                crate::config::session::new(
+                    &Config {
+                        nats_routing: crate::config::NatsRouting::Cluster("dead".into()),
+                        ..Default::default()
+                    },
+                    "title-test",
+                    None,
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let config = Arc::new(ConfigLock::new(config));
+
+        let abort = harnx_core::abort::create_abort_signal();
+        abort.set_ctrlc();
+
+        let error = Config::update_setting_durably(&config, "title Cancelled Title", Some(&abort))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cancelled"), "unexpected error: {error}");
+        assert_eq!(config.read().session.as_ref().unwrap().title(), None);
+    }
+
+    /// A write captured for a session that is no longer active returns `Ok(false)`
+    /// before any broker round trip, and never retitles the replacement session.
+    #[tokio::test]
+    async fn record_title_durably_for_stale_target_rejects_before_connecting() {
+        let config = Config {
+            nats_routing: crate::config::NatsRouting::Cluster("dead".into()),
+            nats_servers: vec![crate::config::NatsServerConfig {
+                user_id: None,
+                name: "dead".to_string(),
+                url: "nats://127.0.0.1:1".to_string(),
+                token: None,
+                replicas: None,
+                tls: None,
+                tls_cert: None,
+                tls_key: None,
+                tls_ca: None,
+                ignore_discovered_servers: None,
+                agents: vec![],
+            }],
+            session: Some(
+                crate::config::session::new(
+                    &Config {
+                        nats_routing: crate::config::NatsRouting::Cluster("dead".into()),
+                        ..Default::default()
+                    },
+                    "session-a",
+                    None,
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let config = Arc::new(ConfigLock::new(config));
+        let (target, record) = Config::capture_manual_title_write(&config, "Stale Write").unwrap();
+
+        // Switch active session before durable write begins.
+        {
+            let mut guard = config.write();
+            guard.session = Some(crate::config::session::new(&guard, "session-b", None).unwrap());
+        }
+
+        let applied = crate::config::session::record_title_durably(&config, target, record, None)
+            .await
+            .expect("stale target rejects cleanly without dialing dead broker");
+
+        assert!(!applied);
+        assert_eq!(config.read().session.as_ref().unwrap().title(), None);
+        assert_eq!(
+            config
+                .read()
+                .session
+                .as_ref()
+                .unwrap()
+                .title_last_updated_tokens(),
+            0
+        );
+    }
+
+    #[test]
+    fn parse_dot_set_title_respects_command_boundaries() {
+        assert_eq!(
+            Config::parse_dot_set_title(".set title My Title"),
+            Some("My Title")
+        );
+        assert_eq!(Config::parse_dot_set_title("  .set\ttitle   "), Some(""));
+        assert_eq!(Config::parse_dot_set_title(".settitle Foo"), None);
+        assert_eq!(Config::parse_dot_set_title("/set title Foo"), None);
+        assert_eq!(Config::parse_dot_set_title(".set dry_run true"), None);
     }
 }
 

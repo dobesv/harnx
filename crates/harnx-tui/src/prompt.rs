@@ -230,6 +230,7 @@ impl Tui {
         crate::lifecycle::append_markdown_links(&mut self.app.transcript, &pending.text);
         self.render_submitted_attachments(&pending.attachments)
             .await;
+        self.note_live_transcript_mutation();
         self.pin_transcript_to_bottom();
         if pending.text.trim_start().starts_with('.') {
             self.app.attachments = pending.attachments;
@@ -308,6 +309,7 @@ impl Tui {
             timestamp: Some(chrono::Utc::now()),
         });
         crate::lifecycle::append_markdown_links(&mut self.app.transcript, &pending.text);
+        self.note_live_transcript_mutation();
         self.pin_transcript_to_bottom();
     }
 
@@ -472,14 +474,21 @@ impl Tui {
                 self.app
                     .transcript
                     .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
+                self.note_live_transcript_mutation();
                 self.pin_transcript_to_bottom();
             }
+        } else if self.is_history_repair_pending()
+            && self.history_rebuild_abort.is_none()
+            && self.history_repair_retry_handle.is_none()
+        {
+            self.schedule_history_repair_retry();
         }
     }
 
     /// Freeze any running tool timers on the main transcript that lack a final elapsed value.
     /// Called when the main session's turn ends or is interrupted.
     fn freeze_main_unfinished_tool_timers(&mut self) {
+        let mut mutated = false;
         for item in self.app.transcript.iter_mut() {
             if let TranscriptItem::ToolCall {
                 start_anchor,
@@ -489,8 +498,12 @@ impl Tui {
             {
                 if final_elapsed_ms.is_none() {
                     *final_elapsed_ms = Some(start_anchor.elapsed().as_millis() as u64);
+                    mutated = true;
                 }
             }
+        }
+        if mutated {
+            self.note_live_transcript_mutation();
         }
     }
 
