@@ -137,7 +137,11 @@ fn before_compaction_rejects_structured_formats_before_session_io() {
         let command = crate::cli::DumpArgs {
             command: DumpSubcommands::Session(args),
         };
-        let error = tokio_test::block_on(crate::run_dump_command(&command)).unwrap_err();
+        let error = tokio_test::block_on(crate::run_dump_command(
+            &command,
+            &crate::CommandInterrupt::new(),
+        ))
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "--before-compaction supports only --format text; JSON/YAML export the full log"

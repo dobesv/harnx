@@ -1,7 +1,49 @@
 //! Bootstrap the CLI without constructing its async state on the OS main stack.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use harnx_core::abort::{create_abort_signal, AbortSignal};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Ctrl-C for non-turn CLI dispatch. Prompt and TUI keep their own handlers.
+pub(super) struct CommandInterrupt {
+    cooperative: AtomicBool,
+    abort: AbortSignal,
+}
+
+impl CommandInterrupt {
+    pub(super) fn new() -> Self {
+        Self {
+            cooperative: AtomicBool::new(false),
+            abort: create_abort_signal(),
+        }
+    }
+
+    pub(super) async fn run<T>(&self, command: impl Future<Output = Result<T>>) -> Result<T> {
+        let signal = tokio::signal::ctrl_c();
+        tokio::pin!(command);
+        tokio::select! {
+            // Tokio registers its signal handler on first poll. Do so before
+            // any command can acquire a broker. Dropping the command only
+            // drops its wait; run_main still awaits broker shutdown.
+            biased;
+            result = signal => result.context("listen for Ctrl-C")?,
+            result = &mut command => return result,
+        }
+        if !self.cooperative.load(Ordering::Relaxed) {
+            bail!("interrupted by user");
+        }
+        self.abort.set_ctrlc();
+        command.await
+    }
+
+    /// Hand Ctrl-C to a command that needs to finish cleanup or preserve its
+    /// follow-mode exit status. It must observe this signal until it returns.
+    pub(super) fn handle_in_command(&self) -> &AbortSignal {
+        self.cooperative.store(true, Ordering::Relaxed);
+        &self.abort
+    }
+}
 
 const MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
 

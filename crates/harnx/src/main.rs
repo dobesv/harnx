@@ -1,4 +1,5 @@
 mod agent_event_sink;
+mod broker_notice_stderr;
 mod cli;
 mod cli_event_sink;
 mod cli_replay_sink;
@@ -45,6 +46,7 @@ use crate::config::{
     list_agents, load_env_file, macro_execute, render_agent_dump, Config, GlobalConfig, Input,
     WorkingMode,
 };
+use crate::main_runtime::CommandInterrupt;
 use crate::tui::{TranscriptItem, Tui};
 use harnx_core::agent_config::collect_agent_variables;
 use harnx_core::event::{AgentEventSink, AgentSource};
@@ -56,6 +58,7 @@ use harnx_runtime::utils::*;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use harnx_runtime::config::ConfigLock;
+use harnx_runtime::nats_local_server::LocalBrokerScope;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -182,6 +185,26 @@ async fn init_frontend_config(working_mode: WorkingMode, info_flag: bool) -> Res
 }
 
 async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
+    // Frontend execution scope (design 8/11): begins before any subcommand
+    // dispatch or configuration, so every CLI/TUI path in this process shares
+    // one patient managed-local acquisition, one notice route, and one
+    // explicit shutdown. `LocalBrokerScope::begin` installs stderr as the
+    // bootstrap notice route — independent of the CLI event sink, so
+    // `--final-only` cannot suppress or redirect broker wait notices.
+    let mut broker_scope = LocalBrokerScope::begin(broker_notice_stderr::sink())?;
+    let result = dispatch_cli(cli).await;
+    // Awaited shutdown on the normal, error, and cancel paths alike, after
+    // the dispatched command has released its worker guards.
+    if let Err(shutdown_error) = broker_scope.shutdown().await {
+        log::warn!("shared local NATS shutdown did not finish cleanly: {shutdown_error:#}");
+        if result.is_ok() {
+            return Err(shutdown_error);
+        }
+    }
+    result
+}
+
+async fn dispatch_cli(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
     match &cli.command {
         Some(
             command @ (Commands::Info(_)
@@ -196,7 +219,10 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
             | Commands::Compact(_)
             | Commands::Validate(_)),
         ) => {
-            let exit_code = run_command(command, &cli).await?;
+            let interrupt = CommandInterrupt::new();
+            let exit_code = interrupt
+                .run(run_command(command, &cli, &interrupt))
+                .await?;
             return Ok((None, exit_code));
         }
         Some(Commands::Prompt(_)) | None => {}
@@ -214,7 +240,7 @@ async fn run_main(cli: Cli) -> Result<(Option<anyhow::Error>, u8)> {
     Ok((run(config, cli, text).await.err(), 0))
 }
 
-async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
+async fn run_command(command: &Commands, cli: &Cli, interrupt: &CommandInterrupt) -> Result<u8> {
     match command {
         Commands::Prompt(_) => bail!("prompt commands use the one-shot execution path"),
         Commands::Call(args) => match &args.command {
@@ -227,6 +253,7 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
                         tool_input: None,
                     },
                     args.json,
+                    interrupt,
                 )
                 .await
             }
@@ -234,26 +261,32 @@ async fn run_command(command: &Commands, cli: &Cli) -> Result<u8> {
             // worker startup, so bad scripts fail fast (#2630).
             crate::cli::CallSubcommands::Bash(args) => {
                 let command = tool_cmd::call_bash_command(cli, args)?;
-                tool_cmd::run(cli, command, args.json).await
+                tool_cmd::run(cli, command, args.json, interrupt).await
             }
         },
-        Commands::Info(info_args) => run_info_command(info_args, cli).await,
-        Commands::Dump(dump_args) => run_dump_command(dump_args).await.map(|()| 0),
+        Commands::Info(info_args) => run_info_command(info_args, cli, interrupt).await,
+        Commands::Dump(dump_args) => run_dump_command(dump_args, interrupt).await.map(|()| 0),
         Commands::Open(open_args) => run_open_command(open_args).await.map(|()| 0),
-        Commands::Delete(delete_args) => run_delete_command(delete_args).await,
-        Commands::List(list_args) => run_list_command(list_args, cli).await,
+        Commands::Delete(delete_args) => run_delete_command(delete_args, interrupt).await,
+        Commands::List(list_args) => run_list_command(list_args, cli, interrupt).await,
         Commands::Interact(interact_args) => interact::run_interact_command(interact_args).await,
         Commands::Surface(surface_args) => surface::run_surface_command(surface_args).await,
         Commands::Credentials(credentials_args) => {
-            credentials_cmd::run(cli, credentials_args).await
+            credentials_cmd::run(cli, credentials_args, interrupt).await
         }
-        Commands::Compact(compact_args) => compact::run_compact_command(compact_args, cli).await,
+        Commands::Compact(compact_args) => {
+            compact::run_compact_command(compact_args, interrupt).await
+        }
         // Reads files only: never initializes Config or reaches a broker.
         Commands::Validate(validate_args) => Ok(validate_cmd::run(validate_args).await),
     }
 }
 
-async fn run_info_command(info_args: &crate::cli::InfoArgs, cli: &Cli) -> Result<u8> {
+async fn run_info_command(
+    info_args: &crate::cli::InfoArgs,
+    cli: &Cli,
+    interrupt: &CommandInterrupt,
+) -> Result<u8> {
     match &info_args.command {
         InfoSubcommands::Tool(args) => {
             tool_cmd::run(
@@ -262,6 +295,7 @@ async fn run_info_command(info_args: &crate::cli::InfoArgs, cli: &Cli) -> Result
                     name: args.name.clone(),
                 },
                 args.json,
+                interrupt,
             )
             .await
         }
@@ -327,7 +361,10 @@ async fn fetch_session_metadata(
     )
 }
 
-async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
+async fn run_dump_command(
+    dump_args: &crate::cli::DumpArgs,
+    interrupt: &CommandInterrupt,
+) -> Result<()> {
     match &dump_args.command {
         DumpSubcommands::Session(args) => {
             args.validate()?;
@@ -336,7 +373,7 @@ async fn run_dump_command(dump_args: &crate::cli::DumpArgs) -> Result<()> {
                     .await;
             }
             if args.follow {
-                return run_dump_session_follow(args).await;
+                return run_dump_session_follow(args, interrupt).await;
             }
             run_dump_session_once(args).await
         }
@@ -536,7 +573,10 @@ async fn run_check_loop_detection(
     Ok(())
 }
 
-async fn run_dump_session_follow(args: &crate::cli::DumpSessionArgs) -> Result<()> {
+async fn run_dump_session_follow(
+    args: &crate::cli::DumpSessionArgs,
+    interrupt: &CommandInterrupt,
+) -> Result<()> {
     use std::io::Write;
 
     let config = init_frontend_config(WorkingMode::Cmd, true).await?;
@@ -558,6 +598,7 @@ async fn run_dump_session_follow(args: &crate::cli::DumpSessionArgs) -> Result<(
         session_dump::DumpRenderer::new(args, tool_decl_map(&config), new_text_dump_sink());
 
     // Replay initial history
+    let abort = interrupt.handle_in_command();
     renderer.replay(stream.history(), 0)?;
     std::io::stdout().flush()?;
 
@@ -573,7 +614,7 @@ async fn run_dump_session_follow(args: &crate::cli::DumpSessionArgs) -> Result<(
             // Periodic poll timeout — REQUIRED for entries with no advisory (e.g. TurnEnd)
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => {}
             // Clean exit on Ctrl-C
-            _ = tokio::signal::ctrl_c() => {
+            _ = wait_abort_signal(abort) => {
                 return Ok(());
             }
         }
@@ -612,11 +653,14 @@ async fn flush_new_entries(
     Ok(())
 }
 
-async fn run_delete_command(delete_args: &crate::cli::DeleteArgs) -> Result<u8> {
+async fn run_delete_command(
+    delete_args: &crate::cli::DeleteArgs,
+    interrupt: &CommandInterrupt,
+) -> Result<u8> {
     match &delete_args.command {
         DeleteSubcommands::Session(args) => run_session_delete_command(args).await.map(|()| 0),
         DeleteSubcommands::OrphanStreams(args) => {
-            orphan_streams_cmd::run_orphan_stream_delete_command(args)
+            orphan_streams_cmd::run_orphan_stream_delete_command(args, interrupt)
                 .await
                 .map(|()| 0)
         }
@@ -627,9 +671,13 @@ async fn run_delete_command(delete_args: &crate::cli::DeleteArgs) -> Result<u8> 
     }
 }
 
-async fn run_list_command(list_args: &crate::cli::ListArgs, cli: &Cli) -> Result<u8> {
+async fn run_list_command(
+    list_args: &crate::cli::ListArgs,
+    cli: &Cli,
+    interrupt: &CommandInterrupt,
+) -> Result<u8> {
     match &list_args.command {
-        ListSubcommands::Sessions => run_list_sessions(cli).await.map(|()| 0),
+        ListSubcommands::Sessions => run_list_sessions(cli, interrupt).await.map(|()| 0),
         ListSubcommands::OrphanStreams(args) => {
             orphan_streams_cmd::run_list_orphan_streams_command(args)
                 .await
@@ -642,13 +690,14 @@ async fn run_list_command(list_args: &crate::cli::ListArgs, cli: &Cli) -> Result
                     pattern: args.pattern.clone(),
                 },
                 args.json,
+                interrupt,
             )
             .await
         }
     }
 }
 
-async fn run_list_sessions(cli: &Cli) -> Result<()> {
+async fn run_list_sessions(cli: &Cli, interrupt: &CommandInterrupt) -> Result<()> {
     let mut config = init_frontend_config(WorkingMode::Cmd, true).await?;
 
     // Activate remote agent if specified via --agent
@@ -660,23 +709,35 @@ async fn run_list_sessions(cli: &Cli) -> Result<()> {
     }
 
     let target = resolve_list_sessions_target(&config);
-    match target {
+    let cluster_label = match &target {
+        ListSessionsTarget::Remote { cluster } => format!(" for cluster '{cluster}'"),
+        ListSessionsTarget::Local => String::new(),
+    };
+    // Ctrl-C cancels this listing's patient managed-local wait; the shared
+    // acquisition itself is owned by the frontend scope and survives.
+    let abort = interrupt.handle_in_command();
+    let outcome = match target {
         ListSessionsTarget::Remote { cluster } => {
-            let result = config.list_remote_sessions_with_meta(&cluster).await;
-            match remote_list_outcome(result) {
-                ListSessionsOutcome::Print(output) => {
-                    println!("{output}");
-                }
-                ListSessionsOutcome::Error(msg) => {
-                    eprintln!("error: could not list sessions for cluster '{cluster}': {msg}");
-                    return Err(anyhow::anyhow!("{msg}"));
-                }
-            }
+            let result = config
+                .list_remote_sessions_with_abort(&cluster, Some(abort))
+                .await;
+            remote_list_outcome(result)
         }
         ListSessionsTarget::Local => {
             let cluster = config.default_cluster_key().to_string();
-            let sessions = config.list_remote_sessions_with_meta(&cluster).await?;
-            println!("{}", format_sessions_for_output(&sessions));
+            let result = config
+                .list_remote_sessions_with_abort(&cluster, Some(abort))
+                .await;
+            remote_list_outcome(result)
+        }
+    };
+    match outcome {
+        ListSessionsOutcome::Print(output) => {
+            println!("{output}");
+        }
+        ListSessionsOutcome::Error(msg) => {
+            eprintln!("error: could not list sessions{cluster_label}: {msg}");
+            return Err(anyhow::anyhow!("{msg}"));
         }
     }
     Ok(())
@@ -744,7 +805,11 @@ fn command_only_needs_supplied_session(cli: &Cli) -> bool {
     cli.info
 }
 
-async fn apply_session_arg(config: &GlobalConfig, cli: &Cli) -> Result<()> {
+async fn apply_session_arg(
+    config: &GlobalConfig,
+    cli: &Cli,
+    abort_signal: &AbortSignal,
+) -> Result<()> {
     let Some(session) = &cli.session else {
         return Ok(());
     };
@@ -753,7 +818,9 @@ async fn apply_session_arg(config: &GlobalConfig, cli: &Cli) -> Result<()> {
     }
     let session = match session {
         Some(s) => s.clone(),
-        None => Config::reserve_new_session_id(config).await?,
+        // Patient, caller-cancellable managed-local wait: the bootstrap abort
+        // wakes this reservation, the broker scope owns the shared startup.
+        None => Config::reserve_new_session_id_with_abort(config, Some(abort_signal)).await?,
     };
     config.write().use_session(Some(&session))
 }
@@ -778,7 +845,9 @@ async fn activate_cli_agent(
         match cli.session.as_ref() {
             Some(None) => {
                 Config::use_agent(config, agent, None, abort_signal.clone()).await?;
-                let session_id = Config::reserve_new_session_id(config).await?;
+                let session_id =
+                    Config::reserve_new_session_id_with_abort(config, Some(&abort_signal.clone()))
+                        .await?;
                 config.write().use_session(Some(&session_id))
             }
             Some(Some(session)) => {
@@ -800,7 +869,14 @@ async fn activate_cli_agent(
 
 fn spawn_cmd_sigint_watcher(config: &GlobalConfig, abort_signal: &AbortSignal) {
     let working_mode = config.read().working_mode.clone();
-    if matches!(working_mode, WorkingMode::Cmd) {
+    if matches!(working_mode, WorkingMode::Cmd | WorkingMode::Tui) {
+        // In Cmd mode this is the turn-level interrupt. In TUI mode it is the
+        // bootstrap interrupt only: it wakes configuration waits (session
+        // reservation, agent activation) before the terminal is set up, and
+        // `start_interactive` races the same Ctrl-C against `Tui::init`.
+        // Once the terminal is in raw mode, Ctrl-C arrives as a key event
+        // through crossterm, not as SIGINT, so this watcher does not touch
+        // active-turn interruption.
         let abort_for_signal = abort_signal.clone();
         tokio::spawn(async move {
             while tokio::signal::ctrl_c().await.is_ok() {
@@ -863,7 +939,7 @@ async fn configure_agent_and_session(
         if let Some(prompt) = &cli.prompt {
             config.write().use_prompt(prompt)?;
         }
-        apply_session_arg(config, cli).await?;
+        apply_session_arg(config, cli, abort_signal).await?;
         if let Some(rag) = &cli.rag {
             Config::use_rag(config, Some(rag), abort_signal.clone()).await?;
         }
@@ -974,7 +1050,10 @@ async fn run_one_shot(
     );
     ensure_active_agent(&config.read())?;
     if config.read().session.is_none() {
-        let session_id = Config::reserve_new_session_id(config).await?;
+        // Ordinary Cmd new-session creation: the managed-local wait is
+        // patient and this Ctrl-C signal cancels it.
+        let session_id =
+            Config::reserve_new_session_id_with_abort(config, Some(&abort_signal)).await?;
         config.write().use_session(Some(&session_id))?;
     }
     let input = create_input(config, text, &cli.file, abort_signal.clone()).await?;
@@ -1218,7 +1297,19 @@ async fn start_directive(
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
-    let mut tui: Tui = Tui::init(config).await?;
+    // Pre-terminal Ctrl-C must exit through cleanup, not a raw SIGINT death:
+    // `Tui::init` blocks on broker acquisition/history reads before the
+    // terminal is set up, so race the bootstrap Ctrl-C against it. Losing
+    // side of the race is dropped, which cancels only this caller's broker
+    // wait; `run_main` still awaits the broker scope shutdown on the way
+    // out, so the owned child is stopped and reaped before the lock goes.
+    let mut tui: Tui = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => {
+            anyhow::bail!("interrupted before the terminal was set up")
+        }
+        tui = Tui::init(config) => tui?,
+    };
     let result = tui.run().await;
     if let Some(details) = tui.exit_interrupt_error() {
         eprintln!("Warning: failed to interrupt active session while exiting ({details}).");

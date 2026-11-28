@@ -255,6 +255,9 @@ async fn handoff_session_enter_opens_target_session() {
         .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
+    // The post-enter transcript reconcile is background work (design 9);
+    // settle it before asserting TUI state.
+    harness.tui().flush_history_work_for_test().await;
 
     // Verify the config now points to the target agent + session
     {
@@ -361,12 +364,17 @@ async fn seed_handoff_child_transcript(config: &GlobalConfig) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handoff_session_enter_loads_child_transcript() {
+async fn handoff_session_enter_loads_child_transcript_nats() {
     use harnx_runtime::config::LOCAL_CLUSTER_KEY;
 
+    if !super::has_nats_server_binary() {
+        eprintln!("skipping: nats-server binary not found");
+        return;
+    }
     let temp = TempDir::new().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _environment = TestEnvironment::set(temp.path());
+    let _nats_env = super::NatsEnvReset::clear();
     let config = test_config_with_mock_client_and_agent("source", Some("source-session"));
     seed_handoff_child_transcript(&config).await;
 
@@ -390,6 +398,9 @@ async fn handoff_session_enter_loads_child_transcript() {
     tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
+    // The post-enter transcript rebuild is background work (design 9);
+    // settle it before asserting transcript contents.
+    tui.flush_history_work_for_test().await;
 
     {
         let cfg = config.read();

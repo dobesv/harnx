@@ -209,14 +209,15 @@ async fn create_backing_session(
             worker_id,
         } => targeted_reserve_subject(LocalWorkerTarget::new(session_scope, worker_id)?),
     };
-    let server = config.resolve_nats_server(&cluster).await?;
+    let (server, client) = config.resolve_nats_connection(&cluster, None).await?;
     let replicas = server.resolved_replicas();
-    let client = Config::connect_nats_server(&server).await?;
+    let user_id = config.default_user_id(Some(&server));
+    drop(server);
     let session = NatsSession::new_with_resolved_options(
         NatsSessionConfig {
             cluster,
             initializer: SessionInitializer::inline("", Default::default(), Default::default())
-                .with_default_user_id(config.default_user_id(Some(&server))),
+                .with_default_user_id(user_id),
             session_id: None,
             activation_route: route,
         },

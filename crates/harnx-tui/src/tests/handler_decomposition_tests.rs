@@ -170,7 +170,7 @@ async fn attachment_failures_and_named_detach_consume_only_command_line() {
 }
 
 #[tokio::test]
-async fn reconciliation_preserves_exact_mutation_prefixes() {
+async fn reconciliation_recognizes_runtime_mutation_commands() {
     let mut tui = Tui::init(&test_config()).await.unwrap();
     for command in [
         ".empty session",
@@ -181,10 +181,16 @@ async fn reconciliation_preserves_exact_mutation_prefixes() {
         ".edit message 1",
         ".delete message 1",
         ".rewind 1",
+        " .reset session",
+        ".empty  session",
+        ".delete\tmessage 1",
     ] {
         tui.app.transcript = vec![TranscriptItem::SystemText("sentinel".into())];
         tui.reconcile_transcript_after_command(None, None, command)
             .await;
+        // The rebuild is background work (design 9); settle it before the
+        // transcript assertion.
+        tui.flush_history_work_for_test().await;
         assert!(
             tui.app.transcript.iter().all(
                 |item| !matches!(item, TranscriptItem::SystemText(text) if text == "sentinel")
@@ -197,7 +203,7 @@ async fn reconciliation_preserves_exact_mutation_prefixes() {
         ".edit message",
         ".delete message",
         ".rewind",
-        " .reset session",
+        ".reset session extra",
     ] {
         tui.app.transcript = vec![TranscriptItem::SystemText("sentinel".into())];
         tui.reconcile_transcript_after_command(None, None, command)

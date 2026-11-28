@@ -73,6 +73,9 @@ async fn mid_turn_compaction_rebuild_then_chunks_and_final_keep_streaming_once()
             .await
             .unwrap();
     }
+    // The post-compaction reload now runs as the unified background rebuild
+    // (design 9); flush it before asserting on transcript state.
+    tui.flush_history_work_for_test().await;
     assert_streaming_reset(&tui);
     assert!(tui.app.llm_busy, "compaction isn't the end of the turn");
     chunk(&mut tui, "Resumed ").await;

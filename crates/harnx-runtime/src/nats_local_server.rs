@@ -5,6 +5,7 @@
 //! details through an atomically replaced metadata file.
 
 use anyhow::{bail, Context, Result};
+use harnx_core::child_process::ChildProcessManager;
 use harnx_core::config_paths::{
     nats_runtime_dir, nats_runtime_lock_file, nats_runtime_ports_file, nats_runtime_store_dir,
 };
@@ -14,21 +15,31 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
 use uuid::Uuid;
 
+mod manager;
 mod supervision;
-pub use supervision::{LocalBroker, LocalBrokerStatus};
+mod wait_notice;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) use manager::{cancel_broker_wait, connect_local_broker};
+pub use manager::{
+    reroute_frontend_broker_notices, restore_frontend_broker_notices, LocalBrokerScope,
+};
+pub(crate) use supervision::BrokerWatch;
+pub use supervision::{LocalBroker, LocalBrokerStatus};
+pub use wait_notice::{BrokerNoticeSink, BrokerWaitNotice};
+
+use wait_notice::{WaitNotices, WaitPhase};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RETRY_DELAY: Duration = Duration::from_millis(100);
 const SPAWN_ATTEMPTS: usize = 5;
-/// How long to wait for nats-server to write its ports file. Generous: it is
-/// written as soon as the listeners are bound, well before JetStream is ready.
-const PORT_REPORT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(unix)]
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -52,48 +63,39 @@ impl SharedNatsServer {
 
     /// Process ID when this handle owns the server; joiners return `None`.
     pub fn server_process_id(&self) -> Option<u32> {
-        self.owner.as_ref().map(|owner| owner.child.id())
+        self.owner.as_ref().map(|owner| {
+            owner
+                .child
+                .as_ref()
+                .expect("running owner has a child")
+                .id()
+        })
     }
 
-    /// Whether this handle still identifies the active shared broker.
-    ///
-    /// Joiners cannot keep the owner process alive, so their cached discovery
-    /// result is valid only while the same nonce is published and another
-    /// process still holds the lifetime lock. Checking those local files avoids
-    /// a new NATS connection for every config lookup while still detecting an
-    /// owner that exited and left stale metadata behind.
-    pub async fn is_current(&mut self) -> bool {
-        if let Some(owner) = self.owner.as_mut() {
-            return matches!(owner.child.try_wait(), Ok(None));
+    // File and child checks are not a readiness proof. A new owner can hold
+    // the lock without having published new metadata yet.
+    fn owner_or_file_is_current(&mut self) -> bool {
+        if let Some(owner) = &mut self.owner {
+            return owner
+                .child
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
         }
-
-        let cached_identity = (self.url.clone(), self.token.clone(), self.nonce.clone());
-        tokio::task::spawn_blocking(move || joiner_is_current(cached_identity))
-            .await
-            .unwrap_or(false)
-    }
-
-    /// Replace a stale broker identity, returning whether it changed.
-    ///
-    /// The old owner must be dropped before discovery runs again: even after
-    /// its child exits, it retains the lifetime lock until cleanup completes.
-    pub(crate) async fn refresh_if_stale(&mut self) -> Result<bool> {
-        if self.is_current().await {
-            return Ok(false);
-        }
-
-        self.owner.take();
-        *self = ensure_shared_server().await?;
-        Ok(true)
+        joiner_is_current((&self.url, &self.token, &self.nonce))
     }
 }
 
-fn joiner_is_current(cached_identity: (String, String, String)) -> bool {
+fn joiner_is_current(cached_identity: (&str, &str, &str)) -> bool {
     let Ok(metadata) = read_metadata() else {
         return false;
     };
-    let discovered_identity = (metadata.url(), metadata.token, metadata.nonce);
-    if discovered_identity != cached_identity {
+    if metadata.nonce.is_empty()
+        || (
+            metadata.url().as_str(),
+            metadata.token.as_str(),
+            metadata.nonce.as_str(),
+        ) != cached_identity
+    {
         return false;
     }
 
@@ -123,21 +125,30 @@ impl std::fmt::Debug for SharedNatsServer {
 }
 
 struct ServerOwner {
-    child: Child,
-    lock_file: File,
+    child: Option<Child>,
+    report: Option<PathBuf>,
     config_path: PathBuf,
+    _lock_file: File,
+    processes: ChildProcessManager,
+}
+
+impl ServerOwner {
+    fn clear_attempt(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            stop_server(&mut child);
+        }
+        if let Some(report) = self.report.take() {
+            remove_file_if_present(&report, "shared local NATS ports report");
+        }
+    }
 }
 
 impl Drop for ServerOwner {
     fn drop(&mut self) {
-        // Keep lock held until child has exited and stale discovery metadata has
-        // been removed. A waiter can only become owner after cleanup completes.
-        stop_server(&mut self.child);
-        // Keep the authenticated endpoint across owner changes. Existing NATS
-        // clients reconnect to this address; the lifetime lock, not metadata
-        // existence, proves that an owner is present.
+        // Reap first, then release the lifetime lock. Keep ports.json so
+        // existing clients can reconnect to the same authenticated endpoint.
+        self.clear_attempt();
         remove_file_if_present(&self.config_path, "shared local NATS config");
-        let _ = self.lock_file.unlock();
     }
 }
 
@@ -183,27 +194,25 @@ impl ServerMetadata {
 /// for atomically published metadata, authenticate, then re-read the metadata
 /// to prove the nonce did not change during connection.
 pub async fn ensure_shared_server() -> Result<SharedNatsServer> {
+    acquire_server(&mut WaitNotices::new(None)).await
+}
+
+async fn acquire_server(notices: &mut WaitNotices) -> Result<SharedNatsServer> {
     prepare_runtime_directories()?;
     let lock_file = open_lock_file()?;
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
 
     loop {
         if crate::file_lock::try_lock_exclusive(&lock_file)
             .context("failed to acquire shared local NATS lock")?
         {
-            return start_owned_server(lock_file).await;
+            return start_owned_server(lock_file, notices).await;
         }
 
         if let Some(server) = try_join_server().await {
             return Ok(server);
         }
 
-        if Instant::now() >= deadline {
-            bail!(
-                "shared local NATS owner did not publish valid ports.json within {}s",
-                STARTUP_TIMEOUT.as_secs()
-            );
-        }
+        notices.waiting(WaitPhase::OtherOwner);
         sleep(RETRY_DELAY).await;
     }
 }
@@ -269,130 +278,96 @@ fn persistent_endpoint() -> Result<(Option<u16>, String)> {
     Ok((port, token))
 }
 
-async fn start_owned_server(lock_file: File) -> Result<SharedNatsServer> {
+async fn start_owned_server(
+    lock_file: File,
+    notices: &mut WaitNotices,
+) -> Result<SharedNatsServer> {
     let binary = nats_server_binary()?;
-    verify_nats_server_version(&binary)?;
-    let nonce = Uuid::new_v4().to_string();
     let (port, token) = persistent_endpoint()?;
-    let config_path = nats_runtime_dir().join("nats.conf");
+    let mut owner = ServerOwner {
+        child: None,
+        report: None,
+        config_path: nats_runtime_dir().join("nats.conf"),
+        _lock_file: lock_file,
+        processes: ChildProcessManager::new(),
+    };
+    verify_nats_server_version(&binary, &mut owner, notices).await?;
+    write_server_config_atomically(&owner.config_path, &token, port)?;
     let mut last_error = None;
-
     for _ in 0..SPAWN_ATTEMPTS {
-        match spawn_once(&binary, &config_path, &token, port).await {
-            Ok((child, port)) => {
-                let metadata = ServerMetadata {
-                    port,
-                    nonce: nonce.clone(),
-                    token: token.clone(),
-                };
-                if let Err(error) = write_metadata_atomically(&metadata) {
-                    let mut child = child;
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    remove_file_if_present(&config_path, "shared local NATS config");
-                    return Err(error);
-                }
-                return Ok(SharedNatsServer {
-                    url: metadata.url(),
-                    token,
-                    nonce: nonce.clone(),
-                    owner: Some(ServerOwner {
-                        child,
-                        lock_file,
-                        config_path,
-                    }),
-                });
+        match spawn_once(&binary, &mut owner, &token, notices).await {
+            Ok(port) => return publish_owned_server(port, token, owner),
+            Err(error) => {
+                owner.clear_attempt();
+                last_error = Some(error);
             }
-            Err(error) => last_error = Some(error),
         }
     }
-
-    remove_file_if_present(&config_path, "shared local NATS config");
     Err(last_error.expect("at least one NATS spawn attempt must run")).context(format!(
         "failed to start shared local NATS server after {SPAWN_ATTEMPTS} attempts"
     ))
 }
 
+fn publish_owned_server(port: u16, token: String, owner: ServerOwner) -> Result<SharedNatsServer> {
+    let metadata = ServerMetadata {
+        port,
+        nonce: Uuid::new_v4().to_string(),
+        token,
+    };
+    write_metadata_atomically(&metadata)?;
+    Ok(SharedNatsServer {
+        url: metadata.url(),
+        token: metadata.token,
+        nonce: metadata.nonce,
+        owner: Some(owner),
+    })
+}
+
 async fn spawn_once(
     binary: &Path,
-    config_path: &Path,
+    owner: &mut ServerOwner,
     token: &str,
-    port: Option<u16>,
-) -> Result<(Child, u16)> {
-    write_server_config_atomically(config_path, token, port)?;
-
+    notices: &mut WaitNotices,
+) -> Result<u16> {
     let mut command = Command::new(binary);
     command
         .arg("-c")
-        .arg(config_path)
+        .arg(&owner.config_path)
         .stdin(Stdio::null())
-        // Where our own logs go. Discarding this left a broker that refuses to
-        // start — a bad config, a port it can't bind — saying nothing at all.
         .stdout(harnx_core::logging::child_output_sink())
         .stderr(harnx_core::logging::child_output_sink());
-    configure_parent_death(&mut command);
-    let child = command
-        .spawn()
+    let child = owner
+        .processes
+        .spawn_std(command)
         .with_context(|| format!("failed to spawn {}", binary.display()))?;
-    // Discovery can be cancelled when its frontend exits. Retain RAII cleanup
-    // through startup, including while waiting for the ports report/readiness.
-    let mut startup = ServerStartup(Some(child));
-    let child = startup.0.as_mut().expect("startup owns child");
-
-    let child_pid = child.id();
-    let ports_path = port_report_path(binary, child_pid);
-    let port = match read_bound_port(child, &ports_path).await {
-        Ok(port) => port,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
+    let report = port_report_path(binary, child.id());
+    owner.report = Some(report.clone());
+    let child = owner.child.insert(child);
+    let port = read_bound_port(child, &report, notices).await?;
     let url = format!("nats://127.0.0.1:{port}");
-    if let Err(error) = wait_for_nats_ready(&url, token, child).await {
-        let _ = child.kill();
-        let _ = child.wait();
-        remove_ports_file(ports_path);
-        return Err(error);
-    }
-    // nats-server removes its own ports file on a clean exit, but this server is
-    // usually killed, so drop it now that the port is known and republished in
-    // harnx's ports.json.
-    remove_ports_file(ports_path);
-    Ok((startup.0.take().expect("startup owns child"), port))
-}
-
-struct ServerStartup(Option<Child>);
-
-impl Drop for ServerStartup {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.0 {
-            stop_server(child);
-        }
-    }
+    wait_for_nats_ready(child, notices, || async {
+        connect_authenticated(&url, token).await.map(|_| ())
+    })
+    .await?;
+    remove_file_if_present(&report, "shared local NATS ports report");
+    owner.report.take();
+    Ok(port)
 }
 
 /// Wait for nats-server to report the port it bound.
 ///
 /// nats-server writes into the file rather than renaming it into place, so a
 /// parse failure is treated the same as not-yet-written.
-async fn read_bound_port(child: &mut Child, path: &Path) -> Result<u16> {
-    let deadline = Instant::now() + PORT_REPORT_TIMEOUT;
+async fn read_bound_port(child: &mut Child, path: &Path, notices: &mut WaitNotices) -> Result<u16> {
     loop {
+        if let Some(status) = child.try_wait()? {
+            bail!("shared local NATS exited during startup: {status}");
+        }
         if let Some(port) = parse_reported_port(path) {
             return Ok(port);
         }
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("shared local NATS exited during startup: {status}");
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!(
-                "shared local NATS did not report its port within {}s",
-                PORT_REPORT_TIMEOUT.as_secs()
-            );
-        }
-        sleep(Duration::from_millis(20)).await;
+        notices.waiting(WaitPhase::PortReport(child.id()));
+        sleep(CHILD_POLL_INTERVAL).await;
     }
 }
 
@@ -412,62 +387,13 @@ fn parse_reported_port(path: &Path) -> Option<u16> {
     url.rsplit_once(':')?.1.parse().ok()
 }
 
-fn remove_ports_file(path: PathBuf) {
-    remove_file_if_present(&path, "shared local NATS ports report");
-}
-
-#[cfg(target_os = "linux")]
-fn configure_parent_death(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    let parent_pid = std::process::id() as libc::pid_t;
-    // SAFETY: pre_exec only invokes async-signal-safe libc calls and captures a
-    // plain pid. The parent check closes the fork-to-prctl race.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != parent_pid {
-                libc::raise(libc::SIGTERM);
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn configure_parent_death(_command: &mut Command) {}
-
 async fn try_join_server() -> Option<SharedNatsServer> {
     let before = read_metadata().ok()?;
     let url = before.url();
-    let client = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        async_nats::ConnectOptions::new()
-            .token(before.token.clone())
-            .connect(&url),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    // The owner can exit after the TCP/auth handshake but before this flush.
-    // async-nats then waits for a reconnect to the now-dead ephemeral port, so
-    // bound the validation just like the connect itself.
-    if !matches!(
-        tokio::time::timeout(CONNECT_TIMEOUT, client.flush()).await,
-        Ok(Ok(()))
-    ) {
+    connect_authenticated(&url, &before.token).await.ok()?;
+    if !joiner_is_current((&url, &before.token, &before.nonce)) {
         return None;
     }
-
-    // A successful connection is only accepted if discovery data remained the
-    // same throughout it. This rejects stale metadata while a new owner starts.
-    let after = read_metadata().ok()?;
-    if before != after || before.nonce.is_empty() {
-        return None;
-    }
-
     Some(SharedNatsServer {
         url,
         token: before.token,
@@ -476,9 +402,40 @@ async fn try_join_server() -> Option<SharedNatsServer> {
     })
 }
 
-async fn wait_for_nats_ready(url: &str, token: &str, child: &mut Child) -> Result<()> {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let mut attempts = 0u32;
+async fn connect_authenticated(url: &str, token: &str) -> Result<async_nats::Client> {
+    let options = harnx_nats_common::connect::managed_local_connect_options(token.to_owned());
+    // The dial future embeds TLS machinery even for plaintext; don't store
+    // that frame inline in every caller of the managed-local readiness path.
+    let client = tokio::time::timeout(CONNECT_TIMEOUT, Box::pin(options.connect(url)))
+        .await
+        .context("timed out connecting to shared local NATS")??;
+    flush_probe(client.flush()).await?;
+    // A plaintext server without auth ignores the token entirely. It is not
+    // the elected local broker, even if it occupies the recorded port.
+    if !client
+        .try_server_info()
+        .is_some_and(|info| info.auth_required && info.jetstream)
+    {
+        bail!("the shared local NATS endpoint must require authentication and offer JetStream");
+    }
+    Ok(client)
+}
+
+async fn flush_probe<E>(flush: impl std::future::Future<Output = Result<(), E>>) -> Result<()>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(CONNECT_TIMEOUT, flush)
+        .await
+        .context("timed out flushing shared local NATS readiness connection")??;
+    Ok(())
+}
+
+async fn wait_for_nats_ready<F: std::future::Future<Output = Result<()>>>(
+    child: &mut Child,
+    notices: &mut WaitNotices,
+    mut probe: impl FnMut() -> F,
+) -> Result<()> {
     loop {
         if let Some(status) = child
             .try_wait()
@@ -486,38 +443,11 @@ async fn wait_for_nats_ready(url: &str, token: &str, child: &mut Child) -> Resul
         {
             bail!("nats-server exited during startup with status {status}");
         }
-
-        attempts += 1;
-        let result = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            async_nats::ConnectOptions::new()
-                .token(token.to_owned())
-                .connect(url),
-        )
-        .await;
-        match result {
-            Ok(Ok(client)) => {
-                tokio::time::timeout(CONNECT_TIMEOUT, client.flush())
-                    .await
-                    .context("timed out flushing shared local NATS readiness connection")??;
-                return Ok(());
-            }
-            Ok(Err(error)) if Instant::now() >= deadline => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "NATS server at {url} did not become ready within {}s after {attempts} attempts",
-                        STARTUP_TIMEOUT.as_secs()
-                    )
-                });
-            }
-            Err(_) if Instant::now() >= deadline => {
-                bail!(
-                    "NATS server at {url} did not become ready within {}s after {attempts} attempts: connection timed out",
-                    STARTUP_TIMEOUT.as_secs()
-                );
-            }
-            _ => sleep(RETRY_DELAY).await,
+        if probe().await.is_ok() {
+            return Ok(());
         }
+        notices.waiting(WaitPhase::Readiness(child.id()));
+        sleep(RETRY_DELAY).await;
     }
 }
 
@@ -565,23 +495,41 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to canonicalize {}", path.display()))
 }
 
-fn verify_nats_server_version(binary: &Path) -> Result<()> {
-    let output = Command::new(binary)
+async fn verify_nats_server_version(
+    binary: &Path,
+    owner: &mut ServerOwner,
+    notices: &mut WaitNotices,
+) -> Result<()> {
+    use std::io::Read as _;
+    // Use a file so checking version remains cancellable without a separate
+    // pipe reader task. The owner guard reaps this child too on shutdown.
+    let mut output = tempfile::tempfile().context("open nats-server version output")?;
+    let mut command = Command::new(binary);
+    command
         .arg("--version")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(output.try_clone()?)
+        .stderr(output.try_clone()?);
+    let child = owner
+        .processes
+        .spawn_std(command)
         .with_context(|| format!("failed to run {} --version", binary.display()))?;
-    if !output.status.success() {
-        bail!(
-            "{} --version failed with status {}",
-            binary.display(),
-            output.status
-        );
+    let child = owner.child.insert(child);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        notices.waiting(WaitPhase::Version(child.id()));
+        sleep(CHILD_POLL_INTERVAL).await;
+    };
+    owner.child.take();
+    if !status.success() {
+        bail!("{} --version failed with status {status}", binary.display());
     }
-    let text = format!(
-        "{} {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    use std::io::Seek as _;
+    output.rewind()?;
+    let mut text = String::new();
+    output.read_to_string(&mut text)?;
     let (major, minor) = parse_major_minor(&text)
         .with_context(|| format!("could not parse nats-server version from {:?}", text.trim()))?;
     if (major, minor) < (2, 11) {
@@ -758,9 +706,13 @@ mod tests {
             .expect("spawn short-lived child");
         let started = Instant::now();
 
-        let error = wait_for_nats_ready("nats://127.0.0.1:1", "unused", &mut child)
-            .await
-            .expect_err("exited child must fail readiness");
+        let error = wait_for_nats_ready(&mut child, &mut super::WaitNotices::new(None), || async {
+            super::connect_authenticated("nats://127.0.0.1:1", "unused")
+                .await
+                .map(|_| ())
+        })
+        .await
+        .expect_err("exited child must fail readiness");
 
         assert!(
             error
@@ -772,5 +724,58 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "dead child should not wait for startup timeout"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod probe_tests {
+    use super::*;
+
+    struct TestChild(Child);
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            stop_server(&mut self.0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nats_readiness_retries_connect_and_flush_failures_on_same_child() {
+        let processes = ChildProcessManager::new();
+        let mut command = Command::new("sleep");
+        command.arg("60");
+        let mut child = TestChild(processes.spawn_std(command).unwrap());
+        let pid = child.0.id();
+        let mut attempts = 0;
+        let mut notices = WaitNotices::new(None);
+        wait_for_nats_ready(&mut child.0, &mut notices, || {
+            attempts += 1;
+            controlled_probe(attempts)
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 4);
+        assert_eq!(child.0.id(), pid);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "a probe failure killed the child"
+        );
+    }
+
+    async fn controlled_probe(attempt: usize) -> Result<()> {
+        use std::io;
+        match attempt {
+            1 => Err(io::Error::from(ErrorKind::ConnectionRefused).into()),
+            2 => flush_probe(std::future::pending::<io::Result<()>>()).await,
+            3 => {
+                flush_probe(std::future::ready(Err(io::Error::from(
+                    ErrorKind::BrokenPipe,
+                ))))
+                .await
+            }
+            4 => flush_probe(std::future::ready(Ok::<_, io::Error>(()))).await,
+            _ => panic!("readiness retried after success"),
+        }
     }
 }

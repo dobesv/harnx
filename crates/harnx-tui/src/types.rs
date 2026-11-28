@@ -75,6 +75,176 @@ pub(super) type TestDetachedOpenFn =
 pub(super) type TestClipboardFn = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
 #[cfg(test)]
 pub(super) type TestCommandFn = Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(test)]
+pub(super) type TestHistoryLoadFn = Arc<
+    dyn Fn(
+            GlobalConfig,
+            crate::history_work::RebuildMode,
+            AbortSignal,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<TranscriptItem>>> + Send>>
+        + Send
+        + Sync,
+>;
+#[cfg(test)]
+pub(super) type TestHistoryCommandGateFn = Arc<
+    dyn Fn(String, AbortSignal) -> Pin<Box<dyn Future<Output = AbortSignal> + Send>> + Send + Sync,
+>;
+#[cfg(test)]
+pub(super) type TestPickerSessionsFn = Arc<
+    dyn Fn(
+            GlobalConfig,
+            AbortSignal,
+        ) -> Pin<Box<dyn Future<Output = (Vec<SessionMeta>, Option<String>)> + Send>>
+        + Send
+        + Sync,
+>;
+#[cfg(test)]
+pub(super) type TestInfoOverlayFn = Arc<
+    dyn Fn(
+            GlobalConfig,
+            Vec<String>,
+            crate::input_commands::InfoOverlayType,
+            AbortSignal,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Target identity `(cluster, agent)` owning a background session-picker list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PickerTarget {
+    pub cluster: String,
+    pub agent: Option<String>,
+}
+
+/// Identity of the TUI's currently displayed session target for history
+/// rebuild/repair fencing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HistoryTarget {
+    pub session_id: Option<String>,
+    pub agent: Option<String>,
+    pub cluster: String,
+}
+
+/// Full durable destination identity (`HistoryTarget` plus canonical session
+/// storage key) used to fence unsettled writes and preserve navigation
+/// replacement intent without collapsing distinct targets that share short IDs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HistoryDestination {
+    pub target: HistoryTarget,
+    pub storage_key: Option<String>,
+}
+
+/// Target identity and view revision that owns the transcript rows currently
+/// displayed in `app.transcript`. Confirmations and queued durable row
+/// mutations bind to this exact value and are rejected if navigation,
+/// retirement, or a same-session incarnation/rebuild advances past it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TranscriptActionTarget {
+    pub cluster: String,
+    pub storage_key: Option<String>,
+    pub target: HistoryTarget,
+    pub view_revision: u64,
+}
+
+/// Ownership state for `app.transcript` row-derived actions and target-bound
+/// session history commands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TranscriptViewOwnership {
+    pub view_revision: u64,
+    pub active_binding: Option<TranscriptActionTarget>,
+    pub active_destination: HistoryDestination,
+    /// Full durable destination of a coordinate-invalidating history command
+    /// (`invalidates_transcript_coordinates`) whose write is in flight. Set
+    /// when the command starts and cleared only by actual settlement
+    /// (`settle_history_mutation`) — never on navigation abort or caller
+    /// cancellation, since a failed or cancelled write may still have
+    /// landed in durable history. Blocks same-destination rebuilds while
+    /// reads for other destinations proceed. Regression:
+    /// `src/tests/unsettled_write_navigation_tests.rs` (#2922).
+    pub unsettled_write_destination: Option<HistoryDestination>,
+    /// Destination a target switch navigated to while the display may still
+    /// hold the previous destination's foreign rows. Set on every switched
+    /// navigation — not only returns to a destination with a prior write.
+    /// Replacement-on-error semantics must survive any superseding read (a
+    /// failed reconnect repair or paced retry must not downgrade to
+    /// preserve-stale), or the old destination's rows can stay on screen
+    /// under the new header. Cleared only once those foreign rows are
+    /// actually removed — by a committed rebuild, an initial-error
+    /// replacement, or an explicit handoff; rejected and mutation-drift
+    /// snapshots leave the intent pending. Regression:
+    /// `src/tests/navigation_failure_policy_tests.rs` (#2922).
+    pub unresolved_navigation_target: Option<HistoryDestination>,
+    pub session_fence: SessionCommandFence,
+}
+
+impl TranscriptViewOwnership {
+    pub(crate) fn initial() -> Self {
+        Self {
+            view_revision: 1,
+            session_fence: SessionCommandFence::initial(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Submission target identity for session-wide history commands (`.empty
+/// session`, `.reset session`, `.reset repl`, `.compact session`,
+/// `.edit session`), binding them to the submitting session without requiring
+/// transcript row bindings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionCommandTarget {
+    pub target: HistoryTarget,
+    pub storage_key: Option<String>,
+    pub target_epoch: u64,
+}
+
+/// Fence state for target-bound history commands (row and session-wide):
+/// tracks the monotonic `target_epoch` bumped on every real target switch and
+/// the currently running bound command's captured submission target + epoch so
+/// stale completions from a prior target or epoch cannot affect the current
+/// destination's work or transcript.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionCommandFence {
+    pub target_epoch: u64,
+    pub running_bound_target: Option<SessionCommandTarget>,
+}
+
+impl SessionCommandFence {
+    pub(crate) fn initial() -> Self {
+        Self {
+            target_epoch: 1,
+            ..Self::default()
+        }
+    }
+}
+
+/// Entry in `Tui::history_command_queue`: durable transcript mutations carry
+/// the `TranscriptActionTarget` captured from the displayed rows so a prior
+/// target switch or view revision change rejects them before execution;
+/// session-wide history commands carry `SessionCommandTarget` captured at
+/// submission without requiring row bindings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueuedHistoryCommand {
+    pub line: String,
+    pub expected_target: Option<TranscriptActionTarget>,
+    pub expected_session: Option<SessionCommandTarget>,
+}
+
+/// Payload for `TuiEvent::HistoryRebuildFinished`. Bundled in a struct so the
+/// completion handler and event variant stay compact and within parameter caps.
+pub(crate) struct HistoryRebuildCompletion {
+    pub seq: u64,
+    pub target: HistoryTarget,
+    pub attachment_gen: u64,
+    pub refresh_rev: u64,
+    pub mutation_fence: u64,
+    pub live_stamp: Option<crate::event_isolation::EventStamp>,
+    pub preserved_from: usize,
+    pub mode: crate::history_work::RebuildMode,
+    pub failure_policy: crate::history_work::RebuildFailurePolicy,
+    pub result: Result<Vec<TranscriptItem>, String>,
+}
 
 pub struct Tui {
     pub(super) config: GlobalConfig,
@@ -140,6 +310,16 @@ pub struct Tui {
     pub(super) copy_to_clipboard_override: Option<TestClipboardFn>,
     #[cfg(test)]
     pub(super) command_override: Option<TestCommandFn>,
+    #[cfg(test)]
+    pub(super) history_load_override: Option<TestHistoryLoadFn>,
+    #[cfg(test)]
+    pub(super) history_command_gate: Option<TestHistoryCommandGateFn>,
+    #[cfg(test)]
+    pub(super) picker_sessions_override: Option<TestPickerSessionsFn>,
+    #[cfg(test)]
+    pub(super) info_overlay_override: Option<TestInfoOverlayFn>,
+    #[cfg(test)]
+    pub(super) history_repair_retry_delay_override: Option<Duration>,
     /// Sessions whose durable text append succeeded but whose worker activation
     /// must be retried without submitting the text as a second user message.
     pub(super) pending_remote_activations: HashSet<(String, String)>,
@@ -157,6 +337,98 @@ pub struct Tui {
     /// Set when a durable transcript rebuild may have introduced child rows.
     /// The next monitor sync consumes it instead of rescanning every frame.
     pub(super) subagent_rows_dirty: bool,
+    /// Sequence of the most recently scheduled background history rebuild;
+    /// completions carrying anything else are stale and discarded.
+    pub(super) history_rebuild_seq: u64,
+    /// Abort signal of the in-flight background history rebuild, superseded
+    /// (set) when a newer rebuild is scheduled, cancelled by Ctrl-C, or
+    /// taken (cleared) when the rebuild no longer has an in-flight load to
+    /// cancel — completion applied, target discarded, or cancel requested.
+    pub(super) history_rebuild_abort: Option<AbortSignal>,
+    /// Task handle of the in-flight background history rebuild, aborted on
+    /// supersession, Ctrl-C, or Drop so at most one load runs at a time.
+    pub(super) history_rebuild_handle: Option<JoinHandle<()>>,
+    /// Attachment generation of the current session monitor; increments on
+    /// monitor attach/detach and on same-session stream reconnections so a
+    /// snapshot read from an earlier attachment cannot overwrite newer state.
+    pub(super) session_attachment_gen: u64,
+    /// True after the current monitor has reported its first stream attach;
+    /// subsequent `SessionStreamAttached` events on the same monitor are
+    /// same-session reconnects and bump `session_attachment_gen`.
+    pub(super) session_stream_attached: bool,
+    /// Monotonic revision of transcript snapshot scheduling/application.
+    pub(super) history_refresh_rev: u64,
+    /// Monotonic counter of live transcript mutations (messages, tool rows,
+    /// command output, snapshots). Used to reject stale repair/refresh reads
+    /// that started before newer live rows arrived.
+    pub(super) transcript_mutation_seq: u64,
+    /// Target whose initial history load failed (or whose repair was discarded
+    /// after concurrent live edits) and still needs background repair.
+    pub(super) history_repair_target: Option<HistoryTarget>,
+    /// Whether pending `RepairInitial` reloads should wrap items with the
+    /// initial welcome/agent header (true for startup/target-switch/PreserveTail
+    /// repair; false when repairing a failed `ReplaceAll` compaction/handoff).
+    pub(super) history_repair_uses_wrapper: bool,
+    /// Current paced-retry delay for pending history repair (resets on success
+    /// or target switch).
+    pub(super) history_repair_retry_delay: Duration,
+    /// Handle of the scheduled paced-retry timer for pending history repair.
+    pub(super) history_repair_retry_handle: Option<JoinHandle<()>>,
+    /// A backgrounded history command (session switch / transcript
+    /// mutation) is in flight; its finish event will arrive on the loop.
+    pub(super) history_command_running: bool,
+    /// Abort signal of the in-flight backgrounded history command. Each
+    /// command gets its own signal: Enter's `abort_signal.reset()` must not
+    /// un-abort an in-flight command (design 9 cancellation bug).
+    pub(super) history_command_abort: Option<AbortSignal>,
+    /// History commands submitted while one is in flight; started in
+    /// order when the running one finishes, preserving dot-command order.
+    pub(super) history_command_queue: std::collections::VecDeque<QueuedHistoryCommand>,
+    /// Abort signal of the single in-flight background `.set title` rename;
+    /// retired on Ctrl-C or any target switch.
+    pub(super) title_rename_abort: Option<AbortSignal>,
+    /// Fence for background `.set title` renames: incremented on spawn,
+    /// cancellation, or target switch so stale completions never update chrome.
+    pub(super) title_rename_seq: u64,
+    /// Target identity and view revision owning the currently displayed
+    /// transcript rows; `active_binding` is `None` while prior-target rows
+    /// are retired during navigation or a pending mutation reload.
+    pub(crate) transcript_view_ownership: TranscriptViewOwnership,
+    /// Abort signal of the in-flight background info-overlay load
+    /// (`.info session` / `.dump session`); superseded by a newer request
+    /// and cancelled by Ctrl-C.
+    pub(super) info_overlay_abort: Option<AbortSignal>,
+    /// Fence for background info-overlay loads: each spawn, cancellation, or
+    /// target switch bumps the seq so stale completions cannot clear a newer
+    /// slot or open an overlay after Ctrl-C or navigation.
+    pub(super) info_overlay_seq: u64,
+    /// Abort signal of the in-flight background session-picker refresh;
+    /// superseded by a newer refresh and cancelled by Ctrl-C.
+    pub(super) picker_refresh_abort: Option<AbortSignal>,
+    /// Fence for background session-picker refreshes: bumped on each spawn,
+    /// cancellation, or picker dismissal/reopen.
+    pub(super) picker_refresh_seq: u64,
+    /// Monotonic incarnation of the active `SessionPicker` modal; prevents
+    /// queued completions from an earlier picker from populating a reopened one.
+    pub(super) picker_incarnation: u64,
+    /// Target `(cluster, agent)` of the currently active picker refresh slot.
+    pub(super) picker_refresh_target: Option<PickerTarget>,
+    /// Abort signal of the in-flight background "New session" reservation
+    /// started from the session picker; superseded by a newer reservation
+    /// and cancelled by Ctrl-C.
+    pub(super) new_session_reservation_abort: Option<AbortSignal>,
+    /// Fence for background "New session" reservations: each spawn bumps the
+    /// seq and carries it in its completion event, so a stale completion
+    /// (superseded or cancelled job) can never clear the newer job's slot,
+    /// switch the session, or clobber the modal.
+    pub(super) new_session_reservation_seq: u64,
+    /// Abort signal of the in-flight background picker unread toggle
+    /// (`u`/`U` in the session picker); superseded by a newer toggle and
+    /// cancelled by Ctrl-C.
+    pub(super) picker_unread_toggle_abort: Option<AbortSignal>,
+    /// Fence for background picker unread toggles: a stale completion must
+    /// not trigger a refresh for a view that has moved on.
+    pub(super) picker_unread_toggle_seq: u64,
     #[allow(private_interfaces)]
     pub(crate) app: App,
     pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,
@@ -635,11 +907,16 @@ impl Clone for ConfirmToolUseState {
 #[allow(dead_code)]
 pub(super) enum ModalState {
     /// Confirmation for deleting one or more transcript entries.
-    ConfirmDelete { from: usize, to: usize },
+    ConfirmDelete {
+        from: usize,
+        to: usize,
+        target: TranscriptActionTarget,
+    },
     /// Confirmation for rewinding session to a specific entry.
     ConfirmRewind {
         seq: usize,
         user_text: Option<String>,
+        target: TranscriptActionTarget,
     },
     /// Confirmation for a tool call gated by tool confirmation or legacy approvals.
     /// The reply channel lives in `App::pending_confirm_reply`.
@@ -684,15 +961,21 @@ pub(super) enum ModalState {
 impl std::fmt::Debug for ModalState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ConfirmDelete { from, to } => f
+            Self::ConfirmDelete { from, to, target } => f
                 .debug_struct("ConfirmDelete")
                 .field("from", from)
                 .field("to", to)
+                .field("target", target)
                 .finish(),
-            Self::ConfirmRewind { seq, user_text } => f
+            Self::ConfirmRewind {
+                seq,
+                user_text,
+                target,
+            } => f
                 .debug_struct("ConfirmRewind")
                 .field("seq", seq)
                 .field("user_text", user_text)
+                .field("target", target)
                 .finish(),
             Self::ConfirmInteraction(state) => {
                 f.debug_tuple("ConfirmInteraction").field(state).finish()
@@ -741,13 +1024,19 @@ impl std::fmt::Debug for ModalState {
 impl Clone for ModalState {
     fn clone(&self) -> Self {
         match self {
-            Self::ConfirmDelete { from, to } => Self::ConfirmDelete {
+            Self::ConfirmDelete { from, to, target } => Self::ConfirmDelete {
                 from: *from,
                 to: *to,
+                target: target.clone(),
             },
-            Self::ConfirmRewind { seq, user_text } => Self::ConfirmRewind {
+            Self::ConfirmRewind {
+                seq,
+                user_text,
+                target,
+            } => Self::ConfirmRewind {
                 seq: *seq,
                 user_text: user_text.clone(),
+                target: target.clone(),
             },
             Self::ConfirmInteraction(state) => Self::ConfirmInteraction(state.clone()),
             Self::SurfaceAction(state) => Self::SurfaceAction(state.clone()),
@@ -824,29 +1113,33 @@ fn same_tool_confirmation(a: &ConfirmToolUseState, b: &ConfirmToolUseState) -> b
 }
 
 impl PartialEq for ModalState {
-    // qual:allow(complexity, max_function_lines=73) reason: "the eq match grows one arm per modal variant"
+    // qual:allow(complexity, max_function_lines=76) reason: "the eq match grows one arm per modal variant"
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::ConfirmDelete {
                     from: a_from,
                     to: a_to,
+                    target: a_target,
                 },
                 Self::ConfirmDelete {
                     from: b_from,
                     to: b_to,
+                    target: b_target,
                 },
-            ) => (a_from, a_to) == (b_from, b_to),
+            ) => (a_from, a_to, a_target) == (b_from, b_to, b_target),
             (
                 Self::ConfirmRewind {
                     seq: a_seq,
                     user_text: a_user_text,
+                    target: a_target,
                 },
                 Self::ConfirmRewind {
                     seq: b_seq,
                     user_text: b_user_text,
+                    target: b_target,
                 },
-            ) => a_seq == b_seq && a_user_text == b_user_text,
+            ) => (a_seq, a_user_text, a_target) == (b_seq, b_user_text, b_target),
             (Self::ConfirmInteraction(a), Self::ConfirmInteraction(b)) => a.same_request(b),
             (Self::SurfaceAction(a), Self::SurfaceAction(b)) => a.same_form(b),
             (Self::ConfirmToolUse(a), Self::ConfirmToolUse(b)) => same_tool_confirmation(a, b),
@@ -902,10 +1195,12 @@ impl PartialEq for ModalState {
 impl ModalState {
     pub(super) fn simple_confirmation_prompt(&self) -> Option<String> {
         match self {
-            Self::ConfirmDelete { from, to } if from == to => {
+            Self::ConfirmDelete { from, to, .. } if from == to => {
                 Some(format!("Delete entry {from}? [y/N]"))
             }
-            Self::ConfirmDelete { from, to } => Some(format!("Delete entries {from}–{to}? [y/N]")),
+            Self::ConfirmDelete { from, to, .. } => {
+                Some(format!("Delete entries {from}–{to}? [y/N]"))
+            }
             Self::ConfirmRewind { seq, .. } => Some(format!("Rewind to entry {seq}? [y/N]")),
             _ => None,
         }
@@ -1266,6 +1561,11 @@ pub(super) struct SubAgentSnapshot {
     pub status: SubAgentStatus,
 }
 
+pub(crate) type AdoptedSessionSink = (
+    String,
+    std::sync::Arc<dyn harnx_runtime::config::session::SessionAppendSink>,
+);
+
 pub(crate) enum TuiEvent {
     /// Durable non-modal surface snapshot / action outcome (plan T5.1).
     Surface(crate::surfaces::SurfaceEvent),
@@ -1292,6 +1592,14 @@ pub(crate) enum TuiEvent {
     PromptTaskFinished {
         task: AbortSignal,
         error: Option<String>,
+    },
+    /// Shared session stream successfully attached (including idle attach
+    /// and same-session reconnect).
+    SessionStreamAttached {
+        stamp: crate::event_isolation::EventStamp,
+        session_id: String,
+        cluster: String,
+        active: bool,
     },
     /// Shared activity observed directly from the session fan-out stream.
     SessionActivity {
@@ -1344,4 +1652,84 @@ pub(crate) enum TuiEvent {
     },
     /// Periodic reconcile event to refresh session list (emitted by main loop when picker is open).
     RefreshSessionList,
+    /// A background transcript rebuild/repair/refresh finished loading.
+    /// Fenced on seq, target, attachment generation, refresh revision, prompt
+    /// state, and live mutation fence before mutating the transcript.
+    HistoryRebuildFinished(Box<HistoryRebuildCompletion>),
+    /// Paced retry timer for pending initial-history repair fired.
+    HistoryRepairRetryDue {
+        target: HistoryTarget,
+        attachment_gen: u64,
+        refresh_rev: u64,
+    },
+    /// A backgrounded history command finished. History commands (session
+    /// switches, transcript mutations) can wait on managed-local
+    /// acquisition or the session log, so they run off the input loop and
+    /// land here; `finish_command` then applies their output as usual.
+    HistoryCommandFinished {
+        line: String,
+        prev_session: Option<String>,
+        prev_agent: Option<String>,
+        output: String,
+        result: Result<harnx_runtime::commands::CommandOutcome, anyhow::Error>,
+        adopted_sink: Option<AdoptedSessionSink>,
+    },
+    /// A backgrounded `.set title` rename finished against its submission-time
+    /// captured destination. Applied only while `seq`, target, and storage key
+    /// still match.
+    TitleRenameFinished {
+        seq: u64,
+        target: HistoryTarget,
+        storage_key: Option<String>,
+        title: String,
+        result: Result<(), anyhow::Error>,
+    },
+    /// A backgrounded session-picker refresh finished. Session listing can
+    /// wait on managed-local acquisition, so it runs off the input loop and
+    /// lands here; it applies only while the originating picker incarnation
+    /// and target are still active and the request seq has not been superseded
+    /// or cancelled.
+    PickerSessionsLoaded {
+        seq: u64,
+        picker_incarnation: u64,
+        target: PickerTarget,
+        sessions: Vec<harnx_runtime::config::SessionMeta>,
+        fetch_error: Option<String>,
+    },
+    /// A backgrounded "New session" reservation from the session picker
+    /// finished; applying it switches the session and reconciles. `seq`
+    /// fences stale completions against a newer reservation.
+    NewSessionReserved {
+        seq: u64,
+        session_id: String,
+        origin_agent: Option<String>,
+        origin_session: Option<String>,
+    },
+    /// A backgrounded "New session" reservation failed; the picker the
+    /// user started it from is restored with the error. `seq` fences
+    /// stale completions against a newer reservation.
+    NewSessionReservationFailed {
+        seq: u64,
+        error: String,
+        sessions: Vec<harnx_runtime::config::SessionMeta>,
+        selected: usize,
+        origin_agent: Option<String>,
+        origin_session: Option<String>,
+    },
+    /// A backgrounded picker unread toggle (`u`/`U`) finished. The picker
+    /// re-lists only if it is still the current view; `seq` fences stale
+    /// completions.
+    PickerUnreadToggleFinished {
+        seq: u64,
+    },
+    /// A backgrounded info-overlay load (`.info session` / `.dump session`)
+    /// finished; the overlay opens only if `seq`, `target`, and `storage_key`
+    /// still match the active request (not cancelled, superseded, or navigated).
+    InfoOverlayLoaded {
+        seq: u64,
+        target: HistoryTarget,
+        storage_key: Option<String>,
+        display_text: String,
+        info_type: crate::input_commands::InfoOverlayType,
+    },
 }
