@@ -1,9 +1,10 @@
 use crate::cli::Cli;
+use crate::main_runtime::CommandInterrupt;
 use anyhow::{ensure, Context, Result};
-use harnx_core::abort::{create_abort_signal, wait_abort_signal, AbortSignal};
+use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_runtime::{
     config::WorkingMode,
-    local_orchestrator::activation_route_for_cluster,
+    local_orchestrator::activation_route_for_cluster_with_timeout,
     nats_worker::tool_reservation::ToolReservationView,
     operator_tools::{
         cli::{
@@ -100,6 +101,22 @@ fn reservation_view(command: &OperatorToolCommand) -> ToolReservationView {
     }
 }
 
+/// Default post-readiness budget for worker activation and tool reservation
+/// startup. Separate from acquisition: `WorkerBroker::managed` waits patiently
+/// for the broker before this budget starts.
+const WORKER_ACTIVATION_BUDGET: Duration = Duration::from_secs(120);
+
+/// Test-only budget seam: `HARNX_TEST_WORKER_ACTIVATION_TIMEOUT_MS` shrinks
+/// the activation/reservation cutoff so e2e tests can prove it fires after
+/// readiness without multi-second sleeps. The acquisition boundary is
+/// unchanged, and production never sets the variable.
+fn worker_activation_budget() -> Duration {
+    harnx_runtime::utils::test_env_duration_ms(
+        "HARNX_TEST_WORKER_ACTIVATION_TIMEOUT_MS",
+        WORKER_ACTIVATION_BUDGET,
+    )
+}
+
 /// Timeout/cancellation does not replay calls. Retain full output if cancellation
 /// completes with a result, but never turn an unknown outcome into exit status 0.
 async fn bounded_operation(
@@ -132,36 +149,42 @@ pub(crate) async fn execute(
     cli: &Cli,
     command: OperatorToolCommand,
     json: bool,
+    abort: &AbortSignal,
 ) -> Result<OperatorToolReply> {
     // Reject JSON before loading configuration or starting any worker/tool process.
     validate(&command)?;
-    let abort = create_abort_signal();
-    let signal_abort = abort.clone();
-    let signal_task = scopeguard::guard(
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                signal_abort.set_ctrlc();
-            }
-        }),
-        |task| task.abort(),
-    );
     let CallerSelection {
         config,
         named,
         cluster,
-    } = resolve_caller(cli).await?;
+    } = tokio::select! {
+        biased;
+        _ = wait_abort_signal(abort) => anyhow::bail!("interrupted by user"),
+        caller = resolve_caller(cli) => caller?,
+    };
     let supervisor = Arc::new(tokio::sync::Mutex::new(None));
-    let route = tokio::time::timeout(
-        Duration::from_secs(120),
-        activation_route_for_cluster(&cluster, &supervisor, abort.clone()),
+    // Broker acquisition is patient and cancellable via the abort signal; only
+    // the worker operation after readiness is bounded by this budget.
+    // Test-only seam: `HARNX_TEST_WORKER_ACTIVATION_TIMEOUT_MS` shrinks the
+    // cutoff so e2e tests can prove it fires without multi-second sleeps.
+    let route = activation_route_for_cluster_with_timeout(
+        &cluster,
+        &supervisor,
+        abort.clone(),
+        worker_activation_budget(),
     )
-    .await
-    .context("Tool worker startup timed out")??;
+    .await?;
     let timeout = Duration::from_secs(
         cli.timeout_secs
             .filter(|seconds| *seconds > 0)
             .unwrap_or(600),
     );
+    let execution = ToolCommandExecution {
+        command: &command,
+        json,
+        abort,
+        bash_timeout_secs: cli.timeout_secs.filter(|seconds| *seconds > 0),
+    };
     let result = if let Some((agent, cluster)) = named {
         bounded_operation(
             run_named_tool_command(
@@ -171,32 +194,15 @@ pub(crate) async fn execute(
                     cluster: &cluster,
                     route,
                 },
-                ToolCommandExecution {
-                    command: &command,
-                    json,
-                    abort: &abort,
-                    bash_timeout_secs: cli.timeout_secs.filter(|seconds| *seconds > 0),
-                },
+                execution,
             ),
             timeout,
-            &abort,
+            abort,
         )
         .await
     } else {
-        execute_reserved(
-            config,
-            route,
-            ToolCommandExecution {
-                command: &command,
-                json,
-                abort: &abort,
-                bash_timeout_secs: cli.timeout_secs.filter(|seconds| *seconds > 0),
-            },
-            timeout,
-        )
-        .await
+        execute_reserved(config, route, execution, timeout).await
     };
-    drop(signal_task);
     // Reservation release precedes local worker teardown.
     supervisor.lock().await.take();
     result
@@ -249,7 +255,7 @@ async fn execute_reserved(
 ) -> Result<OperatorToolReply> {
     let view = reservation_view(execution.command);
     let mut reservation = tokio::time::timeout(
-        Duration::from_secs(120),
+        worker_activation_budget(),
         ToolReservationHandle::open(config, route, view.clone()),
     )
     .await
@@ -273,9 +279,14 @@ async fn execute_reserved(
     }
 }
 
-pub(crate) async fn run(cli: &Cli, command: OperatorToolCommand, json: bool) -> Result<u8> {
+pub(crate) async fn run(
+    cli: &Cli,
+    command: OperatorToolCommand,
+    json: bool,
+    interrupt: &CommandInterrupt,
+) -> Result<u8> {
     let is_bash = matches!(command, OperatorToolCommand::Bash { .. });
-    let reply = execute(cli, command, json)
+    let reply = execute(cli, command, json, interrupt.handle_in_command())
         .await
         .unwrap_or_else(|error| OperatorToolReply {
             output: String::new(),
@@ -308,6 +319,7 @@ pub(crate) async fn run(cli: &Cli, command: OperatorToolCommand, json: bool) -> 
 mod tests {
     use super::*;
     use clap::Parser;
+    use harnx_core::abort::create_abort_signal;
 
     #[test]
     fn virtual_view_never_uses_a_default_agent() {

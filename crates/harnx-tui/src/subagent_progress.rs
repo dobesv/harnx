@@ -14,8 +14,8 @@ impl Tui {
         &mut self,
         parent: Option<&MonitoredSessionKey>,
         key: MonitoredSessionKey,
-    ) {
-        self.upsert_subagent_row(
+    ) -> bool {
+        let change = self.upsert_subagent_row(
             parent,
             RowUpdate {
                 key: key.clone(),
@@ -36,15 +36,16 @@ impl Tui {
         self.update_subagent_row_status(&key, status);
         self.ensure_subagent_monitor(key);
         self.pin_transcript_to_bottom();
+        change != RowChange::Rejected
     }
 
     pub(super) fn record_subagent_progress(
         &mut self,
         parent: Option<&MonitoredSessionKey>,
         snapshot: SubAgentProgress,
-    ) {
+    ) -> bool {
         if !valid_snapshot(&snapshot) {
-            return;
+            return false;
         }
         let key = MonitoredSessionKey {
             cluster: parent.map_or_else(
@@ -68,7 +69,7 @@ impl Tui {
             },
         );
         if change == RowChange::Rejected {
-            return;
+            return false;
         }
         self.app
             .monitored_sessions
@@ -87,6 +88,7 @@ impl Tui {
         self.show_in_open_views(&invocation_id, &status, &progress);
         self.ensure_subagent_monitor(key);
         self.pin_transcript_to_bottom();
+        true
     }
 
     pub(super) fn record_recovered_subagent_progress(&mut self, snapshot: SubAgentProgress) {
@@ -94,7 +96,7 @@ impl Tui {
             return;
         }
         if has_visible_origin(&self.app.transcript, &snapshot) {
-            self.record_subagent_progress(None, snapshot);
+            let _ = self.record_subagent_progress(None, snapshot);
         } else {
             // Compaction may have hidden the originating call. Keep an open
             // child view current without resurrecting archived rows at the tail.

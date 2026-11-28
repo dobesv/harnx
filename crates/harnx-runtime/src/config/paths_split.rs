@@ -71,10 +71,18 @@ impl Config {
     /// I/O. The reserved session may remain transcript-empty until its first
     /// turn.
     pub async fn reserve_new_session_id(config: &GlobalConfig) -> Result<String> {
+        Self::reserve_new_session_id_with_abort(config, None).await
+    }
+
+    /// Cancellable wait for managed-local readiness before reserving an ID.
+    pub async fn reserve_new_session_id_with_abort(
+        config: &GlobalConfig,
+        abort: Option<&AbortSignal>,
+    ) -> Result<String> {
         let config = config.read().clone();
         let initializer = crate::SessionInitializer::from_config(&config)?;
         config
-            .reserve_new_session_id_with_timeout(initializer)
+            .reserve_new_session_id_with_timeout(initializer, abort)
             .await
     }
 
@@ -86,18 +94,33 @@ impl Config {
     ) -> Result<String> {
         let config = config.read().clone();
         config
-            .reserve_new_session_id_with_timeout(initializer)
+            .reserve_new_session_id_with_timeout(initializer, None)
             .await
     }
 
     async fn reserve_new_session_id_with_timeout(
         &self,
         initializer: crate::SessionInitializer,
+        abort: Option<&AbortSignal>,
     ) -> Result<String> {
         const RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-        tokio::time::timeout(
+        let cluster = self.remote_agent.as_ref().map_or_else(
+            || self.default_cluster_key(),
+            |(_, cluster)| cluster.as_str(),
+        );
+        // Use the authenticated connection acquired here inside the timeout.
+        // A fresh connect inside it would race another owner handoff.
+        let prepared = self.prepare_managed_local(cluster, abort).await?;
+        // Test-only budget seam (see `test_env_duration_ms`): shrinks the
+        // reservation cutoff so e2e tests can prove it fires without
+        // multi-second sleeps. The acquisition boundary above is unchanged.
+        let reservation_timeout = crate::utils::test_env_duration_ms(
+            "HARNX_TEST_RESERVATION_TIMEOUT_MS",
             RESERVATION_TIMEOUT,
-            self.reserve_new_session_id_inner(initializer),
+        );
+        tokio::time::timeout(
+            reservation_timeout,
+            self.reserve_new_session_id_inner(cluster, &initializer, prepared.as_ref()),
         )
         .await
         .context("Timed out reserving a new NATS session ID")?
@@ -105,66 +128,56 @@ impl Config {
 
     async fn reserve_new_session_id_inner(
         &self,
-        initializer: crate::SessionInitializer,
+        cluster: &str,
+        initializer: &crate::SessionInitializer,
+        prepared: Option<&(NatsServerConfig, async_nats::Client)>,
     ) -> Result<String> {
         const LOCAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
-        // The initializer is validated before the local broker handoff retry loop:
-        // configuration errors are deterministic and must not become timeouts.
-
-        let cluster = self
-            .remote_agent
-            .as_ref()
-            .map(|(_, cluster)| cluster.as_str())
-            .unwrap_or(LOCAL_CLUSTER_KEY);
+        const LOCAL_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        // Inside the reservation budget: only the test stall seam runs before
+        // the KV round trips, so a stalled reservation proves the budget
+        // enforces after readiness.
+        crate::utils::test_env_sleep_ms("HARNX_TEST_RESERVATION_STALL_MS").await;
         if cluster != LOCAL_CLUSTER_KEY {
             return self
-                .reserve_new_session_id_once(cluster, &initializer)
+                .reserve_new_session_id_once(cluster, initializer, prepared)
                 .await;
         }
 
-        // The embedded broker is owned by one of the connected processes. It
-        // can legitimately disappear between discovery and the KV operation
-        // when that process exits, so rediscover and retry during that narrow
-        // handoff rather than surfacing a transient no-responders error.
+        // Keep the existing bounded handoff retry for the KV operation. The
+        // ready client reconnects across owner loss without repeating startup.
         loop {
-            match self
-                .reserve_new_session_id_once(cluster, &initializer)
-                .await
+            let attempt = self.reserve_new_session_id_once(cluster, initializer, prepared);
+            if let Ok(Ok(session_id)) = tokio::time::timeout(LOCAL_OPERATION_TIMEOUT, attempt).await
             {
-                Ok(session_id) => return Ok(session_id),
-                Err(_) => tokio::time::sleep(LOCAL_RETRY_DELAY).await,
+                return Ok(session_id);
             }
+            tokio::time::sleep(LOCAL_RETRY_DELAY).await;
         }
     }
 
     async fn reserve_new_session_id_once(
         &self,
         cluster: &str,
-        initializer: &crate::nats_session_metadata::SessionInitializer,
+        initializer: &crate::SessionInitializer,
+        prepared: Option<&(NatsServerConfig, async_nats::Client)>,
     ) -> Result<String> {
-        const LOCAL_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-        let server = self.resolve_nats_server(cluster).await?;
-        if cluster == LOCAL_CLUSTER_KEY {
-            tokio::time::timeout(
-                LOCAL_OPERATION_TIMEOUT,
-                self.reserve_new_session_id_on_server(&server, initializer),
-            )
-            .await
-            .context("Timed out reserving an ID on the shared local NATS server")?
-        } else {
-            self.reserve_new_session_id_on_server(&server, initializer)
-                .await
+        if let Some((server, client)) = prepared {
+            return self
+                .reserve_new_session_id_on_server(server, client.clone(), initializer)
+                .await;
         }
+        let (server, client) = self.resolve_nats_connection(cluster, None).await?;
+        self.reserve_new_session_id_on_server(&server, client, initializer)
+            .await
     }
 
     async fn reserve_new_session_id_on_server(
         &self,
         server: &NatsServerConfig,
-        initializer: &crate::nats_session_metadata::SessionInitializer,
+        client: async_nats::Client,
+        initializer: &crate::SessionInitializer,
     ) -> Result<String> {
-        let client = Self::connect_nats_server(server).await?;
         let jetstream = async_nats::jetstream::new(client);
         let store = crate::nats_session_metadata::SessionMetadataStore::ensure(
             &jetstream,

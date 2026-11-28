@@ -54,12 +54,14 @@ async fn production_compaction(tui: &mut Tui) {
         },
     ))
     .await;
+    tui.flush_history_work_for_test().await;
 }
 
 async fn production_refresh(tui: &mut Tui) {
     // Stamp freshness is not under test; live is accepted unconditionally.
     let stamp = crate::event_isolation::EventStamp::live(&tui.live_events);
     crate::Tui::refresh_shared_session_transcript(tui, &stamp).await;
+    tui.flush_history_work_for_test().await;
 }
 
 /// B1: an explicit child Answer keeps tray focus, its guard-free deadline,
@@ -642,4 +644,25 @@ async fn archive_refusal_notice_is_visible_on_screen() {
         screen.contains("Ctrl+D answers in the tray"),
         "notice invisible in archive view: {screen}"
     );
+}
+
+/// Rebase integration: background refresh and compaction rebuilds keep an open
+/// compaction archive browser alive while a confirmation is pending.
+#[tokio::test]
+async fn background_rebuild_preserves_archive_browser_while_interaction_pending() {
+    let mut tui = fresh_tui().await;
+    tui.app.llm_busy = false;
+    tui.app.archive_browser = Some(crate::compaction_history::ArchiveView::browser_for_tests(
+        vec![user_item("archived row")],
+    ));
+    pending_snapshot(&mut tui);
+    assert_eq!(tui.app.interaction_focus, InteractionFocus::Reading);
+
+    production_refresh(&mut tui).await;
+    assert!(tui.app.archive_browser.is_some());
+    assert_eq!(tui.app.interaction_focus, InteractionFocus::Reading);
+
+    production_compaction(&mut tui).await;
+    assert!(tui.app.archive_browser.is_some());
+    assert_eq!(tui.app.interaction_focus, InteractionFocus::Reading);
 }

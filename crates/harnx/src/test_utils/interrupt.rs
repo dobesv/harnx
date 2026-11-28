@@ -6,8 +6,135 @@
 use crate::test_utils::mock_openai_server::{MockOpenAiScript, MockOpenAiTurn};
 use crate::test_utils::tmux_harness::TmuxHarness;
 use anyhow::{Context, Result};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// A `NATS_SERVER_BIN` wrapper that delays the managed-local broker's port
+/// report until a gate file appears, for patient-startup tests. Same shape
+/// as `harnx-runtime`'s patient fixtures: exec preserves the wrapper PID,
+/// the real server publishes its own ports file, and the gate delays that
+/// publication instead of inventing readiness.
+#[cfg(unix)]
+pub const GATED_NATS_WRAPPER: &str = r#"#!/bin/sh
+set -eu
+root=${0%/*}
+if [ "$1" = --version ]; then exec "$root/real/nats-server" "$@"; fi
+printf '%s\n' "$$" >> "$root/starts"
+trap 'exit 0' TERM
+while [ ! -f "$root/go" ]; do sleep 0.025; done
+exec "$root/real/nats-server" "$@"
+"#;
+
+/// Gated managed-local broker fixture. `new()` returns `None` when no real
+/// nats-server is available (capability probe, not a timeout skip).
+#[cfg(unix)]
+pub struct GatedNats {
+    fixture: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl GatedNats {
+    pub fn new() -> Result<Option<Self>> {
+        harnx_core::require_nextest();
+        let real = match std::env::var_os("NATS_SERVER_BIN") {
+            Some(value) if Path::new(&value).is_file() => PathBuf::from(value),
+            _ => match which::which("nats-server") {
+                Ok(found) => found,
+                Err(_) => {
+                    eprintln!("skipping: nats-server binary not found");
+                    return Ok(None);
+                }
+            },
+        };
+        let fixture = tempfile::tempdir().context("broker fixture dir")?;
+        let root = fixture.path();
+        std::fs::create_dir(root.join("real"))?;
+        std::os::unix::fs::symlink(real.canonicalize()?, root.join("real/nats-server"))?;
+        std::fs::write(root.join("nats-server"), GATED_NATS_WRAPPER)?;
+        std::fs::set_permissions(
+            root.join("nats-server"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        Ok(Some(Self { fixture }))
+    }
+
+    /// Environment for the spawned harnx child: the gated wrapper plus the
+    /// broker-notice cadence seam so tests need no multi-second sleeps.
+    pub fn child_env(&self, notice_seam_ms: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                "NATS_SERVER_BIN".to_string(),
+                self.wrapper().to_string_lossy().into_owned(),
+            ),
+            (
+                "HARNX_TEST_BROKER_NOTICE_MS".to_string(),
+                notice_seam_ms.to_string(),
+            ),
+        ]
+    }
+
+    /// Environment for a tmux pane export, as `KEY=VALUE` strings ready for
+    /// `shell_escape`.
+    pub fn pane_env(&self, notice_seam_ms: &str) -> Vec<(String, String)> {
+        self.child_env(notice_seam_ms)
+    }
+
+    pub fn wrapper(&self) -> PathBuf {
+        self.fixture.path().join("nats-server")
+    }
+
+    pub fn allow(&self) -> Result<()> {
+        std::fs::write(self.fixture.path().join("go"), [])?;
+        Ok(())
+    }
+
+    pub fn close(&self) -> Result<()> {
+        std::fs::remove_file(self.fixture.path().join("go"))?;
+        Ok(())
+    }
+
+    /// PIDs of the wrapper children harnx started (exec preserves them).
+    pub fn attempts(&self) -> Vec<u32> {
+        std::fs::read_to_string(self.fixture.path().join("starts"))
+            .unwrap_or_default()
+            .lines()
+            .map(|pid| pid.parse().expect("wrapper PID"))
+            .collect()
+    }
+
+    /// Wait until the wrapper has started `attempt` children.
+    pub fn started(&self, attempt: usize) -> Result<u32> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(pid) = self.attempts().get(attempt) {
+                return Ok(*pid);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("wrapper child {attempt} never started");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+/// The child was reaped: its PID is gone entirely (a zombie would still
+/// answer `kill(pid, 0)`).
+#[cfg(unix)]
+pub fn assert_process_reaped(pid: u32) {
+    assert_eq!(
+        unsafe { libc::kill(pid as libc::pid_t, 0) },
+        -1,
+        "PID {pid} is still present"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
 /// Spinner frames used by the TUI when an LLM/tool/hook call is in flight.
 /// Mirrors `SPINNER_FRAMES` in `src/tui/types.rs`. Used to detect whether
 /// the TUI is currently busy.
@@ -267,13 +394,29 @@ pub fn write_with_blocking_hook(
 /// `repo_root` is used as the working directory for the tmux session; pass
 /// `PathBuf::from(env!("CARGO_MANIFEST_DIR"))` from the test.
 pub fn spawn_tui(paths: &ConfigPaths, harnx_bin: &Path, repo_root: &Path) -> Result<TmuxHarness> {
+    spawn_tui_with_envs(paths, harnx_bin, repo_root, &[])
+}
+
+/// Like [`spawn_tui`], but exports extra environment variables (e.g. a gated
+/// `NATS_SERVER_BIN` wrapper and the broker-notice test seam) before starting
+/// harnx.
+pub fn spawn_tui_with_envs(
+    paths: &ConfigPaths,
+    harnx_bin: &Path,
+    repo_root: &Path,
+    envs: &[(&str, &str)],
+) -> Result<TmuxHarness> {
     let tmux = TmuxHarness::new(repo_root, 120, 35).context("failed to create tmux session")?;
-    tmux.send_text(&format!(
+    let mut export_line = format!(
         "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}\n",
         shell_escape(&paths.harnx_config_dir.to_string_lossy()),
         shell_escape(&paths.harnx_data_dir.to_string_lossy()),
         shell_escape(&paths.harnx_state_dir.to_string_lossy())
-    ))?;
+    );
+    for (key, value) in envs {
+        export_line = format!("{export_line}export {key}={}\n", shell_escape(value));
+    }
+    tmux.send_text(&export_line)?;
     // Pass --agent default --session so the TUI starts with both an agent
     // and a session already active, bypassing the agent/session pickers.
     // The "default" agent is written by write_minimal_config.
@@ -409,8 +552,57 @@ pub fn spawn_oneshot_with_args(
     prompt: &str,
     extra_args: &[&str],
 ) -> Result<std::process::Child> {
+    spawn_oneshot_with_envs(paths, harnx_bin, prompt, extra_args, &[])
+}
+
+/// Spawns a one-shot command with extra CLI arguments and extra environment
+/// variables (e.g. a gated `NATS_SERVER_BIN` wrapper or the broker-notice
+/// test seam).
+pub fn spawn_oneshot_with_envs(
+    paths: &ConfigPaths,
+    harnx_bin: &Path,
+    prompt: &str,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<std::process::Child> {
     harnx_core::require_nextest();
-    use std::process::{Command, Stdio};
+    let mut command = one_shot_command(paths, harnx_bin, prompt, extra_args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.spawn().context("failed to spawn harnx one-shot")
+}
+
+/// Spawns a harnx subcommand (not the one-shot prompt path) with extra
+/// environment variables, with piped output for assertion.
+pub fn spawn_harnx_subcommand_with_envs(
+    paths: &ConfigPaths,
+    harnx_bin: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<std::process::Child> {
+    harnx_core::require_nextest();
+    let mut command = Command::new(harnx_bin);
+    command
+        .args(args)
+        .env("HARNX_CONFIG_DIR", &paths.harnx_config_dir)
+        .env("HARNX_DATA_DIR", &paths.harnx_data_dir)
+        .env("HARNX_STATE_DIR", &paths.harnx_state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.spawn().context("failed to spawn harnx subcommand")
+}
+
+fn one_shot_command(
+    paths: &ConfigPaths,
+    harnx_bin: &Path,
+    prompt: &str,
+    extra_args: &[&str],
+) -> Command {
     // --agent default is required since chat activity needs an active agent.
     // The "default" agent is written by write_minimal_config.
     let mut command = Command::new(harnx_bin);
@@ -424,9 +616,8 @@ pub fn spawn_oneshot_with_args(
         .env("HARNX_STATE_DIR", &paths.harnx_state_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn harnx one-shot")
+        .stderr(Stdio::piped());
+    command
 }
 
 /// Sends SIGINT to a running child via `libc::kill`. Unix-only.

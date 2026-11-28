@@ -123,7 +123,13 @@ async fn row_key_captures_child_target_and_full_legacy_or_confirm_identity() {
 #[tokio::test]
 async fn child_modal_queues_behind_foreground_and_drops_obsolete_generations() {
     let mut tui = tui(true).await;
-    tui.app.modal = Some(ModalState::ConfirmDelete { from: 0, to: 1 });
+    let target = tui.current_transcript_action_target();
+    let foreground_modal = ModalState::ConfirmDelete {
+        from: 0,
+        to: 1,
+        target: target.clone(),
+    };
+    tui.app.modal = Some(foreground_modal.clone());
     assert!(tui.answer_selected_child());
     assert!(matches!(
         tui.app.modal,
@@ -140,7 +146,7 @@ async fn child_modal_queues_behind_foreground_and_drops_obsolete_generations() {
     tui.present_child_confirmation();
     let request = modal_request(&tui);
     assert_eq!(request.summary, summary(true));
-    tui.app.modal = Some(ModalState::ConfirmDelete { from: 0, to: 1 });
+    tui.app.modal = Some(foreground_modal);
     tui.queue_child_confirmation(request);
     tui.app.transcript[0] = row(summary(false));
     tui.app.modal = None;
