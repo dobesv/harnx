@@ -1007,3 +1007,70 @@ async fn help_lists_the_declared_result_fields() {
     assert!(stdout.contains("FIELDS (-o json)"), "{payload}");
     assert!(stdout.contains("line_count"), "{payload}");
 }
+
+/// Counts and byte totals per `(name, status)` from the operator payload's
+/// raw trace, the ground truth the rendered report is parsed back against.
+fn trace_totals(payload: &Value) -> Vec<(String, String, u64, u64)> {
+    let mut totals: Vec<(String, String, u64, u64)> = Vec::new();
+    for entry in payload["trace"].as_array().unwrap() {
+        let name = entry["name"].as_str().unwrap();
+        let status = entry["status"].as_str().unwrap();
+        let bytes = entry["bytes"].as_u64().unwrap();
+        match totals.iter_mut().find(|t| t.0 == name && t.1 == status) {
+            Some(t) => {
+                t.2 += 1;
+                t.3 += bytes;
+            }
+            None => totals.push((name.into(), status.into(), 1, bytes)),
+        }
+    }
+    totals.sort();
+    totals
+}
+
+fn parsed_totals(payload: &Value) -> Vec<(String, String, u64, u64)> {
+    let text = payload["content"][0]["text"].as_str().unwrap();
+    let parsed = crate::script_usage::parse_report(text);
+    assert_eq!(parsed.unparsed_lines, 0, "{text}");
+    let mut totals: Vec<(String, String, u64, u64)> = Vec::new();
+    for r in &parsed.rows {
+        match totals.iter_mut().find(|t| t.0 == r.name && t.1 == r.status) {
+            Some(t) => {
+                t.2 += r.count;
+                t.3 += r.bytes;
+            }
+            None => totals.push((r.name.clone(), r.status.clone(), r.count, r.bytes)),
+        }
+    }
+    totals.sort();
+    totals
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_usage_parser_reads_the_per_call_report() {
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let abort = create_abort_signal();
+    let script =
+        "set +e\nfs_read --path a >/dev/null\nfs_read --path b >/dev/null\nbroken --path x\nfs_read --path c >/dev/null\n";
+    let payload = ok(run(&bash, script, &abort).await).value;
+    let expected = trace_totals(&payload);
+    assert_eq!(expected.iter().map(|t| t.2).sum::<u64>(), 4);
+    assert!(expected.iter().any(|t| t.1 == "tool_error"), "{expected:?}");
+    assert_eq!(parsed_totals(&payload), expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_usage_parser_reads_the_grouped_report() {
+    let (bash, _slot, _ctx) = harness(FakeProvider::new(), Vec::new());
+    let abort = create_abort_signal();
+    let script = format!(
+        "set +e\n{}{}{}",
+        "fs_read --path a >/dev/null\n".repeat(8),
+        "broken --path x\n".repeat(3),
+        "fs_read --path a >/dev/null\n"
+    );
+    let payload = ok(run(&bash, &script, &abort).await).value;
+    let expected = trace_totals(&payload);
+    assert_eq!(expected.iter().map(|t| t.2).sum::<u64>(), 12);
+    assert_eq!(parsed_totals(&payload), expected);
+}

@@ -11,6 +11,10 @@ mod main_runtime;
 mod oneshot_nats;
 mod orphan_streams_cmd;
 mod response_inputs;
+mod script_usage_cmd;
+mod script_usage_failures;
+mod script_usage_figures;
+mod script_usage_render;
 mod session_attach;
 mod session_dump;
 mod session_stats_cmd;
@@ -313,6 +317,7 @@ async fn run_info_command(
             .await
             .map(|()| 0),
         InfoSubcommands::Sessions(args) => session_stats_cmd::run(args).await,
+        InfoSubcommands::ScriptUsage(args) => script_usage_cmd::run(args).await,
     }
 }
 
