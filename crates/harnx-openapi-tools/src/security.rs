@@ -20,9 +20,19 @@
 //!   whether or not an operation redundantly declares the parameter too — and
 //!   keeps every operation available for other operator-selected credentials.
 //!
+//! Reserved HTTP credential headers (`Authorization`,
+//! `Proxy-Authorization`, `Cookie`) are protected by identity at the header
+//! location, case-insensitively, with or without a matching scheme: they
+//! always carry operator-supplied credentials.
+//!
+//! A scheme declared as a Reference Object (`$ref`) resolves through its
+//! local target chain before classification, cycle-safely. Dangling,
+//! non-local or cyclic scheme references fail collection with scheme and
+//! reference context instead of silently passing name validation.
+//!
 //! Ordinary parameters that merely look like credentials by name are never
 //! protected — only parameters at the scheme's own location that the scheme
-//! itself names are.
+//! itself names, plus the reserved credential header identities, are.
 
 use std::collections::BTreeMap;
 
@@ -47,6 +57,48 @@ impl ApiKeyPlacement {
 
 /// Diagnostic names of [`ApiKeyPlacement`], indexed by discriminant.
 const WIRE_LOCATIONS: [&str; 3] = ["header", "query", "cookie"];
+
+/// The scheme recorded for a parameter protected because it is a reserved
+/// HTTP credential header (`Authorization`, `Proxy-Authorization`, `Cookie`;
+/// see `normalize::params::RESERVED_CREDENTIAL_HEADERS`), not because a
+/// declared security scheme names it.
+pub const RESERVED_HEADER_SCHEME: &str = "<reserved HTTP credential header>";
+
+/// Follow a scheme declaration's `$ref` chain to the concrete target.
+///
+/// Only local pointers resolve, cycle-safely: a chain that revisits a
+/// reference fails instead of looping. Dangling and non-local references
+/// error with the scheme and reference in the message, so they can never
+/// pass security-name validation while silently skipping classification.
+fn resolve_scheme_declaration<'a>(
+    declaration: &'a Value,
+    root: &'a Value,
+    context: &str,
+) -> SpecResult<&'a Value> {
+    let mut visited = std::collections::BTreeSet::new();
+    let mut current = declaration;
+    while let Some(reference) = current.get("$ref").and_then(Value::as_str) {
+        if !visited.insert(reference.to_string()) {
+            return Err(SpecError::invalid(
+                context,
+                format!(
+                    "cyclic security-scheme reference chain through {reference:?}; inline the \
+                     target scheme"
+                ),
+            ));
+        }
+        current = crate::refs::resolve_pointer(root, reference, context)?;
+        if !current.is_object() {
+            return Err(SpecError::invalid(
+                context,
+                format!(
+                    "security-scheme reference {reference:?} does not resolve to a scheme object"
+                ),
+            ));
+        }
+    }
+    Ok(current)
+}
 
 /// A security scheme identified as carrying a credential in a parameter.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +127,12 @@ pub struct SecuritySchemes {
 
 impl SecuritySchemes {
     /// Collect the security schemes of a Swagger 2.0 or OpenAPI 3.0 document.
-    pub fn collect(document: &crate::document::SpecDocument) -> Self {
+    ///
+    /// A scheme declared as a Reference Object resolves through its local
+    /// target before classification; dangling, non-local or cyclic references
+    /// fail here with scheme and reference context, so they can never pass
+    /// security-name validation unclassified.
+    pub fn collect(document: &crate::document::SpecDocument) -> SpecResult<Self> {
         let mut schemes = Self::default();
         let declarations = match document.kind {
             crate::document::SpecKind::Swagger2 => document.root.get("securityDefinitions"),
@@ -85,33 +142,38 @@ impl SecuritySchemes {
                 .and_then(|components| components.get("securitySchemes")),
         };
         let Some(declarations) = declarations.and_then(Value::as_object) else {
-            return schemes;
+            return Ok(schemes);
         };
         for (name, declaration) in declarations {
             schemes.scheme_names.push(name.clone());
-            schemes.collect_scheme(name, declaration);
+            schemes.collect_scheme(name, declaration, document)?;
         }
-        schemes
+        Ok(schemes)
     }
 
-    /// Register one declared scheme.
-    fn collect_scheme(&mut self, name: &str, declaration: &Value) {
-        let kind = declaration
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+    /// Register one declared scheme, resolving a Reference Object to its
+    /// concrete target first.
+    fn collect_scheme(
+        &mut self,
+        name: &str,
+        declaration: &Value,
+        document: &crate::document::SpecDocument,
+    ) -> SpecResult<()> {
+        let context = format!("security scheme {name:?}");
+        let target = resolve_scheme_declaration(declaration, &document.root, &context)?;
+        let kind = target.get("type").and_then(Value::as_str).unwrap_or("");
         if kind == "mutualTLS" {
             self.unsupported_scheme_types.push(format!(
                 "scheme {name:?} uses unsupported type \"mutualTLS\""
             ));
         }
         if kind != "apiKey" {
-            return;
+            return Ok(());
         }
-        let Some(parameter_name) = declaration.get("name").and_then(Value::as_str) else {
-            return;
+        let Some(parameter_name) = target.get("name").and_then(Value::as_str) else {
+            return Ok(());
         };
-        match declaration.get("in").and_then(Value::as_str) {
+        match target.get("in").and_then(Value::as_str) {
             Some("header") => {
                 self.header_api_keys
                     .insert(parameter_name.to_ascii_lowercase(), name.to_string());
@@ -135,6 +197,7 @@ impl SecuritySchemes {
                 ));
             }
         }
+        Ok(())
     }
 
     /// The unsupported-placement diagnostic for a scheme, with its parameter
@@ -233,7 +296,7 @@ mod tests {
             json!({"tokenHeader": {"type": "apiKey", "in": "header", "name": "X-Api-Token"}}),
             json!([{"tokenHeader": []}]),
         );
-        let schemes = SecuritySchemes::collect(&document);
+        let schemes = SecuritySchemes::collect(&document).unwrap();
         assert_eq!(schemes.header_scheme("x-api-token").unwrap(), "tokenHeader");
         assert!(schemes.header_scheme("x-other").is_none());
         assert!(schemes.unsupported_scheme_types.is_empty());
@@ -250,7 +313,7 @@ mod tests {
             }),
             json!([]),
         );
-        let schemes = SecuritySchemes::collect(&document);
+        let schemes = SecuritySchemes::collect(&document).unwrap();
         assert_eq!(schemes.query_scheme("apiKey").unwrap(), "queryKey");
         assert_eq!(schemes.cookie_scheme("session").unwrap(), "cookieKey");
         let messages = schemes.unsupported_scheme_types.join("\n");
@@ -269,7 +332,7 @@ mod tests {
             json!({"tokenHeader": {"type": "apiKey", "in": "header", "name": "X-Api-Token"}}),
             json!([]),
         );
-        let schemes = SecuritySchemes::collect(&document);
+        let schemes = SecuritySchemes::collect(&document).unwrap();
         // "token" and "Authorization" are not scheme-named parameters.
         assert!(schemes.header_scheme("token").is_none());
         assert!(schemes.header_scheme("authorization").is_none());
@@ -300,7 +363,7 @@ mod tests {
             json!({"basic": {"type": "http", "scheme": "basic"}}),
             json!([]),
         );
-        let schemes = SecuritySchemes::collect(&document);
+        let schemes = SecuritySchemes::collect(&document).unwrap();
         assert!(schemes
             .validate_requirements(&["missing".to_string()], "GET /x")
             .is_err());

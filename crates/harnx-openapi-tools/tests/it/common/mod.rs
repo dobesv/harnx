@@ -94,6 +94,12 @@ fn merge_members(members: &[Value], defs: &Map<String, Value>) -> Map<String, Va
 
 /// Synthesize the first variant that constrains something.
 fn synthesize_variant(variants: &[Value], defs: &Map<String, Value>) -> Value {
+    if variants
+        .first()
+        .is_some_and(|variant| variant["properties"]["encoding"].is_object())
+    {
+        return synthesize_media(variants, defs);
+    }
     for variant in variants {
         let variant = resolve(variant, defs);
         // A `{}` or boolean variant accepts null; keep looking for a
@@ -104,6 +110,49 @@ fn synthesize_variant(variants: &[Value], defs: &Map<String, Value>) -> Value {
         return synthesize(variant, defs);
     }
     Value::Null
+}
+
+/// Locate a complete variant rather than picking a type and an encoder independently.
+fn synthesize_media(variants: &[Value], defs: &Map<String, Value>) -> Value {
+    for variant in variants {
+        let content_type = &variant["properties"]["content_type"];
+        let validator = jsonschema::validator_for(content_type).unwrap();
+        let sample = content_type["enum"].get(0).cloned().or_else(|| {
+            [
+                "application/json",
+                "application/json-patch+json",
+                "text/plain",
+                "application/x-www-form-urlencoded",
+                "multipart/form-data",
+                "application/octet-stream",
+            ]
+            .into_iter()
+            .map(Value::from)
+            .find(|sample| validator.is_valid(sample))
+        });
+        if let Some(sample) = sample {
+            let mut value = synthesize(variant, defs);
+            value["content_type"] = sample;
+            return value;
+        }
+    }
+    panic!("No media sample matched the fixture envelope: {variants:?}");
+}
+
+pub fn media_variant<'a>(schema: &'a Value, encoding: &str, content_type: &str) -> &'a Value {
+    let variants = schema["anyOf"]
+        .as_array()
+        .map_or_else(|| std::slice::from_ref(schema), Vec::as_slice);
+    let content_type = Value::from(content_type);
+    variants
+        .iter()
+        .find(|variant| {
+            variant["properties"]["encoding"]["enum"][0] == encoding
+                && jsonschema::validator_for(&variant["properties"]["content_type"])
+                    .unwrap()
+                    .is_valid(&content_type)
+        })
+        .unwrap_or_else(|| panic!("no {encoding} variant for {content_type}"))
 }
 
 /// Synthesize a value for the schema's declared `type`.

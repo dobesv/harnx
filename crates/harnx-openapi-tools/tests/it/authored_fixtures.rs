@@ -3,8 +3,7 @@
 //! nullability, credential protection, naming collisions, JSON/YAML
 //! equivalence, and actionable diagnostics for unsupported constructs.
 
-#[path = "common/mod.rs"]
-mod common;
+use crate::common;
 
 use harnx_openapi_tools::{BodyInput, Catalog, ParamStyle, ProtectedParam, SpecDocument};
 use serde_json::{json, Value};
@@ -301,41 +300,41 @@ fn oas3_media_variants_publish_the_documented_envelope_shapes() {
     let BodyInput::Envelope(envelope) = &name.body.as_ref().unwrap().input else {
         panic!("two media entries must publish an envelope");
     };
-    assert_eq!(
-        envelope["properties"]["content_type"]["enum"],
-        json!(["application/json", "text/plain"])
-    );
-    assert_eq!(
-        envelope["properties"]["encoding"]["enum"],
-        json!(["json", "text"])
-    );
+    let json = common::media_variant(envelope, "json", "application/json");
+    let text = common::media_variant(envelope, "text", "text/plain");
+    assert_eq!(json["properties"]["value"]["type"], "string");
+    assert_eq!(text["properties"]["text"]["type"], "string");
 
-    // wildcard + multipart with a shared object schema: value dedupes to the
-    // single source schema and field/part names are constrained to `columns`.
+    // Wildcard and multipart use the shared source schema independently.
     let columns = catalog.find_operation("setThingColumns").unwrap();
     let BodyInput::Envelope(envelope) = &columns.body.as_ref().unwrap().input else {
         panic!("wildcard bodies publish an envelope");
     };
+    let json = common::media_variant(envelope, "json", "application/json");
+    assert_eq!(json["properties"]["value"]["$ref"], "#/$defs/ColumnSpec");
+    let form = common::media_variant(envelope, "form", "application/x-www-form-urlencoded");
     assert_eq!(
-        envelope["properties"]["value"]["$ref"],
-        json!("#/$defs/ColumnSpec")
-    );
-    assert_eq!(
-        envelope["properties"]["fields"]["items"]["properties"]["name"]["enum"],
+        form["properties"]["fields"]["items"]["properties"]["name"]["enum"],
         json!(["columns"])
     );
+    let multipart = common::media_variant(envelope, "multipart", "multipart/form-data");
     assert_eq!(
-        envelope["properties"]["parts"]["items"]["properties"]["name"]["enum"],
+        multipart["properties"]["parts"]["items"]["properties"]["name"]["enum"],
         json!(["columns"])
     );
 
-    // binary wildcard: no JSON value payload, base64 available.
+    // Binary wildcard has a viable base64 branch and never offers JSON.
     let icon = catalog.find_operation("setIcon").unwrap();
     let BodyInput::Envelope(envelope) = &icon.body.as_ref().unwrap().input else {
         panic!("binary wildcard publishes an envelope");
     };
-    assert!(envelope["properties"].get("value").is_none());
-    assert!(envelope["properties"]["base64"].is_object());
+    let binary = common::media_variant(envelope, "base64", "image/png");
+    assert!(binary["properties"]["base64"].is_object());
+    assert!(envelope["anyOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|variant| variant["properties"].get("value").is_none()));
 
     // single concrete non-JSON type: base64 envelope with the concrete enum.
     let archive = catalog.find_operation("archiveThing").unwrap();

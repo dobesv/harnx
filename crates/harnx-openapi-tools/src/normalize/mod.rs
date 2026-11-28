@@ -210,7 +210,7 @@ fn normalize_operation(
     record_diagnostics(state.schema_diagnostics, &mut compactor);
     let defs = compactor.finish();
     let mut body = parts.body;
-    resolve_body_input(&mut body, &defs)?;
+    resolve_body_input(&mut body, &defs, &site.context)?;
     let mut normalized = NormalizedOperation {
         method: site.method.to_string(),
         path: site.path.to_string(),
@@ -232,9 +232,13 @@ fn normalize_operation(
 }
 
 /// Resolve an optional body's published input once all definitions exist.
-fn resolve_body_input(body: &mut Option<BodySpec>, defs: &Map<String, Value>) -> SpecResult<()> {
+fn resolve_body_input(
+    body: &mut Option<BodySpec>,
+    defs: &Map<String, Value>,
+    context: &str,
+) -> SpecResult<()> {
     if let Some(body) = body.as_mut() {
-        body.resolve_input(defs)?;
+        body.resolve_input(defs, context)?;
     }
     Ok(())
 }
@@ -348,7 +352,7 @@ mod tests {
             path_params: vec![ParamSpec {
                 name: "petId".to_string(),
                 required: true,
-                style: ParamStyle::Simple,
+                style: ParamStyle::Simple { explode: false },
                 schema: json!({"type": "string"}),
             }],
             query_params: vec![ParamSpec {

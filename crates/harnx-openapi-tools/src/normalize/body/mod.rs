@@ -1,15 +1,18 @@
 //! Request-body construction for both spec kinds.
 
-use serde_json::{json, Map, Value};
+mod oas3;
+mod swagger2;
+
+use std::collections::BTreeMap;
+
+use serde_json::{Map, Value};
 
 use crate::compact::SchemaCompactor;
 use crate::document::{SpecDocument, SpecKind};
 use crate::envelope::{build_body_input, BodyInput};
 use crate::error::{SpecError, SpecResult};
-use crate::media::{classify_media, MediaBranch, MediaKind};
-use crate::normalize::params::{
-    json_consumes, parameter_style, swagger2_param_schema, MergedParam,
-};
+use crate::media::MediaBranch;
+use crate::normalize::params::MergedParam;
 
 /// A Swagger 2.0 `formData` field, kept for dispatch.
 #[derive(Clone, Debug, PartialEq)]
@@ -32,8 +35,17 @@ pub struct BodySpec {
 
 impl BodySpec {
     /// Resolve the published body input from the collected branches.
-    pub fn resolve_input(&mut self, defs: &Map<String, Value>) -> SpecResult<()> {
-        self.input = build_body_input(&self.branches, defs)?;
+    pub fn resolve_input(&mut self, defs: &Map<String, Value>, context: &str) -> SpecResult<()> {
+        if self.branches.is_empty() {
+            return Err(SpecError::invalid(
+                "operation",
+                "request body advertises no media entries",
+            ));
+        }
+        for branch in &mut self.branches {
+            branch.resolve_payload_kinds(defs);
+        }
+        self.input = build_body_input(&self.branches, defs, context)?;
         Ok(())
     }
 }
@@ -51,176 +63,27 @@ pub fn build_body(
     compactor: &mut SchemaCompactor<'_>,
 ) -> SpecResult<Option<BodySpec>> {
     match document.kind {
-        SpecKind::OpenApi3 => build_oas3_body(document, operation, context, compactor),
-        SpecKind::Swagger2 => build_swagger2_body(document, merged, operation, context, compactor),
+        SpecKind::OpenApi3 => oas3::build_body(document, operation, context, compactor),
+        SpecKind::Swagger2 => swagger2::build_body(document, merged, operation, context, compactor),
     }
 }
 
-fn build_oas3_body(
-    document: &SpecDocument,
-    operation: &Map<String, Value>,
+pub(super) fn check_media_key<'a>(
+    advertised: &mut BTreeMap<String, &'a str>,
+    declaration: &'a str,
+    branch: &MediaBranch,
     context: &str,
-    compactor: &mut SchemaCompactor<'_>,
-) -> SpecResult<Option<BodySpec>> {
-    let Some(request_body) = operation.get("requestBody") else {
-        return Ok(None);
-    };
-    let request_body = if request_body.get("$ref").is_some() {
-        let reference = request_body
-            .get("$ref")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        crate::refs::resolve_pointer(&document.root, reference, context)?.clone()
-    } else {
-        request_body.clone()
-    };
-    let required = request_body.get("required") == Some(&Value::Bool(true));
-    let Some(content) = request_body.get("content").and_then(Value::as_object) else {
+) -> SpecResult<()> {
+    if let Some(previous) = advertised.insert(branch.media_type.clone(), declaration) {
         return Err(SpecError::invalid(
             context,
-            "request body without a `content` map",
-        ));
-    };
-    let mut branches = Vec::new();
-    for (media_type, entry) in content {
-        let schema = compactor.compact(entry.get("schema").unwrap_or(&json!({})))?;
-        let encoding = entry
-            .get("encoding")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        branches.push(MediaBranch::new(media_type, schema, encoding));
-    }
-    Ok(Some(BodySpec {
-        required,
-        branches,
-        input: BodyInput::Direct(Value::Null),
-        form_fields: Vec::new(),
-    }))
-}
-
-/// Swagger 2.0 bodies: one `in: body` parameter (a JSON value sent with the
-/// JSON-family `consumes` entry, when one is declared) or `formData`
-/// parameters (multipart when a `type: file` field or a multipart
-/// `consumes` entry demands it, URL-encoded otherwise).
-fn build_swagger2_body(
-    document: &SpecDocument,
-    merged: &[MergedParam],
-    operation: &Map<String, Value>,
-    context: &str,
-    compactor: &mut SchemaCompactor<'_>,
-) -> SpecResult<Option<BodySpec>> {
-    let body_param = merged.iter().find(|param| param.location == "body");
-    let form_params: Vec<&MergedParam> = merged
-        .iter()
-        .filter(|param| param.location == "formData")
-        .collect();
-    if body_param.is_some() && !form_params.is_empty() {
-        return Err(SpecError::invalid(
-            context,
-            "an operation cannot declare both a `body` and `formData` parameters",
+            format!(
+            "ambiguous media entries {previous:?} and {declaration:?}: both canonicalize to {:?}",
+            branch.media_type
+        ),
         ));
     }
-    let consumes = consumes_list(document, operation);
-    if let Some(body_param) = body_param {
-        let schema = body_param
-            .param
-            .get("schema")
-            .ok_or_else(|| SpecError::invalid(context, "body parameter without a schema"))?;
-        let compacted = compactor.compact(schema)?;
-        // The wire media type comes from `consumes`; a JSON-family entry
-        // carries the value directly, anything else falls through to the
-        // envelope's base64 encoder.
-        let media = json_consumes(&consumes)
-            .or_else(|| consumes.first().map(String::as_str))
-            .unwrap_or("application/json");
-        return Ok(Some(BodySpec {
-            required: body_param.required,
-            branches: vec![MediaBranch::new(media, compacted, Map::new())],
-            input: BodyInput::Direct(Value::Null),
-            form_fields: Vec::new(),
-        }));
-    }
-    if form_params.is_empty() {
-        return Ok(None);
-    }
-    build_form_data_body(&form_params, &consumes, context, compactor)
-}
-
-/// The effective `consumes` list: an operation-level list overrides the
-/// global one, per the Swagger 2.0 rules.
-fn consumes_list(document: &SpecDocument, operation: &Map<String, Value>) -> Vec<String> {
-    let source = operation
-        .get("consumes")
-        .or_else(|| document.root.get("consumes"));
-    source
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Build the body for `formData` parameters: multipart when a `type: file`
-/// field or an advertised multipart `consumes` entry demands it, URL-encoded
-/// fields otherwise. Swagger's `type: "file"` is not a JSON Schema type, so
-/// the published schema carries binary strings instead (see
-/// [`swagger2_param_schema`]).
-fn build_form_data_body(
-    form_params: &[&MergedParam],
-    consumes: &[String],
-    context: &str,
-    compactor: &mut SchemaCompactor<'_>,
-) -> SpecResult<Option<BodySpec>> {
-    let has_file = form_params
-        .iter()
-        .any(|param| param.param.get("type") == Some(&json!("file")));
-    let media = if has_file
-        || consumes
-            .iter()
-            .any(|media| classify_media(media) == MediaKind::Multipart)
-    {
-        "multipart/form-data"
-    } else {
-        consumes
-            .iter()
-            .find(|media| classify_media(media) == MediaKind::UrlencodedForm)
-            .map(String::as_str)
-            .unwrap_or("application/x-www-form-urlencoded")
-    };
-    let mut form_fields = Vec::new();
-    let mut properties = Map::new();
-    let mut required = Vec::new();
-    for param in form_params {
-        let schema = swagger2_param_schema(&param.param);
-        if param.required {
-            required.push(json!(param.name));
-        }
-        let collection_format = parameter_style(SpecKind::Swagger2, param, context)?;
-        form_fields.push(FormField {
-            name: param.name.clone(),
-            required: param.required,
-            collection_format,
-        });
-        properties.insert(param.name.clone(), schema);
-    }
-    let mut source = Map::new();
-    source.insert("type".to_string(), json!("object"));
-    source.insert("properties".to_string(), Value::Object(properties));
-    if !required.is_empty() {
-        source.insert("required".to_string(), Value::Array(required));
-    }
-    let compacted = compactor.compact(&Value::Object(source))?;
-    Ok(Some(BodySpec {
-        required: form_fields.iter().any(|field| field.required),
-        branches: vec![MediaBranch::new(media, compacted, Map::new())],
-        input: BodyInput::Direct(Value::Null),
-        form_fields,
-    }))
+    Ok(())
 }
 
 #[cfg(test)]

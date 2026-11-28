@@ -360,7 +360,7 @@ pub fn short_hash(input: &str) -> String {
 }
 
 /// Follow up to [`MAX_REF_CHAIN`] leading `#/$defs/…` references.
-fn resolve_def_chain<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> &'a Value {
+pub(crate) fn resolve_def_chain<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> &'a Value {
     let mut current = schema;
     for _ in 0..MAX_REF_CHAIN {
         let Some(reference) = current.get("$ref").and_then(Value::as_str) else {

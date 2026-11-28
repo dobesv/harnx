@@ -217,8 +217,9 @@ mod tests {
         assert!(name.len() <= namer.max_raw_len());
         assert_eq!(name.len(), 59);
         assert!(name.ends_with(&format!("_{}", short_hash("get /x"))));
-        // Deterministic: same inputs, same output.
+        // Deterministic: rebuilding from the same assignments gives the same name.
         let mut again = Namer::new("jira").unwrap();
+        assert_eq!(name, again.assign(&long_id, "get", "/x"));
         assert_eq!(
             namer.assign("other", "get", "/y"),
             again.assign("other", "get", "/y")

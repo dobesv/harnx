@@ -3,8 +3,7 @@
 //! requests, and the reviewed contract's media shapes. No network, no live
 //! Jira, no authentication.
 
-#[path = "common/mod.rs"]
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 
@@ -324,19 +323,14 @@ fn column_operations_support_repeated_fields_through_their_wildcard_entry() {
         "setColumns",
     ] {
         let envelope = envelope_of(&catalog, raw_name);
-        let name_schema = &envelope["properties"]["fields"]["items"]["properties"]["name"];
+        let form = common::media_variant(&envelope, "form", "application/x-www-form-urlencoded");
         assert_eq!(
-            name_schema["enum"],
-            json!(["columns"]),
-            "{raw_name} must constrain URL-encoded field names to the source columns field"
+            form["properties"]["fields"]["items"]["properties"]["name"]["enum"],
+            json!(["columns"])
         );
-        assert!(
-            envelope["properties"]["fields"]["items"]
-                .get("required")
-                .is_none()
-                || envelope["properties"]["fields"]["items"]["required"]
-                    == json!(["name", "value"]),
-            "{raw_name} fields must carry name and value"
+        assert_eq!(
+            form["properties"]["fields"]["items"]["required"],
+            json!(["name", "value"])
         );
         // The wildcard entry keeps the URL-encoded fields encoder available.
         let operation = catalog.find_operation(raw_name).unwrap();
@@ -360,13 +354,10 @@ fn wildcard_avatar_uploads_publish_generic_binary_and_json_encoders() {
         "storeAvatar",
     ] {
         let envelope = envelope_of(&catalog, raw_name);
-        assert_eq!(
-            envelope["properties"]["encoding"]["enum"],
-            json!(["json", "text", "form", "multipart", "base64"])
-        );
-        assert!(envelope["properties"]["content_type"]["pattern"].is_string());
-        assert!(envelope["properties"]["base64"].is_object());
-        assert!(envelope["properties"]["value"].is_object());
+        let binary = common::media_variant(&envelope, "base64", "image/png");
+        assert_eq!(binary["properties"]["base64"]["type"], "string");
+        let json = common::media_variant(&envelope, "json", "application/json");
+        assert!(json["properties"]["value"].is_object());
     }
 }
 
@@ -375,15 +366,10 @@ fn text_and_json_preference_operation_offers_both_encodings() {
     harnx_core::require_nextest();
     let catalog = catalog();
     let envelope = envelope_of(&catalog, "setPreference");
-    assert_eq!(
-        envelope["properties"]["content_type"]["enum"],
-        json!(["application/json", "text/plain"])
-    );
-    assert_eq!(
-        envelope["properties"]["encoding"]["enum"],
-        json!(["json", "text"])
-    );
-    assert_eq!(envelope["properties"]["value"], json!({"type": "string"}));
+    let json = common::media_variant(&envelope, "json", "application/json");
+    assert_eq!(json["properties"]["value"], json!({"type": "string"}));
+    let text = common::media_variant(&envelope, "text", "text/plain");
+    assert_eq!(text["properties"]["text"], json!({"type": "string"}));
 }
 
 #[test]

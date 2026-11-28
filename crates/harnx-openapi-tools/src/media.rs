@@ -15,6 +15,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::compact::is_binary_schema;
+use crate::error::{SpecError, SpecResult};
+
+mod matching;
+use matching::{classify_concrete, is_concrete, is_token};
+pub(crate) use matching::{encoding_domains, excluding, MediaMatch};
+
 /// How a request-body media entry encodes onto the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,41 +44,74 @@ pub enum MediaKind {
 }
 
 impl MediaKind {
-    /// The envelope `encoding` discriminator values this kind makes available.
-    pub fn encodings(self) -> &'static [&'static str] {
+    /// The envelope `encoding` discriminator for a concrete media kind.
+    pub fn encoding(self) -> Option<&'static str> {
         match self {
-            Self::Json | Self::JsonPatch => &["json"],
-            Self::Text => &["text"],
-            Self::UrlencodedForm => &["form"],
-            Self::Multipart => &["multipart"],
-            Self::Base64 => &["base64"],
-            Self::Wildcard => &["json", "text", "form", "multipart", "base64"],
+            Self::Json | Self::JsonPatch => Some("json"),
+            Self::Text => Some("text"),
+            Self::UrlencodedForm => Some("form"),
+            Self::Multipart => Some("multipart"),
+            Self::Base64 => Some("base64"),
+            Self::Wildcard => None,
         }
     }
 }
 
-/// Classify an advertised media type.
-pub fn classify_media(media_type: &str) -> MediaKind {
-    let media = media_type.trim().to_ascii_lowercase();
-    if media == "application/json-patch+json" {
-        return MediaKind::JsonPatch;
+/// Classify a media declaration by its canonical base type.
+fn classify_media(media_type: &str) -> MediaKind {
+    if matches!(MediaMatch::new(media_type), MediaMatch::Exact(_)) {
+        classify_concrete(media_type)
+    } else {
+        MediaKind::Wildcard
     }
-    if media == "application/json" || media.ends_with("+json") {
-        return MediaKind::Json;
+}
+
+fn canonical_base(media_type: &str) -> String {
+    let base = media_type
+        .split_once(';')
+        .map_or(media_type, |(base, _)| base);
+    base.trim().to_ascii_lowercase()
+}
+
+fn validate_media_schema(media_type: &str, schema: &Value, context: &str) -> SpecResult<()> {
+    if schema.is_null() {
+        return Err(SpecError::invalid(
+            context,
+            format!("media entry {media_type:?} has a null schema"),
+        ));
     }
-    if media.starts_with("text/") {
-        return MediaKind::Text;
+    Ok(())
+}
+
+fn validated_media_type(media_type: &str, context: &str) -> SpecResult<String> {
+    validate_canonical_media_type(media_type, canonical_base(media_type), context)
+}
+
+fn validate_canonical_media_type(
+    original: &str,
+    canonical: String,
+    context: &str,
+) -> SpecResult<String> {
+    if media_type_is_valid(&canonical) {
+        Ok(canonical)
+    } else {
+        Err(SpecError::invalid(
+            context,
+            format!("invalid advertised media type {original:?}"),
+        ))
     }
-    if media == "application/x-www-form-urlencoded" {
-        return MediaKind::UrlencodedForm;
+}
+
+fn media_type_is_valid(media_type: &str) -> bool {
+    media_match_is_valid(MediaMatch::new(media_type))
+}
+
+fn media_match_is_valid(media: MediaMatch<'_>) -> bool {
+    match media {
+        MediaMatch::Any => true,
+        MediaMatch::Type(ty) => is_token(ty),
+        MediaMatch::Exact(ty) => is_concrete(ty),
     }
-    if media.starts_with("multipart/") {
-        return MediaKind::Multipart;
-    }
-    if media == "*/*" || media.ends_with("/*") {
-        return MediaKind::Wildcard;
-    }
-    MediaKind::Base64
 }
 
 /// The published schema for the RFC 6902 patch array a `json-patch+json`
@@ -97,8 +137,7 @@ pub fn json_patch_array_schema() -> Value {
 /// One advertised request-body media entry, with its compacted source schema.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaBranch {
-    /// The media type as advertised in the document (`application/json`,
-    /// `*/*`, ...). Wildcard entries are kept verbatim.
+    /// Canonical advertised type or range: lowercase, without parameters.
     pub media_type: String,
     pub kind: MediaKind,
     /// The compacted source schema of the entry, `{}` when the document
@@ -108,64 +147,79 @@ pub struct MediaBranch {
     /// dispatch.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub encoding: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    binary_wildcard: bool,
 }
 
 impl MediaBranch {
-    pub fn new(media_type: &str, source_schema: Value, encoding: Map<String, Value>) -> Self {
-        Self {
-            media_type: media_type.to_string(),
-            kind: classify_media(media_type),
-            source_schema,
-            encoding,
-        }
+    pub fn new(
+        media_type: &str,
+        source_schema: Value,
+        encoding: Map<String, Value>,
+        context: &str,
+    ) -> SpecResult<Self> {
+        validate_media_schema(media_type, &source_schema, context)?;
+        let canonical = validated_media_type(media_type, context)?;
+        Ok(Self::from_canonical(canonical, source_schema, encoding))
     }
 
-    pub fn is_wildcard(&self) -> bool {
-        self.kind == MediaKind::Wildcard
+    fn from_canonical(
+        media_type: String,
+        source_schema: Value,
+        encoding: Map<String, Value>,
+    ) -> Self {
+        let mut branch = Self {
+            kind: classify_media(&media_type),
+            media_type,
+            source_schema,
+            encoding,
+            binary_wildcard: false,
+        };
+        branch.resolve_payload_kinds(&Map::new());
+        branch
+    }
+
+    pub(crate) fn resolve_payload_kinds(&mut self, defs: &Map<String, Value>) {
+        self.binary_wildcard =
+            self.kind == MediaKind::Wildcard && is_binary_schema(&self.source_schema, defs);
+    }
+
+    pub(crate) fn matcher(&self) -> MediaMatch<'_> {
+        MediaMatch::new(&self.media_type)
+    }
+
+    pub(crate) fn allows_kind(&self, kind: MediaKind) -> bool {
+        !self.binary_wildcard || !matches!(kind, MediaKind::Json | MediaKind::JsonPatch)
+    }
+
+    /// Concrete encoder for this branch and media type, if compatible. Call
+    /// after selecting the branch; do not retry with a less specific branch.
+    pub fn payload_kind(&self, content_type: &str) -> Option<MediaKind> {
+        if !is_concrete(content_type) || !self.matcher().covers(content_type) {
+            return None;
+        }
+        let kind = classify_concrete(content_type);
+        self.allows_kind(kind).then_some(kind)
     }
 }
 
-// qual:api — media selection is the reviewed dispatch contract used by T3
-// and pinned by tests; see the module docs for the precedence rules.
-/// Pick the branch a concrete `content_type` selects.
-///
-/// Precedence: an exact advertised entry, then a matching `type/*` entry, then
-/// `*/*`. Wildcard content types and values with parameters are never matched
-/// against exact entries.
+// qual:api — media selection contract used by T3.
+/// Pick the branch for a lowercase, parameter-free, concrete `content_type`.
+/// Media parameters (including multipart boundaries) are encoder-owned.
+/// Exact entries win over `type/*`, then `*/*`. If the winning entry cannot
+/// encode this concrete type, there is no match; never use a weaker branch.
 pub fn select_media_branch<'a>(
     branches: &'a [MediaBranch],
     content_type: &str,
 ) -> Option<&'a MediaBranch> {
-    let concrete = normalize_media(content_type)?;
-    if concrete.contains('*') {
+    if !is_concrete(content_type) {
         return None;
     }
-    if let Some(branch) = branches.iter().find(|branch| {
-        !branch.is_wildcard()
-            && normalize_media(&branch.media_type).as_deref() == Some(concrete.as_str())
-    }) {
-        return Some(branch);
-    }
-    let (selected_type, _) = concrete.split_once('/')?;
-    let type_wildcard = format!("{selected_type}/*");
     branches
         .iter()
-        .find(|branch| branch.is_wildcard() && branch.media_type == type_wildcard)
-        .or_else(|| branches.iter().find(|branch| branch.media_type == "*/*"))
-}
-
-fn normalize_media(media_type: &str) -> Option<String> {
-    let base = media_type
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if base.split_once('/').is_some() && !base.contains(' ') {
-        Some(base)
-    } else {
-        None
-    }
+        .filter(|branch| branch.matcher().covers(content_type))
+        .max_by_key(|branch| branch.matcher().precedence())
+        .filter(|branch| branch.payload_kind(content_type).is_some())
 }
 
 #[cfg(test)]
@@ -174,7 +228,7 @@ mod tests {
     use serde_json::json;
 
     fn branch(media_type: &str, schema: Value) -> MediaBranch {
-        MediaBranch::new(media_type, schema, Map::new())
+        MediaBranch::new(media_type, schema, Map::new(), "POST /test").unwrap()
     }
 
     #[test]
@@ -208,7 +262,7 @@ mod tests {
             branch("image/*", json!({})),
             branch("*/*", json!({})),
         ];
-        let selected = select_media_branch(&branches, "application/json; charset=utf-8").unwrap();
+        let selected = select_media_branch(&branches, "application/json").unwrap();
         assert_eq!(selected.media_type, "application/json");
         assert_eq!(
             select_media_branch(&branches, "image/png")

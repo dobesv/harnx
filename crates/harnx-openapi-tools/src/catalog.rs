@@ -55,7 +55,7 @@ impl Catalog {
     /// context — nothing registers partially.
     pub fn build(document: &SpecDocument, server_name: &str) -> SpecResult<Self> {
         let mut namer = Namer::new(server_name)?;
-        let schemes = SecuritySchemes::collect(document);
+        let schemes = SecuritySchemes::collect(document)?;
         let mut schema_diagnostics = Vec::new();
         let operations =
             normalize_document(document, &mut namer, &schemes, &mut schema_diagnostics)?;

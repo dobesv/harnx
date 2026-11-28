@@ -5,18 +5,10 @@ use serde_json::{json, Map, Value};
 use crate::compact::SchemaCompactor;
 use crate::document::{SpecDocument, SpecKind};
 use crate::error::{SpecError, SpecResult};
-use crate::media::MediaKind;
 use crate::security::{ApiKeyPlacement, ProtectedParam, SecuritySchemes};
 
-/// The parameter serialization styles this release can encode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParamStyle {
-    /// `form` (query/header default) with its explode flag. Swagger 2.0
-    /// `collectionFormat: csv` maps to explode=false, `multi` to explode=true.
-    Form { explode: bool },
-    /// `simple` (path default).
-    Simple,
-}
+mod serialization;
+pub use serialization::{parameter_style, swagger2_param_schema, ParamStyle};
 
 /// A wire parameter, grouped by location and ready for dispatch.
 #[derive(Clone, Debug, PartialEq)]
@@ -139,8 +131,12 @@ fn merged_param(document: &SpecDocument, raw: &Value, context: &str) -> SpecResu
 /// Credential matching checks the parameter's location: only a header
 /// parameter named by an `apiKey`-in-header scheme, a query parameter named by
 /// an `apiKey`-in-query scheme, or a cookie parameter named by an
-/// `apiKey`-in-cookie scheme is protected. An ordinary `path`/`query`/`header`
-/// parameter that merely shares a credential's name stays a model argument.
+/// `apiKey`-in-cookie scheme is protected. The same goes for the reserved
+/// HTTP credential header identities (`Authorization`, `Proxy-Authorization`,
+/// `Cookie`), matched case-insensitively at the header location only: all
+/// HTTP authorization comes from operator configuration, so those headers are
+/// never model arguments. An ordinary `path`/`query` parameter that merely
+/// shares a credential's name stays a model argument.
 pub fn classify_parameters(
     document: &SpecDocument,
     params: Vec<MergedParam>,
@@ -159,7 +155,7 @@ pub fn classify_parameters(
         if let Some((scheme, placement)) = credential_scheme(schemes, &param) {
             groups.protected.push(ProtectedParam {
                 name: param.name.clone(),
-                scheme: scheme.clone(),
+                scheme: scheme.to_string(),
                 placement,
             });
             continue;
@@ -203,19 +199,38 @@ pub fn classify_parameters(
 fn credential_scheme<'a>(
     schemes: &'a SecuritySchemes,
     param: &MergedParam,
-) -> Option<(&'a String, ApiKeyPlacement)> {
+) -> Option<(&'a str, ApiKeyPlacement)> {
     match param.location.as_str() {
         "header" => schemes
             .header_scheme(&param.name)
-            .map(|scheme| (scheme, ApiKeyPlacement::Header)),
+            .map(|scheme| (scheme.as_str(), ApiKeyPlacement::Header))
+            .or_else(|| reserved_header_credential(&param.name)),
         "query" => schemes
             .query_scheme(&param.name)
-            .map(|scheme| (scheme, ApiKeyPlacement::Query)),
+            .map(|scheme| (scheme.as_str(), ApiKeyPlacement::Query)),
         "cookie" => schemes
             .cookie_scheme(&param.name)
-            .map(|scheme| (scheme, ApiKeyPlacement::Cookie)),
+            .map(|scheme| (scheme.as_str(), ApiKeyPlacement::Cookie)),
         _ => None,
     }
+}
+
+/// The reserved HTTP credential header identities, lowercased. These headers
+/// always carry operator-supplied credentials, so a declared header parameter
+/// with one of these names is a protected input even when no scheme names it.
+pub const RESERVED_CREDENTIAL_HEADERS: [&str; 3] =
+    ["authorization", "proxy-authorization", "cookie"];
+
+/// Whether a header parameter is a reserved credential header, by wire name,
+/// case-insensitively. Only the header location matches; an unrelated
+/// path/query parameter with the same name stays a model argument.
+fn reserved_header_credential(name: &str) -> Option<(&'static str, ApiKeyPlacement)> {
+    let lowered = name.to_ascii_lowercase();
+    let is_reserved = RESERVED_CREDENTIAL_HEADERS.contains(&lowered.as_str());
+    is_reserved.then_some((
+        crate::security::RESERVED_HEADER_SCHEME,
+        ApiKeyPlacement::Header,
+    ))
 }
 
 /// Build one classified parameter: compacted schema plus serialization style.
@@ -272,90 +287,6 @@ fn param_schema_source(
             Ok(swagger2_param_schema(&param.param))
         }
     }
-}
-
-/// Reshape a Swagger 2.0 non-body parameter (type keywords inline) into a
-/// JSON schema. Swagger's `type: "file"` is not a JSON Schema type; it maps
-/// to binary string content.
-pub fn swagger2_param_schema(param: &Value) -> Value {
-    let Some(source) = param.as_object() else {
-        return json!({});
-    };
-    let mut schema = Map::new();
-    for (key, value) in source {
-        if matches!(
-            key.as_str(),
-            "name" | "in" | "description" | "required" | "collectionFormat"
-        ) || key.starts_with("x-")
-        {
-            continue;
-        }
-        if key == "type" && value == &json!("file") {
-            schema.insert("type".to_string(), json!("string"));
-            schema.insert("format".to_string(), json!("binary"));
-        } else {
-            schema.insert(key.clone(), value.clone());
-        }
-    }
-    Value::Object(schema)
-}
-
-/// The serialization style a parameter uses, with unsupported styles rejected
-/// instead of silently mis-encoded.
-pub fn parameter_style(
-    kind: SpecKind,
-    param: &MergedParam,
-    context: &str,
-) -> SpecResult<ParamStyle> {
-    match kind {
-        SpecKind::OpenApi3 => {
-            let style = param.param.get("style").and_then(Value::as_str);
-            let explode = param.param.get("explode");
-            let is_path = param.location == "path";
-            match style.unwrap_or(if is_path { "simple" } else { "form" }) {
-                "form" => Ok(ParamStyle::Form {
-                    explode: explode.map(Value::as_bool) != Some(Some(false)),
-                }),
-                "simple" => Ok(ParamStyle::Simple),
-                other => Err(SpecError::unsupported(
-                    context,
-                    format!(
-                        "parameter {:?} uses serialization style {other:?}, which is not \
-                         supported (form, simple and their defaults are)",
-                        param.name
-                    ),
-                )),
-            }
-        }
-        SpecKind::Swagger2 => {
-            let collection_format = param
-                .param
-                .get("collectionFormat")
-                .and_then(Value::as_str)
-                .unwrap_or("csv");
-            match collection_format {
-                "csv" => Ok(ParamStyle::Form { explode: false }),
-                "multi" => Ok(ParamStyle::Form { explode: true }),
-                other => Err(SpecError::unsupported(
-                    context,
-                    format!(
-                        "parameter {:?} uses collectionFormat {other:?}, which is not supported \
-                         (csv and multi are)",
-                        param.name
-                    ),
-                )),
-            }
-        }
-    }
-}
-
-/// Media kind of the first `consumes` entry that selects JSON-family bodies,
-/// if any.
-pub fn json_consumes(consumes: &[String]) -> Option<&str> {
-    consumes
-        .iter()
-        .find(|media| matches!(crate::media::classify_media(media), MediaKind::Json))
-        .map(String::as_str)
 }
 
 #[cfg(test)]
@@ -433,7 +364,7 @@ mod tests {
         };
         assert_eq!(
             parameter_style(SpecKind::OpenApi3, &id, "GET /things/{id}").unwrap(),
-            ParamStyle::Simple
+            ParamStyle::Simple { explode: false }
         );
     }
 
@@ -472,7 +403,7 @@ mod tests {
             }}
         });
         let document = SpecDocument::from_value(root).unwrap();
-        let schemes = SecuritySchemes::collect(&document);
+        let schemes = SecuritySchemes::collect(&document).unwrap();
         let mut compactor = SchemaCompactor::new(&document.root, "GET /x");
         // A path parameter named `token` is an ordinary model argument, not a
         // credential for the header scheme.
@@ -520,7 +451,7 @@ mod tests {
             }}
         });
         let document = SpecDocument::from_value(root).unwrap();
-        let schemes = SecuritySchemes::collect(&document);
+        let schemes = SecuritySchemes::collect(&document).unwrap();
         let mut compactor = SchemaCompactor::new(&document.root, "GET /x");
         let api_key = query_param(
             "query",
@@ -533,5 +464,102 @@ mod tests {
         assert!(groups.query.is_empty());
         assert_eq!(groups.protected[0].scheme, "keyQuery");
         assert_eq!(groups.protected[0].placement, ApiKeyPlacement::Query);
+    }
+
+    #[test]
+    fn oas3_header_defaults_match_explicit_simple_for_all_shapes() {
+        harnx_core::require_nextest();
+        let schemas = [
+            json!({"type": "string"}),
+            json!({"type": "array", "items": {"type": "string"}}),
+            json!({"type": "object", "additionalProperties": {"type": "string"}}),
+        ];
+        for schema in schemas {
+            let implicit = query_param(
+                "header",
+                "X-Value",
+                json!({"name": "X-Value", "in": "header", "schema": schema}),
+            );
+            let explicit = query_param(
+                "header",
+                "X-Value",
+                json!({"name": "X-Value", "in": "header", "style": "simple", "schema": schema}),
+            );
+            let default_style =
+                parameter_style(SpecKind::OpenApi3, &implicit, "GET /things").unwrap();
+            let explicit_style =
+                parameter_style(SpecKind::OpenApi3, &explicit, "GET /things").unwrap();
+            assert_eq!(default_style, ParamStyle::Simple { explode: false });
+            assert_eq!(explicit_style, default_style);
+        }
+
+        // Explode has meaning for simple-style objects, so retain it rather
+        // than collapsing distinct wire metadata into the same variant.
+        let exploded_object = query_param(
+            "header",
+            "X-Value",
+            json!({"name": "X-Value", "in": "header", "style": "simple", "explode": true, "schema": {"type": "object"}}),
+        );
+        assert_eq!(
+            parameter_style(SpecKind::OpenApi3, &exploded_object, "GET /things").unwrap(),
+            ParamStyle::Simple { explode: true }
+        );
+    }
+
+    #[test]
+    fn swagger2_header_array_csv_uses_simple_serialization() {
+        harnx_core::require_nextest();
+        let array = query_param(
+            "header",
+            "X-Ids",
+            json!({"name": "X-Ids", "in": "header", "type": "array", "items": {"type": "string"}}),
+        );
+        assert_eq!(
+            parameter_style(SpecKind::Swagger2, &array, "GET /things").unwrap(),
+            ParamStyle::Simple { explode: false }
+        );
+        let explicit_csv = query_param(
+            "header",
+            "X-Ids",
+            json!({"name": "X-Ids", "in": "header", "type": "array", "collectionFormat": "csv"}),
+        );
+        assert_eq!(
+            parameter_style(SpecKind::Swagger2, &explicit_csv, "GET /things").unwrap(),
+            ParamStyle::Simple { explode: false }
+        );
+    }
+
+    #[test]
+    fn unsupported_header_serialization_reports_location_and_context() {
+        harnx_core::require_nextest();
+        let form = query_param(
+            "header",
+            "X-Ids",
+            json!({"name": "X-Ids", "in": "header", "style": "form", "schema": {"type": "array"}}),
+        );
+        let error = parameter_style(SpecKind::OpenApi3, &form, "GET /things").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("X-Ids"), "{message}");
+        assert!(message.contains("header"), "{message}");
+        assert!(message.contains("form"), "{message}");
+        assert!(message.contains("GET /things"), "{message}");
+
+        let deep_object = query_param(
+            "header",
+            "X-Filter",
+            json!({"name": "X-Filter", "in": "header", "style": "deepObject", "schema": {"type": "object"}}),
+        );
+        let error = parameter_style(SpecKind::OpenApi3, &deep_object, "POST /things").unwrap_err();
+        assert!(error.to_string().contains("deepObject"), "{error}");
+        assert!(error.to_string().contains("POST /things"), "{error}");
+
+        let multi = query_param(
+            "header",
+            "X-Ids",
+            json!({"name": "X-Ids", "in": "header", "type": "array", "collectionFormat": "multi"}),
+        );
+        let error = parameter_style(SpecKind::Swagger2, &multi, "GET /things").unwrap_err();
+        assert!(error.to_string().contains("multi"), "{error}");
+        assert!(error.to_string().contains("header"), "{error}");
     }
 }

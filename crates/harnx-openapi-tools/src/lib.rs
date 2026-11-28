@@ -31,4 +31,4 @@ pub use error::{SpecError, SpecResult};
 pub use media::{json_patch_array_schema, select_media_branch, MediaBranch, MediaKind};
 pub use naming::{Namer, MAX_MODEL_TOOL_NAME_LEN, MIN_RAW_NAME_BUDGET};
 pub use normalize::{NormalizedOperation, ParamSpec, ParamStyle};
-pub use security::{ApiKeyPlacement, ProtectedParam, SecuritySchemes};
+pub use security::{ApiKeyPlacement, ProtectedParam, SecuritySchemes, RESERVED_HEADER_SCHEME};
