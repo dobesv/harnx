@@ -10,6 +10,7 @@ pub use compaction_selector::CompactionSelector;
 mod credentials_args;
 mod delete_args;
 mod interact_args;
+mod script_usage_args;
 mod surface_args;
 mod validate_args;
 pub use credentials_args::{CredentialsArgs, CredentialsSubcommands};
@@ -18,6 +19,7 @@ pub use delete_args::{
     DeleteSubcommands,
 };
 pub use interact_args::*;
+pub use script_usage_args::InfoScriptUsageArgs;
 pub use surface_args::*;
 pub use validate_args::{OutputFormat, ToolsMode, ValidateArgs};
 
@@ -386,6 +388,8 @@ pub enum InfoSubcommands {
     },
     /// Report broker-side session storage statistics (read-only)
     Sessions(InfoSessionsArgs),
+    /// Report how agents use the script-mode `bash` tool (read-only)
+    ScriptUsage(InfoScriptUsageArgs),
 }
 
 /// `harnx info sessions` scope selection. The cluster is always explicit; a
@@ -775,6 +779,62 @@ mod tests {
             result.is_err(),
             "a session id must require --agent at the parser layer"
         );
+    }
+
+    fn parse_script_usage(extra: &[&str]) -> Result<InfoScriptUsageArgs, clap::Error> {
+        let mut argv = vec!["harnx", "info", "script-usage", "--cluster", "prod"];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv).map(|cli| match cli.command {
+            Some(Commands::Info(InfoArgs {
+                command: InfoSubcommands::ScriptUsage(args),
+            })) => args,
+            other => panic!("unexpected command: {other:?}"),
+        })
+    }
+
+    #[test]
+    fn parses_info_script_usage_cluster_scope() {
+        let args = parse_script_usage(&[]).unwrap();
+        assert_eq!(args.cluster, "prod");
+        assert_eq!(args.agent, None);
+        assert_eq!(args.session_id, None);
+        assert_eq!(args.since, None);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn parses_info_script_usage_agent_pattern_with_window() {
+        let args = parse_script_usage(&[
+            "--agent",
+            "pantheon/*",
+            "--since",
+            "7d",
+            "--until",
+            "2026-11-20",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(args.agent.as_deref(), Some("pantheon/*"));
+        assert_eq!(args.since.as_deref(), Some("7d"));
+        assert_eq!(args.until.as_deref(), Some("2026-11-20"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn parses_info_script_usage_session_view() {
+        let args = parse_script_usage(&["--agent", "plain", "sess-1"]).unwrap();
+        assert_eq!(args.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn rejects_info_script_usage_window_with_session_id() {
+        assert!(parse_script_usage(&["--agent", "plain", "sess-1", "--since", "7d"]).is_err());
+        assert!(parse_script_usage(&["--agent", "plain", "sess-1", "--until", "7d"]).is_err());
+    }
+
+    #[test]
+    fn rejects_info_script_usage_session_id_without_agent() {
+        assert!(parse_script_usage(&["sess-1"]).is_err());
     }
 
     #[test]
