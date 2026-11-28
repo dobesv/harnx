@@ -1,10 +1,10 @@
 name: publish_plan
-description: Publish a clean plan snapshot from a delivery worktree to refs/plans/<branch> on the validated GitHub origin
-# The publisher's scanner must be the first reader of the worktree's bytes.
-# Execution-history snapshots would copy eligible tracked/untracked bytes
-# into the delivery repository's local Git object store before the scanner
-# refuses them, so this invocation takes no snapshot and reports no diff.
-snapshots: none
+description: Publish a clean plan from a delivery worktree to refs/plans/<branch> on the validated GitHub origin
+# The publisher scans the rendered source file before publishing it.
+# Execution history would snapshot the worktree before the scan runs, copying
+# worktree bytes into the delivery repository's local Git object store, so
+# this invocation skips execution history entirely.
+diff: none
 parameters:
   source:
     type: string

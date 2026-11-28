@@ -57,8 +57,6 @@ fn build_registered_tool_template(
     let (read_paths, write_paths) = expand_template_grant_paths(&template.name, &sandbox)?;
     let name = template.name.clone();
     let description = template_description(&template);
-    // Copy before `template` moves into the entry below.
-    let snapshot_policy = template.snapshots;
     let entry = RegisteredToolTemplate {
         on_user_message: template.on_user_message,
         protocol: template.protocol,
@@ -71,7 +69,6 @@ fn build_registered_tool_template(
         sandbox_enabled: sandbox.enabled,
         no_network: !sandbox.network,
         ignored_grants: !sandbox.enabled && has_grants,
-        snapshot_policy,
     };
     Ok((name, entry))
 }

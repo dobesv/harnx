@@ -19,38 +19,22 @@ regular incremental commit (e.g. "Document <topic> constraints"). If Mnemosyne
 fails or times out, log it and continue — repository knowledge maintenance is an enhancement, not
 a gate.
 
-## Hand Clio the Plan (after Mnemosyne, before Clio)
-
-After Mnemosyne (and its knowledge commit), hand the work to Clio. Clio owns
-snapshot rendering; you do not render or draft a snapshot. Hand over:
-
-- The plan URL (`cid:plan:...`) when a live plan exists, or the supplied plan
-  attachment/content reference when that is what you have.
-- Compact execution context for anything the plan and the repository cannot
-  show: user decisions, verification outcomes, review discussion, and
-  constraints. Without a usable plan this is all Clio has, so include the
-  goal, the approach, how the work was verified, decisions actually made,
-  and learnings.
-
-If Clio cannot publish a safe snapshot or publication otherwise fails,
-report the sanitized blocker. Delivering without the `Plan:` link is the
-user's decision.
-
 ## Delegate Squash + Push to Clio
 
 Delegate **final squash, rebase, and force push** to `clio` when all work
-is complete (including any Mnemosyne docs commit) and the plan/context
-handoff from the previous section is ready.
+is complete (including any Mnemosyne docs commit).
 
-When delegating to `clio`, send the plan URL (`cid:plan:...`) and instruct `clio` to read the plan using `plans_get_plan`. Clio inspects structured metadata (`github_issue` paired with `github_owner_repo`, or `external_task_url`) or legacy plan notes to include the issue reference in the commit body. **Do NOT provide a pre-composed commit message.**
+When delegating to `clio`:
+- Send the plan URL (`cid:plan:...`) if a stored plan was used, and instruct `clio` to read it via `plans_get_plan` for issue metadata and plan publication. **Do NOT provide a pre-composed commit message.**
+- Pass an explicit issue reference override (e.g. `Issue: FDEV-1234`, `Issue: #123`, or repo-qualified `Issue: owner/repo#123` when target repository differs) only if needed; Clio reads plan metadata first by default.
+- Name the base branch if the work is stacked on another branch.
 
-You may pass an explicit issue reference override (e.g. `Issue: FDEV-1234`, `Issue: #123`, or repo-qualified `Issue: owner/repo#123` when target repository differs) if needed, but Clio reads plan metadata first by default.
+If Clio reports that plan publication failed, pass the blocker to the user;
+delivering without the `Plan:` link is the user's decision.
 
-If the work is stacked on another branch, name that base branch in your delegation to Clio.
-
-Clio will return structured delivery metadata with either an existing pull request's
-link and status or, when none is open, a compare link for opening one. Clio does NOT
-create pull requests.
+Clio returns structured delivery metadata with an existing pull request's link and
+status or, when none is open, a compare link for opening one, along with
+`plan_url` (when published) and `head_sha`. Clio does NOT create pull requests.
 
 ## Wait for Pull Request Stability
 

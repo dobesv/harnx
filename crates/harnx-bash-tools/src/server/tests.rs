@@ -656,11 +656,11 @@ async fn sandboxed_template_honors_worktree_and_package_local_grant() {
 }
 
 /// A sandboxed template launch forwards declared ambient env names to the
-/// helper as name-only `--env NAME` arguments; the helper — which inherits
-/// this process's environment — passes the values through itself. The
-/// helper's argv must never carry the value. A wrapper in `sandbox_run_path`
-/// captures the real helper's argv, so the synthetic token is asserted on
-/// both sides: the child receives it, the argv does not.
+/// local `harnx-sandbox-exec` helper as name-only `--env NAME` arguments;
+/// the helper inherits this process's environment and passes the values
+/// through itself, so a value must never reach the helper's argv. A wrapper
+/// in `sandbox_run_path` captures the real helper's argv, asserting the
+/// synthetic token on both sides: the child receives it, the argv does not.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]

@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use harnx_git_history::DiffLevel;
 use minijinja::value::Serde;
 use minijinja::{Environment, UndefinedBehavior};
 use serde::Deserialize;
@@ -29,23 +30,18 @@ pub(crate) enum OnUserMessage {
     Terminate,
 }
 
-/// Whether invocations of this template take execution-history snapshots of
-/// the working tree.
-///
-/// `auto` (the default) keeps the usual behavior: the exec pipeline snapshots
-/// eligible worktree bytes into the repository's local Git object store
-/// before and after the command, so it can report what the command changed.
-/// `none` opts out entirely — no snapshot is taken, nothing is classified,
-/// and the invocation reports no diff. A tool whose own scanner must be the
-/// first and only reader of sensitive worktree bytes (the plan publisher)
-/// needs exactly that: a host-side pre-scan snapshot would copy flagged bytes
-/// into local Git objects before the scanner refuses them.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum SnapshotPolicy {
-    #[default]
-    Auto,
-    None,
+/// Deserializes `diff:` through `DiffLevel::from_str`, so an invalid value
+/// fails with the setting's name and accepted levels, matching the error the
+/// `diff` option itself gives on `exec`/`spawn`.
+fn deserialize_diff_level<'de, D>(deserializer: D) -> Result<Option<DiffLevel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(text) => text.parse().map(Some).map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -62,10 +58,15 @@ pub struct ToolTemplate {
     pub(crate) template: bool,
     #[serde(default)]
     pub(crate) on_user_message: OnUserMessage,
-    /// Whether invocations take execution-history snapshots; see
-    /// [`SnapshotPolicy`].
-    #[serde(default)]
-    pub(crate) snapshots: SnapshotPolicy,
+    /// The level this template's invocations report their change at: the
+    /// same `none`/`summary`/`files`/`full` values as the `diff` option of
+    /// `exec`/`spawn`. Omitted keeps the per-invocation default (full for
+    /// a direct call, summary inside a bash script). `none` disables
+    /// execution history for the invocation: no snapshot is taken, so
+    /// nothing is captured into the repository's local Git object store
+    /// and no diff is reported.
+    #[serde(default, deserialize_with = "deserialize_diff_level")]
+    pub(crate) diff: Option<DiffLevel>,
     #[serde(default)]
     pub(crate) protocol: Option<ToolProtocol>,
     pub(crate) script: String,
@@ -528,13 +529,13 @@ fn validate_env_name_uniqueness(template: &ToolTemplate) -> Result<()> {
     Ok(())
 }
 
-/// `snapshots: none` cannot combine with `protocol:`: a protocol template's
+/// `diff: none` cannot combine with `protocol:`: a protocol template's
 /// result is its stderr plus the whole diff, which needs snapshots, so the
 /// opt-out would be silently ignored.
-fn validate_snapshot_policy(template: &ToolTemplate) -> Result<()> {
-    if template.snapshots == SnapshotPolicy::None && template.protocol.is_some() {
+fn validate_diff(template: &ToolTemplate) -> Result<()> {
+    if template.diff == Some(DiffLevel::None) && template.protocol.is_some() {
         anyhow::bail!(
-            "`snapshots: none` cannot combine with `protocol:` in tool `{}`",
+            "`diff: none` cannot combine with `protocol:` in tool `{}`",
             template.name
         );
     }
@@ -720,7 +721,7 @@ pub(crate) fn parse_template_str(yaml: &str, source: &Path) -> Result<ToolTempla
         .with_context(|| format!("failed to load tool template {}", source.display()))?;
     validate_env_name_uniqueness(&template)
         .with_context(|| format!("failed to load tool template {}", source.display()))?;
-    validate_snapshot_policy(&template)
+    validate_diff(&template)
         .with_context(|| format!("failed to load tool template {}", source.display()))?;
     template
         .input_schema()
@@ -735,9 +736,8 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{
-        discover_templates, param_to_env_name, parse_template_str, ParamType, SnapshotPolicy,
-    };
+    use super::{discover_templates, param_to_env_name, parse_template_str, ParamType};
+    use harnx_git_history::DiffLevel;
 
     const CANONICAL_YAML: &str = r#"name: gh_issue_view
 description: View a GitHub issue as JSON
@@ -1031,45 +1031,54 @@ script: echo ok
             sandbox.env,
             ["GH_TOKEN", "GITHUB_TOKEN", "HARNX_PACKAGE_DIR"]
         );
-        // The publisher's scanner must be the only pre-publication reader of
-        // the worktree: the invocation takes no execution-history snapshot.
-        assert_eq!(template.snapshots, SnapshotPolicy::None);
+        // The publisher scans the rendered plan before publishing; `diff:
+        // none` keeps execution history from snapshotting the worktree.
+        assert_eq!(template.diff, Some(DiffLevel::None));
     }
 
     #[test]
-    fn snapshots_policy_parses_none_defaults_to_auto_and_rejects_unknown_values() {
-        let parsed = parse_template_str(
-            "name: snap\nsnapshots: none\nscript: echo ok\n",
-            Path::new("snap.yaml"),
-        )
-        .expect("`snapshots: none` should parse");
-        assert_eq!(parsed.snapshots, SnapshotPolicy::None);
+    fn diff_setting_accepts_exec_levels_and_defaults_when_omitted() {
+        for (value, level) in [
+            ("none", DiffLevel::None),
+            ("summary", DiffLevel::Summary),
+            ("files", DiffLevel::Files),
+            ("full", DiffLevel::Full),
+        ] {
+            let parsed = parse_template_str(
+                &format!("name: level\nscript: echo ok\ndiff: {value}\n"),
+                Path::new("level.yaml"),
+            )
+            .expect("known diff level should parse");
+            assert_eq!(parsed.diff, Some(level), "`diff: {value}` should parse");
+        }
 
-        let parsed =
-            parse_template_str("name: auto_snap\nscript: echo ok\n", Path::new("auto.yaml"))
-                .expect("omitted snapshots should parse");
-        assert_eq!(parsed.snapshots, SnapshotPolicy::Auto);
+        let parsed = parse_template_str(
+            "name: default_level\nscript: echo ok\n",
+            Path::new("auto.yaml"),
+        )
+        .expect("omitted diff should parse");
+        assert_eq!(parsed.diff, None);
 
         let error = parse_template_str(
-            "name: bad_snap\nsnapshots: sometimes\nscript: echo ok\n",
+            "name: bad_level\ndiff: sometimes\nscript: echo ok\n",
             Path::new("bad.yaml"),
         )
-        .expect_err("unknown snapshots value should fail");
+        .expect_err("unknown diff value should fail");
         assert!(
-            format!("{error:#}").contains("snapshots"),
+            format!("{error:#}").contains("diff must be one of none, summary, files, full"),
             "unexpected error: {error:#}"
         );
     }
 
     #[test]
-    fn snapshots_none_cannot_combine_with_protocol() {
+    fn diff_none_cannot_combine_with_protocol() {
         let error = parse_template_str(
-            "name: proto_snap\nsnapshots: none\nprotocol: jsonl\nscript: echo ok\n",
+            "name: proto_snap\ndiff: none\nprotocol: jsonl\nscript: echo ok\n",
             Path::new("proto.yaml"),
         )
-        .expect_err("`snapshots: none` + `protocol:` should fail");
+        .expect_err("`diff: none` + `protocol:` should fail");
         assert!(
-            format!("{error:#}").contains("`snapshots: none` cannot combine with `protocol:`"),
+            format!("{error:#}").contains("`diff: none` cannot combine with `protocol:`"),
             "unexpected error: {error:#}"
         );
     }

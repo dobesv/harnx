@@ -89,9 +89,7 @@ fn shipped_config(root: &Path, package: &str) -> Result<Config> {
     Ok(config)
 }
 
-/// The registered `bash_publish_plan` tool's installed-package fixture: the
-/// shipped bash config with the publisher template installed, no global
-/// script/env grant, and the proxy service's synthetic-GitHub hook.
+/// Install the registered publisher tool and synthetic-GitHub fixture into a temp package.
 fn publisher_config(root: &Path, package: &str) -> Result<Config> {
     let packages = root.join("packages");
     std::fs::create_dir_all(&packages)?;
@@ -119,9 +117,8 @@ fn publisher_config(root: &Path, package: &str) -> Result<Config> {
         );
         server.command = binary(&server.command).to_string_lossy().into_owned();
         if server.name == "bash" {
-            // The registered publish tool carries its own script grant; the
-            // global Bash script-path and HARNX_PACKAGE_DIR grants the
-            // branch used to add must stay gone.
+            // The registered tool carries its own script grant, so no global
+            // publisher path or package-directory grant is needed.
             assert!(!server.args.windows(2).any(|args| args
                 == [
                     "--allow-read",
@@ -379,13 +376,8 @@ async fn discover_until(
     .expect("fixture tool servers register")
 }
 
-/// The registered `bash_publish_plan` tool runs with no middleware: the
-/// publisher authenticates through the ambient GitHub credential route, the
-/// same one wait_for_pr_stable uses. The proxy service here is only the
-/// synthetic GitHub that ambient egress configuration points the
-/// authenticated route at, so it must start first: its address and CA travel
-/// in the bash server's ambient environment, the way a real ambient egress
-/// proxy would.
+/// Run the registered publisher through ambient GitHub credentials and a
+/// synthetic egress endpoint; no live GitHub request is made.
 async fn run_publisher(package: &str) -> Result<()> {
     harnx_core::require_nextest();
     let Some(nats) = spawn_nats_server_with_options(SpawnNatsServerOptions {
@@ -404,8 +396,7 @@ async fn run_publisher(package: &str) -> Result<()> {
         .connect(nats.url())
         .await?;
 
-    // Phase 1: the synthetic-GitHub proxy service alone, so its egress
-    // environment can be resolved before the bash server starts.
+    // Start the synthetic GitHub endpoint first so its egress settings are available to Bash.
     let proxy_server = config
         .tool_servers
         .iter()
@@ -439,14 +430,8 @@ async fn run_publisher(package: &str) -> Result<()> {
     };
     let egress = environment.get("env").cloned().unwrap_or_else(|| json!({}));
 
-    // Phase 2: the bash server with the waiter-style credential route. The
-    // token rides as declared ambient passthrough: the template declares
-    // GITHUB_TOKEN in sandbox env, so the invocation resolves it from the
-    // server process environment. The egress configuration rides as
-    // name-only `--env NAME` passthrough — the existing deployment
-    // mechanism for ambient host values — so the publisher's script finds
-    // proxy and CA settings in its own environment, exactly like the waiter.
-    // The typed publish call itself carries none of it.
+    // Supply token and proxy/CA settings through the Bash server environment;
+    // the typed publish call carries none of these credentials.
     let mut bash_server = config
         .tool_servers
         .iter()

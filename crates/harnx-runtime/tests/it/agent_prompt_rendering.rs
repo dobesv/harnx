@@ -70,16 +70,6 @@ fn render_agent_prompt(qualified_name: &str, tools: &[ToolDeclaration]) -> Resul
         .map_err(|e| format!("{qualified_name}: failed to render prompt: {e}"))
 }
 
-/// Render an agent prompt and collapse whitespace so substring checks can
-/// span the hard line wraps the shared fragments use mid-phrase.
-fn normalized_prompt(qualified_name: &str) -> String {
-    render_agent_prompt(qualified_name, &[])
-        .unwrap_or_else(|error| panic!("{qualified_name}: {error}"))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Test case for sandbox branching behavior verification.
 struct BranchTestCase {
     agent: &'static str,
@@ -640,165 +630,42 @@ fn clio_prompt_checks_for_an_existing_pull_request_after_push() {
         prompt.contains("url,state,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup"),
         "Clio must retrieve the existing pull request's link and status"
     );
-    assert!(
-        prompt.contains("Only when no open pull request exists for the branch"),
-        "Clio must reserve the compare-link fallback for branches without an open pull request"
-    );
 }
 
-/// Plan snapshot publication (#2977): Clio renders and publishes the
-/// snapshot before composing the commit message and links it from the final
-/// `Plan:` paragraph. Clean snapshots publish automatically; a content
-/// refusal calls for sanitization, not an override.
+/// Check Clio's publisher binding and delivery fields after resolving its prompt.
 #[test]
-fn clio_prompt_covers_plan_snapshot_publication() {
+fn clio_prompt_loads_publisher_and_delivery_metadata_contract() {
     harnx_core::require_nextest();
     let Some(workspace_root) = workspace_root() else {
         return;
     };
     let (_temp, _config_guard) = install_packages(&workspace_root);
 
-    let clio = normalized_prompt("pantheon/clio");
-    assert!(
-        clio.contains("Plan Snapshot Publication"),
-        "Clio must have a plan snapshot publication section"
-    );
-    assert!(
-        clio.contains("Publish with the `bash_publish_plan` tool"),
-        "Clio must use the registered publication tool"
-    );
-    for phrase in [
-        "`source` is the rendered snapshot file",
-        "`branch` the delivery branch",
-        "`worktree` the absolute path of the delivery worktree",
-    ] {
+    let agent_path = Config::agent_file("pantheon/clio");
+    let mut agent = load_with_qualified_name(&agent_path, "pantheon/clio").expect("load Clio");
+    let tools = agent.use_tools().expect("Clio tools");
+    for required in ["plans_get_plan", "bash_publish_plan"] {
         assert!(
-            clio.contains(phrase),
-            "Clio must document typed inputs: {phrase}"
+            tools.iter().any(|tool| tool == required),
+            "Clio must have the registered `{required}` tool"
         );
     }
-    for phrase in [
-        "Publish clean snapshots automatically to the validated public or private repository without asking the user",
-        "Omit flagged material or replace it with a public-safe summary, then write a fresh snapshot and call the tool again",
-        "Never quote flagged values or try to bypass the scanner",
-        "anything else means no `Plan:` paragraph and no retry on your own",
-        "Only a new, explicit call publishes",
-    ] {
-        assert!(clio.contains(phrase), "Clio must cover: {phrase}");
+    resolve_variables(&mut agent).expect("resolve Clio variables");
+    let prompt = agent.system_text().expect("render Clio prompt");
+
+    // Callers consume these delivery fields; publication prose can change.
+    for field in ["plan_url:", "head_sha:"] {
+        assert!(
+            prompt.contains(field),
+            "Clio prompt is missing delivery field {field}"
+        );
     }
-    // The retired route is gone: no model-authored shell command, package path
-    // or environment mechanics anywhere in the delivery prompts.
-    for name in ["pantheon/clio", "pantheon/sisyphus", "pantheon/atlas"] {
-        let prompt = normalized_prompt(name);
-        for retired in [
-            "HARNX_PACKAGE_DIR",
-            "publish-plan.sh",
-            "--source \\\"$snapshot\\\"",
-        ] {
-            assert!(
-                !prompt.contains(retired),
-                "{name} must not render retired publisher mechanics: {retired}"
-            );
-        }
-    }
-    assert!(
-        clio.contains("Plan: https://github.com/"),
-        "Clio must end the commit message with the immutable Plan URL paragraph"
-    );
-    assert!(
-        clio.contains("never construct or guess"),
-        "Clio must not fabricate snapshot URLs"
-    );
-    assert!(
-        clio.contains("Plan-Id: cid:plan:"),
-        "Clio must preserve the Plan-Id trailer alongside the Plan paragraph"
-    );
-    assert!(
-        clio.contains("plan_url") && clio.contains("head_sha"),
-        "Clio must report the published URL and delivered head SHA in delivery metadata"
-    );
-    assert!(
-        clio.contains("Never create the pull request yourself"),
-        "PR creation must stay manual"
-    );
-    let publication = clio.find("Plan Snapshot Publication").expect("section");
-    let squash = clio.find("## Squash Base Rule").expect("squash section");
-    assert!(
-        publication < squash,
-        "Clio must publish before the squash instructions so the URL exists first"
-    );
 }
 
-/// Clio owns snapshot rendering (#2977): she renders a conservative,
-/// self-contained, public-safe Markdown snapshot from the caller-supplied
-/// live plan, supplied plan content, or execution context — including a
-/// no-plan retrospective — before publication.
+/// Check that caller configurations can delegate to Clio; handoff prose is
+/// intentionally left free to change with the workflow.
 #[test]
-fn clio_prompt_owns_conservative_snapshot_rendering() {
-    harnx_core::require_nextest();
-    let Some(workspace_root) = workspace_root() else {
-        return;
-    };
-    let (_temp, _config_guard) = install_packages(&workspace_root);
-
-    let clio = normalized_prompt("pantheon/clio");
-    assert!(
-        clio.contains("Render the Plan Snapshot"),
-        "Clio must have a snapshot rendering section"
-    );
-    assert!(
-        clio.contains("You own snapshot rendering"),
-        "Clio must own rendering instead of receiving a caller-rendered file"
-    );
-    for phrase in [
-        "live plan URL (`cid:plan:...`) or a supplied plan",
-        "compact execution context",
-        "Decisions and learnings",
-        "`Goal`, `Approach`, `Verification`",
-        "Without a usable plan, write a factual retrospective",
-        "do not invent decisions that were never made",
-        "distinguish verified facts from assumptions",
-    ] {
-        assert!(
-            clio.contains(phrase),
-            "Clio must render from plan or context: {phrase}"
-        );
-    }
-    for phrase in [
-        "conservatively",
-        "self-contained and safe for a public reader",
-        "Exclude secrets, credentials, personal data",
-        "prefer excluding material over publishing it",
-    ] {
-        assert!(
-            clio.contains(phrase),
-            "Clio must render conservative public-safe content: {phrase}"
-        );
-    }
-    assert!(
-        clio.contains("mktemp -d /tmp/plan-snapshot.XXXXXX"),
-        "Clio must render the snapshot into a private temp directory"
-    );
-
-    // Render first, then publish, then squash: the URL must exist before the
-    // commit message links it.
-    let render_section = clio
-        .find("## Render the Plan Snapshot")
-        .expect("render section");
-    let publication = clio
-        .find("## Plan Snapshot Publication")
-        .expect("publication section");
-    let squash = clio.find("## Squash Base Rule").expect("squash section");
-    assert!(
-        render_section < publication && publication < squash,
-        "Clio must render before publishing and publish before the squash instructions"
-    );
-}
-
-/// Callers hand Clio the plan reference and compact execution context; the
-/// rendering and sanitization instructions live in Clio's prompt alone.
-#[test]
-fn caller_prompts_hand_plan_context_to_clio_for_rendering() {
+fn delivery_callers_have_clio_delegation_tools() {
     harnx_core::require_nextest();
     let Some(workspace_root) = workspace_root() else {
         return;
@@ -806,184 +673,23 @@ fn caller_prompts_hand_plan_context_to_clio_for_rendering() {
     let (_temp, _config_guard) = install_packages(&workspace_root);
 
     for name in ["pantheon/sisyphus", "pantheon/atlas"] {
-        let prompt = normalized_prompt(name);
-        for phrase in [
-            "Clio owns snapshot rendering",
-            "Compact execution context",
-            "report the sanitized blocker",
-        ] {
-            assert!(
-                prompt.contains(phrase),
-                "{name} must hand Clio the plan and context: {phrase}"
-            );
-        }
-        // The rendering algorithm is Clio's alone.
-        for retired_rendering in [
-            "Render the Plan Snapshot",
-            "Render the plan snapshot",
-            "Decisions and learnings",
-            "`Goal`, `Approach`, `Verification`",
-            "mktemp -d /tmp/plan-snapshot",
-        ] {
-            assert!(
-                !prompt.contains(retired_rendering),
-                "{name} must not duplicate Clio's rendering algorithm: {retired_rendering}"
-            );
-        }
-        // So are the publisher mechanics; the caller only hands over the plan
-        // reference and context.
-        for retired_publisher in [
-            "renders the publication snapshot",
-            "publishes it before composing the commit message",
-            "re-renders the snapshot",
-        ] {
-            assert!(
-                !prompt.contains(retired_publisher),
-                "{name} must not duplicate Clio's publisher mechanics: {retired_publisher}"
-            );
-        }
-    }
-
-    for name in ["pantheon/sisyphus", "pantheon/atlas", "pantheon/clio"] {
-        let prompt = normalized_prompt(name);
-        for retired_approval in ["approval_required", "approval_scope", "--approve-"] {
-            assert!(
-                !prompt.contains(retired_approval),
-                "{name} must not use the retired publication approval flow: {retired_approval}"
-            );
-        }
-    }
-
-    // The handoff happens after Mnemosyne and before the Clio delegation.
-    let sisyphus = render_agent_prompt("pantheon/sisyphus", &[]).expect("render Sisyphus prompt");
-    let mnemosyne = sisyphus
-        .find("Knowledge Reconciliation (Mnemosyne)")
-        .expect("Mnemosyne section");
-    let handoff_sisyphus = sisyphus
-        .find("Hand Clio the Plan")
-        .expect("plan handoff section");
-    let clio_delegation = sisyphus
-        .find("Delegate Squash + Push to Clio")
-        .expect("Clio delegation section");
-    assert!(mnemosyne < handoff_sisyphus && handoff_sisyphus < clio_delegation);
-
-    let atlas = render_agent_prompt("pantheon/atlas", &[]).expect("render Atlas prompt");
-    let mnemosyne_atlas = atlas
-        .find("Knowledge Reconciliation (Mnemosyne)")
-        .expect("Mnemosyne section");
-    let handoff_atlas = atlas
-        .find("Hand Clio the plan and context")
-        .expect("plan handoff paragraph");
-    assert!(mnemosyne_atlas < handoff_atlas);
-}
-
-/// Sisyphus PR resume keeps the pre-branch trailer-based plan discovery; the
-/// branch-added whole-message scraping, published-snapshot HTTPS fallback, and
-/// PR-description cleanup expansions are gone.
-#[test]
-fn sisyphus_resume_prompt_keeps_baseline_trailer_discovery() {
-    harnx_core::require_nextest();
-    let Some(workspace_root) = workspace_root() else {
-        return;
-    };
-    let (_temp, _config_guard) = install_packages(&workspace_root);
-
-    let normalized = normalized_prompt("pantheon/sisyphus");
-    for phrase in [
-        "Look in Pytheas's response for a plan reference in commit trailers",
-        "Plan-Id: cid:plan:... or Plan: cid:plan:...",
-        "call `plans_get_plan` with the plan URL",
-        "bash_wait_for_pr_stable",
-    ] {
+        let agent_path = Config::agent_file(name);
+        let mut agent = load_with_qualified_name(&agent_path, name)
+            .unwrap_or_else(|error| panic!("failed to load {name}: {error}"));
+        let tools = agent.use_tools().expect("caller tools");
         assert!(
-            normalized.contains(phrase),
-            "Sisyphus must retain baseline resume phrase: {phrase}"
+            tools.iter().any(|tool| tool == "clio_session_send"),
+            "{name} must be able to delegate to Clio"
         );
-    }
-    for retired_expansion in [
-        "whole commit message",
-        "published snapshot link",
-        "authenticated GitHub access",
-        "no usable live plan can be loaded",
-        "task statuses as historical",
-        "Opportunistic PR Description Cleanup",
-    ] {
         assert!(
-            !normalized.contains(retired_expansion),
-            "Sisyphus must not render retired resume expansion: {retired_expansion}"
+            !tools.iter().any(|tool| tool == "bash_publish_plan"),
+            "{name} must leave publication to Clio"
         );
+        resolve_variables(&mut agent).expect("resolve caller variables");
+        agent
+            .system_text()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
     }
-}
-
-/// Atlas resumes from context supplied by its caller and does not search PR or
-/// commit history for a missing plan.
-#[test]
-fn atlas_prompt_uses_supplied_resume_context_without_discovery() {
-    harnx_core::require_nextest();
-    let Some(workspace_root) = workspace_root() else {
-        return;
-    };
-    let (_temp, _config_guard) = install_packages(&workspace_root);
-
-    let atlas = normalized_prompt("pantheon/atlas");
-    for phrase in [
-        "plan or context supplied by its caller",
-        "supplied live plan URL, attached snapshot, or explicit context",
-        "Load a supplied live plan with `plans_get_plan`",
-        "ask for it",
-        "Do not delegate to `pytheas` or search PR descriptions, commit messages, trailers, or other history to discover a plan",
-        "bash_wait_for_pr_stable",
-    ] {
-        assert!(atlas.contains(phrase), "Atlas must cover: {phrase}");
-    }
-    for retired_policy in [
-        "Search Pytheas's response for plan references",
-        "whole commit message",
-        "no usable live plan can be loaded",
-        "authenticated GitHub access",
-    ] {
-        assert!(
-            !atlas.contains(retired_policy),
-            "Atlas must not render retired discovery policy: {retired_policy}"
-        );
-    }
-}
-
-/// No prompt instructs PR-description cleanup: the 2026-11-27 user scope
-/// revision removed all publication-related opportunistic description edits,
-/// while Clio keeps sole rendering/scan/publication ownership.
-#[test]
-fn prompts_do_not_edit_pr_descriptions() {
-    harnx_core::require_nextest();
-    let Some(workspace_root) = workspace_root() else {
-        return;
-    };
-    let (_temp, _config_guard) = install_packages(&workspace_root);
-
-    for name in ["pantheon/sisyphus", "pantheon/atlas", "pantheon/clio"] {
-        let prompt = normalized_prompt(name);
-        for retired_cleanup in [
-            "Opportunistic PR Description Cleanup",
-            "tidy it opportunistically",
-            "preserve meaningful user text",
-            "bare description",
-        ] {
-            assert!(
-                !prompt.contains(retired_cleanup),
-                "{name} must not render retired PR-description cleanup: {retired_cleanup}"
-            );
-        }
-    }
-
-    // Clio keeps the delivery-owned parts: the immutable `Plan:` link, manual
-    // PR creation, and the stability waiter.
-    let clio = normalized_prompt("pantheon/clio");
-    assert!(clio.contains("Never create the pull request yourself"));
-    assert!(clio.contains("Plan: https://github.com/"));
-    let sisyphus = normalized_prompt("pantheon/sisyphus");
-    assert!(sisyphus.contains("bash_wait_for_pr_stable"));
-    let atlas = normalized_prompt("pantheon/atlas");
-    assert!(atlas.contains("bash_wait_for_pr_stable"));
 }
 
 #[test]

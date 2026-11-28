@@ -1,5 +1,5 @@
 //! Declared ambient passthrough, the fail-closed `env` rejection, and the
-//! `snapshots:` policy on template invocations — the core support
+//! `diff:` setting on template invocations — the core support
 //! `bash_publish_plan` runs on.
 use harnx_toolset::Toolset;
 use serde_json::{json, Value};
@@ -188,17 +188,17 @@ fn init_repo(work: &Path) {
     );
 }
 
-/// A `snapshots: none` invocation must not capture the worktree into the
+/// A `diff: none` invocation must not capture the worktree into the
 /// repository's local Git object store: a scanner-refusing tool (the plan
 /// publisher's shape) would otherwise leave flagged tracked and untracked
 /// bytes behind as unreferenced objects. The worktree is a nested repo of the
-/// invocation's default directory — the real publisher's delivery worktree
+/// invocation's default directory — the publisher's delivery worktree
 /// sits under the server's working directory the same way — so a default
-/// snapshot decision captures it. The control template, identical except for
-/// the default snapshot policy, proves the snapshot machinery is active in
-/// this fixture, so the policy assertions fail before the fix.
+/// snapshot decision captures it. The control template, identical except
+/// for the omitted `diff:`, proves the snapshot machinery is active in
+/// this fixture, so the assertions fail before the fix.
 #[tokio::test]
-async fn snapshots_none_invocation_writes_no_local_git_objects() {
+async fn diff_none_invocation_writes_no_local_git_objects() {
     const MARKER: &str = "untracked-sensitive-marker-8675309";
     let root = tempfile::tempdir().expect("grant root");
     let scanner = root.path().join("scanner.sh");
@@ -209,7 +209,7 @@ async fn snapshots_none_invocation_writes_no_local_git_objects() {
     .expect("write scanner script");
 
     let mut workdirs = Vec::new();
-    for (name, yaml_extra) in [("snap_none", "\nsnapshots: none"), ("snap_auto", "")] {
+    for (name, yaml_extra) in [("diff_none", "\ndiff: none"), ("diff_default", "")] {
         let work = root.path().join(name);
         std::fs::create_dir(&work).expect("work directory");
         std::fs::write(work.join("delivery.txt"), "tracked fixture content\n")
@@ -247,10 +247,10 @@ async fn snapshots_none_invocation_writes_no_local_git_objects() {
         );
         let after = object_census(work);
 
-        if *name == "snap_auto" {
+        if *name == "diff_default" {
             assert!(
                 after > before,
-                "default-policy control must snapshot (and thus write objects): \
+                "default-diff control must snapshot (and thus write objects): \
                  {before:?} -> {after:?}"
             );
             assert!(
@@ -260,11 +260,11 @@ async fn snapshots_none_invocation_writes_no_local_git_objects() {
         } else {
             assert_eq!(
                 after, before,
-                "snapshots:none invocation must not write local Git objects: {before:?} -> {after:?}"
+                "diff:none invocation must not write local Git objects: {before:?} -> {after:?}"
             );
             assert!(
                 !objects_contain(work, MARKER),
-                "snapshots:none invocation must not retain flagged untracked bytes in local Git objects"
+                "diff:none invocation must not retain flagged untracked bytes in local Git objects"
             );
         }
         let _ = toolset.cleanup_log_dir().await;

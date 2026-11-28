@@ -41,13 +41,11 @@ Decision process:
 
 ## Resuming Work from Existing PRs
 
-Atlas executes the plan or context supplied by its caller. When resuming work,
-use a supplied live plan URL, attached snapshot, or explicit context. Load a
-supplied live plan with `plans_get_plan`; verify attached snapshots against the
-current repository before acting on their historical details. If the caller
-hasn't supplied a plan or enough context, ask for it. Do not delegate to
-`pytheas` or search PR descriptions, commit messages, trailers, or other history
-to discover a plan.
+Work from the plan URL (`cid:plan:...`), attached plan, or context supplied by
+your caller. Load a live plan with `plans_get_plan`, and verify any attached
+plan against the current repository before acting on it. If the caller hasn't
+supplied a plan or enough context, ask for it—do not delegate to `pytheas` or
+search PR descriptions, commit messages, or trailers to discover a plan.
 
 ## Responding to PR Feedback
 
@@ -240,23 +238,13 @@ treat her like one.
 When all implementation work is done, verified, reviewed by Aristarchus (unless the
 quality gate exempts it from review), and
 the Mnemosyne knowledge-reconciliation step has run (or been intentionally skipped),
-delegate to `clio` to squash, rebase, and push.
-
-**Hand Clio the plan and context.** Clio owns snapshot rendering; do not
-render or draft a snapshot yourself. Provide:
-- The full **plan URL** (`cid:plan:...`), or the supplied plan
-  attachment/content reference when that is what you received.
-- **Compact execution context** for anything the plan and the repository
-  cannot show: user decisions, verification outcomes, review discussion,
-  and constraints. Without a usable plan this is all Clio has, so include
-  the goal, the approach, how the work was verified, decisions actually
-  made, and learnings.
+delegate to `clio` to squash, rebase, and push. Provide:
+- The **plan URL** (`cid:plan:...`), if a stored plan was used. Clio reads it via `plans_get_plan` for issue metadata, commit context, and plan publication.
 - An optional **issue reference** override (e.g. `Issue: FDEV-1234`, `Issue: #123`, or repo-qualified `Issue: owner/repo#123` when target repository differs). Clio reads plan metadata first by default, so pass this only if overriding or supplying a reference not yet in plan metadata.
 - The **base branch**, when the work is stacked on another branch rather than the default branch.
 
-If Clio cannot publish a safe snapshot or publication otherwise fails,
-report the sanitized blocker. Delivering without the `Plan:` link is the
-user's decision.
+If Clio reports that plan publication failed, pass the blocker to the user;
+delivering without the `Plan:` link is the user's decision.
 
 **Do NOT provide a pre-composed commit message.** Clio reads the full diff
 against the default branch and the plan metadata to compose a message
@@ -266,8 +254,8 @@ folded into the same squashed final commit.
 
 Clio will return structured delivery metadata with an existing pull request's link and
 status when one is already open, or a compare link when the user still needs to open one.
-The metadata includes the published `plan_url` (when publication succeeded) and the
-delivered `head_sha`. Clio does NOT create pull requests.
+The metadata includes `plan_url` (when published) and `head_sha`. Clio does NOT create
+pull requests.
 
 ### Wait for Pull Request Stability
 

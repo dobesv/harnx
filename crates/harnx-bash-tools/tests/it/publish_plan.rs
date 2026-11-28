@@ -1,4 +1,5 @@
-//! Real Git transactions; wrappers replace only the GitHub HTTP boundary and inject races.
+//! Runs the shipped publisher against disposable Git repositories. GitHub,
+//! token lookup, and race injection are isolated behind fixture commands.
 #![cfg(unix)]
 
 use serde_json::Value;
@@ -16,7 +17,7 @@ const FLAGGED: &[u8] = b"github_pat_83alX20w0s9j23a7BydcZe55\r\n-----BEGIN OPENS
 // The publisher authenticates with the ambient GitHub token route: the
 // anonymous probe carries no token, proxy or CA; the authenticated
 // confirmation carries the fixture token as a stdin header line, never argv.
-const CURL: &str = r#"#!/usr/bin/env bash
+const CURL_STUB: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 [[ $1 == -q && ${!#} == https://api.github.com/repos/example/* ]]
@@ -28,6 +29,10 @@ case $mode in
     if [[ " $* " == *' --proxy  --noproxy * '* ]]; then
       # The anonymous probe: no credentials of any kind reach it.
       [[ " $* " != *' Authorization:'* ]]
+      [[ ! ${GH_TOKEN+x} && ! ${GITHUB_TOKEN+x} && ! ${HOME+x} && ! ${CURL_HOME+x} ]]
+      [[ ! ${HTTP_PROXY+x} && ! ${HTTPS_PROXY+x} && ! ${ALL_PROXY+x} && ! ${NO_PROXY+x} ]]
+      [[ ! ${http_proxy+x} && ! ${https_proxy+x} && ! ${all_proxy+x} && ! ${no_proxy+x} ]]
+      [[ ! ${SSL_CERT_FILE+x} && ! ${CURL_CA_BUNDLE+x} && ! ${GIT_SSL_CAINFO+x} ]]
       if [[ $mode != public ]]; then
         printf '{"message":"Not Found"}\n404'
         exit
@@ -53,7 +58,7 @@ esac
 
 // Stands in for `gh auth token --hostname github.com`; gh-mode selects the
 // output framing so refusal branches stay covered.
-const GH: &str = r#"#!/usr/bin/env bash
+const GH_STUB: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 printf '%s\n' "gh $*" >> "$root/gh-calls"
@@ -64,7 +69,8 @@ case $(cat "$root/gh-mode") in
 esac
 "#;
 
-const GIT: &str = r#"#!/usr/bin/env bash
+// Forward normal operations to Git; redirect origin transport and inject controlled races.
+const GIT_SHIM: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 export PATH=${PATH#*:}
@@ -132,9 +138,9 @@ impl Fixture {
         for dir in ["bin", "home", "work", "remote.git"] {
             fs::create_dir(root.path().join(dir)).expect("fixture directory");
         }
-        install(&root.path().join("bin/git"), GIT);
-        install(&root.path().join("bin/curl"), CURL);
-        install(&root.path().join("bin/gh"), GH);
+        install(&root.path().join("bin/git"), GIT_SHIM);
+        install(&root.path().join("bin/curl"), CURL_STUB);
+        install(&root.path().join("bin/gh"), GH_STUB);
         let inherited_path = std::env::var_os("PATH").expect("PATH");
         let path = std::env::join_paths(
             std::iter::once(root.path().join("bin")).chain(std::env::split_paths(&inherited_path)),
@@ -212,6 +218,7 @@ impl Fixture {
     }
 
     fn invocation(&self) -> Command {
+        // Exercise the shipped implementation; PATH substitutes only external boundaries.
         let helper = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../packages/pantheon/scripts/publish-plan.sh");
         let mut command = self.command("bash");

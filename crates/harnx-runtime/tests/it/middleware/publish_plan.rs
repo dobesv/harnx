@@ -218,9 +218,8 @@ pub(super) async fn check_installed(ctx: &ToolEvalContext, root: &Path) -> Resul
         ],
     )?;
 
-    // Success: one JSON record with the exact plan_url, and the local ref
-    // written in the named worktree. The fixture curl on the bash server's
-    // PATH asserts the anonymous probe sees no proxy, CA, config or token env.
+    // Success: metadata and the local ref identify the snapshot in this worktree.
+    // Fixture curl checks that the anonymous probe has no proxy, CA, config, or token.
     fs::write(work.join("snapshot.md"), "# Installed fixture\r\n")?;
     let result = publish(ctx, &work, "snapshot.md", BRANCH).await;
     assert_eq!(result["exit_code"], 0, "{result}");
@@ -239,12 +238,9 @@ pub(super) async fn check_installed(ctx: &ToolEvalContext, root: &Path) -> Resul
         format!("{sha}\n")
     );
 
-    // Failure: flagged content is refused before any Git object or ref write,
-    // the result carries no URL, and no ref appears in the worktree. The
-    // invocation must also not capture the worktree into local Git objects on
-    // its own: before the scanner refuses, a host-side execution-history
-    // snapshot would have copied the flagged tracked and untracked bytes into
-    // the repository's object store.
+    // Refuse the untracked secret before any Git object or ref write. A
+    // host-side execution-history snapshot would copy it into the object store
+    // before the publisher's scanner runs.
     fs::write(
         work.join("secret.md"),
         "token: ghp_0123456789abcdefghijKLM\n",
@@ -281,9 +277,7 @@ pub(super) async fn check_installed(ctx: &ToolEvalContext, root: &Path) -> Resul
          local Git objects"
     );
 
-    // Note: exact-byte reuse across calls needs a storing remote; the
-    // middleware fixture is terminal (asserts the transport, discards the
-    // push), so reuse semantics stay covered by the publisher's own
-    // disposable-remote tests in harnx-bash-tools/tests/it/publish_plan.rs.
+    // This transport fixture discards the push. Reuse and ancestry are covered
+    // by publish_plan.rs's disposable-remote tests in harnx-bash-tools.
     Ok(())
 }
